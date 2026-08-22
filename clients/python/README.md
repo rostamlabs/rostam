@@ -122,6 +122,11 @@ hits = r.recommend("docs", positive=[1, 2], k=5)
 r.kv.put("user:42", b'{"coins":100}', ttl_ms=300_000)
 r.kv.get("user:42")
 r.kv.incr("views:42", 1)   # atomic; missing key counts as 0
+
+# Bind a collection so its name stops repeating (mirrors Go's client.Collection):
+docs = r.collection("docs")
+docs.upsert(1, embedding, content="the chunk text")
+hits = docs.hybrid_text(embedding, "apple pie", k=5)
 ```
 
 `r.query(...)` (the general composable Query API) and a few HTTP-only extras

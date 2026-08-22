@@ -22,11 +22,13 @@ from ._types import (
     SearchResults,
     TransportError,
 )
+from ._collection import Collection
 from .embeddings import Embedder, FunctionEmbedder, OpenAIEmbedder, TextStore
 from .rostam import Rostam
 
 __all__ = [
     "Rostam",
+    "Collection",
     "RostamError",
     "TransportError",
     "SearchResult",

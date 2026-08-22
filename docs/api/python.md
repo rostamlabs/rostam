@@ -76,6 +76,29 @@ c.drop_collection("docs")
 `insert` has no `content` parameter (it's create-only, and the wire op it
 sends carries no content field) — use `upsert` when a point needs stored text.
 
+## Collection handle
+
+When most of your calls target one collection, `r.collection(name)` returns a
+handle that binds the name so it stops being the first argument every time
+(mirrors the Go client's `client.Collection`). Construction does no I/O, and
+each method forwards to the identically-named flat method — so transport rules
+still apply (`query`, `delete_by_filter` raise `TransportError` on TCP just as
+`r.query` / `r.delete_by_filter` do).
+
+```python
+docs = c.collection("docs")   # a handle; does no I/O
+docs.create(dim=384, metric="cosine")
+docs.upsert(1, embedding, content="the chunk text")
+hits = docs.search_docs(embedding, k=5, filter=f.eq("doc_id", 7))
+docs.delete(1)
+docs.drop()          # -> c.drop_collection("docs")
+```
+
+Handle methods: `create`, `drop`, `upsert`, `insert`, `upsert_batch`, `delete`,
+`delete_by_filter`, `get`, `get_batch`, `scroll`, `exists`, `search`,
+`search_docs`, `search_groups`, `hybrid_search`, `hybrid_text`, `recommend`,
+`query`.
+
 ## Connections
 
 The client keeps a small pool of connections and reuses them, so a sequence

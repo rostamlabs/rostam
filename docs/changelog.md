@@ -5,6 +5,14 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **Python client: collection handle.** `r.collection(name)` returns a handle
+  bound to one collection so its name stops being repeated on every call —
+  `r.collection("posts").search(vec, k=10)` instead of
+  `r.search("posts", vec, k=10)`. Mirrors the Go client's `client.Collection`;
+  construction does no I/O, and transport rules are preserved (e.g. `query` /
+  `delete_by_filter` still raise `TransportError` on a TCP client). Exported as
+  `rostam.Collection`. Additive — the flat API is unchanged.
+
 - **The Python client (`rostam-client` on PyPI) unifies on a single `Rostam`
   class — v0.2.0 (Breaking).** The Python client is versioned and released
   independently of the server/project (this changelog's `v0.3.0` entry

@@ -3,6 +3,7 @@ from typing import Optional, Tuple
 from urllib.parse import urlsplit
 
 from . import _http, _tcp
+from ._collection import Collection
 from ._kv import _KV, _KVUnavailable
 from ._types import TransportError
 
@@ -107,6 +108,13 @@ class Rostam:
     def _require_http(self, op: str) -> None:
         if self._kind != "http":
             raise TransportError(f"{op} requires the HTTP transport; connect with http://host:8080")
+
+    def collection(self, name: str) -> Collection:
+        """Return a handle bound to `name` so the collection argument stops being
+        repeated: `r.collection("posts").search(vec, k=10)` is
+        `r.search("posts", vec, k=10)`. Construction does no I/O. Mirrors the Go
+        client's `client.Collection`."""
+        return Collection(self, name)
 
     def create_collection(self, *args, **kwargs):
         """See TcpTransport.create_collection / HttpTransport.create_collection."""

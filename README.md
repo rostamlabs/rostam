@@ -341,6 +341,15 @@ r.kv.put("user:42", b'{"coins":100}', ttl_ms=300_000)   # TCP-only
 r.kv.incr("views:42", 1)                                  # atomic; missing key counts as 0
 ```
 
+Working against one collection? `r.collection(name)` binds it so you stop
+repeating the name (mirrors the Go client's `client.Collection`):
+
+```python
+docs = r.collection("docs")
+docs.upsert(1, vec, content="hello")
+hits = docs.hybrid_text(dense=vec, text="hello", k=5)
+```
+
 Bulk ingest (`bulk_stage` + `bulk_build`, HTTP-only) ships vectors as raw f32
 over a binary wire rather than JSON text, which is what makes large loads
 fast — a 1M × 768d load runs in **282 s**.
