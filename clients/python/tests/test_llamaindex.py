@@ -5,7 +5,7 @@ import unittest
 
 import pytest
 
-from rostam import RostamClient
+from rostam import Rostam
 
 try:
     from llama_index.core.schema import NodeRelationship, RelatedNodeInfo, TextNode
@@ -39,7 +39,7 @@ def li_env():
 def test_llamaindex_auto_create_on_first_add(li_env):
     from rostam.llamaindex import RostamVectorStore
     url, make_node = li_env
-    client = RostamClient(url)
+    client = Rostam(url)
     calls = []
     orig = client.create_collection
     def spy(name, dim, **kw):
@@ -81,7 +81,7 @@ class LlamaIndexAdapterTest(unittest.TestCase):
         from rostam.llamaindex import RostamVectorStore
 
         self.fake.docs.clear()  # isolate each test (the fake is shared per class)
-        client = RostamClient(self.fake.url)
+        client = Rostam(self.fake.url)
         client.create_collection("li", dim=3, metric="l2")
         self.store = RostamVectorStore(client=client, collection="li")
         self.col = "li"
@@ -119,7 +119,7 @@ def li_hybrid_env():
         pytest.skip("llama-index-core not installed")
     fake = FakeRostam()
     url = fake.url
-    client = RostamClient(url)
+    client = Rostam(url)
     client.create_collection("li_hybrid", dim=2, metric="cosine", full_text=True)
 
     from rostam.llamaindex import RostamVectorStore
@@ -161,7 +161,7 @@ def test_llamaindex_async_methods(li_env, monkeypatch):
         assert name in RostamVectorStore.__dict__, f"{name} not an explicit override on RostamVectorStore"
 
     url, make_node = li_env
-    store = RostamVectorStore(client=RostamClient(url), collection="li_async")
+    store = RostamVectorStore(client=Rostam(url), collection="li_async")
 
     # (a) Spy on asyncio.to_thread as seen by the module to confirm routing.
     calls = []
@@ -198,7 +198,7 @@ def test_llamaindex_dict_full_text_preserved(li_env):
     from rostam.llamaindex import RostamVectorStore
 
     url, make_node = li_env
-    client = RostamClient(url)
+    client = Rostam(url)
     calls = []
     orig = client.create_collection
     def spy(name, dim, **kw):

@@ -4,11 +4,11 @@ Requires ``llama-index-core`` (``pip install rostam-client[llamaindex]``). Store
 each node's embedding, text (as Rostam content), and serialized node metadata;
 serves ``query`` via Rostam KNN and ``delete`` by ref-doc filter.
 
-    from rostam import RostamClient
+    from rostam import Rostam
     from rostam.llamaindex import RostamVectorStore
     from llama_index.core import VectorStoreIndex, StorageContext
 
-    client = RostamClient("http://localhost:8080")
+    client = Rostam("http://localhost:8080")
     client.create_collection("docs", dim=1536, metric="cosine")
     store = RostamVectorStore(client=client, collection="docs")
     index = VectorStoreIndex.from_documents(
@@ -36,7 +36,8 @@ from llama_index.core.vector_stores.utils import (
 
 from . import filters as f
 from ._ids import to_uint64
-from .client import RostamClient, RostamError
+from ._types import RostamError
+from .rostam import Rostam
 
 # Reserved metadata key holding a node's ref-doc id, so delete(ref_doc_id) can
 # purge every node of a document via a Rostam metadata filter.
@@ -89,7 +90,7 @@ class RostamVectorStore(BasePydanticVectorStore):
 
     collection: str
 
-    _client: RostamClient
+    _client: Rostam
     _default_k: int
     _auto_create: bool
     _metric: str
@@ -98,7 +99,7 @@ class RostamVectorStore(BasePydanticVectorStore):
     _sparse_embedding: Any
 
     def __init__(
-        self, client: RostamClient, collection: str, *,
+        self, client: Rostam, collection: str, *,
         default_top_k: int = 10, auto_create: bool = True,
         metric: str = "cosine", full_text: bool = False,
         sparse_embedding: Optional[Any] = None, **kwargs: Any,

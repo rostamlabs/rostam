@@ -25,7 +25,7 @@ import time
 import unittest
 
 from _serverbin import find_server_bin
-from rostam import RostamClient, RostamError
+from rostam import Rostam, RostamError
 
 DIM = 24
 N = 150
@@ -57,7 +57,7 @@ class CrossStackBinarySearchTest(unittest.TestCase):
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         cls.base = f"http://127.0.0.1:{cls.port}"
-        cls.c = RostamClient(cls.base, timeout=120)
+        cls.c = Rostam(cls.base, timeout=120)
         deadline = time.time() + 20
         while time.time() < deadline:
             if cls.proc.poll() is not None:
@@ -85,7 +85,13 @@ class CrossStackBinarySearchTest(unittest.TestCase):
             cls.proc.kill()
 
     def _json_client(self):
-        return RostamClient(self.base, timeout=120, binary_search=False)
+        # binary_search isn't part of the unified Rostam() constructor surface
+        # (the facade doesn't expose transport-tuning kwargs beyond pool_maxsize);
+        # the underlying HttpTransport still has the attribute, so it is set
+        # directly to force the JSON fallback path for this comparison.
+        c = Rostam(self.base, timeout=120)
+        c._t.binary_search = False
+        return c
 
     def test_binary_query_matches_json_query(self):
         q = _vec(42)
@@ -139,7 +145,7 @@ class CrossStackBinarySearchTest(unittest.TestCase):
             self.c.search("q", _vec(1), k=0)
         self.assertEqual(400, caught.exception.status)
         # Still on the binary path — a real 400 must not disable the framing.
-        self.assertTrue(self.c._binary_search_supported)
+        self.assertTrue(self.c._t._binary_search_supported)
 
 
 if __name__ == "__main__":

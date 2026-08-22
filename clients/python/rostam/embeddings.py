@@ -1,6 +1,6 @@
 """Embedding helpers — work in text, not vectors.
 
-The core ``RostamClient`` is deliberately vector-only (and dependency-free): you
+The core ``Rostam`` client is deliberately vector-only (and dependency-free): you
 hand it float32 vectors. This module adds the missing piece for RAG ergonomics —
 turning text into vectors — without pulling a model into the core:
 
@@ -9,7 +9,7 @@ turning text into vectors — without pulling a model into the core:
 - ``OpenAIEmbedder`` calls any OpenAI-compatible ``/embeddings`` endpoint over the
   standard library (no ``openai`` package needed) — OpenAI, Azure OpenAI, and
   local servers such as Ollama, LM Studio, or text-embeddings-inference.
-- ``TextStore`` wraps a ``RostamClient`` + an embedder and exposes a text-first
+- ``TextStore`` wraps a ``Rostam`` client + an embedder and exposes a text-first
   surface: ``add(texts=…)``, ``search("a query")``, ``search_groups(…)``.
 
 In-server embedding (running the model inside Rostam via the WASM UDF subsystem)
@@ -17,9 +17,9 @@ is intentionally not done here: production embedding models don't fit a WASM
 sandbox well, and keeping generation client-side keeps model dependencies out of
 the engine's hot path.
 
-    from rostam import RostamClient, TextStore, OpenAIEmbedder
+    from rostam import Rostam, TextStore, OpenAIEmbedder
 
-    store = TextStore(RostamClient("http://localhost:8080"), "docs", OpenAIEmbedder())
+    store = TextStore(Rostam("http://localhost:8080"), "docs", OpenAIEmbedder())
     store.create_collection()                       # dim inferred from the embedder
     store.add(["first chunk", "second chunk"], metadatas=[{"doc_id": 1}, {"doc_id": 1}])
     hits = store.search("a question", k=4, filter={"op": "eq", "field": "doc_id", ...})
@@ -34,7 +34,8 @@ import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence
 
 from ._ids import to_uint64
-from .client import Document, Group, RostamClient, RostamError
+from ._types import Document, Group, RostamError
+from .rostam import Rostam
 
 
 class Embedder(Protocol):
@@ -141,7 +142,7 @@ class TextStore:
     LangChain users, see ``rostam.langchain.RostamVectorStore``.
     """
 
-    def __init__(self, client: RostamClient, collection: str, embedder: Embedder):
+    def __init__(self, client: Rostam, collection: str, embedder: Embedder):
         self.client = client
         self.collection = collection
         self.embedder = embedder

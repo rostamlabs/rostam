@@ -305,23 +305,45 @@ backups to S3, and Prometheus metrics are flag-driven.
 pip install rostam-client   # stdlib-only; optional [langchain] [llamaindex] [haystack]
 ```
 
-```python
-from rostam import RostamClient
+One class, `Rostam(target)`, picks the transport from the target string: an
+`http(s)://` URL speaks REST, a `tcp://host:port` (or bare `host:port`)
+speaks the native binary protocol. Vector methods are identical either way:
 
-c = RostamClient("http://localhost:8080")
+```python
+from rostam import Rostam, filters as f
+
+c = Rostam("http://localhost:8080")   # REST, port 8080
 c.create_collection("docs", dim=768, full_text=True)
+vec = [0.0] * 768  # replace with a real embedding
 c.upsert("docs", 1, vec, content="hello", metadata={"tenant": "acme"})
 
 # Dense kNN, hybrid dense+sparse, or BM25 full text — one call each.
-hits = c.hybrid_text("docs", vector=vec, text="hello", k=5)
+hits = c.hybrid_text("docs", dense=vec, text="hello", k=5)
 
 # Metadata filtering goes through the exact filter-first planner, so a
 # selective filter does not degrade recall.
-hits = c.search("docs", vector=vec, k=10, filter={"tenant": "acme"})
+hits = c.search("docs", vec, k=10, filter=f.eq("tenant", "acme"))
 ```
 
-Bulk ingest ships vectors as raw f32 over a binary wire rather than JSON text,
-which is what makes large loads fast — a 1M × 768d load runs in **282 s**.
+Point the same class at the `-tcp` port instead for the native binary
+protocol — same flat vector API, plus `r.kv.*` for the key-value store, which
+has no REST surface:
+
+```python
+r = Rostam("tcp://localhost:7000")    # or Rostam("localhost:7000") — bare host:port defaults to TCP
+
+r.create_collection("docs", dim=768, full_text=True)
+vec = [0.0] * 768  # replace with a real embedding
+r.upsert("docs", 1, vec, content="hello", metadata={"tenant": "acme"})
+hits = r.hybrid_text("docs", dense=vec, text="hello", k=5)
+
+r.kv.put("user:42", b'{"coins":100}', ttl_ms=300_000)   # TCP-only
+r.kv.incr("views:42", 1)                                  # atomic; missing key counts as 0
+```
+
+Bulk ingest (`bulk_stage` + `bulk_build`, HTTP-only) ships vectors as raw f32
+over a binary wire rather than JSON text, which is what makes large loads
+fast — a 1M × 768d load runs in **282 s**.
 → [Python client docs](https://docs.rostamlabs.com/api/python/)
 
 Other languages talk to the same server over

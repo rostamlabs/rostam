@@ -13,7 +13,7 @@ designing around one:
 | kNN + content | `SearchDocs` | `points/search/docs` | `SearchDocs` | `vector_search_docs` | `search_docs()` |
 | [Grouping](#grouping-top-k-per-group) | `SearchGroups` | `points/search/groups` | `SearchGroups` | `vector_search_groups` | `search_groups()` |
 | [Scroll](#scroll-filtered-listing-with-pagination) | `ScrollDocs` | `points/scroll` | `Scroll` | `vector_scroll` | `scroll()` |
-| [Recommend](#recommendation-positivenegative-examples) | `Recommend` | via Query API | via `VectorQuery` | via `vector_query` | — |
+| [Recommend](#recommendation-positivenegative-examples) | `Recommend` | via Query API | via `VectorQuery` | via `vector_query` | `recommend()` |
 | [Discover](#discovery-context-pairs) | `Discover` | via Query API | via `VectorQuery` | via `vector_query` | — |
 | [MMR](#mmr-diversified-retrieval) | `SearchMMR` | — | — | — | client-side † |
 
@@ -48,9 +48,9 @@ that (`max_marginal_relevance_search`), so reach for it before writing your own.
 === "Python"
 
     ```python
-    from rostam import RostamClient, filters as f
+    from rostam import Rostam, filters as f
 
-    c = RostamClient("http://localhost:8080")
+    c = Rostam("http://localhost:8080")
     query = [0.1, 0.2, 0.3, 0.4]   # your embedding model's output
 
     hits = c.search("docs", query, k=10)                       # ids, distances, scores

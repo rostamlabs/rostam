@@ -1,17 +1,31 @@
-"""A dependency-free Python client for Rostam's REST API.
+"""HTTP transport backend: Rostam's REST API over the ``-http`` port (default
+:8080).
 
-Uses only the standard library (``http.client``), so it installs and runs
-anywhere with no transitive dependencies. Metadata and filter values are
-converted to and from Rostam's tagged wire form automatically — callers work in
-native Python.
+``HttpTransport`` is the migration target for what used to be ``client.py``'s
+``RostamClient`` — same connection pool, same request/response plumbing, same
+binary-query (RVQ1) and binary-bulk (RVB1) framings — but every shared vector
+op now returns one of the unified ``rostam._types`` result types instead of
+this module's own dataclasses, so callers get the same shapes regardless of
+which transport backend answered (see ``rostam._tcp.TcpTransport``).
 
-    from rostam import RostamClient
-    from rostam import filters as f
+Construction (``HttpTransport(base_url, ...)``) does **no** network I/O: the
+underlying ``_ConnectionPool`` connects lazily on the first request, exactly
+like the pre-unification HTTP client. This matters for tests that build a
+client against a target with nothing listening yet.
 
-    c = RostamClient("http://localhost:8080", api_key="secret")
-    c.create_collection("docs", dim=384, metric="cosine")
-    c.upsert("docs", 1, vector, content="hello", metadata={"doc_id": 7})
-    hits = c.search_docs("docs", query, k=5, filter=f.eq("doc_id", 7))
+Method surface:
+
+- Shared with ``TcpTransport`` (unified return types, identical signatures —
+  verified by tests/test_transport_gaps.py): create_collection,
+  drop_collection, upsert, insert, upsert_batch, delete, get, get_batch,
+  scroll, search, search_docs, search_groups, hybrid_search, hybrid_text,
+  recommend, exists.
+- HTTP-only (guarded by the ``Rostam`` facade, which raises TransportError for
+  these on a TCP client): health, search_text, discover, mv_*,
+  delete_by_filter, bulk_stage, bulk_build, batch_upsert, and the general
+  composable ``query`` (TCP has no ``query`` of its own — a TCP client uses
+  ``recommend()`` directly, which is exactly what a recommend-shaped query
+  would send).
 """
 
 from __future__ import annotations
@@ -26,12 +40,22 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+from ._types import (
+    Document,
+    Group,
+    GroupResults,
+    Point,
+    RostamError,
+    SearchResult,
+    SearchResults,
+    ScrollPage,
+)
 from ._values import decode_metadata, decode_value, encode_metadata
 
 Vector = Sequence[float]
 
 # Reserved payload key holding a record's document content (server-side rag.go
-# contentField). get_batch lifts it into Point.content.
+# contentField). get()/get_batch() lift it into Point.content.
 _RESERVED_CONTENT = "$content"
 
 
@@ -40,89 +64,37 @@ def _seg(s: Union[str, int]) -> str:
     return urllib.parse.quote(str(s), safe="")
 
 
-class RostamError(Exception):
-    """An error returned by the Rostam server or transport.
-
-    ``status`` is the HTTP status code (0 for a transport-level failure).
-    """
-
-    def __init__(self, message: str, status: int = 0):
-        super().__init__(message)
-        self.status = status
-        self.message = message
-
-
-@dataclass
-class SearchResult:
-    id: int
-    distance: float
-    score: float = 0.0
-
-
-@dataclass
-class Document:
-    id: int
-    distance: float
-    content: str = ""
-    score: float = 0.0
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class Point:
-    """A point fetched by id (get_batch): vector + content + user metadata.
-
-    Content is lifted out of the reserved payload field ($content) into
-    .content; .metadata holds only user keys (content stripped)."""
-    id: int
-    vector: List[float] = field(default_factory=list)
-    content: str = ""
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class Group:
-    key: Any
-    hits: List[Document] = field(default_factory=list)
+def _err(message: str, status: int = 0) -> RostamError:
+    """Build a ``_types.RostamError`` carrying the HTTP status code (0 for a
+    transport-level failure with no response, e.g. a connection error)."""
+    return RostamError(message, status=status)
 
 
 @dataclass
 class MultiResult:
+    """One hit from a late-interaction (multi-vector / ColBERT MaxSim) search.
+
+    HTTP-only: multivector has no native-TCP counterpart, so this stays a
+    local dataclass rather than moving into ``_types``."""
     id: int
     score: float
     metadata: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class ScrollPage:
-    """One page of a scroll() listing over a collection's id-ascending order.
-
-    Iterates and ``len()``s like the underlying document list, so list-style
-    callers keep working, while exposing ``next_cursor`` for pagination. When
-    ``next_cursor`` is non-empty, pass it back as ``scroll(cursor=...)`` to
-    fetch the next page; an empty ``next_cursor`` means the listing is
-    exhausted.
-    """
-    documents: List[Document] = field(default_factory=list)
-    next_cursor: str = ""
-
-    def __iter__(self):
-        return iter(self.documents)
-
-    def __len__(self) -> int:
-        return len(self.documents)
-
-    def __getitem__(self, i):
-        return self.documents[i]
-
-    def __bool__(self) -> bool:
-        return bool(self.documents)
 
 
 def _sparse(sparse: Optional[Dict[str, Sequence]]) -> Dict[str, Any]:
     if not sparse:
         return {}
     return {"indices": list(sparse["indices"]), "values": list(sparse["values"])}
+
+
+def _to_document(d: Dict[str, Any]) -> Document:
+    return Document(
+        id=d["id"],
+        distance=d.get("distance", 0.0),
+        score=d.get("score", 0.0),
+        content=d.get("content", ""),
+        metadata=decode_metadata(d.get("metadata")),
+    )
 
 
 # ---- binary bulk framing ("RVB1") ----
@@ -345,26 +317,35 @@ class _ConnectionPool:
             self.discard(c)
 
 
-class RostamClient:
-    """REST client for a Rostam HTTP server (see ``rostam.NewHTTPServer``)."""
+class HttpTransport:
+    """Vector-database operations over Rostam's REST API (see
+    ``rostam.NewHTTPServer``).
+
+    Shares one keep-alive connection pool and bearer token across every call.
+    Search-family reads (search, search_docs, search_groups, hybrid_search,
+    hybrid_text, recommend, query) surface the response's degraded/missing
+    trailer via SearchResults/GroupResults, matching TcpTransport; scroll()
+    carries next_cursor via ScrollPage. get()/get_batch() return Point(s).
+    """
 
     def __init__(
         self,
         base_url: str,
-        api_key: Optional[str] = None,
+        token: Optional[str] = None,
         timeout: float = 30.0,
         *,
         binary_search: bool = True,
         pool_maxsize: int = 8,
     ):
         self.base_url = base_url.rstrip("/")
-        self.api_key = api_key
+        self.token = token
         self.timeout = timeout
         # Whether to send search queries in the binary framing. Turning it off
-        # forces the JSON body; see _search_body for what the framing buys and
-        # for how an older server is detected and fallen back to automatically.
+        # forces the JSON body; see _search for what the framing buys and for
+        # how an older server is detected and fallen back to automatically.
         self.binary_search = binary_search
         self._binary_search_supported = True
+        # No network I/O here: _ConnectionPool connects lazily on first acquire().
         self._pool = _ConnectionPool(self.base_url, maxsize=pool_maxsize)
         self._path_prefix = urllib.parse.urlsplit(self.base_url).path.rstrip("/")
 
@@ -372,7 +353,7 @@ class RostamClient:
         """Close pooled connections. The client stays usable; it reconnects."""
         self._pool.close()
 
-    def __enter__(self) -> "RostamClient":
+    def __enter__(self) -> "HttpTransport":
         return self
 
     def __exit__(self, *exc: Any) -> None:
@@ -400,8 +381,8 @@ class RostamClient:
         idempotent: bool = False,
     ) -> Any:
         headers = {"Content-Type": content_type}
-        if self.api_key:
-            headers["Authorization"] = "Bearer " + self.api_key
+        if self.token:
+            headers["Authorization"] = "Bearer " + self.token
         deadline = timeout or self.timeout
         url = self._path_prefix + path
 
@@ -431,10 +412,10 @@ class RostamClient:
                 self._pool.discard(conn)
                 if reused and attempts > 0:
                     continue
-                raise RostamError(f"transport error: {e}", status=0) from None
+                raise _err(f"transport error: {e}", status=0) from None
             except (OSError, http.client.HTTPException) as e:
                 self._pool.discard(conn)
-                raise RostamError(f"transport error: {e}", status=0) from None
+                raise _err(f"transport error: {e}", status=0) from None
 
             # Only a connection the server intends to keep goes back in the pool.
             # A response that closes it (HTTP/1.0, or an explicit Connection:
@@ -451,7 +432,7 @@ class RostamClient:
                     msg = json.loads(raw).get("error", msg)
                 except Exception:
                     pass
-                raise RostamError(msg, status=status)
+                raise _err(msg, status=status)
             if not raw:
                 return None
             return json.loads(raw)
@@ -491,7 +472,7 @@ class RostamClient:
                 # message is the signal to stop offering binary for the life of
                 # this client and use JSON — anything else is a real error about
                 # this request (a bad k, a bad filter) and must surface as one.
-                if not (e.status == 400 and "invalid JSON body" in str(e)):
+                if not (getattr(e, "status", None) == 400 and "invalid JSON body" in str(e)):
                     raise
                 self._binary_search_supported = False
 
@@ -503,7 +484,7 @@ class RostamClient:
     # ---- collections ----
 
     def health(self) -> bool:
-        """Return True if the server is reachable and healthy."""
+        """Return True if the server is reachable and healthy. HTTP-only."""
         return (self._request("GET", "/v1/health") or {}).get("status") == "ok"
 
     def create_collection(
@@ -517,9 +498,31 @@ class RostamClient:
         ef_search: int = 0,
         seed: int = 0,
         quant: str = "",
+        persistent: bool = False,
+        rescore_factor: int = 0,
+        extend_candidates: bool = False,
+        extend_candidates_max: int = 0,
+        level0_full_degree: bool = False,
+        quantized_build: bool = False,
+        partitions: int = 0,
+        index_type: str = "",
+        ivf_nlist: int = 0,
+        ivf_nprobe: int = 0,
+        ivf_pq: bool = False,
+        ivf_pq_m: int = 0,
+        ivf_rerank: bool = False,
+        quant_pq_m: int = 0,
+        opq: bool = False,
+        pq_drop_vecs: bool = False,
+        ivf_train_threshold: int = 0,
+        ivf_drift_retrain: bool = False,
+        ivf_drift_growth_factor: float = 0.0,
+        ivf_drift_factor: float = 0.0,
+        filter_first_relative_bp: int = 0,
+        opq_iters: int = 0,
+        full_text: Any = None,
         sq_bits: int = 0,
         prq_layers: int = 0,
-        index_type: str = "",
         vamana_r: int = 0,
         vamana_l: int = 0,
         vamana_alpha: float = 0.0,
@@ -527,12 +530,18 @@ class RostamClient:
         soar: bool = False,
         soar_lambda: float = 0.0,
         pq_nbits: int = 0,
-        persistent: bool = False,
-        rescore_factor: int = 0,
-        full_text: Any = None,
     ) -> None:
         """Create a collection. metric: "cosine"|"l2"|"dot"; quant:
         ""|"sq8"|"bq1"|"pq"|"sq"|"prq".
+
+        The keyword surface is identical to TcpTransport.create_collection's
+        (the unification promise — signatures match byte for byte via
+        inspect.signature): index_type/ivf_*/opq*/pq_drop_vecs/
+        ivf_train_threshold/ivf_drift_* tune an "ivf" index; extend_candidates*/
+        level0_full_degree/quantized_build are HNSW build levers; partitions
+        sets the collection-level partition count. Each is sent to the server
+        only when non-default, so a plain create stays byte-compatible with a
+        pre-unification request.
 
         quant="sq" is the trained metric-agnostic scalar quantizer; sq_bits picks
         its bit-depth (4, 6, or 8; 0 = server default 8). quant="prq" is
@@ -570,12 +579,50 @@ class RostamClient:
             "persistent": persistent,
             "rescore_factor": rescore_factor,
         }
+        if extend_candidates:
+            cfg["extend_candidates"] = extend_candidates
+        if extend_candidates_max:
+            cfg["extend_candidates_max"] = extend_candidates_max
+        if level0_full_degree:
+            cfg["level0_full_degree"] = level0_full_degree
+        if quantized_build:
+            cfg["quantized_build"] = quantized_build
+        if partitions:
+            cfg["partitions"] = partitions
+        if index_type:
+            cfg["index_type"] = index_type
+        if ivf_nlist:
+            cfg["ivf_nlist"] = ivf_nlist
+        if ivf_nprobe:
+            cfg["ivf_nprobe"] = ivf_nprobe
+        if ivf_pq:
+            cfg["ivf_pq"] = ivf_pq
+        if ivf_pq_m:
+            cfg["ivf_pq_m"] = ivf_pq_m
+        if ivf_rerank:
+            cfg["ivf_rerank"] = ivf_rerank
+        if quant_pq_m:
+            cfg["quant_pq_m"] = quant_pq_m
+        if opq:
+            cfg["opq"] = opq
+        if pq_drop_vecs:
+            cfg["pq_drop_vecs"] = pq_drop_vecs
+        if ivf_train_threshold:
+            cfg["ivf_train_threshold"] = ivf_train_threshold
+        if ivf_drift_retrain:
+            cfg["ivf_drift_retrain"] = ivf_drift_retrain
+        if ivf_drift_growth_factor:
+            cfg["ivf_drift_growth_factor"] = ivf_drift_growth_factor
+        if ivf_drift_factor:
+            cfg["ivf_drift_factor"] = ivf_drift_factor
+        if filter_first_relative_bp:
+            cfg["filter_first_relative_bp"] = filter_first_relative_bp
+        if opq_iters:
+            cfg["opq_iters"] = opq_iters
         if sq_bits:
             cfg["sq_bits"] = sq_bits
         if prq_layers:
             cfg["prq_layers"] = prq_layers
-        if index_type:
-            cfg["index_type"] = index_type
         if vamana_r:
             cfg["vamana_r"] = vamana_r
         if vamana_l:
@@ -622,13 +669,16 @@ class RostamClient:
         id: int,
         vector: Vector,
         *,
-        content: str = "",
         metadata: Optional[Dict[str, Any]] = None,
         ttl_ms: int = 0,
         sparse: Optional[Dict[str, Sequence]] = None,
     ) -> None:
-        """Insert a point, rejecting a duplicate id (use upsert to replace)."""
-        self._put_point(collection, id, vector, content, metadata, ttl_ms, sparse, upsert=False)
+        """Insert a point, rejecting a duplicate id (use upsert to replace).
+
+        No `content` kwarg (unlike upsert): content is a RAG/upsert concept —
+        the engine's Insert rejects Content, and this mirrors that so the
+        signature is identical to TcpTransport.insert's."""
+        self._put_point(collection, id, vector, "", metadata, ttl_ms, sparse, upsert=False)
 
     def _put_point(self, collection, id, vector, content, metadata, ttl_ms, sparse, upsert):
         body = {
@@ -644,7 +694,36 @@ class RostamClient:
             body["sparse"] = sp
         self._request("POST", f"/v1/collections/{_seg(collection)}/points", body)
 
-    # ---- bulk load (binary wire) ----
+    def upsert_batch(self, collection: str, points: Sequence[Dict[str, Any]]) -> None:
+        """Upsert many points in one request, over the JSON /points/batch route.
+
+        Mirrors TcpTransport.upsert_batch's shape (one dict per point: {id,
+        vector, content="", ttl_ms=0, metadata=None, sparse=None}), always as
+        an unconditional upsert — matching the TCP backend, which sends every
+        point as vector_upsert. For a large INITIAL load prefer bulk_stage() +
+        bulk_build() (HTTP-only, ~6x faster to searchable); this is the
+        cross-transport, indexed-inline equivalent.
+        """
+        body_points = []
+        for p in points:
+            row: Dict[str, Any] = {
+                "id": p["id"],
+                "vector": list(p["vector"]),
+                "content": p.get("content", ""),
+                "ttl_ms": p.get("ttl_ms", 0),
+                "metadata": encode_metadata(p.get("metadata")),
+                "upsert": True,
+            }
+            sp = _sparse(p.get("sparse"))
+            if sp:
+                row["sparse"] = sp
+            body_points.append(row)
+        self._request(
+            "POST", f"/v1/collections/{_seg(collection)}/points/batch",
+            {"upsert": True, "points": body_points},
+        )
+
+    # ---- bulk load (binary wire; HTTP-only) ----
 
     def bulk_stage(
         self,
@@ -665,15 +744,15 @@ class RostamClient:
         (``None`` for a point with no payload). The payloads are applied by the
         build itself, so a load whose points need metadata to filter on gets the
         multi-core build too — measured ~6x faster to searchable than indexing the
-        same corpus inline via :meth:`batch_upsert`. Prefer this method for an
-        initial load even when the points carry payloads; :meth:`batch_upsert` is
+        same corpus inline via :meth:`upsert_batch`. Prefer this method for an
+        initial load even when the points carry payloads; :meth:`upsert_batch` is
         for writes into a collection that is already built, or for points that
         need content, sparse vectors, TTLs or a CAS precondition, none of which
         the staging wire carries.
 
         The load is SPLIT across requests to stay under the server's per-request
         caps (256 MiB, 262,144 points), so passing a million vectors in one call
-        works. Returns the number of points staged.
+        works. Returns the number of points staged. HTTP-only.
         """
         path = f"/v1/collections/{_seg(collection)}/points/bulk"
         staged = 0
@@ -696,6 +775,7 @@ class RostamClient:
 
         Blocks until the build finishes (minutes on a large corpus), so the
         default timeout is deliberately generous. workers=0 uses every core.
+        HTTP-only.
         """
         self._send(
             "POST",
@@ -723,7 +803,8 @@ class RostamClient:
         gets the multi-core build — measured ~6x faster to searchable on a
         payload-bearing 1M x 768d corpus. Split across requests under the server's
         per-request caps, like :meth:`bulk_stage`. Returns the number of points
-        written.
+        written. HTTP-only (parallel-array shape); see :meth:`upsert_batch` for
+        the cross-transport, one-dict-per-point shape.
         """
         flags = _BULK_FLAG_UPSERT if upsert else 0
         path = f"/v1/collections/{_seg(collection)}/points/batch"
@@ -748,9 +829,45 @@ class RostamClient:
         return bool((res or {}).get("deleted"))
 
     def delete_by_filter(self, collection: str, filter: Dict[str, Any]) -> int:
-        """Delete every point matching filter; returns the count removed."""
+        """Delete every point matching filter; returns the count removed. HTTP-only."""
         res = self._request("POST", f"/v1/collections/{_seg(collection)}/points/delete", {"filter": filter})
         return int((res or {}).get("deleted", 0))
+
+    def exists(self, collection: str, id: int) -> bool:
+        """Whether a point id is live. No projection is requested (id-only check)."""
+        try:
+            self._request(
+                "GET",
+                f"/v1/collections/{_seg(collection)}/points/{_seg(id)}"
+                "?with_vector=false&with_payload=false",
+            )
+            return True
+        except RostamError as e:
+            if getattr(e, "status", None) == 404:
+                return False
+            raise
+
+    def get(
+        self, collection: str, id: int, *, with_vector: bool = True, with_payload: bool = True,
+    ) -> Optional[Point]:
+        """Fetch a point by id, or None if absent."""
+        q = (
+            f"?with_vector={'true' if with_vector else 'false'}"
+            f"&with_payload={'true' if with_payload else 'false'}"
+        )
+        try:
+            res = self._request("GET", f"/v1/collections/{_seg(collection)}/points/{_seg(id)}{q}") or {}
+        except RostamError as e:
+            if getattr(e, "status", None) == 404:
+                return None
+            raise
+        meta = decode_metadata(res.get("payload")) if with_payload else {}
+        content = ""
+        if isinstance(meta, dict) and _RESERVED_CONTENT in meta:
+            cv = meta.pop(_RESERVED_CONTENT)
+            content = cv if isinstance(cv, str) else ""
+        vec = res.get("vector")
+        return Point(id=int(id), vector=list(vec) if vec else None, content=content, metadata=meta)
 
     def scroll(
         self,
@@ -777,7 +894,7 @@ class RostamClient:
             body["cursor"] = cursor
         res = self._request("POST", f"/v1/collections/{_seg(collection)}/points/scroll", body) or {}
         docs = [_to_document(d) for d in (res.get("documents") or [])]
-        return ScrollPage(documents=docs, next_cursor=res.get("next_cursor") or "")
+        return ScrollPage(docs, next_cursor=res.get("next_cursor") or "")
 
     def get_batch(
         self,
@@ -786,7 +903,7 @@ class RostamClient:
         *,
         with_vector: bool = True,
         with_payload: bool = True,
-    ) -> List["Point"]:
+    ) -> List[Point]:
         """Fetch points by id in one request. Returns one Point per PRESENT id
         (absent ids are omitted; never raises on partial miss). Content is lifted
         from the reserved payload field into Point.content and removed from
@@ -796,7 +913,7 @@ class RostamClient:
             "with_vector": with_vector,
             "with_payload": with_payload,
         }
-        res = self._request("POST", f"/v1/collections/{_seg(collection)}/points/batch-get", body)
+        res = self._request("POST", f"/v1/collections/{_seg(collection)}/points/batch-get", body) or {}
         out: List[Point] = []
         for row in (res.get("points") or []):
             meta = decode_metadata(row.get("payload")) if with_payload else {}
@@ -804,9 +921,10 @@ class RostamClient:
             if isinstance(meta, dict) and _RESERVED_CONTENT in meta:
                 cv = meta.pop(_RESERVED_CONTENT)
                 content = cv if isinstance(cv, str) else ""
+            rvec = row.get("vector")
             out.append(Point(
                 id=row["id"],
-                vector=list(row.get("vector") or []),
+                vector=list(rvec) if rvec else None,
                 content=content,
                 metadata=meta,
             ))
@@ -816,18 +934,20 @@ class RostamClient:
 
     def search(
         self, collection: str, query: Vector, k: int, *, filter: Optional[Dict[str, Any]] = None
-    ) -> List[SearchResult]:
+    ) -> SearchResults:
         """k-nearest-neighbor search, returning ids + distances."""
         res = self._search(f"/v1/collections/{_seg(collection)}/points/search", query, k, filter)
-        return [SearchResult(id=r["id"], distance=r.get("distance", 0.0), score=r.get("score", 0.0))
-                for r in (res.get("results") or [])]
+        items = [SearchResult(id=r["id"], distance=r.get("distance", 0.0), score=r.get("score", 0.0))
+                 for r in (res.get("results") or [])]
+        return SearchResults(items, degraded=res.get("degraded", False), missing=res.get("missing") or [])
 
     def search_docs(
         self, collection: str, query: Vector, k: int, *, filter: Optional[Dict[str, Any]] = None
-    ) -> List[Document]:
+    ) -> SearchResults:
         """kNN search returning each hit enriched with content + metadata."""
         res = self._search(f"/v1/collections/{_seg(collection)}/points/search/docs", query, k, filter)
-        return [_to_document(d) for d in (res.get("documents") or [])]
+        items = [_to_document(d) for d in (res.get("documents") or [])]
+        return SearchResults(items, degraded=res.get("degraded", False), missing=res.get("missing") or [])
 
     def search_groups(
         self,
@@ -839,17 +959,17 @@ class RostamClient:
         group_size: int = 1,
         fetch_k: int = 0,
         filter: Optional[Dict[str, Any]] = None,
-    ) -> List[Group]:
+    ) -> GroupResults:
         """Group-by-document search: top-k distinct documents, best chunk(s) each."""
         body = {"query": list(query), "k": k, "group_by": group_by, "group_size": group_size, "fetch_k": fetch_k}
         if filter:
             body["filter"] = filter
-        res = self._request("POST", f"/v1/collections/{_seg(collection)}/points/search/groups", body)
+        res = self._request("POST", f"/v1/collections/{_seg(collection)}/points/search/groups", body) or {}
         groups = []
         for g in (res.get("groups") or []):
             key = decode_value(g["key"]) if isinstance(g.get("key"), dict) else g.get("key")
             groups.append(Group(key=key, hits=[_to_document(d) for d in (g.get("hits") or [])]))
-        return groups
+        return GroupResults(groups, degraded=res.get("degraded", False), missing=res.get("missing") or [])
 
     def query(
         self,
@@ -883,8 +1003,11 @@ class RostamClient:
         re-scores the union of the prefetch candidates — pass a ``root`` leaf for
         that). ``method`` picks the fusion: "rrf" | "weighted" | "dbsf".
 
-        Returns ``List[SearchResult]``; when ``group_by`` is set the response is
-        grouped and this returns ``List[Group]`` instead, with ``k`` counting groups.
+        Returns ``SearchResults``; when ``group_by`` is set the response is
+        grouped and this returns ``GroupResults`` instead, with ``k`` counting
+        groups. HTTP-only: TCP has no general QuerySpec builder, only a
+        recommend-shaped call (``recommend()``); ``recommend()``/``discover()``
+        are the cross-transport-shaped entry points.
         """
         if not prefetch:
             raise ValueError("query requires at least one prefetch leaf")
@@ -897,38 +1020,39 @@ class RostamClient:
         if group_by:
             body["group_by"] = group_by
             body["group_size"] = group_size or 1
-        res = self._request("POST", f"/v1/collections/{_seg(collection)}/query", body)
+        res = self._request("POST", f"/v1/collections/{_seg(collection)}/query", body) or {}
+        degraded, missing = res.get("degraded", False), res.get("missing") or []
         if group_by:
-            out = []
+            groups = []
             for g in (res.get("groups") or []):
                 key = decode_value(g["key"]) if isinstance(g.get("key"), dict) else g.get("key")
-                out.append(Group(key=key, hits=[_to_document(d) for d in (g.get("hits") or [])]))
-            return out
-        return [SearchResult(id=r["id"], distance=r.get("distance", 0.0), score=r.get("score", 0.0))
-                for r in (res.get("results") or [])]
+                groups.append(Group(key=key, hits=[_to_document(d) for d in (g.get("hits") or [])]))
+            return GroupResults(groups, degraded=degraded, missing=missing)
+        items = [SearchResult(id=r["id"], distance=r.get("distance", 0.0), score=r.get("score", 0.0))
+                 for r in (res.get("results") or [])]
+        return SearchResults(items, degraded=degraded, missing=missing)
 
     def recommend(
         self,
         collection: str,
         positive: Sequence[int],
-        k: int,
         *,
         negative: Optional[Sequence[int]] = None,
-        strategy: str = "",
+        k: int = 10,
         filter: Optional[Dict[str, Any]] = None,
-    ) -> List[SearchResult]:
+        strategy: str = "average_vector",
+    ) -> SearchResults:
         """Recommend by example: score toward the ``positive`` ids and away from the
         ``negative`` ids, instead of from a raw query vector. ``strategy`` is
-        "average" (default, mean(pos) - mean(neg) → one dense query) or "best_score".
+        "average_vector" (default, mean(pos) - mean(neg) → one dense query) or
+        "best_score". Signature is identical to TcpTransport.recommend's.
 
         Carried over the wire by the Query API — there is no ``points/recommend``
         route — so this works identically on HTTP, gRPC and the binary TCP protocol.
         """
-        rec: Dict[str, Any] = {"positive": [int(i) for i in positive]}
+        rec: Dict[str, Any] = {"positive": [int(i) for i in positive], "strategy": strategy}
         if negative:
             rec["negative"] = [int(i) for i in negative]
-        if strategy:
-            rec["strategy"] = strategy
         leaf: Dict[str, Any] = {"recommend": rec, "k": k}
         if filter:
             leaf["filter"] = filter
@@ -943,13 +1067,13 @@ class RostamClient:
         target: Optional[int] = None,
         target_vec: Optional[Vector] = None,
         filter: Optional[Dict[str, Any]] = None,
-    ) -> List[SearchResult]:
+    ) -> SearchResults:
         """Guided "more like this, away from that" search. ``context`` is a list of
         ``(positive_id, negative_id)`` pairs; ``target`` (a point id) or
         ``target_vec`` (a raw vector) is an optional anchor to explore around.
 
         Like ``recommend()``, this rides the Query API and so is available on every
-        transport.
+        transport. HTTP-only surface (no ``discover`` on TcpTransport today).
         """
         pairs = [{"positive": int(p), "negative": int(n)} for (p, n) in context]
         disc: Dict[str, Any] = {"context": pairs}
@@ -975,7 +1099,7 @@ class RostamClient:
         rrf_k: int = 0,
         dense_k: int = 0,
         sparse_k: int = 0,
-    ) -> List[SearchResult]:
+    ) -> SearchResults:
         """Fused dense + sparse search. method: "rrf"|"weighted"."""
         body: Dict[str, Any] = {
             "dense": list(dense), "k": k, "method": method, "alpha": alpha,
@@ -986,17 +1110,19 @@ class RostamClient:
             body["sparse"] = sp
         if filter:
             body["filter"] = filter
-        res = self._request("POST", f"/v1/collections/{_seg(collection)}/points/search/hybrid", body)
-        return [SearchResult(id=r["id"], distance=r.get("distance", 0.0), score=r.get("score", 0.0))
-                for r in (res.get("results") or [])]
+        res = self._request("POST", f"/v1/collections/{_seg(collection)}/points/search/hybrid", body) or {}
+        items = [SearchResult(id=r["id"], distance=r.get("distance", 0.0), score=r.get("score", 0.0))
+                 for r in (res.get("results") or [])]
+        return SearchResults(items, degraded=res.get("degraded", False), missing=res.get("missing") or [])
 
     def search_text(
         self, collection: str, text: str, k: int, *,
         filter: Optional[Dict[str, Any]] = None, global_idf: bool = False,
-    ) -> List[Document]:
+    ) -> SearchResults:
         """BM25 full-text search. The RAW query text is sent to the server, which
         tokenizes + scores it (the SDK ships no tokens). Returns each hit enriched
         with content + metadata. Requires a collection created with full_text=True.
+        HTTP-only (no equivalent op on TcpTransport today).
 
         global_idf=True opts into the BM25 global-DF (dfs_query_then_fetch) two-phase
         search across partitions (default False ⇒ the per-shard-local-IDF fast path;
@@ -1006,13 +1132,14 @@ class RostamClient:
             body["filter"] = filter
         if global_idf:
             body["global_idf"] = True
-        res = self._request("POST", f"/v1/collections/{_seg(collection)}/points/search/text", body)
-        return [_to_document(d) for d in (res.get("documents") or [])]
+        res = self._request("POST", f"/v1/collections/{_seg(collection)}/points/search/text", body) or {}
+        items = [_to_document(d) for d in (res.get("documents") or [])]
+        return SearchResults(items, degraded=res.get("degraded", False), missing=res.get("missing") or [])
 
     def hybrid_text(
         self,
         collection: str,
-        vector: Vector,
+        dense: Vector,
         text: str,
         k: int,
         *,
@@ -1023,29 +1150,31 @@ class RostamClient:
         dense_k: int = 0,
         sparse_k: int = 0,
         global_idf: bool = False,
-    ) -> List[SearchResult]:
-        """Fused dense + BM25 full-text search. The dense query vector plus the RAW
-        query text are sent; the server analyzes the text into the BM25 lane and
-        fuses it with the dense lane. method: "rrf"|"weighted"|"dbsf". Requires a
-        collection created with full_text=True.
+    ) -> SearchResults:
+        """Fuse a dense query vector plus the RAW query text; the server analyzes
+        the text into the BM25 lane and fuses it with the dense lane. method:
+        "rrf"|"weighted"|"dbsf". Requires a collection created with
+        full_text=True. Parameter name/order is identical to
+        TcpTransport.hybrid_text's (the `dense` param serializes to the wire's
+        "vector" field either way).
 
         global_idf=True opts into the BM25 global-DF (dfs_query_then_fetch) two-phase
         text lane across partitions (default False ⇒ the per-shard-local-IDF fast
         path; affects only the BM25 text lane)."""
         body: Dict[str, Any] = {
-            "vector": list(vector), "text": text, "k": k, "method": method, "alpha": alpha,
+            "vector": list(dense), "text": text, "k": k, "method": method, "alpha": alpha,
             "rrf_k": rrf_k, "dense_k": dense_k, "sparse_k": sparse_k,
         }
         if filter:
             body["filter"] = filter
         if global_idf:
             body["global_idf"] = True
-        res = self._request("POST", f"/v1/collections/{_seg(collection)}/points/search/hybrid-text", body)
-        return [SearchResult(id=r["id"], distance=r.get("distance", 0.0), score=r.get("score", 0.0))
-                for r in (res.get("results") or [])]
+        res = self._request("POST", f"/v1/collections/{_seg(collection)}/points/search/hybrid-text", body) or {}
+        items = [SearchResult(id=r["id"], distance=r.get("distance", 0.0), score=r.get("score", 0.0))
+                 for r in (res.get("results") or [])]
+        return SearchResults(items, degraded=res.get("degraded", False), missing=res.get("missing") or [])
 
-
-    # ---- late interaction (multi-vector / ColBERT MaxSim) ----
+    # ---- late interaction (multi-vector / ColBERT MaxSim; HTTP-only) ----
 
     def mv_create_collection(
         self,
@@ -1098,7 +1227,7 @@ class RostamClient:
     ) -> List[MultiResult]:
         """MaxSim late-interaction search: top-k documents for the multi-vector query."""
         body = {"query": [list(t) for t in query], "k": k, "candidates_per_token": candidates_per_token}
-        res = self._request("POST", f"/v1/multivector/{_seg(name)}/search", body)
+        res = self._request("POST", f"/v1/multivector/{_seg(name)}/search", body) or {}
         return [MultiResult(id=r["id"], score=r.get("score", 0.0), metadata=decode_metadata(r.get("metadata")))
                 for r in (res.get("results") or [])]
 
@@ -1106,13 +1235,3 @@ class RostamClient:
         """Delete a document from a late-interaction collection."""
         res = self._request("DELETE", f"/v1/multivector/{_seg(name)}/docs/{_seg(doc_id)}")
         return bool((res or {}).get("deleted"))
-
-
-def _to_document(d: Dict[str, Any]) -> Document:
-    return Document(
-        id=d["id"],
-        distance=d.get("distance", 0.0),
-        score=d.get("score", 0.0),
-        content=d.get("content", ""),
-        metadata=decode_metadata(d.get("metadata")),
-    )

@@ -4,15 +4,24 @@ These run a real loopback HTTP server, so they exercise the client's request
 construction (paths, JSON bodies, bearer auth, tagged-metadata encoding) and
 response parsing (tagged-metadata/group decoding) over an actual socket — no
 third-party deps required.
+
+Uses ``from rostam.rostam import Rostam`` (not ``from rostam import Rostam``,
+which still resolves to the pre-unification ``kv.Rostam`` until the old
+classes are removed in a later task) and calls the flat vector API through the
+facade, which delegates to ``rostam._http.HttpTransport``. Errors and result
+types come from ``rostam._types`` (the unified set), not ``rostam.client``'s
+now-superseded dataclasses.
 """
 
 import json
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
-from rostam import RostamClient, RostamError
 from rostam import filters as f
+from rostam._types import Point, RostamError, ScrollPage
+from rostam.rostam import Rostam
 from _wire import read_body
 from _fakestore import FakeRostam
 
@@ -47,8 +56,22 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self._record()
-        if self.path == "/v1/health":
+        parsed = urlsplit(self.path)
+        if parsed.path == "/v1/health":
             return self._send(200, {"status": "ok"})
+        if "/points/" in parsed.path:
+            # Match on the parsed path, not the raw self.path: a real GET
+            # (Rostam.get()) always appends `?with_vector=...&with_payload=...`,
+            # so `self.path.endswith("/missing")` would never fire for an
+            # actual missing-point request — only for a query-string-free path.
+            if parsed.path.endswith("/missing"):
+                return self._send(404, {"error": "not found"})
+            qs = parse_qs(parsed.query)
+            with_vector = qs.get("with_vector", ["true"])[0] == "true"
+            body = {"id": 1, "payload": {}}
+            if with_vector:
+                body["vector"] = [1.0, 0.0, 0.0]
+            return self._send(200, body)
         self._send(404, {"error": "not found"})
 
     def do_DELETE(self):
@@ -109,9 +132,34 @@ class ClientTest(unittest.TestCase):
 
     def setUp(self):
         REQUESTS.clear()
-        self.c = RostamClient(self.base, api_key="secret")
+        self.c = Rostam(self.base, api_key="secret")
+
+    def test_get_with_vector(self):
+        p = self.c.get("docs", 1)
+        self.assertEqual(p.vector, [1.0, 0.0, 0.0])
+
+    def test_get_without_vector_is_none(self):
+        # Normalized to None (not []) when the vector wasn't fetched — must
+        # match TcpTransport.get's contract, which already returns None here.
+        # See test_get_batch_without_vector_skips_vectors for the get_batch
+        # counterpart.
+        p = self.c.get("docs", 1, with_vector=False)
+        self.assertIsNone(p.vector)
+
+    def test_get_missing_point_returns_none(self):
+        # Rostam.get() always appends a query string (?with_vector=...&
+        # with_payload=...), so the fake server's "/missing" route match must
+        # be done on the parsed path, not the raw request line — otherwise a
+        # real 404 never round-trips into a None here.
+        self.assertIsNone(self.c.get("docs", "missing"))
+
+    def test_exists_missing_point_is_false(self):
+        self.assertFalse(self.c.exists("docs", "missing"))
 
     def test_health(self):
+        # health() is HTTP-only; the facade guards it (raises TransportError
+        # on TCP) and forwards it here. Exercise it through the public facade
+        # so a broken guard/forward would fail this test too.
         self.assertTrue(self.c.health())
 
     def test_auth_header_sent(self):
@@ -165,6 +213,8 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(REQUESTS[-1]["body"]["sparse"], {"indices": [3], "values": [0.7]})
 
     def test_search_text(self):
+        # search_text() is HTTP-only (no TCP equivalent); the facade guards
+        # and forwards it. Exercise it through the public facade.
         docs = self.c.search_text("docs", "quick fox", k=5)
         self.assertEqual(docs[0].id, 4)
         self.assertEqual(docs[0].content, "the quick brown fox")
@@ -276,6 +326,7 @@ class ClientTest(unittest.TestCase):
         self.assertFalse(self.c.delete("docs", "missing"))
 
     def test_delete_by_filter(self):
+        # delete_by_filter() is HTTP-only; the facade guards and forwards it.
         n = self.c.delete_by_filter("docs", f.eq("doc_id", 2))
         self.assertEqual(n, 2)
 
@@ -294,10 +345,9 @@ class ClientTest(unittest.TestCase):
 
 
 def test_get_batch_returns_vectors_content_metadata_and_omits_missing():
-    from rostam import RostamClient, Point
     srv = FakeRostam()
     try:
-        c = RostamClient(srv.url)
+        c = Rostam(srv.url)
         c.create_collection("docs", dim=2, metric="l2")
         c.upsert("docs", 1, [1.0, 0.0], content="hello", metadata={"doc_id": 7})
         c.upsert("docs", 2, [0.0, 1.0], content="world", metadata={"doc_id": 8})
@@ -315,24 +365,26 @@ def test_get_batch_returns_vectors_content_metadata_and_omits_missing():
 
 
 def test_get_batch_without_vector_skips_vectors():
-    from rostam import RostamClient
     srv = FakeRostam()
     try:
-        c = RostamClient(srv.url)
+        c = Rostam(srv.url)
         c.create_collection("docs", dim=2)
         c.upsert("docs", 1, [1.0, 2.0], content="x", metadata={"a": 1})
         pts = c.get_batch("docs", [1], with_vector=False)
-        assert pts[0].vector == []
+        # Normalized to None (not []) — matches TcpTransport.get_batch, so a
+        # caller checking "was the vector fetched" behaves the same on both
+        # transports. See test_get_without_vector_is_none for the
+        # single-point get() counterpart.
+        assert pts[0].vector is None
         assert pts[0].content == "x"
     finally:
         srv.close()
 
 
 def test_scroll_paginates_with_cursor():
-    from rostam import RostamClient, ScrollPage
     srv = FakeRostam()
     try:
-        c = RostamClient(srv.url)
+        c = Rostam(srv.url)
         c.create_collection("docs", dim=2, metric="l2")
         for i in range(1, 6):  # ids 1..5
             c.upsert("docs", i, [float(i), 0.0], content=f"c{i}", metadata={"n": i})

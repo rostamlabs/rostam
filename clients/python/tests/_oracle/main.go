@@ -145,6 +145,8 @@ func main() {
 
 	emit("delete", ops.EncodeVectorDeleteArgs("docs", 42))
 	emit("exists", ops.EncodeExistsArgs("docs", 42))
+	emit("drop_collection/plain", ops.EncodeDropCollectionArgs("docs"))
+	emit("drop_collection/longname", ops.EncodeDropCollectionArgs("longname-collection"))
 	emit("get/plain", ops.EncodeVectorGetArgs("docs", 1, 0))
 	emit("get/withvec_payload", ops.EncodeVectorGetArgs("docs", 1, 0x03))
 

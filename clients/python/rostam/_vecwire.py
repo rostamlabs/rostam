@@ -631,6 +631,13 @@ def encode_create_collection_args(name: str, cfg: Dict[str, Any]) -> bytes:
     return bytes(out)
 
 
+def encode_drop_collection_args(name: str) -> bytes:
+    """Mirrors ops.EncodeDropCollectionArgs: [nameLen u8][name] — the same
+    length-prefixed name framing create_collection uses for its `name` field
+    (see `_col`), just with no config trailer."""
+    return _col(name)
+
+
 # ---- vector_query: hand-rolled protobuf QuerySpec ---------------------------
 #
 # The vector_query op carries a proto-marshaled pb.QuerySpec as its spec blob

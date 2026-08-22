@@ -23,7 +23,7 @@ import time
 import unittest
 
 from _serverbin import find_server_bin
-from rostam import RostamClient, filters as f
+from rostam import Rostam, filters as f
 
 DIM = 4
 # Cluster A ids 1-3 near [1,0,0,0]; cluster B ids 4-6 near [0,0,1,0].
@@ -57,7 +57,7 @@ class CrossStackQueryTest(unittest.TestCase):
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         cls.base = f"http://127.0.0.1:{cls.port}"
-        cls.c = RostamClient(cls.base, timeout=120)
+        cls.c = Rostam(cls.base, timeout=120)
         deadline = time.time() + 20
         while time.time() < deadline:
             if cls.proc.poll() is not None:

@@ -7,12 +7,12 @@ text (as content), and metadata, and serves similarity search / group-by-documen
 retrieval.
 
     from langchain_openai import OpenAIEmbeddings
-    from rostam import RostamClient
+    from rostam import Rostam
     from rostam.langchain import RostamVectorStore
 
     store = RostamVectorStore.from_texts(
         texts, OpenAIEmbeddings(),
-        client=RostamClient("http://localhost:8080"),
+        client=Rostam("http://localhost:8080"),
         collection="docs",
     )
     docs = store.similarity_search("a query", k=4, filter={"doc_id": 7})
@@ -30,7 +30,8 @@ from langchain_core.vectorstores import VectorStore
 
 from . import filters as f
 from ._ids import to_uint64
-from .client import Document, RostamClient, RostamError
+from ._types import Document, RostamError
+from .rostam import Rostam
 
 # Rostam metrics whose distance is "smaller = closer", so a 0..1 relevance score
 # is 1/(1+distance). Cosine/L2 are distances; dot is a negated similarity.
@@ -87,7 +88,7 @@ class RostamVectorStore(VectorStore):
 
     def __init__(
         self,
-        client: RostamClient,
+        client: Rostam,
         collection: str,
         embedding: Embeddings,
         *,
@@ -294,7 +295,7 @@ class RostamVectorStore(VectorStore):
         embedding: Embeddings,
         metadatas: Optional[List[dict]] = None,
         *,
-        client: RostamClient,
+        client: Rostam,
         collection: str,
         ids: Optional[List[str]] = None,
         **kwargs: Any,

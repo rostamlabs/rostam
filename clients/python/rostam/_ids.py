@@ -10,7 +10,7 @@ id address the same point across runs.
    An astronomically unlikely BLAKE2b collision would cause one point to
    silently overwrite another.  In practice this is not a concern, but callers
    who derive ids from user input should use one id form consistently per
-   collection, or call the int-id ``RostamClient`` methods directly.
+   collection, or call the int-id ``Rostam`` methods directly.
 """
 
 from __future__ import annotations

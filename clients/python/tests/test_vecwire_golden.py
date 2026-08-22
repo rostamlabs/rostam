@@ -75,6 +75,8 @@ _DATAPLANE = {
     "search/plain": lambda: w.encode_search_args("docs", 10, _VEC),
     "delete": lambda: w.encode_delete_args("docs", 42),
     "exists": lambda: w.encode_exists_args("docs", 42),
+    "drop_collection/plain": lambda: w.encode_drop_collection_args("docs"),
+    "drop_collection/longname": lambda: w.encode_drop_collection_args("longname-collection"),
     "get/plain": lambda: w.encode_get_args("docs", 1, 0),
     "get/withvec_payload": lambda: w.encode_get_args("docs", 1, 0x03),
 

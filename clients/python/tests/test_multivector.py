@@ -10,7 +10,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from rostam import RostamClient
+from rostam import Rostam
 from _wire import read_body
 
 DOCS = {}   # id -> {"tokens": [[...]], "metadata": tagged}
@@ -80,7 +80,7 @@ class MultiVectorClientTest(unittest.TestCase):
     def setUp(self):
         DOCS.clear()
         LAST.clear()
-        self.c = RostamClient(self.base)
+        self.c = Rostam(self.base)
 
     def test_create_sends_config(self):
         self.c.mv_create_collection("docs", dim=4, m=8, quant="sq8", persistent=True)

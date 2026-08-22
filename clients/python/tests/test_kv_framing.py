@@ -1,10 +1,14 @@
-"""Unit tests for RostamKV's response-frame handling, against a fake socket.
+"""Unit tests for r.kv's response-frame handling, against a fake socket.
 
 These do not need the server binary: they assert the client is robust to a peer
 that sends a hostile or truncated frame — an oversized length must not make the
 client buffer unboundedly, and a malformed body must surface as RostamError
 (not IndexError/struct.error) with the socket discarded, not returned to the
 pool. A real server never does this; a broken proxy or a bug might.
+
+r.kv shares TcpTransport's framing (``_call``) with the flat vector API, so
+this exercises the framing through ``r.kv.get`` — the same code path a vector
+op would hit.
 """
 
 from __future__ import annotations
@@ -14,8 +18,9 @@ import struct
 import threading
 import unittest
 
-from rostam import RostamKV, RostamError
-from rostam.kv import _MAX_FRAME
+from rostam._tcp import _MAX_FRAME
+from rostam._types import RostamError
+from rostam.rostam import Rostam
 
 
 def _recv_all(conn, n):
@@ -73,34 +78,34 @@ class _FakeServer:
 
 
 class KVFramingTest(unittest.TestCase):
-    def _kv(self, responder):
+    def _client(self, responder):
         srv = _FakeServer(responder)
         self.addCleanup(srv.close)
-        kv = RostamKV("127.0.0.1", srv.port, timeout=2.0)
-        self.addCleanup(kv.close)
-        return kv
+        r = Rostam(f"tcp://127.0.0.1:{srv.port}", timeout=2.0)
+        self.addCleanup(r.close)
+        return r
 
     def test_oversized_body_length_is_rejected_not_buffered(self):
         # Advertise a body far larger than a frame but send nothing more. The
         # client must reject the length outright rather than block reading it.
-        kv = self._kv(lambda: struct.pack(">I", _MAX_FRAME + 1))
+        r = self._client(lambda: struct.pack(">I", _MAX_FRAME + 1))
         with self.assertRaises(RostamError) as cm:
-            kv.get("k")
+            r.kv.get("k")
         self.assertIn("invalid response frame length", str(cm.exception))
 
     def test_body_shorter_than_header_is_rostam_error(self):
         # body_len = 3 (< the 5-byte minimum): must be RostamError, not IndexError.
-        kv = self._kv(lambda: struct.pack(">I", 3) + b"\x00\x00\x00")
+        r = self._client(lambda: struct.pack(">I", 3) + b"\x00\x00\x00")
         with self.assertRaises(RostamError):
-            kv.get("k")
+            r.kv.get("k")
 
     def test_payload_length_mismatch_is_rostam_error(self):
         # Frame says body is 5 bytes (status + payloadLen=100) but no payload.
         def reply():
             return struct.pack(">I", 5) + bytes([0]) + struct.pack(">I", 100)
-        kv = self._kv(reply)
+        r = self._client(reply)
         with self.assertRaises(RostamError):
-            kv.get("k")
+            r.kv.get("k")
 
     def test_connect_failure_is_rostam_error(self):
         # Nothing is listening on this port: acquire()'s connect must convert
@@ -109,10 +114,10 @@ class KVFramingTest(unittest.TestCase):
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
         s.close()  # port now free → connection refused
-        kv = RostamKV("127.0.0.1", port, timeout=1.0)
-        self.addCleanup(kv.close)
+        r = Rostam(f"tcp://127.0.0.1:{port}", timeout=1.0)
+        self.addCleanup(r.close)
         with self.assertRaises(RostamError):
-            kv.get("k")
+            r.kv.get("k")
 
 
 if __name__ == "__main__":

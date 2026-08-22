@@ -4,8 +4,9 @@ A dependency-free Python client and LangChain adapter for the
 [Rostam](https://github.com/rostamlabs/rostam) vector store.
 
 The core client uses **only the Python standard library** — no `requests`, no
-gRPC, nothing to pull in. The optional LangChain adapter requires
-`langchain-core`.
+gRPC, nothing to pull in. It speaks both of the server's non-gRPC transports:
+REST over `http.client` and the native binary protocol over `socket`. The
+optional LangChain adapter requires `langchain-core`.
 
 ## Install
 
@@ -16,30 +17,34 @@ pip install rostam-client[langchain] # + the LangChain VectorStore adapter
 
 ## Run a server
 
-This client speaks **HTTP** — it is built on `http.client`, so the server needs
-its `-http` listener and that is the port you point the client at. (The server
-also offers gRPC and a binary TCP protocol; this client uses neither.)
+Point the client at either the server's `-http` listener (REST, default port
+`8080`) or its `-tcp` listener (the native binary protocol, default port
+`7000`) — pick one when you start the server, or bind both. (The server also
+offers gRPC; this client does not speak it.)
 
 Neither of these needs a Go toolchain or a checkout:
 
 ```bash
 # Container. Auth is required because it binds 0.0.0.0 inside the container.
-docker run --rm -p 127.0.0.1:8080:8080 -e ROSTAM_API_KEY=dev-token \
-  -v rostam-data:/data ghcr.io/rostamlabs/rostam:latest -http 0.0.0.0:8080 -data /data
+docker run --rm -p 127.0.0.1:8080:8080 -p 127.0.0.1:7000:7000 \
+  -e ROSTAM_API_KEY=dev-token -v rostam-data:/data \
+  ghcr.io/rostamlabs/rostam:latest -http 0.0.0.0:8080 -tcp 0.0.0.0:7000 -data /data
 
 # Prebuilt binary. Verifies the release checksum before installing.
 curl -fsSL https://raw.githubusercontent.com/rostamlabs/rostam/main/install.sh | sh
 export PATH="$PATH:$HOME/.local/bin"    # where the installer puts it
-rostam-server -http 127.0.0.1:8080 -data ./data
+rostam-server -http 127.0.0.1:8080 -tcp 127.0.0.1:7000 -data ./data
 ```
 
-Then point the client at it:
+Then point the client at it. `Rostam(target)` picks the transport from the
+target string — `http(s)://` speaks REST, `tcp://host:port` (or a bare
+`host:port`) speaks the native binary protocol:
 
 ```python
-from rostam import RostamClient
+from rostam import Rostam
 
-c = RostamClient("http://localhost:8080", api_key="dev-token")  # container
-c = RostamClient("http://localhost:8080")                       # loopback binary
+c = Rostam("http://localhost:8080", api_key="dev-token")  # container, REST
+c = Rostam("http://localhost:8080")                       # loopback binary, REST
 ```
 
 Without `-data` the store is memory-only and everything is lost when the process
@@ -58,11 +63,13 @@ Building from source stays available for contributors:
 
 ## Quickstart
 
+### HTTP (`http://host:8080`)
+
 ```python
-from rostam import RostamClient
+from rostam import Rostam
 from rostam import filters as f
 
-c = RostamClient("http://localhost:8080", api_key="optional-bearer-token")
+c = Rostam("http://localhost:8080", api_key="optional-bearer-token")
 
 c.create_collection("docs", dim=384, metric="cosine")   # metric: cosine|l2|dot
 
@@ -84,11 +91,43 @@ hits = c.search_docs("docs", query_embedding, k=5,
                      filter=f.and_(f.gte("price", 10.0), f.eq("in_stock", True)))
 
 c.delete("docs", 1)
-c.delete_by_filter("docs", f.eq("doc_id", 7))   # purge a whole document
+c.delete_by_filter("docs", f.eq("doc_id", 7))   # purge a whole document; HTTP-only
 ```
 
 The client also exposes `insert` (rejects duplicate ids), `hybrid_search`
 (dense + sparse fusion), `drop_collection`, and `health`.
+
+### Native TCP (`tcp://host:7000`)
+
+Same vector API, flat, over the binary protocol — plus `r.kv.*`, which has no
+HTTP equivalent:
+
+```python
+from rostam import Rostam
+from rostam import filters as f
+
+r = Rostam("tcp://localhost:7000")   # or Rostam("localhost:7000") — bare host:port defaults to TCP
+
+r.create_collection("docs", dim=384, metric="cosine")
+r.upsert("docs", 1, embedding, content="the chunk text", metadata={"doc_id": 7, "lang": "en"})
+
+# Dense + BM25 fusion in one call (collection needs full-text indexing enabled).
+hits = r.hybrid_text("docs", embedding, "apple pie", k=5, filter=f.eq("doc_id", 7))
+
+# Recommend: score toward example ids (and away from `negative` ones).
+hits = r.recommend("docs", positive=[1, 2], k=5)
+
+# Key-value, same connection. TCP-only: r.kv raises TransportError on an
+# HTTP-connected client.
+r.kv.put("user:42", b'{"coins":100}', ttl_ms=300_000)
+r.kv.get("user:42")
+r.kv.incr("views:42", 1)   # atomic; missing key counts as 0
+```
+
+`r.query(...)` (the general composable Query API) and a few HTTP-only extras
+(`health`, `delete_by_filter`, `bulk_build`, `mv_*`, `search_text`,
+`discover`) raise `TransportError` on a TCP-connected client; TCP callers use
+`recommend()`/`hybrid_text()` in their place.
 
 ## Embeddings (work in text, not vectors)
 
@@ -96,9 +135,9 @@ The core client takes vectors. `TextStore` adds the text-first ergonomics —
 embedding happens client-side, so no model dependency touches Rostam's engine.
 
 ```python
-from rostam import RostamClient, TextStore, OpenAIEmbedder
+from rostam import Rostam, TextStore, OpenAIEmbedder
 
-store = TextStore(RostamClient("http://localhost:8080"), "docs", OpenAIEmbedder())
+store = TextStore(Rostam("http://localhost:8080"), "docs", OpenAIEmbedder())
 store.create_collection()                       # dim inferred from the embedder
 store.add(["first chunk", "second chunk"], metadatas=[{"doc_id": 1}, {"doc_id": 1}])
 
@@ -155,10 +194,10 @@ the vector, the chunk text, and metadata.
 
 ```python
 from langchain_openai import OpenAIEmbeddings
-from rostam import RostamClient
+from rostam import Rostam
 from rostam.langchain import RostamVectorStore
 
-client = RostamClient("http://localhost:8080")
+client = Rostam("http://localhost:8080")
 client.create_collection("docs", dim=1536, metric="cosine")
 
 store = RostamVectorStore.from_texts(
@@ -265,11 +304,11 @@ constructor, so the class method works the same way.
 interface (`pip install rostam-client[llamaindex]`).
 
 ```python
-from rostam import RostamClient
+from rostam import Rostam
 from rostam.llamaindex import RostamVectorStore
 from llama_index.core import VectorStoreIndex, StorageContext
 
-client = RostamClient("http://localhost:8080")
+client = Rostam("http://localhost:8080")
 client.create_collection("docs", dim=1536, metric="cosine")
 store = RostamVectorStore(client=client, collection="docs")
 index = VectorStoreIndex.from_documents(
@@ -351,10 +390,10 @@ and a `RostamEmbeddingRetriever` component (`pip install rostam-client[haystack]
 
 ```python
 from haystack import Document
-from rostam import RostamClient
+from rostam import Rostam
 from rostam.haystack import RostamDocumentStore, RostamEmbeddingRetriever
 
-RostamClient("http://localhost:8080").create_collection("docs", dim=384, metric="cosine")
+Rostam("http://localhost:8080").create_collection("docs", dim=384, metric="cosine")
 store = RostamDocumentStore(url="http://localhost:8080", collection="docs")
 store.write_documents([Document(content="hello", embedding=[...], meta={"src": "a"})])
 
@@ -376,7 +415,8 @@ Documents must carry embeddings; writes use overwrite semantics.
 - **Search encoding.** Searches go out in Rostam's binary query framing rather
   than as JSON text, which at dim=768 was 31% of the request. Against a server
   too old to understand it the client notices and falls back to JSON for the
-  rest of its life; `RostamClient(url, binary_search=False)` opts out entirely.
+  rest of its life; this is automatic and not currently a constructor option
+  on `Rostam(...)`.
 - **IDs.** Rostam point ids are `uint64`. The client takes integers directly. The
   LangChain adapter accepts string ids: a purely-numeric string is used verbatim,
   anything else is hashed (BLAKE2b) to a stable 64-bit id, so repeated

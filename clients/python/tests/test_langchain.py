@@ -21,7 +21,7 @@ try:
 except Exception:  # pragma: no cover - exercised only without langchain
     HAVE_LC = False
 
-from rostam import RostamClient
+from rostam import Rostam
 from _wire import read_body
 
 STORE = {}        # id -> {"content":..., "metadata": tagged}
@@ -107,7 +107,7 @@ class LangChainAdapterTest(unittest.TestCase):
         STORE.clear()
         from rostam.langchain import RostamVectorStore
 
-        self.store = RostamVectorStore(RostamClient(self.base), "docs", FakeEmbeddings())
+        self.store = RostamVectorStore(Rostam(self.base), "docs", FakeEmbeddings())
 
     def test_add_texts_and_search(self):
         ids = self.store.add_texts(
@@ -164,7 +164,7 @@ class LangChainAdapterTest(unittest.TestCase):
 
         store = RostamVectorStore.from_texts(
             ["hello"], FakeEmbeddings(), metadatas=[{"k": "v"}],
-            client=RostamClient(self.base), collection="docs", ids=["1"],
+            client=Rostam(self.base), collection="docs", ids=["1"],
         )
         self.assertEqual(STORE[1]["content"], "hello")
         self.assertEqual(store.embeddings.__class__.__name__, "FakeEmbeddings")
@@ -187,10 +187,10 @@ def lc_env():
 
 @pytest.mark.skipif(not HAVE_LC, reason="langchain-core not installed")
 def test_auto_create_on_first_add(lc_env):
-    from rostam import RostamClient
+    from rostam import Rostam
     from rostam.langchain import RostamVectorStore
     url, emb = lc_env
-    client = RostamClient(url)
+    client = Rostam(url)
     calls = []
     orig = client.create_collection
     def spy(name, dim, **kw):
@@ -213,10 +213,10 @@ def test_auto_create_on_first_add(lc_env):
 
 @pytest.mark.skipif(not HAVE_LC, reason="langchain-core not installed")
 def test_get_by_ids_roundtrips_string_ids(lc_env):
-    from rostam import RostamClient
+    from rostam import Rostam
     from rostam.langchain import RostamVectorStore
     url, emb = lc_env
-    store = RostamVectorStore(RostamClient(url), "byid", emb)
+    store = RostamVectorStore(Rostam(url), "byid", emb)
     store.add_texts(["one", "two"], [{"n": 1}, {"n": 2}], ids=["id-one", "id-two"])
     docs = store.get_by_ids(["id-one", "id-two", "nope"])
     by_content = {d.page_content: d for d in docs}
@@ -253,11 +253,11 @@ def mmr_env():
         def embed_query(self, text):
             return self._vec(text)
 
-    from rostam import RostamClient
+    from rostam import Rostam
     from rostam.langchain import RostamVectorStore
 
     fake = FakeRostam()
-    store = RostamVectorStore(RostamClient(fake.url), "mmr", MMREmbeddings(), metric="cosine")
+    store = RostamVectorStore(Rostam(fake.url), "mmr", MMREmbeddings(), metric="cosine")
     yield store
     fake.close()
 
@@ -279,10 +279,10 @@ def test_mmr_selects_diverse_results(mmr_env):
 
 @pytest.mark.skipif(not HAVE_LC, reason="langchain-core not installed")
 def test_from_texts_forwards_options(lc_env):
-    from rostam import RostamClient
+    from rostam import Rostam
     from rostam.langchain import RostamVectorStore
     url, emb = lc_env
-    client = RostamClient(url)
+    client = Rostam(url)
     calls = []
     orig = client.create_collection
     def spy(name, dim, **kw):
@@ -302,10 +302,10 @@ def test_from_texts_forwards_options(lc_env):
 def test_from_texts_forwards_sparse_embedding(lc_env):
     """sparse_embedding kwarg must propagate into the constructed store's
     _sparse_embedding attribute; previously the forwarding tuple omitted it."""
-    from rostam import RostamClient
+    from rostam import Rostam
     from rostam.langchain import RostamVectorStore
     url, emb = lc_env
-    client = RostamClient(url)
+    client = Rostam(url)
     sentinel = lambda q: {"indices": [0], "values": [1.0]}
     store = RostamVectorStore.from_texts(
         ["a", "b"], emb, client=client, collection="sparse_fwd",
@@ -327,11 +327,11 @@ def hybrid_env():
     if not HAVE_LC:
         pytest.skip("langchain-core not installed")
 
-    from rostam import RostamClient
+    from rostam import Rostam
     from rostam.langchain import RostamVectorStore
 
     fake = FakeRostam()
-    store = RostamVectorStore(RostamClient(fake.url), "hybrid", FakeEmbeddings(), full_text=True)
+    store = RostamVectorStore(Rostam(fake.url), "hybrid", FakeEmbeddings(), full_text=True)
     yield store
     fake.close()
 
@@ -355,10 +355,10 @@ def test_async_methods_use_to_thread(lc_env):
     import asyncio
     from unittest.mock import patch
     import rostam.langchain as lcmod
-    from rostam import RostamClient
+    from rostam import Rostam
     from rostam.langchain import RostamVectorStore
     url, emb = lc_env
-    store = RostamVectorStore(RostamClient(url), "async2", emb)
+    store = RostamVectorStore(Rostam(url), "async2", emb)
 
     calls = []
     real_to_thread = asyncio.to_thread

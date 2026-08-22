@@ -8,7 +8,8 @@ in-process cache, through `cache.Cache` directly.
 Unlike the vector API, KV is **not on the REST endpoint** — it lives only on the
 binary TCP protocol, because it is built for sub-microsecond operations an HTTP
 round trip would defeat. In Go that is the `Store` facade below; from Python it
-is the native `RostamKV` client, which speaks the same protocol over a socket.
+is `r.kv` on a `tcp://`-connected `Rostam` client, which speaks the same
+protocol over a socket.
 
 ## Core operations
 
@@ -26,19 +27,21 @@ is the native `RostamKV` client, which speaks the same protocol over a socket.
     ```python
     from rostam import Rostam
 
-    kv = Rostam("127.0.0.1", 7000)             # the server's -tcp port
-    kv.put("user:42", b'{"coins":100}', ttl_ms=300_000)   # ttl_ms 0 = no expiry
-    kv.get("user:42")                            # bytes, or None on miss/expiry
-    kv.delete("user:42")                         # -> bool (existed)
+    r = Rostam("tcp://127.0.0.1:7000")           # the server's -tcp port
+    r.kv.put("user:42", b'{"coins":100}', ttl_ms=300_000)   # ttl_ms 0 = no expiry
+    r.kv.get("user:42")                            # bytes, or None on miss/expiry
+    r.kv.delete("user:42")                         # -> bool (existed)
     ```
 
     Keys and values may be `str` (encoded UTF-8) or `bytes`; reads always return
     `bytes` (or `None`). Pass `auth_token=` when the server requires one — it
     rides the protocol-v2 frame on every request.
 
-    The same client speaks the vector database over the same connection —
-    `Rostam(...).vector.create_collection / upsert / search / get / delete` — see
-    [the vector docs](../vector/collections-and-indexes.md).
+    The same client speaks the vector database over the same connection — the
+    flat API directly on `r` (`r.create_collection / upsert / search / get /
+    delete`) — see [the vector docs](../vector/collections-and-indexes.md).
+    `r.kv.<operation>` raises `TransportError` on an HTTP-connected client (`Rostam("http://...")`);
+    KV has no REST surface.
 
 Beyond get/put/del, two built-in atomic ops run server-side — no
 read-modify-write race, no extra round trips:
@@ -57,8 +60,8 @@ read-modify-write race, no extra round trips:
 === "Python"
 
     ```python
-    kv.incr("views:42", 1)          # atomic add, returns the new int (missing = 0)
-    kv.expire("user:42", 3_600_000) # refresh the TTL without rewriting the value
+    r.kv.incr("views:42", 1)          # atomic add, returns the new int (missing = 0)
+    r.kv.expire("user:42", 3_600_000) # refresh the TTL without rewriting the value
     ```
 
 The Python client covers the five built-in ops (`get`, `put`, `delete`, `incr`,

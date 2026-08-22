@@ -11,7 +11,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from rostam import RostamClient, RostamError
+from rostam import Rostam, RostamError
 from _wire import read_body
 
 
@@ -86,7 +86,7 @@ class TransportTest(unittest.TestCase):
         self.srv.server_close()
 
     def test_search_is_sent_in_the_binary_framing(self):
-        c = RostamClient(self.url)
+        c = Rostam(self.url)
         hits = c.search("docs", [0.25, -0.5, 1.0], k=2)
         c.close()
         self.assertEqual(["application/octet-stream"], RecordingServer.content_types)
@@ -96,21 +96,26 @@ class TransportTest(unittest.TestCase):
         self.assertEqual(2, RecordingServer.search_bodies[0]["k"])
 
     def test_filter_survives_the_binary_framing(self):
-        c = RostamClient(self.url)
+        c = Rostam(self.url)
         filt = {"op": "eq", "field": "lang", "value": {"kind": "string", "str": "en"}}
         c.search("docs", [1.0, 2.0], k=1, filter=filt)
         c.close()
         self.assertEqual(filt, RecordingServer.search_bodies[0]["filter"])
 
     def test_binary_can_be_turned_off(self):
-        c = RostamClient(self.url, binary_search=False)
+        # binary_search isn't part of the unified Rostam() constructor surface
+        # (the facade doesn't expose transport-tuning kwargs beyond
+        # pool_maxsize); the underlying HttpTransport still carries the
+        # attribute, so it is set directly to exercise the JSON-only path.
+        c = Rostam(self.url)
+        c._t.binary_search = False
         c.search("docs", [1.0], k=1)
         c.close()
         self.assertEqual(["application/json"], RecordingServer.content_types)
 
     def test_falls_back_to_json_against_a_server_without_rvq1(self):
         RecordingServer.fail_binary_as_old_server = True
-        c = RostamClient(self.url)
+        c = Rostam(self.url)
         hits = c.search("docs", [1.0, 2.0], k=3)   # binary rejected, retried as JSON
         self.assertEqual(3, len(hits))
         self.assertEqual(["application/octet-stream", "application/json"],
@@ -125,7 +130,7 @@ class TransportTest(unittest.TestCase):
     def test_a_real_error_is_not_mistaken_for_a_missing_feature(self):
         """A 400 about the request itself must surface, not trigger a JSON retry."""
         RecordingServer.fail_next_with = (400, "k must be between 1 and 65536")
-        c = RostamClient(self.url)
+        c = Rostam(self.url)
         with self.assertRaises(RostamError) as caught:
             c.search("docs", [1.0], k=0)
         c.close()
@@ -141,7 +146,7 @@ class TransportTest(unittest.TestCase):
         """
         big = {"op": "in", "field": "sku",
                "value": {"kind": "strings", "strs": ["x" * 32 for _ in range(40000)]}}
-        c = RostamClient(self.url)
+        c = Rostam(self.url)
         c.search("docs", [1.0, 2.0], k=1, filter=big)
         c.close()
         self.assertEqual(["application/json"], RecordingServer.content_types)
@@ -150,7 +155,7 @@ class TransportTest(unittest.TestCase):
     def test_k_the_framing_cannot_express_falls_back_to_json(self):
         """Negative k must not become a struct.error where JSON gives a 400."""
         RecordingServer.fail_next_with = (400, "k must be between 1 and 65536")
-        c = RostamClient(self.url)
+        c = Rostam(self.url)
         with self.assertRaises(RostamError) as caught:
             c.search("docs", [1.0, 2.0], k=-1)
         c.close()
@@ -159,7 +164,7 @@ class TransportTest(unittest.TestCase):
                          "an unencodable k should take the JSON path, not raise struct.error")
 
     def test_connections_are_reused(self):
-        c = RostamClient(self.url)
+        c = Rostam(self.url)
         for _ in range(12):
             c.search("docs", [1.0, 2.0], k=1)
         c.close()
@@ -168,7 +173,7 @@ class TransportTest(unittest.TestCase):
                          "12 searches should share one connection, not open one each")
 
     def test_close_then_reuse_reconnects(self):
-        c = RostamClient(self.url)
+        c = Rostam(self.url)
         c.search("docs", [1.0], k=1)
         c.close()
         c.search("docs", [1.0], k=1)   # the client stays usable after close()
@@ -182,7 +187,7 @@ class TransportTest(unittest.TestCase):
         desynchronize the response stream; with a pool each thread holds a
         connection for the length of its request.
         """
-        c = RostamClient(self.url, pool_maxsize=4)
+        c = Rostam(self.url, pool_maxsize=4)
         errors = []
         counts = []
 
@@ -245,14 +250,14 @@ class StaleConnectionTest(unittest.TestCase):
         self.srv.server_close()
 
     def test_a_search_survives_a_connection_that_died_while_idle(self):
-        c = RostamClient(self.url)
+        c = Rostam(self.url)
         self.assertEqual(2, len(c.search("docs", [1.0, 2.0], k=2)))
         # The pooled connection is now dead; the retry must make this transparent.
         self.assertEqual(2, len(c.search("docs", [1.0, 2.0], k=2)))
         c.close()
 
     def test_a_write_is_not_replayed(self):
-        c = RostamClient(self.url)
+        c = Rostam(self.url)
         c.search("docs", [1.0], k=1)          # leaves a dead connection pooled
         with self.assertRaises(RostamError) as caught:
             c.upsert("docs", 1, [1.0, 2.0])   # must fail rather than risk a double write
@@ -284,16 +289,16 @@ class TimeoutTest(unittest.TestCase):
         self.srv.server_close()
 
     def test_a_later_call_can_raise_the_timeout_on_a_pooled_connection(self):
-        c = RostamClient(self.url, timeout=5.0)
+        c = Rostam(self.url, timeout=5.0)
         c.search("docs", [1.0], k=1)                 # pools a 5s connection
-        conn, reused = c._pool.acquire(3600.0)
+        conn, reused = c._t._pool.acquire(3600.0)
         try:
             self.assertTrue(reused, "expected the pooled connection back")
             self.assertEqual(3600.0, conn.timeout)
             self.assertEqual(3600.0, conn.sock.gettimeout(),
                              "the live socket kept the old timeout")
         finally:
-            c._pool.discard(conn)
+            c._t._pool.discard(conn)
             c.close()
 
 class ClosingServer(RecordingServer):
@@ -325,7 +330,7 @@ class ClosingServerTest(unittest.TestCase):
         self.srv.server_close()
 
     def test_works_and_opens_exactly_one_connection_per_request(self):
-        c = RostamClient(self.url)
+        c = Rostam(self.url)
         for _ in range(6):
             self.assertEqual(1, len(c.search("docs", [1.0, 2.0], k=1)))
         c.close()

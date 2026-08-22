@@ -96,7 +96,7 @@ server from [Run it](#run-it), which needs no token.
 
 Against the container, authenticate every call: add
 `-H 'Authorization: Bearer secret'` to each curl, construct the Python client as
-`RostamClient("http://localhost:8080", api_key="secret")`, and set
+`Rostam("http://localhost:8080", api_key="secret")`, and set
 `ClientConfig.AuthToken` in Go.
 
 === "curl"
@@ -123,9 +123,9 @@ Against the container, authenticate every call: add
     ```
 
     ```python
-    from rostam import RostamClient, filters as f
+    from rostam import Rostam, filters as f
 
-    c = RostamClient("http://localhost:8080")
+    c = Rostam("http://localhost:8080")
 
     c.create_collection("docs", dim=4, metric="cosine")
     c.upsert("docs", 1, [0.1, 0.2, 0.3, 0.4],

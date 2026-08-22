@@ -1,10 +1,14 @@
-"""Python<->Go cross-stack test for the native KV client.
+"""Python<->Go cross-stack test for the r.kv namespace on the unified Rostam
+facade.
 
 The KV store is only on the binary TCP protocol, so there is no HTTP path and no
 fake worth trusting: the whole point is that the Python framing, the protocol-v2
 auth prefix, and each op's byte layout agree with the Go server exactly. A slip
 in any of them produces a wrong value or a spurious error, not a clean failure.
-So this launches the real server with `-tcp` and drives every op against it.
+So this launches the real server with `-tcp` and drives every op against it via
+``Rostam("tcp://...").kv.*``.
+
+Uses the public package API (``from rostam import Rostam, RostamError``).
 
 Skipped when no server binary is found (same rule as the other cross-stack
 modules): $ROSTAM_SERVER_BIN, or a `rostam-server*` built at the repo root.
@@ -19,7 +23,7 @@ import time
 import unittest
 
 from _serverbin import find_server_bin
-from rostam import RostamKV, RostamError
+from rostam import Rostam, RostamError
 
 
 def _free_port():
@@ -58,11 +62,11 @@ class CrossStackKVTest(unittest.TestCase):
         if not _wait_tcp("127.0.0.1", cls.tcp, time.time() + 20):
             cls.proc.kill()
             raise RuntimeError("rostam-server -tcp did not come up in time")
-        cls.kv = RostamKV("127.0.0.1", cls.tcp)
+        cls.r = Rostam(f"tcp://127.0.0.1:{cls.tcp}")
 
     @classmethod
     def tearDownClass(cls):
-        cls.kv.close()
+        cls.r.close()
         cls.proc.terminate()
         try:
             cls.proc.wait(timeout=5)
@@ -70,41 +74,41 @@ class CrossStackKVTest(unittest.TestCase):
             cls.proc.kill()
 
     def test_ping(self):
-        self.assertTrue(self.kv.ping())
+        self.assertTrue(self.r.kv.ping())
 
     def test_put_get_bytes_and_str(self):
-        self.kv.put("k:bytes", b'{"coins":100}')
-        self.assertEqual(self.kv.get("k:bytes"), b'{"coins":100}')
-        self.kv.put("k:str", "hello")            # str encodes UTF-8
-        self.assertEqual(self.kv.get("k:str"), b"hello")
+        self.r.kv.put("k:bytes", b'{"coins":100}')
+        self.assertEqual(self.r.kv.get("k:bytes"), b'{"coins":100}')
+        self.r.kv.put("k:str", "hello")            # str encodes UTF-8
+        self.assertEqual(self.r.kv.get("k:str"), b"hello")
 
     def test_miss_returns_none_not_empty(self):
         # Absent must be None, and distinct from a stored empty value.
-        self.assertIsNone(self.kv.get("k:absent"))
-        self.kv.put("k:empty", b"")
-        self.assertEqual(self.kv.get("k:empty"), b"")
+        self.assertIsNone(self.r.kv.get("k:absent"))
+        self.r.kv.put("k:empty", b"")
+        self.assertEqual(self.r.kv.get("k:empty"), b"")
 
     def test_incr_from_missing_and_negative(self):
-        self.assertEqual(self.kv.incr("k:ctr", 1), 1)   # missing = 0, so +1
-        self.assertEqual(self.kv.incr("k:ctr", 5), 6)
-        self.assertEqual(self.kv.incr("k:ctr", -2), 4)  # signed delta
+        self.assertEqual(self.r.kv.incr("k:ctr", 1), 1)   # missing = 0, so +1
+        self.assertEqual(self.r.kv.incr("k:ctr", 5), 6)
+        self.assertEqual(self.r.kv.incr("k:ctr", -2), 4)  # signed delta
 
     def test_delete_reports_existence(self):
-        self.kv.put("k:del", "x")
-        self.assertTrue(self.kv.delete("k:del"))        # existed
-        self.assertFalse(self.kv.delete("k:del"))       # already gone
-        self.assertIsNone(self.kv.get("k:del"))
+        self.r.kv.put("k:del", "x")
+        self.assertTrue(self.r.kv.delete("k:del"))        # existed
+        self.assertFalse(self.r.kv.delete("k:del"))       # already gone
+        self.assertIsNone(self.r.kv.get("k:del"))
 
     def test_expire_on_a_live_key(self):
-        self.kv.put("k:ttl", "x")
-        self.kv.expire("k:ttl", 60_000)                 # 60s — still present now
-        self.assertEqual(self.kv.get("k:ttl"), b"x")
+        self.r.kv.put("k:ttl", "x")
+        self.r.kv.expire("k:ttl", 60_000)                 # 60s — still present now
+        self.assertEqual(self.r.kv.get("k:ttl"), b"x")
 
     def test_binary_safe_keys_and_values(self):
         key = bytes(range(256))
         val = bytes([0, 1, 2, 255, 254])
-        self.kv.put(key, val)
-        self.assertEqual(self.kv.get(key), val)
+        self.r.kv.put(key, val)
+        self.assertEqual(self.r.kv.get(key), val)
 
 
 @unittest.skipUnless(_BIN, _WHY)
@@ -135,29 +139,32 @@ class CrossStackKVAuthTest(unittest.TestCase):
             cls.proc.kill()
 
     def test_correct_token_works(self):
-        kv = RostamKV("127.0.0.1", self.tcp, auth_token="s3cret")
+        r = Rostam(f"tcp://127.0.0.1:{self.tcp}", auth_token="s3cret")
         try:
-            kv.put("k", "v")
-            self.assertEqual(kv.get("k"), b"v")
+            r.kv.put("k", "v")
+            self.assertEqual(r.kv.get("k"), b"v")
         finally:
-            kv.close()
+            r.close()
 
     def test_missing_token_is_unauthorized(self):
-        kv = RostamKV("127.0.0.1", self.tcp)
+        r = Rostam(f"tcp://127.0.0.1:{self.tcp}")
         try:
             with self.assertRaises(RostamError) as cm:
-                kv.get("k")
-            self.assertEqual(cm.exception.status, 4)  # StatusUnauthorized
+                r.kv.get("k")
+            # The unified _types.RostamError (unlike the pre-unification
+            # client.RostamError) doesn't carry a `.status` field — the status
+            # is folded into the message instead (see _tcp._status_message).
+            self.assertIn("unauthorized", str(cm.exception).lower())
         finally:
-            kv.close()
+            r.close()
 
     def test_wrong_token_is_unauthorized(self):
-        kv = RostamKV("127.0.0.1", self.tcp, auth_token="nope")
+        r = Rostam(f"tcp://127.0.0.1:{self.tcp}", auth_token="nope")
         try:
             with self.assertRaises(RostamError):
-                kv.get("k")
+                r.kv.get("k")
         finally:
-            kv.close()
+            r.close()
 
 
 if __name__ == "__main__":

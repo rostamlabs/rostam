@@ -105,9 +105,9 @@ an ordering, and inventing one leaves `x >= 3 AND x <= 2` matching a NaN row.
 `rostam.filters` has helpers for the operators you reach for most:
 
 ```python
-from rostam import RostamClient, filters as f
+from rostam import Rostam, filters as f
 
-c = RostamClient("http://localhost:8080")
+c = Rostam("http://localhost:8080")
 query = [0.1, 0.2, 0.3, 0.4]   # your embedding model's output
 
 c.search_docs("docs", query, k=5, filter=f.eq("tenant", "acme"))

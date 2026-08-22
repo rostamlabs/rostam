@@ -11,7 +11,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from rostam import FunctionEmbedder, OpenAIEmbedder, RostamClient, TextStore
+from rostam import FunctionEmbedder, OpenAIEmbedder, Rostam, TextStore
 from _wire import read_body
 
 # ---- fake OpenAI-compatible embeddings endpoint ----
@@ -133,7 +133,7 @@ class TextStoreTest(unittest.TestCase):
         STORE.clear()
         LAST.clear()
         embedder = FunctionEmbedder(lambda ts: [[float(len(t)), 1.0, 0.0] for t in ts])
-        self.store = TextStore(RostamClient(self.base), "docs", embedder)
+        self.store = TextStore(Rostam(self.base), "docs", embedder)
 
     def test_create_collection_infers_dim(self):
         self.store.create_collection()

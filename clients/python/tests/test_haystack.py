@@ -3,7 +3,7 @@ fake store."""
 
 import unittest
 
-from rostam import RostamClient
+from rostam import Rostam
 
 try:
     from haystack import Document
@@ -33,7 +33,7 @@ class HaystackAdapterTest(unittest.TestCase):
         from rostam.haystack import RostamDocumentStore
 
         self.fake.docs.clear()  # isolate each test (the fake is shared per class)
-        RostamClient(self.fake.url).create_collection("hs", dim=3, metric="l2")
+        Rostam(self.fake.url).create_collection("hs", dim=3, metric="l2")
         self.store = RostamDocumentStore(url=self.fake.url, collection="hs")
 
     def test_write_count_filter(self):

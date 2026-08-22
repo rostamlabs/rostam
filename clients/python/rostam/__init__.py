@@ -1,27 +1,42 @@
-"""Rostam Python client — dependency-free SDK: a REST client for the vector API,
-and a native binary-protocol client (Rostam) for the KV store and vector ops.
+"""Rostam Python client — dependency-free SDK.
 
-The core client (``RostamClient``) uses only the standard library. The optional
-LangChain adapter lives in ``rostam.langchain`` and requires the ``langchain``
-extra.
+One entry point, ``Rostam(target)``, whose transport is chosen from the
+target: ``http(s)://host:8080`` speaks the REST API, ``tcp://host:7000`` (or a
+bare ``host:7000``) speaks the native binary TCP protocol. Vector ops are flat
+(``r.search``, ``r.upsert``, ``r.hybrid_text``, ...); key-value ops live under
+``r.kv.*`` (TCP only). Uses only the standard library. The optional LangChain /
+LlamaIndex / Haystack adapters live in ``rostam.langchain`` / ``rostam.llamaindex``
+/ ``rostam.haystack`` and require their respective extras.
 """
 
 from . import filters
-from .client import Document, Group, MultiResult, Point, RostamClient, RostamError, ScrollPage, SearchResult
+from ._http import MultiResult
+from ._types import (
+    Document,
+    Group,
+    GroupResults,
+    Point,
+    RostamError,
+    ScrollPage,
+    SearchResult,
+    SearchResults,
+    TransportError,
+)
 from .embeddings import Embedder, FunctionEmbedder, OpenAIEmbedder, TextStore
-from .kv import Rostam, RostamKV
+from .rostam import Rostam
 
 __all__ = [
-    "RostamClient",
     "Rostam",
-    "RostamKV",
     "RostamError",
+    "TransportError",
     "SearchResult",
+    "SearchResults",
+    "GroupResults",
     "Document",
     "Point",
     "Group",
-    "MultiResult",
     "ScrollPage",
+    "MultiResult",
     "filters",
     "Embedder",
     "FunctionEmbedder",
@@ -34,4 +49,4 @@ __all__ = [
 # anything asking rostam.__version__ was told the wrong release, and nothing
 # noticed. It is a literal rather than an importlib.metadata lookup so that
 # importing the package stays free of a dist-info read.
-__version__ = "0.1.2"
+__version__ = "0.2.0"

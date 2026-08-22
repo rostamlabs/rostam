@@ -1,7 +1,7 @@
 """Python<->Go cross-stack smoke for the binary bulk-ingest wire (RVB1).
 
-It launches the REAL rostam-server binary and drives it via RostamClient's binary
-methods: bulk_stage + bulk_build (the vectors-only initial-load fast path), and
+It launches the REAL rostam-server binary and drives it via the Rostam facade's
+binary methods: bulk_stage + bulk_build (the vectors-only initial-load fast path), and
 batch_upsert with per-point payloads (the filter-case path). The point of running
 against the live Go server is that the framing is a byte-level contract between
 two languages — a mock would only prove the client agrees with itself.
@@ -24,8 +24,7 @@ import time
 import unittest
 
 from _serverbin import find_server_bin
-from rostam import RostamClient
-from rostam.client import RostamError
+from rostam import Rostam, RostamError
 
 DIM = 16
 N = 200
@@ -62,7 +61,7 @@ class CrossStackBinaryBulkTest(unittest.TestCase):
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         cls.base = f"http://127.0.0.1:{cls.port}"
-        cls.c = RostamClient(cls.base, timeout=120)
+        cls.c = Rostam(cls.base, timeout=120)
         deadline = time.time() + 20
         while time.time() < deadline:
             if cls.proc.poll() is not None:
@@ -91,12 +90,12 @@ class CrossStackBinaryBulkTest(unittest.TestCase):
         self.c.create_collection("binstage", dim=DIM, metric="l2")
         self.c.create_collection("jsonstage", dim=DIM, metric="l2")
 
-        staged = self.c.bulk_stage("binstage", ids, vecs)
+        staged = self.c._t.bulk_stage("binstage", ids, vecs)
         self.assertEqual(staged, N)
         self.c.bulk_build("binstage")
 
         # Same points over the untouched JSON staging body.
-        self.c._request(
+        self.c._t._request(
             "POST",
             "/v1/collections/jsonstage/points/bulk",
             {"points": [{"id": i, "vector": v} for i, v in zip(ids, vecs)]},
@@ -122,7 +121,7 @@ class CrossStackBinaryBulkTest(unittest.TestCase):
         metas = [{"id": i, "bucket": "even" if i % 2 == 0 else "odd"} for i in ids]
 
         self.c.create_collection("binbatch", dim=DIM, metric="l2")
-        count = self.c.batch_upsert("binbatch", ids, vecs, metadatas=metas)
+        count = self.c._t.batch_upsert("binbatch", ids, vecs, metadatas=metas)
         self.assertEqual(count, N)
 
         from rostam import filters as f
@@ -148,11 +147,11 @@ class CrossStackBinaryBulkTest(unittest.TestCase):
         # payload section through to the multi-core build, so the same body is
         # ACCEPTED — and the payload has to actually be there afterwards, which is
         # what the old refusal was protecting.
-        from rostam.client import _encode_bulk_body
+        from rostam._http import _encode_bulk_body
 
         self.c.create_collection("binflag", dim=DIM, metric="l2")
         body = _encode_bulk_body([1], [_vec(1)], payloads=[{"id": 1}])
-        self.c._send(
+        self.c._t._send(
             "POST", "/v1/collections/binflag/points/bulk", body, "application/octet-stream"
         )
         self.c.bulk_build("binflag")
@@ -164,7 +163,7 @@ class CrossStackBinaryBulkTest(unittest.TestCase):
         # The server caps one binary body at 256 MiB / 262,144 points. bulk_stage
         # must split rather than 413, or its advertised "load a million vectors"
         # use case does not work. Force many chunks with a tiny per-request span.
-        import rostam.client as rc
+        import rostam._http as rc
 
         ids = list(range(1, 5001))
         vecs = [_vec(i) for i in ids]
@@ -173,7 +172,7 @@ class CrossStackBinaryBulkTest(unittest.TestCase):
         orig = rc._points_per_request
         rc._points_per_request = lambda dim, payload_bytes=0: 500  # 10 requests
         try:
-            staged = self.c.bulk_stage("binsplit", ids, vecs)
+            staged = self.c._t.bulk_stage("binsplit", ids, vecs)
         finally:
             rc._points_per_request = orig
         # The count is summed across requests, not taken from the last one.
@@ -188,7 +187,7 @@ class CrossStackBinaryBulkTest(unittest.TestCase):
         # body cap once metadata was attached: at low dim the point ceiling binds,
         # and 131,072 points x ~2 KB of metadata is ~266 MiB of payload before a
         # single vector. Those requests 413'd.
-        from rostam.client import _payload_bytes, _points_per_request
+        from rostam._http import _payload_bytes, _points_per_request
 
         SERVER_CAP = 256 << 20
         meta = {"blob": "x" * 2000}
@@ -223,7 +222,7 @@ class CrossStackBinaryBulkTest(unittest.TestCase):
         # Every fifth point carries NO payload, so the mixed batch — the shape that
         # makes the client's per-point length prefixes load-bearing — is covered.
         metas = [None if i % 5 == 0 else {"id": i, "bucket": i % 7} for i in ids]
-        staged = self.c.bulk_stage("binpayload", ids, vecs, metadatas=metas)
+        staged = self.c._t.bulk_stage("binpayload", ids, vecs, metadatas=metas)
         self.assertEqual(staged, N)
         self.c.bulk_build("binpayload")
 
@@ -255,7 +254,7 @@ class CrossStackBinaryBulkTest(unittest.TestCase):
         ):
             with self.subTest(field=name):
                 with self.assertRaises(RostamError) as cm:
-                    self.c._request(
+                    self.c._t._request(
                         "POST",
                         "/v1/collections/binrefuse/points/bulk",
                         {"points": [point]},
@@ -263,13 +262,13 @@ class CrossStackBinaryBulkTest(unittest.TestCase):
                 self.assertEqual(cm.exception.status, 400)
 
     def test_dim_mismatch_rejected(self):
-        from rostam.client import _encode_bulk_body
+        from rostam._http import _encode_bulk_body
 
         self.c.create_collection("bindim", dim=DIM, metric="l2")
         wrong = [[0.5] * (DIM + 3)]
         body = _encode_bulk_body([1], wrong)
         with self.assertRaises(RostamError) as cm:
-            self.c._send(
+            self.c._t._send(
                 "POST", "/v1/collections/bindim/points/bulk", body, "application/octet-stream"
             )
         # The rejection comes from the shard that owns the collection config, so
@@ -278,12 +277,12 @@ class CrossStackBinaryBulkTest(unittest.TestCase):
         self.assertIn("dim", cm.exception.message.lower())
 
     def test_truncated_body_rejected(self):
-        from rostam.client import _encode_bulk_body
+        from rostam._http import _encode_bulk_body
 
         self.c.create_collection("bintrunc", dim=DIM, metric="l2")
         body = _encode_bulk_body([1, 2], [_vec(1), _vec(2)])
         with self.assertRaises(RostamError) as cm:
-            self.c._send(
+            self.c._t._send(
                 "POST", "/v1/collections/bintrunc/points/bulk", body[:-8], "application/octet-stream"
             )
         self.assertEqual(cm.exception.status, 400)

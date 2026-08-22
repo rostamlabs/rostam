@@ -1,7 +1,7 @@
 """Python<->Go cross-stack smoke for the BM25 full-text surface.
 
 It launches the REAL rostam-server binary (REST) and drives it end to end via
-RostamClient: create a full_text collection -> upsert content docs -> search_text
+the Rostam facade: create a full_text collection -> upsert content docs -> search_text
 (rare term ranks its doc first) -> hybrid_text (dense + BM25 fused). This proves
 the Python SDK's raw-text requests round-trip through the live Go server, which
 tokenizes + BM25-scores them server-side (the SDK ships no tokens).
@@ -20,7 +20,7 @@ import time
 import unittest
 
 from _serverbin import find_server_bin
-from rostam import RostamClient
+from rostam import Rostam
 
 
 
@@ -47,7 +47,7 @@ class CrossStackFullTextTest(unittest.TestCase):
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         cls.base = f"http://127.0.0.1:{cls.port}"
-        cls.c = RostamClient(cls.base)
+        cls.c = Rostam(cls.base)
         # Wait for readiness (health) with a deadline.
         deadline = time.time() + 20
         while time.time() < deadline:

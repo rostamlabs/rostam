@@ -5,10 +5,10 @@ Requires ``haystack-ai`` (``pip install rostam-client[haystack]``). Provides a
 (write/delete/count/filter via Rostam's scroll listing) and a
 ``RostamEmbeddingRetriever`` component for embedding retrieval.
 
-    from rostam import RostamClient
+    from rostam import Rostam
     from rostam.haystack import RostamDocumentStore, RostamEmbeddingRetriever
 
-    client = RostamClient("http://localhost:8080")
+    client = Rostam("http://localhost:8080")
     client.create_collection("docs", dim=384, metric="cosine")
     store = RostamDocumentStore(url="http://localhost:8080", collection="docs")
     retriever = RostamEmbeddingRetriever(document_store=store, top_k=5)
@@ -26,7 +26,7 @@ from haystack.document_stores.types import DuplicatePolicy
 
 from . import filters as f
 from ._ids import to_uint64
-from .client import RostamClient
+from .rostam import Rostam
 
 # Reserved metadata key preserving the original Haystack (string) document id,
 # since Rostam point ids are uint64.
@@ -81,7 +81,7 @@ class RostamDocumentStore:
         self.url = url
         self.collection = collection
         self.api_key = api_key
-        self._client = RostamClient(url, api_key=api_key)
+        self._client = Rostam(url, api_key=api_key)
 
     def count_documents(self) -> int:
         return len(self._client.scroll(self.collection))
