@@ -288,6 +288,8 @@ var (
 	EncodeIncrArgs                            = wire.EncodeIncrArgs
 	EncodeIncrResult                          = wire.EncodeIncrResult
 	EncodeKeyArgs                             = wire.EncodeKeyArgs
+	AppendKeyArgs                             = wire.AppendKeyArgs
+	AppendPutArgs                             = wire.AppendPutArgs
 	EncodeKeysAddArgs                         = wire.EncodeKeysAddArgs
 	EncodeKeysListArgs                        = wire.EncodeKeysListArgs
 	EncodeKeysListResult                      = wire.EncodeKeysListResult

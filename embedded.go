@@ -786,6 +786,17 @@ func (e *embedded) Get(_ context.Context, key []byte) ([]byte, error) {
 	return result, nil
 }
 
+// GetInto is the allocation-light Get: the value is copied into dst (reusing its
+// capacity when large enough). Same ErrNotFound semantics as Get; the returned
+// slice may alias dst.
+func (e *embedded) GetInto(_ context.Context, key, dst []byte) ([]byte, error) {
+	result, err := e.node.Call("get", ops.EncodeKeyArgs(key))
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	return append(dst[:0], result...), nil
+}
+
 // Put writes key/value through Raft with the given TTL. Returns
 // ErrNotLeader if the shard leader is unavailable.
 func (e *embedded) Put(_ context.Context, key, value []byte, ttl time.Duration) error {

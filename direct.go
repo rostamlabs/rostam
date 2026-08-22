@@ -126,6 +126,17 @@ func (d *directStore) Get(_ context.Context, key []byte) ([]byte, error) {
 	return raw, nil
 }
 
+func (d *directStore) GetInto(_ context.Context, key, dst []byte) ([]byte, error) {
+	raw, err := d.cache.GetInto(dst[:0], key)
+	if err != nil {
+		if errors.Is(err, cache.ErrNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return raw, nil
+}
+
 // Put and Del write straight to the cache but MUST take the same per-shard opMu
 // that Call's read-write path uses, so a raw Put/Del serializes against a
 // multi-step RMW op (e.g. incr) on the same key. Without it, a Put could land

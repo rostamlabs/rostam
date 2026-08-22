@@ -43,7 +43,20 @@ const ReplMetricsOp = "__repl_metrics__"
 
 // EncodeKeyArgs encodes "{keyLen u16}{key}" used by get and del.
 func EncodeKeyArgs(key []byte) []byte {
-	buf := make([]byte, 2+len(key))
+	return AppendKeyArgs(nil, key)
+}
+
+// AppendKeyArgs is EncodeKeyArgs appending into dst (reusing its capacity when
+// large enough), for a hot-loop caller that pools the buffer. Passing dst=nil
+// reproduces EncodeKeyArgs's bytes exactly. The returned slice may alias dst.
+func AppendKeyArgs(dst, key []byte) []byte {
+	n := 2 + len(key)
+	var buf []byte
+	if cap(dst) >= n {
+		buf = dst[:n]
+	} else {
+		buf = make([]byte, n)
+	}
 	binary.BigEndian.PutUint16(buf[0:2], uint16(len(key))) //nolint:gosec // bounded by upstream key/value length limits
 	copy(buf[2:], key)
 	return buf
@@ -63,7 +76,20 @@ func DecodeKeyArgs(args []byte) ([]byte, error) {
 
 // EncodePutArgs encodes "{keyLen u16}{key}{valLen u32}{val}{ttlMs u64}".
 func EncodePutArgs(key, val []byte, ttl time.Duration) []byte {
-	buf := make([]byte, 2+len(key)+4+len(val)+8)
+	return AppendPutArgs(nil, key, val, ttl)
+}
+
+// AppendPutArgs is EncodePutArgs appending into dst (reusing its capacity when
+// large enough), for a hot-loop caller that pools the buffer. Passing dst=nil
+// reproduces EncodePutArgs's bytes exactly. The returned slice may alias dst.
+func AppendPutArgs(dst, key, val []byte, ttl time.Duration) []byte {
+	n := 2 + len(key) + 4 + len(val) + 8
+	var buf []byte
+	if cap(dst) >= n {
+		buf = dst[:n]
+	} else {
+		buf = make([]byte, n)
+	}
 	binary.BigEndian.PutUint16(buf[0:2], uint16(len(key))) //nolint:gosec // bounded by upstream key/value length limits
 	copy(buf[2:], key)
 	off := 2 + len(key)

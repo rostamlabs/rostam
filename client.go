@@ -98,16 +98,58 @@ type networkedStore struct {
 	c *client.Client
 }
 
+// kvArgsPool recycles the small request-args buffer shared by the KV ops
+// (get/del key args, and put args for small values), so Get/GetInto/Del/Put
+// allocate nothing on the request side in steady state. neither the inline
+// doCall framing nor the pipelined encodeRequestFrame retains args past the
+// call, so the buffer is safe to return afterward. Buffers grown past
+// maxPooledKVArgs (a large Put value) are dropped rather than pooled, to bound
+// retained memory.
+const maxPooledKVArgs = 4 << 10
+
+var kvArgsPool = sync.Pool{New: func() any { b := make([]byte, 0, 128); return &b }}
+
+func putKVArgs(bp *[]byte) {
+	if cap(*bp) <= maxPooledKVArgs {
+		kvArgsPool.Put(bp)
+	}
+}
+
 func (n *networkedStore) Get(ctx context.Context, key []byte) ([]byte, error) {
-	raw, err := n.c.Call(ctx, "get", ops.EncodeKeyArgs(key))
+	bp := kvArgsPool.Get().(*[]byte)
+	*bp = ops.AppendKeyArgs((*bp)[:0], key)
+	raw, err := n.c.Call(ctx, "get", *bp)
+	putKVArgs(bp)
 	if err != nil {
 		return nil, mapErr(err)
 	}
 	return raw, nil
 }
 
+// GetInto is the allocation-light Get: the value is copied into dst inside the
+// zero-copy CallFunc callback (no defensive payload copy) and the request args
+// are pooled, so a reused dst yields a zero-allocation read. Returns ErrNotFound
+// (via mapErr) when the key is absent; the returned slice may alias dst.
+func (n *networkedStore) GetInto(ctx context.Context, key, dst []byte) ([]byte, error) {
+	bp := kvArgsPool.Get().(*[]byte)
+	*bp = ops.AppendKeyArgs((*bp)[:0], key)
+	var out []byte
+	err := n.c.CallFunc(ctx, "get", *bp, func(payload []byte) error {
+		out = append(dst[:0], payload...)
+		return nil
+	})
+	putKVArgs(bp)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	return out, nil
+}
+
 func (n *networkedStore) Put(ctx context.Context, key, value []byte, ttl time.Duration) error {
-	_, err := n.c.Call(ctx, "put", ops.EncodePutArgs(key, value, ttl))
+	bp := kvArgsPool.Get().(*[]byte)
+	*bp = ops.AppendPutArgs((*bp)[:0], key, value, ttl)
+	_, err := n.c.Call(ctx, "put", *bp)
+	putKVArgs(bp)
 	return mapErr(err)
 }
 
@@ -119,7 +161,10 @@ func (n *networkedStore) PutBatch(ctx context.Context, entries []ops.PutEntry) e
 }
 
 func (n *networkedStore) Del(ctx context.Context, key []byte) (bool, error) {
-	raw, err := n.c.Call(ctx, "del", ops.EncodeKeyArgs(key))
+	bp := kvArgsPool.Get().(*[]byte)
+	*bp = ops.AppendKeyArgs((*bp)[:0], key)
+	raw, err := n.c.Call(ctx, "del", *bp)
+	putKVArgs(bp)
 	if err != nil {
 		return false, mapErr(err)
 	}

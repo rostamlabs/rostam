@@ -22,6 +22,19 @@ type Store interface {
 	// ErrNotFound if absent or expired.
 	Get(ctx context.Context, key []byte) ([]byte, error)
 
+	// GetInto is the allocation-light variant of Get: the value is copied into
+	// dst (reusing its capacity when large enough) and the resulting slice is
+	// returned. With a reused dst the Networked path is a zero-allocation read
+	// (pooled request args, no defensive response copy). Same ErrNotFound
+	// semantics as Get. The returned slice may alias dst; do not retain the
+	// argument after the call.
+	//
+	// Note: on the Networked backend GetInto goes through the request-response
+	// path even when PipelineDepth > 0 (pipelining applies to Get, not the
+	// zero-copy CallFunc path GetInto uses) — trade pipelining throughput for
+	// the per-call allocation win accordingly.
+	GetInto(ctx context.Context, key, dst []byte) ([]byte, error)
+
 	// Put writes through Raft with the given TTL. Returns ErrNotLeader
 	// if the backing node (Embedded) or the client's exhausted retry
 	// budget (Networked) cannot reach the shard leader.
