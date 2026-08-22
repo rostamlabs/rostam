@@ -320,6 +320,20 @@ hits = c.hybrid_text("docs", vector=vec, text="hello", k=5)
 hits = c.search("docs", vector=vec, k=10, filter={"tenant": "acme"})
 ```
 
+`RostamClient` above talks REST on `:8080`. The same package also ships a
+**native client over the binary TCP protocol** (the server's `-tcp` port,
+`7000`) — the full vector surface, recommendation and hybrid search included,
+with no HTTP round trip:
+
+```python
+from rostam import Rostam
+
+r = Rostam("127.0.0.1", 7000)                     # binary TCP, not REST
+r.vector.upsert("docs", 1, vec, content="hello", metadata={"tenant": "acme"})
+hits = r.vector.hybrid_text("docs", dense=vec, text="hello", k=5)   # dense + BM25
+recs = r.vector.recommend("docs", positive=[1], k=10)               # "more like this"
+```
+
 Bulk ingest ships vectors as raw f32 over a binary wire rather than JSON text,
 which is what makes large loads fast — a 1M × 768d load runs in **282 s**.
 → [Python client docs](https://docs.rostamlabs.com/api/python/)
@@ -361,6 +375,11 @@ Beyond kNN: hybrid dense+sparse fusion (RRF/weighted/DBSF), BM25 full-text,
 recommendation (± examples), discovery, group-by, scroll with order-by, IVF and
 Vamana indexes, binary/PQ quantization with mmap-resident codes, per-collection
 quotas and TTL. → [Vector engine docs](https://docs.rostamlabs.com/vector/collections-and-indexes/)
+
+Talking to a *remote* server from Go rather than embedding? The typed
+`client.Collection` handle mirrors this API over the binary TCP protocol:
+`client.NewRouted(...)`, then `c.Collection("docs").HybridText(...)` /
+`.Recommend(...)`. → [Go client docs](https://docs.rostamlabs.com/api/go-client/)
 
 ## Quick start — key-value store (Go library)
 
