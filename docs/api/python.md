@@ -21,6 +21,22 @@ All errors raise `RostamError(message, status)` carrying the HTTP status.
 Metadata is plain Python dicts — the client converts to/from the server's
 tagged value encoding automatically.
 
+!!! info "Two clients, two ports"
+    This package ships **two** clients:
+
+    - `RostamClient` (below) speaks **REST over HTTP**, against the server's
+      HTTP port (`8080` above).
+    - `Rostam` (see [Native TCP client](#native-tcp-client-rostam)) speaks the
+      **binary protocol over TCP**, against the server's `-tcp` port (`7000`
+      in the examples). It carries both the KV store (which is TCP-only) and
+      the full vector API as `r.vector.*` — the same collections, the same
+      points, just a different wire.
+
+    Reach for the native client when you want the lower-overhead binary
+    protocol or need the KV store; reach for `RostamClient` for a
+    dependency-free REST surface (and the LangChain/LlamaIndex/Haystack
+    adapters, which are HTTP-only).
+
 ## Connections
 
 The client keeps a small pool of connections and reuses them, so a sequence of
@@ -187,6 +203,113 @@ c.mv_create_collection("docs-colbert", dim=128)
 c.mv_add("docs-colbert", doc_id=1, tokens=token_vectors, metadata={"src": "faq"})
 c.mv_search("docs-colbert", query_tokens, k=10)   # -> [MultiResult(id, score, metadata)]
 c.mv_delete("docs-colbert", 1)
+```
+
+## Native TCP client (Rostam)
+
+`Rostam` (alias `RostamKV`) is a dependency-free, stdlib-only client for the
+binary TCP protocol — the same protocol the [Go smart client](go-client.md)
+speaks. It connects to the server's `-tcp` port (**`7000`** in the examples
+throughout these docs), not the HTTP port:
+
+```python
+from rostam import Rostam
+
+r = Rostam("127.0.0.1", 7000, auth_token=None, timeout=30.0, pool_maxsize=8)
+r.put("user:42", b'{"coins":100}')       # KV ops are TCP-only — see kv/overview.md
+r.vector.create_collection("posts", dim=768, metric="cosine")
+```
+
+Key-value operations (`get`/`put`/`delete`/`incr`/`expire`/`ping`) are methods
+on `r` directly — see [Key-value store](../kv/overview.md). Vector operations
+live under `r.vector`, sharing the same connection pool and auth token.
+
+### Vector operations
+
+`r.vector` covers the full vector surface over TCP, including the batch/scroll/
+RAG-shaped search/hybrid/recommend methods added alongside the Go typed
+[`Collection` client](go-client.md#typed-collection-client):
+
+```python
+r.vector.create_collection("posts", dim=768, metric="cosine", full_text=True)
+
+r.vector.upsert("posts", 1, vec, content="rotating api keys safely",
+                metadata={"tenant": "acme"})
+r.vector.insert("posts", 2, vec)                    # create-only: errors if id exists
+r.vector.upsert_batch("posts", [
+    {"id": 3, "vector": v3, "content": "third post"},
+    {"id": 4, "vector": v4, "content": "fourth post"},
+])                                                    # N sequential upserts, not pipelined
+
+point = r.vector.get("posts", 1, with_vector=True, with_payload=True)
+# -> {vector, metadata, ttl_ms, sparse, content} or None if absent
+
+rows = r.vector.get_batch("posts", [1, 2, 3], with_vector=True, with_payload=True)
+# -> [{id, found, vector, metadata, ttl_ms, sparse, version, content}, ...]
+
+docs, next_cursor = r.vector.scroll("posts", limit=100)
+while next_cursor:
+    docs, next_cursor = r.vector.scroll("posts", limit=100, cursor=next_cursor)
+
+r.vector.delete("posts", 2)                          # -> bool (existed)
+r.vector.exists("posts", 1)                           # -> bool
+```
+
+Search-family methods return `SearchResults` (or `GroupResults` for
+`search_groups`) — a plain `list` subclass that also carries `.degraded` and
+`.missing`, reporting whether the read was partial (e.g. during a cluster
+outage). Iteration, indexing, `len()`, and equality against a bare list all
+work as normal; `.degraded`/`.missing` just ride along, mirroring the Go typed
+client's `SearchResponse{Results, Degraded, Missing}`:
+
+```python
+hits = r.vector.search("posts", query_vec, k=10, filter=None)
+hits.degraded, hits.missing         # False, [] on a healthy single-node server
+
+docs = r.vector.search_docs("posts", query_vec, k=10, filter=None)
+# -> SearchResults of {id, distance, score, content, metadata}
+
+groups = r.vector.search_groups("posts", query_vec, k=5, group_by="doc_id",
+                                group_size=2, fetch_k=0, filter=None)
+# -> GroupResults of {key, hits}
+
+hits = r.vector.hybrid_search("posts", dense=query_vec, k=10,
+                              sparse={"indices": [3, 17], "values": [0.4, 0.9]},
+                              method="rrf", alpha=0.0)
+
+hits = r.vector.hybrid_text("posts", dense=query_vec, text="rotate api keys",
+                            k=10, method="rrf")
+# requires the collection to have been created with full_text=...
+
+hits = r.vector.recommend("posts", positive=[1, 2], negative=[9], k=10,
+                          strategy="average_vector")   # or "best_score"
+```
+
+`r.vector.query(...)` has the same signature as `recommend` — it exists only
+so callers reaching for the "unified Query API" name find the one shape this
+client speaks. This client is **recommend-shaped only**: it does not build the
+general fusion/rerank/prefetch-tree `QuerySpec` the Go SDK's `Query` supports.
+
+### Worked example: recommend the next post (native TCP)
+
+```python
+from rostam import Rostam
+
+r = Rostam("127.0.0.1", 7000)
+r.vector.create_collection("posts", dim=768, metric="cosine", full_text=True)
+
+for id, text in [(1, "rotating api keys safely"),
+                  (2, "kubernetes autoscaling basics"),
+                  (3, "zero-downtime key rotation at scale")]:
+    r.vector.upsert("posts", id, embed(text), content=text,
+                    metadata={"tenant": "acme"})
+
+# Fuse a dense query with BM25 full-text.
+hits = r.vector.hybrid_text("posts", dense=embed("how do i rotate api keys"),
+                            text="how do i rotate api keys", k=5, method="rrf")
+
+# Or: the reader just finished post 1 — recommend what's similar.
+next_up = r.vector.recommend("posts", positive=[1], k=5)
 ```
 
 ## Framework adapters
