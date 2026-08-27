@@ -1,0 +1,69 @@
+---
+title: "Rostam"
+description: "Use Rostam, an open-source vector database, as the vector store in Mem0."
+---
+
+[Rostam](https://github.com/rostamlabs/rostam) is an open-source vector database with an HTTP API. Start it locally with Docker, or point at a remote deployment.
+
+### Usage
+
+```python Python
+import os
+from mem0 import Memory
+
+os.environ["OPENAI_API_KEY"] = "sk-xx"
+
+config = {
+    "vector_store": {
+        "provider": "rostam",
+        "config": {
+            "collection_name": "movie_preferences",
+            "embedding_model_dims": 1536,
+            "url": "http://localhost:8080",
+        }
+    }
+}
+
+m = Memory.from_config(config)
+
+messages = [
+    {"role": "user", "content": "I'm planning to watch a movie tonight. Any recommendations?"},
+    {"role": "assistant", "content": "How about thriller movies? They can be quite engaging."},
+    {"role": "user", "content": "I'm not a big fan of thrillers but I love sci-fi."},
+    {"role": "assistant", "content": "Got it! I'll suggest sci-fi movies instead."}
+]
+
+m.add(messages, user_id="alice", metadata={"category": "movies"})
+
+# Search memories
+results = m.search(query="sci-fi recommendations", filters={"user_id": "alice"})
+```
+
+### Config
+
+Here are the parameters available for configuring Rostam:
+
+| Parameter | Description | Default Value |
+| --- | --- | --- |
+| `collection_name` | Name of the collection | `mem0` |
+| `embedding_model_dims` | Dimensions of the embedding model (must match your chosen embedding model) | `1536` |
+| `url` | Rostam server URL | `http://localhost:8080` |
+| `api_key` | API key for Rostam | `None` |
+| `metric` | Distance metric for vector similarity (`cosine`, `dot`, or `euclidean`) | `cosine` |
+
+### Config Example
+
+```python Python
+config = {
+    "vector_store": {
+        "provider": "rostam",
+        "config": {
+            "collection_name": "my_memories",
+            "embedding_model_dims": 1536,
+            "url": "https://rostam.example.com",
+            "api_key": "rostam-xxxxxxxxxxxx",
+            "metric": "cosine",
+        }
+    }
+}
+```
