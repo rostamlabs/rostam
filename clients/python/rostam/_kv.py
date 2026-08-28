@@ -77,6 +77,45 @@ class _KV:
         payload = self._t._call("incr", args)
         return struct.unpack(">q", payload)[0]
 
+    def set_nx(self, key: Key, value: Key, *, ttl_ms: int = 0) -> bool:
+        """Set only if the key is absent. Returns True if stored, False if it already exists.
+
+        Atomic on the server (the check and the store run under one shard write
+        lock). ``ttl_ms`` > 0 sets an expiry on the stored value.
+        """
+        k, v = _as_bytes(key), _as_bytes(value)
+        args = _enc_key(k) + struct.pack(">I", len(v)) + v + struct.pack(">Q", ttl_ms)
+        payload = self._t._call("set_nx", args)
+        return bool(payload and payload[0])
+
+    def cas(self, key: Key, value: Key, expected: Optional[Key], *, ttl_ms: int = 0) -> bool:
+        """Compare-and-swap: set only if current == expected (``expected=None`` ⇒ only if absent).
+
+        Returns True if the value was stored, False on a mismatch. ``ttl_ms`` > 0
+        sets an expiry on the stored value.
+        """
+        k, v = _as_bytes(key), _as_bytes(value)
+        has = expected is not None
+        e = _as_bytes(expected) if has else b""
+        args = (
+            _enc_key(k)
+            + struct.pack(">I", len(v))
+            + v
+            + struct.pack(">B", 1 if has else 0)
+            + struct.pack(">I", len(e))
+            + e
+            + struct.pack(">Q", ttl_ms)
+        )
+        payload = self._t._call("cas", args)
+        return bool(payload and payload[0])
+
+    def compare_and_delete(self, key: Key, expected: Key) -> bool:
+        """Delete only if current == expected (safe unlock). Returns True if deleted."""
+        k, e = _as_bytes(key), _as_bytes(expected)
+        args = _enc_key(k) + struct.pack(">I", len(e)) + e
+        payload = self._t._call("cad", args)
+        return bool(payload and payload[0])
+
     def expire(self, key: Key, ttl_ms: int) -> None:
         """Set a TTL (in milliseconds) on an existing key."""
         args = _enc_key(_as_bytes(key)) + struct.pack(">Q", ttl_ms)

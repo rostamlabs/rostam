@@ -30,6 +30,11 @@ var BuiltinOps = []BuiltinOp{
 	{"del", OpReadWrite, StdKeyExtractor, RouteLayoutNone, false},
 	{"expire", OpReadWrite, StdKeyExtractor, RouteLayoutNone, false},
 	{"incr", OpReadWrite, StdKeyExtractor, RouteLayoutNone, false},
+	// Conditional-write KV ops. All three lead with [keyLen u16][key], so they
+	// route by that key via StdKeyExtractor exactly like get/put/incr.
+	{"set_nx", OpReadWrite, StdKeyExtractor, RouteLayoutNone, false},
+	{"cas", OpReadWrite, StdKeyExtractor, RouteLayoutNone, false},
+	{"cad", OpReadWrite, StdKeyExtractor, RouteLayoutNone, false},
 	// put_batch packs N puts into one Raft log entry. It routes by its FIRST key,
 	// so every key in a batch must hash to the same shard — the cluster fan-out
 	// (Node.PutBatch) guarantees that by grouping before it calls.

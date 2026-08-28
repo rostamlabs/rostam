@@ -52,6 +52,12 @@ var builtinHandlers = map[string]Handler{
 	"del":    handleDel,
 	"expire": handleExpire,
 	"incr":   handleIncr,
+	// Conditional-write KV ops (atomic under the shard write lock held for the
+	// whole handler): set_nx = set-if-absent, cas = compare-and-swap, cad =
+	// compare-and-delete.
+	"set_nx": handleSetNX,
+	"cas":    handleCAS,
+	"cad":    handleCompareAndDel,
 	// put_batch packs N puts into one Raft log entry (one fsync / round-trip /
 	// apply for the whole batch). It routes by its FIRST key, so every key in a
 	// batch must hash to the same shard — the cluster fan-out (Node.PutBatch)
@@ -159,6 +165,9 @@ var builtinHandlers = map[string]Handler{
 //   - "del"    (read-write)  args: [keyLen u16][key]                    → 1-byte 0/1
 //   - "expire" (read-write)  args: [keyLen u16][key][ttlMs u64]
 //   - "incr"   (read-write)  args: [keyLen u16][key][delta i64]         → new value as i64 BE
+//   - "set_nx" (read-write)  args: [keyLen u16][key][valLen u32][val][ttlMs u64] → 1-byte 1=stored/0=present
+//   - "cas"    (read-write)  args: [keyLen u16][key][valLen u32][val][hasExpected u8][expLen u32][expected][ttlMs u64] → 1-byte 1=stored/0=mismatch
+//   - "cad"    (read-write)  args: [keyLen u16][key][expLen u32][expected] → 1-byte 1=deleted/0=mismatch|absent
 //   - "__ping__" (read-only) args: (ignored)                             → empty
 //
 // Routing metadata (kind/wire.KeyExtractor/wire.RouteLayout) comes from wire.BuiltinOps,
@@ -244,6 +253,85 @@ func handleIncr(tx *TxContext, args []byte) ([]byte, error) {
 		return nil, err
 	}
 	return wire.EncodeIncrResult(next), nil
+}
+
+// handleSetNX sets key only if it is currently absent or expired. Result: 1=stored,
+// 0=key already present. The whole Get→Put runs under the shard write lock, so the
+// check and the store are atomic; tx.Get uses the leader-stamped clock on the
+// replicated path, so every replica agrees on absent-vs-present.
+func handleSetNX(tx *TxContext, args []byte) ([]byte, error) {
+	key, val, ttl, err := wire.DecodePutArgs(args)
+	if err != nil {
+		return nil, err
+	}
+	switch _, err = tx.Get(key); {
+	case err == cache.ErrNotFound:
+		if err := tx.Put(key, val, ttl); err != nil {
+			return nil, err
+		}
+		return []byte{1}, nil
+	case err != nil:
+		return nil, err
+	default:
+		return []byte{0}, nil
+	}
+}
+
+// handleCAS sets key to val only if its current value equals expected (or, when
+// hasExpected is false, only if the key is currently absent). Result: 1=stored,
+// 0=mismatch. Atomic under the shard write lock; the liveness/compare read uses
+// the leader-stamped clock on the replicated path.
+func handleCAS(tx *TxContext, args []byte) ([]byte, error) {
+	key, val, hasExpected, expected, ttl, err := wire.DecodeCASArgs(args)
+	if err != nil {
+		return nil, err
+	}
+	cur, err := tx.Get(key)
+	switch {
+	case err == cache.ErrNotFound:
+		if hasExpected {
+			return []byte{0}, nil
+		}
+	case err != nil:
+		return nil, err
+	default:
+		if !hasExpected || !bytes.Equal(cur, expected) {
+			return []byte{0}, nil
+		}
+	}
+	if err := tx.Put(key, val, ttl); err != nil {
+		return nil, err
+	}
+	return []byte{1}, nil
+}
+
+// handleCompareAndDel deletes key only if its current value equals expected — the
+// safe-unlock primitive. Result: 1=deleted, 0=mismatch or absent. Atomic under the
+// shard write lock; the compare read uses the leader-stamped clock on the
+// replicated path.
+func handleCompareAndDel(tx *TxContext, args []byte) ([]byte, error) {
+	key, expected, err := wire.DecodeCADArgs(args)
+	if err != nil {
+		return nil, err
+	}
+	cur, err := tx.Get(key)
+	if err == cache.ErrNotFound {
+		return []byte{0}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(cur, expected) {
+		return []byte{0}, nil
+	}
+	existed, err := tx.Del(key)
+	if err != nil {
+		return nil, err
+	}
+	if existed {
+		return []byte{1}, nil
+	}
+	return []byte{0}, nil
 }
 
 // handlePing is a no-op heartbeat used by the client pool's stale-conn check.

@@ -109,6 +109,9 @@ var (
 	DecodeBulkBuildArgs                       = wire.DecodeBulkBuildArgs
 	DecodeBulkStageArgs                       = wire.DecodeBulkStageArgs
 	DecodeBulkStagePayloadArgs                = wire.DecodeBulkStagePayloadArgs
+	DecodeCADArgs                             = wire.DecodeCADArgs
+	DecodeCASArgs                             = wire.DecodeCASArgs
+	DecodeCASResult                           = wire.DecodeCASResult
 	DecodeClearPayloadArgs                    = wire.DecodeClearPayloadArgs
 	DecodeClearPayloadArgsCAS                 = wire.DecodeClearPayloadArgsCAS
 	DecodeCreateCollectionArgs                = wire.DecodeCreateCollectionArgs
@@ -259,6 +262,8 @@ var (
 	EncodeBulkBuildArgs                       = wire.EncodeBulkBuildArgs
 	EncodeBulkStageArgs                       = wire.EncodeBulkStageArgs
 	EncodeBulkStagePayloadArgs                = wire.EncodeBulkStagePayloadArgs
+	EncodeCADArgs                             = wire.EncodeCADArgs
+	EncodeCASArgs                             = wire.EncodeCASArgs
 	EncodeClearPayloadArgs                    = wire.EncodeClearPayloadArgs
 	EncodeClearPayloadArgsCAS                 = wire.EncodeClearPayloadArgsCAS
 	EncodeCreateCollectionArgs                = wire.EncodeCreateCollectionArgs
@@ -384,6 +389,7 @@ var (
 	EncodeSetPayloadArgs                      = wire.EncodeSetPayloadArgs
 	EncodeSetPayloadArgsCAS                   = wire.EncodeSetPayloadArgsCAS
 	EncodeSetPayloadArgsOpts                  = wire.EncodeSetPayloadArgsOpts
+	EncodeSetNXArgs                           = wire.EncodeSetNXArgs
 	EncodeVectorDeleteArgs                    = wire.EncodeVectorDeleteArgs
 	EncodeVectorDeleteArgsCAS                 = wire.EncodeVectorDeleteArgsCAS
 	EncodeVectorDocs                          = wire.EncodeVectorDocs

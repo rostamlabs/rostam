@@ -183,6 +183,132 @@ func DecodeIncrResult(b []byte) (int64, error) {
 	return int64(binary.BigEndian.Uint64(b)), nil //nolint:gosec // safe: reinterpret stored u64 as i64 for binary read
 }
 
+// EncodeSetNXArgs encodes the args for set_nx. Its wire layout is IDENTICAL to
+// put's ("{keyLen u16}{key}{valLen u32}{val}{ttlMs u64}"), so it delegates to
+// EncodePutArgs; the server decodes it with DecodePutArgs.
+func EncodeSetNXArgs(key, val []byte, ttl time.Duration) []byte {
+	return EncodePutArgs(key, val, ttl)
+}
+
+// EncodeCASArgs encodes "{keyLen u16}{key}{valLen u32}{val}{hasExpected u8}
+// {expLen u32}{expected}{ttlMs u64}". hasExpected=false means "expect the key to
+// be absent"; the expected bytes are dropped (zero length) in that case.
+func EncodeCASArgs(key, val []byte, hasExpected bool, expected []byte, ttl time.Duration) []byte {
+	if !hasExpected {
+		expected = nil
+	}
+	buf := make([]byte, 2+len(key)+4+len(val)+1+4+len(expected)+8)
+	binary.BigEndian.PutUint16(buf[0:2], uint16(len(key))) //nolint:gosec // bounded by upstream key/value length limits
+	copy(buf[2:], key)
+	off := 2 + len(key)
+	binary.BigEndian.PutUint32(buf[off:off+4], uint32(len(val))) //nolint:gosec // bounded by upstream key/value length limits
+	copy(buf[off+4:], val)
+	off += 4 + len(val)
+	if hasExpected {
+		buf[off] = 1
+	}
+	off++
+	binary.BigEndian.PutUint32(buf[off:off+4], uint32(len(expected))) //nolint:gosec // bounded by upstream key/value length limits
+	copy(buf[off+4:], expected)
+	off += 4 + len(expected)
+	binary.BigEndian.PutUint64(buf[off:off+8], uint64(ttl/time.Millisecond)) //nolint:gosec // safe: duration to milliseconds always positive
+	return buf
+}
+
+// DecodeCASArgs reads args produced by EncodeCASArgs. Every variable-length field
+// is bounds-checked in the 32-bit-safe form `len(args)-off < need` with an
+// explicit `< 0` guard on each u32 length, so a hostile length that widens
+// NEGATIVE on GOARCH=386 (int is 32-bit there) is rejected instead of slipping
+// past an additive `off+need` check that could itself overflow. See the hostile
+// decoder sweep (ops.TestNoDecoderPanicsOnHostileBytes).
+func DecodeCASArgs(args []byte) (key, val []byte, hasExpected bool, expected []byte, ttl time.Duration, err error) {
+	if len(args) < 2 {
+		return nil, nil, false, nil, 0, ErrShortArgs
+	}
+	klen := int(binary.BigEndian.Uint16(args[0:2]))
+	off := 2
+	if len(args)-off < klen+4 { // key + valLen(4)
+		return nil, nil, false, nil, 0, ErrShortArgs
+	}
+	key = args[off : off+klen]
+	off += klen
+	vlen := int(binary.BigEndian.Uint32(args[off : off+4]))
+	off += 4
+	if vlen < 0 || len(args)-off < vlen {
+		return nil, nil, false, nil, 0, ErrShortArgs
+	}
+	val = args[off : off+vlen]
+	off += vlen
+	if len(args)-off < 1+4 { // hasExpected(1) + expLen(4)
+		return nil, nil, false, nil, 0, ErrShortArgs
+	}
+	hasExpected = args[off] != 0
+	off++
+	elen := int(binary.BigEndian.Uint32(args[off : off+4]))
+	off += 4
+	// Check expected and ttlMs separately: never add the untrusted elen to the
+	// need (elen+8 can overflow int to negative on 32-bit and slip past the
+	// guard, then panic the slice below — the exact contract TestNoDecoderPanics
+	// forbids). len(args)-off can't overflow (both bounded by real slice length).
+	if elen < 0 || len(args)-off < elen { // expected
+		return nil, nil, false, nil, 0, ErrShortArgs
+	}
+	expected = args[off : off+elen]
+	off += elen
+	if len(args)-off < 8 { // ttlMs(8)
+		return nil, nil, false, nil, 0, ErrShortArgs
+	}
+	ttl = time.Duration(binary.BigEndian.Uint64(args[off:off+8])) * time.Millisecond //nolint:gosec // safe: u64 from wire is milliseconds, always positive
+	if !hasExpected {
+		expected = nil
+	}
+	return key, val, hasExpected, expected, ttl, nil
+}
+
+// EncodeCADArgs encodes "{keyLen u16}{key}{expLen u32}{expected}" for cad
+// (compare-and-delete).
+func EncodeCADArgs(key, expected []byte) []byte {
+	buf := make([]byte, 2+len(key)+4+len(expected))
+	binary.BigEndian.PutUint16(buf[0:2], uint16(len(key))) //nolint:gosec // bounded by upstream key/value length limits
+	copy(buf[2:], key)
+	off := 2 + len(key)
+	binary.BigEndian.PutUint32(buf[off:off+4], uint32(len(expected))) //nolint:gosec // bounded by upstream key/value length limits
+	copy(buf[off+4:], expected)
+	return buf
+}
+
+// DecodeCADArgs reads args produced by EncodeCADArgs. Bounds-checked in the same
+// 32-bit-safe form as DecodeCASArgs.
+func DecodeCADArgs(args []byte) (key, expected []byte, err error) {
+	if len(args) < 2 {
+		return nil, nil, ErrShortArgs
+	}
+	klen := int(binary.BigEndian.Uint16(args[0:2]))
+	off := 2
+	if len(args)-off < klen+4 { // key + expLen(4)
+		return nil, nil, ErrShortArgs
+	}
+	key = args[off : off+klen]
+	off += klen
+	elen := int(binary.BigEndian.Uint32(args[off : off+4]))
+	off += 4
+	if elen < 0 || len(args)-off < elen {
+		return nil, nil, ErrShortArgs
+	}
+	expected = args[off : off+elen]
+	return key, expected, nil
+}
+
+// DecodeCASResult parses the 1-byte 0/1 result shared by set_nx, cas, and cad:
+// 1 = the write happened (stored / deleted), 0 = the condition failed (key
+// present / value mismatch / absent).
+func DecodeCASResult(b []byte) (bool, error) {
+	if len(b) != 1 {
+		return false, ErrShortArgs
+	}
+	return b[0] != 0, nil
+}
+
 // ScrollOrderToOrderBy maps the wire args ScrollOrder onto vector.OrderBy, including the
 // MULTI-KEY Tail (the secondary key specs) and the v4 resume TUPLE (ResumeKeys). A nil
 // or single-key ScrollOrder maps to the byte/behaviour-identical single-key vector.OrderBy

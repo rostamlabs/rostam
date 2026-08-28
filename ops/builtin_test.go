@@ -153,6 +153,233 @@ func TestBuiltinIncrAccumulates(t *testing.T) {
 	}
 }
 
+func TestBuiltinSetNX(t *testing.T) {
+	r, tx := newTestSetup(t)
+	h, kind, _, ok := r.Lookup("set_nx")
+	if !ok {
+		t.Fatal("set_nx not registered")
+	}
+	if kind != OpReadWrite {
+		t.Fatalf("set_nx kind = %v, want OpReadWrite", kind)
+	}
+	getH, _, _, _ := r.Lookup("get")
+
+	// Stores when absent.
+	res, err := h(tx, EncodeSetNXArgs([]byte("k"), []byte("v1"), 0))
+	if err != nil {
+		t.Fatalf("set_nx: %v", err)
+	}
+	if stored, _ := DecodeCASResult(res); !stored {
+		t.Fatal("set_nx on absent key = false, want true (stored)")
+	}
+	got, _ := getH(tx, EncodeKeyArgs([]byte("k")))
+	if !bytes.Equal(got, []byte("v1")) {
+		t.Fatalf("value = %q, want v1", got)
+	}
+
+	// No-op when present: returns false and does NOT overwrite.
+	res, _ = h(tx, EncodeSetNXArgs([]byte("k"), []byte("v2"), 0))
+	if stored, _ := DecodeCASResult(res); stored {
+		t.Fatal("set_nx on present key = true, want false")
+	}
+	got, _ = getH(tx, EncodeKeyArgs([]byte("k")))
+	if !bytes.Equal(got, []byte("v1")) {
+		t.Fatalf("value overwritten to %q, want v1", got)
+	}
+}
+
+func TestBuiltinSetNXReacquiresAfterExpiry(t *testing.T) {
+	r, tx := newTestSetup(t)
+	h, _, _, _ := r.Lookup("set_nx")
+
+	res, _ := h(tx, EncodeSetNXArgs([]byte("lock"), []byte("a"), 10*time.Millisecond))
+	if stored, _ := DecodeCASResult(res); !stored {
+		t.Fatal("first set_nx not stored")
+	}
+	// While live, a second set_nx is refused.
+	res, _ = h(tx, EncodeSetNXArgs([]byte("lock"), []byte("b"), 10*time.Millisecond))
+	if stored, _ := DecodeCASResult(res); stored {
+		t.Fatal("set_nx acquired a still-live key")
+	}
+	// After expiry, set_nx re-acquires.
+	time.Sleep(30 * time.Millisecond)
+	res, _ = h(tx, EncodeSetNXArgs([]byte("lock"), []byte("c"), 0))
+	if stored, _ := DecodeCASResult(res); !stored {
+		t.Fatal("set_nx did not re-acquire after expiry")
+	}
+	getH, _, _, _ := r.Lookup("get")
+	got, _ := getH(tx, EncodeKeyArgs([]byte("lock")))
+	if !bytes.Equal(got, []byte("c")) {
+		t.Fatalf("value = %q, want c", got)
+	}
+}
+
+func TestBuiltinCAS(t *testing.T) {
+	r, tx := newTestSetup(t)
+	h, kind, _, ok := r.Lookup("cas")
+	if !ok {
+		t.Fatal("cas not registered")
+	}
+	if kind != OpReadWrite {
+		t.Fatalf("cas kind = %v, want OpReadWrite", kind)
+	}
+	putH, _, _, _ := r.Lookup("put")
+	getH, _, _, _ := r.Lookup("get")
+
+	_, _ = putH(tx, EncodePutArgs([]byte("k"), []byte("v1"), 0))
+
+	// Match writes.
+	res, err := h(tx, EncodeCASArgs([]byte("k"), []byte("v2"), true, []byte("v1"), 0))
+	if err != nil {
+		t.Fatalf("cas: %v", err)
+	}
+	if ok, _ := DecodeCASResult(res); !ok {
+		t.Fatal("cas match = false, want true")
+	}
+	got, _ := getH(tx, EncodeKeyArgs([]byte("k")))
+	if !bytes.Equal(got, []byte("v2")) {
+		t.Fatalf("value = %q, want v2", got)
+	}
+
+	// Mismatch no-ops.
+	res, _ = h(tx, EncodeCASArgs([]byte("k"), []byte("v3"), true, []byte("WRONG"), 0))
+	if ok, _ := DecodeCASResult(res); ok {
+		t.Fatal("cas mismatch = true, want false")
+	}
+	got, _ = getH(tx, EncodeKeyArgs([]byte("k")))
+	if !bytes.Equal(got, []byte("v2")) {
+		t.Fatalf("value changed on mismatch to %q, want v2", got)
+	}
+}
+
+func TestBuiltinCASExpectAbsent(t *testing.T) {
+	r, tx := newTestSetup(t)
+	h, _, _, _ := r.Lookup("cas")
+	getH, _, _, _ := r.Lookup("get")
+
+	// Expect-absent (hasExpected=false) succeeds on an absent key.
+	res, _ := h(tx, EncodeCASArgs([]byte("k"), []byte("v1"), false, nil, 0))
+	if ok, _ := DecodeCASResult(res); !ok {
+		t.Fatal("cas expect-absent on absent = false, want true")
+	}
+	got, _ := getH(tx, EncodeKeyArgs([]byte("k")))
+	if !bytes.Equal(got, []byte("v1")) {
+		t.Fatalf("value = %q, want v1", got)
+	}
+
+	// Expect-absent fails on a present key.
+	res, _ = h(tx, EncodeCASArgs([]byte("k"), []byte("v2"), false, nil, 0))
+	if ok, _ := DecodeCASResult(res); ok {
+		t.Fatal("cas expect-absent on present = true, want false")
+	}
+
+	// hasExpected=true fails on an absent key.
+	res, _ = h(tx, EncodeCASArgs([]byte("absent"), []byte("v"), true, []byte("anything"), 0))
+	if ok, _ := DecodeCASResult(res); ok {
+		t.Fatal("cas expect-value on absent = true, want false")
+	}
+}
+
+func TestBuiltinCompareAndDel(t *testing.T) {
+	r, tx := newTestSetup(t)
+	h, kind, _, ok := r.Lookup("cad")
+	if !ok {
+		t.Fatal("cad not registered")
+	}
+	if kind != OpReadWrite {
+		t.Fatalf("cad kind = %v, want OpReadWrite", kind)
+	}
+	putH, _, _, _ := r.Lookup("put")
+	getH, _, _, _ := r.Lookup("get")
+
+	_, _ = putH(tx, EncodePutArgs([]byte("k"), []byte("tok"), 0))
+
+	// Mismatch no-ops (key stays).
+	res, _ := h(tx, EncodeCADArgs([]byte("k"), []byte("WRONG")))
+	if ok, _ := DecodeCASResult(res); ok {
+		t.Fatal("cad mismatch = true, want false")
+	}
+	if _, err := getH(tx, EncodeKeyArgs([]byte("k"))); err != nil {
+		t.Fatalf("key deleted on mismatch: %v", err)
+	}
+
+	// Match deletes.
+	res, _ = h(tx, EncodeCADArgs([]byte("k"), []byte("tok")))
+	if ok, _ := DecodeCASResult(res); !ok {
+		t.Fatal("cad match = false, want true")
+	}
+	if _, err := getH(tx, EncodeKeyArgs([]byte("k"))); err != cache.ErrNotFound {
+		t.Fatalf("post-cad get: err = %v, want ErrNotFound", err)
+	}
+
+	// No-op on absent.
+	res, _ = h(tx, EncodeCADArgs([]byte("absent"), []byte("x")))
+	if ok, _ := DecodeCASResult(res); ok {
+		t.Fatal("cad on absent = true, want false")
+	}
+}
+
+func TestCASCADCodecs(t *testing.T) {
+	// Short-args rejection (never a panic) for the new decoders.
+	if _, _, _, _, _, err := DecodeCASArgs([]byte{0}); err != ErrShortArgs {
+		t.Fatalf("DecodeCASArgs short: err = %v, want ErrShortArgs", err)
+	}
+	if _, _, err := DecodeCADArgs([]byte{0}); err != ErrShortArgs {
+		t.Fatalf("DecodeCADArgs short: err = %v, want ErrShortArgs", err)
+	}
+	// A value-length claim with no body behind it is rejected, not read past.
+	if _, _, _, _, _, err := DecodeCASArgs([]byte{0, 0, 0, 0, 0, 5}); err != ErrShortArgs {
+		t.Fatalf("DecodeCASArgs truncated val: err = %v, want ErrShortArgs", err)
+	}
+	if _, _, err := DecodeCADArgs([]byte{0, 0, 0, 0, 0, 5}); err != ErrShortArgs {
+		t.Fatalf("DecodeCADArgs truncated expected: err = %v, want ErrShortArgs", err)
+	}
+	// A near-MaxInt32 expLen behind a valid zero preamble must be rejected, not
+	// read past. On 32-bit this is where an additive `elen+8` bounds check would
+	// overflow negative, slip the guard, and panic the slice — so the check must
+	// never add the untrusted length. Frame: klen=0, vlen=0, hasExpected=0,
+	// expLen=0x7FFFFFFF, nothing behind it.
+	casOverflow := []byte{0, 0 /*klen*/, 0, 0, 0, 0 /*vlen*/, 0 /*hasExpected*/, 0x7F, 0xFF, 0xFF, 0xFF /*expLen*/}
+	if _, _, _, _, _, err := DecodeCASArgs(casOverflow); err != ErrShortArgs {
+		t.Fatalf("DecodeCASArgs huge expLen: err = %v, want ErrShortArgs", err)
+	}
+	// DecodeCASResult shape.
+	if _, err := DecodeCASResult([]byte{}); err != ErrShortArgs {
+		t.Fatalf("DecodeCASResult empty: err = %v, want ErrShortArgs", err)
+	}
+	if ok, _ := DecodeCASResult([]byte{1}); !ok {
+		t.Fatal("DecodeCASResult([1]) = false, want true")
+	}
+	if ok, _ := DecodeCASResult([]byte{0}); ok {
+		t.Fatal("DecodeCASResult([0]) = true, want false")
+	}
+
+	// CAS roundtrip (expect-value).
+	k, v, has, exp, ttl, err := DecodeCASArgs(EncodeCASArgs([]byte("k"), []byte("v"), true, []byte("e"), 2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(k, []byte("k")) || !bytes.Equal(v, []byte("v")) || !has || !bytes.Equal(exp, []byte("e")) || ttl != 2*time.Second {
+		t.Fatalf("CAS roundtrip: k=%q v=%q has=%v exp=%q ttl=%v", k, v, has, exp, ttl)
+	}
+	// Expect-absent roundtrip drops the expected bytes.
+	_, _, has, exp, _, err = DecodeCASArgs(EncodeCASArgs([]byte("k"), []byte("v"), false, []byte("ignored"), 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if has || exp != nil {
+		t.Fatalf("expect-absent roundtrip: has=%v exp=%q, want false/nil", has, exp)
+	}
+	// CAD roundtrip.
+	dk, de, err := DecodeCADArgs(EncodeCADArgs([]byte("key"), []byte("expected")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(dk, []byte("key")) || !bytes.Equal(de, []byte("expected")) {
+		t.Fatalf("CAD roundtrip: k=%q e=%q", dk, de)
+	}
+}
+
 func TestArgsCodecRoundtrip(t *testing.T) {
 	// EncodeKeyArgs ↔ DecodeKeyArgs
 	k := []byte("user:42")

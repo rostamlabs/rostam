@@ -212,6 +212,40 @@ func (c *Client) Call(ctx context.Context, op string, args []byte) ([]byte, erro
 	return nil, fmt.Errorf("client: NotLeader exceeded %d hops", maxHops)
 }
 
+// SetNX sets key to value only if the key is currently absent or expired — the
+// atomic set-if-absent primitive. Returns true if the value was stored, false if
+// the key was already present. ttl > 0 sets an expiry on the stored value.
+func (c *Client) SetNX(ctx context.Context, key, value []byte, ttl time.Duration) (bool, error) {
+	res, err := c.Call(ctx, "set_nx", wire.EncodeSetNXArgs(key, value, ttl))
+	if err != nil {
+		return false, err
+	}
+	return wire.DecodeCASResult(res)
+}
+
+// CAS is compare-and-swap: it sets key to value only if the key's current value
+// equals expected. Returns true if the value was stored, false on a mismatch (or
+// if the key is absent). ttl > 0 sets an expiry on the stored value. To store only
+// when the key is absent, use SetNX.
+func (c *Client) CAS(ctx context.Context, key, value, expected []byte, ttl time.Duration) (bool, error) {
+	res, err := c.Call(ctx, "cas", wire.EncodeCASArgs(key, value, true, expected, ttl))
+	if err != nil {
+		return false, err
+	}
+	return wire.DecodeCASResult(res)
+}
+
+// CompareAndDelete deletes key only if its current value equals expected — the
+// safe-unlock primitive (release a lock only if you still hold it). Returns true
+// if the key was deleted, false on a value mismatch or an absent key.
+func (c *Client) CompareAndDelete(ctx context.Context, key, expected []byte) (bool, error) {
+	res, err := c.Call(ctx, "cad", wire.EncodeCADArgs(key, expected))
+	if err != nil {
+		return false, err
+	}
+	return wire.DecodeCASResult(res)
+}
+
 // PutBatch writes many key/value pairs as bulk put_batch ops — the ~10x
 // bulk-insert fast path. It groups entries by their owning shard (the same hash
 // as pickInitialTarget) so each shard receives ONE Raft log entry per chunk, and

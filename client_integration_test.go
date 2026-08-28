@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -128,6 +129,97 @@ func TestClientIncrAccumulates(t *testing.T) {
 	v, _ := wire.DecodeIncrResult(res)
 	if v != 5 {
 		t.Fatalf("incr accumulated = %d, want 5", v)
+	}
+}
+
+func TestClientConditionalWrites(t *testing.T) {
+	addr, stop := startTestStack(t)
+	defer stop()
+	c, _ := client.New(client.Config{Servers: []string{addr}})
+	defer func() { _ = c.Close() }()
+	ctx := context.Background()
+
+	// SetNX: first wins, second (key present) is refused.
+	stored, err := c.SetNX(ctx, []byte("k"), []byte("v1"), 0)
+	if err != nil {
+		t.Fatalf("SetNX: %v", err)
+	}
+	if !stored {
+		t.Fatal("first SetNX = false, want true")
+	}
+	stored, err = c.SetNX(ctx, []byte("k"), []byte("v2"), 0)
+	if err != nil {
+		t.Fatalf("SetNX 2: %v", err)
+	}
+	if stored {
+		t.Fatal("second SetNX on present key = true, want false")
+	}
+
+	// CAS: correct expected succeeds, wrong expected fails.
+	swapped, err := c.CAS(ctx, []byte("k"), []byte("v2"), []byte("v1"), 0)
+	if err != nil {
+		t.Fatalf("CAS: %v", err)
+	}
+	if !swapped {
+		t.Fatal("CAS with correct expected = false, want true")
+	}
+	swapped, err = c.CAS(ctx, []byte("k"), []byte("v3"), []byte("WRONG"), 0)
+	if err != nil {
+		t.Fatalf("CAS 2: %v", err)
+	}
+	if swapped {
+		t.Fatal("CAS with wrong expected = true, want false")
+	}
+
+	// CompareAndDelete: wrong token no-ops, right token deletes.
+	deleted, err := c.CompareAndDelete(ctx, []byte("k"), []byte("WRONG"))
+	if err != nil {
+		t.Fatalf("CompareAndDelete wrong: %v", err)
+	}
+	if deleted {
+		t.Fatal("CompareAndDelete with wrong token = true, want false")
+	}
+	deleted, err = c.CompareAndDelete(ctx, []byte("k"), []byte("v2"))
+	if err != nil {
+		t.Fatalf("CompareAndDelete right: %v", err)
+	}
+	if !deleted {
+		t.Fatal("CompareAndDelete with right token = false, want true")
+	}
+	if _, err := c.Call(ctx, "get", wire.EncodeKeyArgs([]byte("k"))); !errors.Is(err, client.ErrNotFound) {
+		t.Fatalf("post-delete get: err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestClientSetNXExactlyOneWinner(t *testing.T) {
+	addr, stop := startTestStack(t)
+	defer stop()
+	c, _ := client.New(client.Config{Servers: []string{addr}, MaxConnsPerServer: 8})
+	defer func() { _ = c.Close() }()
+
+	const goroutines = 24
+	var wins atomic.Int64
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for range goroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			ok, err := c.SetNX(context.Background(), []byte("race-key"), []byte("mine"), 0)
+			if err != nil {
+				t.Errorf("SetNX: %v", err)
+				return
+			}
+			if ok {
+				wins.Add(1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if got := wins.Load(); got != 1 {
+		t.Fatalf("SetNX winners = %d, want exactly 1", got)
 	}
 }
 

@@ -110,6 +110,30 @@ class CrossStackKVTest(unittest.TestCase):
         self.r.kv.put(key, val)
         self.assertEqual(self.r.kv.get(key), val)
 
+    def test_set_nx_stores_once(self):
+        self.assertTrue(self.r.kv.set_nx("k:nx", "first"))    # absent -> stored
+        self.assertFalse(self.r.kv.set_nx("k:nx", "second"))  # present -> refused
+        self.assertEqual(self.r.kv.get("k:nx"), b"first")     # unchanged
+
+    def test_cas_swaps_on_match(self):
+        self.r.kv.put("k:cas", "v1")
+        self.assertTrue(self.r.kv.cas("k:cas", "v2", "v1"))   # match -> swap
+        self.assertEqual(self.r.kv.get("k:cas"), b"v2")
+        self.assertFalse(self.r.kv.cas("k:cas", "v3", "WRONG"))  # mismatch -> no-op
+        self.assertEqual(self.r.kv.get("k:cas"), b"v2")
+
+    def test_cas_expect_absent(self):
+        self.assertTrue(self.r.kv.cas("k:casabs", "v1", None))  # absent -> store
+        self.assertEqual(self.r.kv.get("k:casabs"), b"v1")
+        self.assertFalse(self.r.kv.cas("k:casabs", "v2", None))  # present -> refuse
+
+    def test_compare_and_delete(self):
+        self.r.kv.put("k:cad", "tok")
+        self.assertFalse(self.r.kv.compare_and_delete("k:cad", "WRONG"))  # mismatch
+        self.assertEqual(self.r.kv.get("k:cad"), b"tok")
+        self.assertTrue(self.r.kv.compare_and_delete("k:cad", "tok"))     # match -> delete
+        self.assertIsNone(self.r.kv.get("k:cad"))
+
 
 @unittest.skipUnless(_BIN, _WHY)
 class CrossStackKVAuthTest(unittest.TestCase):
