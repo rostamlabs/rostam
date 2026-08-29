@@ -101,7 +101,11 @@ func (c *Client) callAddrPipelined(ctx context.Context, op string, args []byte, 
 	}
 	status, payload, callErr := pc.call(ctx, op, args)
 	if callErr != nil {
-		return nil, callErr
+		// Post-transmission: the pipelined request may have committed before
+		// its response was lost. Mark it ambiguous so Call won't replay a
+		// conditional write. The pick() error above is pre-transmission and
+		// stays unwrapped.
+		return nil, &ambiguousError{err: callErr}
 	}
 	return mapCallStatus(op, status, payload)
 }
@@ -163,7 +167,11 @@ func New(cfg Config) (*Client, error) {
 // Call sends one request, following NotLeader hints up to cfg.MaxNotLeaderHops.
 // getOrCreatePool handles hinted addrs that are not in cfg.Servers.
 // Transport errors (dial refused, EOF, etc.) are retried against another
-// server within the same hop budget.
+// server within the same hop budget — EXCEPT that an outcome-returning
+// conditional write (set_nx/cas/cad) is NOT replayed across an AMBIGUOUS
+// failure (one that happened after the request was transmitted): the first
+// server may have committed before the response was lost, so a replay would
+// report a wrong result. Such a failure is returned to the caller instead.
 func (c *Client) Call(ctx context.Context, op string, args []byte) ([]byte, error) {
 	select {
 	case <-c.closed:
@@ -199,8 +207,10 @@ func (c *Client) Call(ctx context.Context, op string, args []byte) ([]byte, erro
 			continue
 		}
 		// Non-NotLeader error: if it's a transport error, rotate to
-		// another server and retry within the hop budget.
-		if isTransportError(err) && hop < maxHops {
+		// another server and retry within the hop budget — but never
+		// replay a non-replayable conditional write across an ambiguous
+		// (post-transmission) failure, which could report a wrong outcome.
+		if isTransportError(err) && hop < maxHops && !(nonReplayableOp(op) && isAmbiguous(err)) {
 			next := c.nextServer()
 			if next != "" && next != target {
 				target = next
@@ -215,6 +225,11 @@ func (c *Client) Call(ctx context.Context, op string, args []byte) ([]byte, erro
 // SetNX sets key to value only if the key is currently absent or expired — the
 // atomic set-if-absent primitive. Returns true if the value was stored, false if
 // the key was already present. ttl > 0 sets an expiry on the stored value.
+//
+// On an ambiguous transport failure (the request may have committed before the
+// response was lost) it returns a non-nil error rather than a possibly-wrong
+// false — the write is NOT transparently replayed against another server. A
+// caller that gets a transport error must re-check state itself.
 func (c *Client) SetNX(ctx context.Context, key, value []byte, ttl time.Duration) (bool, error) {
 	res, err := c.Call(ctx, "set_nx", wire.EncodeSetNXArgs(key, value, ttl))
 	if err != nil {
@@ -227,6 +242,9 @@ func (c *Client) SetNX(ctx context.Context, key, value []byte, ttl time.Duration
 // equals expected. Returns true if the value was stored, false on a mismatch (or
 // if the key is absent). ttl > 0 sets an expiry on the stored value. To store only
 // when the key is absent, use SetNX.
+//
+// Like SetNX, an ambiguous transport failure returns a non-nil error rather
+// than a possibly-wrong false; the write is not replayed against another server.
 func (c *Client) CAS(ctx context.Context, key, value, expected []byte, ttl time.Duration) (bool, error) {
 	res, err := c.Call(ctx, "cas", wire.EncodeCASArgs(key, value, true, expected, ttl))
 	if err != nil {
@@ -238,6 +256,9 @@ func (c *Client) CAS(ctx context.Context, key, value, expected []byte, ttl time.
 // CompareAndDelete deletes key only if its current value equals expected — the
 // safe-unlock primitive (release a lock only if you still hold it). Returns true
 // if the key was deleted, false on a value mismatch or an absent key.
+//
+// Like SetNX/CAS, an ambiguous transport failure returns a non-nil error rather
+// than a possibly-wrong false; the delete is not replayed against another server.
 func (c *Client) CompareAndDelete(ctx context.Context, key, expected []byte) (bool, error) {
 	res, err := c.Call(ctx, "cad", wire.EncodeCADArgs(key, expected))
 	if err != nil {
@@ -324,6 +345,37 @@ func groupEntriesByShard(entries []wire.PutEntry, numShards int) map[int][]wire.
 		groups[shard] = append(groups[shard], e)
 	}
 	return groups
+}
+
+// ambiguousError marks a transport failure that occurred AFTER a live
+// connection was obtained — the request may have reached the server and
+// committed before the response was lost. Replaying an outcome-returning
+// conditional write across it can report a wrong result, so Call refuses to.
+// It Unwraps to the underlying error so errors.Is/As (and isTransportError)
+// see straight through the wrapper.
+type ambiguousError struct{ err error }
+
+func (e *ambiguousError) Error() string { return e.err.Error() }
+func (e *ambiguousError) Unwrap() error { return e.err }
+
+// nonReplayableOp reports whether replaying op after an ambiguous transport
+// failure can corrupt its result. The conditional writes are outcome-returning:
+// if the first server committed but the response was lost, a replay sees the
+// key already changed and returns the wrong success bit.
+func nonReplayableOp(op string) bool {
+	switch op {
+	case "set_nx", "cas", "cad":
+		return true
+	}
+	return false
+}
+
+// isAmbiguous reports whether err is (or wraps) an ambiguousError — a
+// post-transmission transport failure that must not be blindly replayed for a
+// non-replayable op.
+func isAmbiguous(err error) bool {
+	var a *ambiguousError
+	return errors.As(err, &a)
 }
 
 // isTransportError reports whether err is a network-level transport
@@ -502,7 +554,9 @@ func (c *Client) CallFunc(ctx context.Context, op string, args []byte, fn func(p
 			}
 			continue
 		}
-		if isTransportError(err) && hop < maxHops {
+		// See Call: a non-replayable conditional write is not retried across
+		// an ambiguous (post-transmission) transport failure.
+		if isTransportError(err) && hop < maxHops && !(nonReplayableOp(op) && isAmbiguous(err)) {
 			next := c.nextServer()
 			if next != "" && next != target {
 				target = next
@@ -538,7 +592,11 @@ func (c *Client) callAddr(ctx context.Context, op string, args []byte, addr stri
 	if callErr != nil {
 		conn.poisoned = true
 		pool.release(res)
-		return nil, callErr
+		// The request may have been transmitted and committed before the
+		// response was lost — ambiguous, so Call won't replay a conditional
+		// write across it. getOrCreatePool/acquire failures above are left
+		// unwrapped: those happen before any bytes are sent (pre-transmission).
+		return nil, &ambiguousError{err: callErr}
 	}
 	switch status {
 	case StatusOK:
@@ -583,7 +641,9 @@ func (c *Client) callAddrFunc(ctx context.Context, op string, args []byte, addr 
 	if callErr != nil {
 		conn.poisoned = true
 		pool.release(res)
-		return callErr
+		// Post-transmission: mark ambiguous so CallFunc's retry guard refuses to
+		// replay a conditional write (parity with callAddr — see Call).
+		return &ambiguousError{err: callErr}
 	}
 	switch status {
 	case StatusOK:

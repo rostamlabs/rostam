@@ -323,6 +323,163 @@ func TestClientRefreshLoopFires(t *testing.T) {
 	t.Errorf("refresh fired %d times, want >= 2", calls.Load())
 }
 
+// startDropAfterReadServer starts a TCP server that reads exactly one framed
+// request, invokes onRequest (to count it / model "the op applied"), then CLOSES
+// the connection WITHOUT writing a response. The client's response read then
+// fails with io.EOF — an AMBIGUOUS, post-transmission transport error (the op may
+// have committed on the server before the reply was lost). Returns addr + stop.
+func startDropAfterReadServer(t *testing.T, onRequest func()) (addr string, stop func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			conn, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				r := bufio.NewReader(c)
+				var hdr [4]byte
+				if _, rerr := io.ReadFull(r, hdr[:]); rerr != nil {
+					return
+				}
+				n := binary.BigEndian.Uint32(hdr[:])
+				body := make([]byte, n)
+				if _, rerr := io.ReadFull(r, body); rerr != nil {
+					return
+				}
+				if onRequest != nil {
+					onRequest()
+				}
+				// Drop the response: close without replying.
+			}(conn)
+		}
+	}()
+	return ln.Addr().String(), func() { _ = ln.Close() }
+}
+
+// closedAddr returns an address whose listener is already closed, so any dial to
+// it is refused — a PRE-transmission transport error (nothing was ever sent).
+func closedAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	return addr
+}
+
+// TestClientConditionalWriteNotReplayedAcrossAmbiguousFailure: server A receives
+// set_nx and drops the response AFTER the op would have applied (models "committed
+// but reply lost" → io.EOF). Server B has the key already present (as it would
+// after A's commit replicated) and would answer set_nx with false. The client must
+// NOT transparently replay onto B and surface a wrong (false, nil); it must return
+// the ambiguous transport error, and B must never be contacted.
+func TestClientConditionalWriteNotReplayedAcrossAmbiguousFailure(t *testing.T) {
+	var callA, callB atomic.Int32
+	addrA, stopA := startDropAfterReadServer(t, func() { callA.Add(1) })
+	defer stopA()
+	addrB, stopB := startFakeServer(t, func(_ []byte) (uint8, []byte) {
+		callB.Add(1)
+		return StatusOK, []byte{0} // set_nx result false: key already present
+	})
+	defer stopB()
+
+	// Ops=nil → pickInitialTarget round-robins from Servers[0]=A. Default
+	// MaxNotLeaderHops=3 gives a hop budget, so WITHOUT the fix the ambiguous
+	// EOF would replay onto B and return (false, nil).
+	c, err := New(Config{Servers: []string{addrA, addrB}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ok, err := c.SetNX(context.Background(), []byte("lock"), []byte("me"), 0)
+	if err == nil {
+		t.Fatalf("SetNX returned (%v, nil); want a non-nil transport error, not a replayed false", ok)
+	}
+	if !isTransportError(err) {
+		t.Fatalf("SetNX err = %v; want a transport error", err)
+	}
+	if !isAmbiguous(err) {
+		t.Fatalf("SetNX err = %v; want an ambiguous (post-transmission) error", err)
+	}
+	if n := callA.Load(); n != 1 {
+		t.Fatalf("server A calls = %d, want 1", n)
+	}
+	if n := callB.Load(); n != 0 {
+		t.Fatalf("server B calls = %d, want 0 (conditional write must not replay across ambiguous failure)", n)
+	}
+}
+
+// TestClientConditionalWriteFailsOverOnPreTransmissionError: server A is
+// unreachable (dial refused → PRE-transmission error, nothing sent). A conditional
+// write MUST still fail over to server B — proving the fix restricts ONLY ambiguous
+// (post-transmission) failures, not all transport errors.
+func TestClientConditionalWriteFailsOverOnPreTransmissionError(t *testing.T) {
+	var callB atomic.Int32
+	badA := closedAddr(t)
+	addrB, stopB := startFakeServer(t, func(_ []byte) (uint8, []byte) {
+		callB.Add(1)
+		return StatusOK, []byte{1} // set_nx result true: acquired
+	})
+	defer stopB()
+
+	c, err := New(Config{Servers: []string{badA, addrB}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ok, err := c.SetNX(context.Background(), []byte("lock"), []byte("me"), 0)
+	if err != nil {
+		t.Fatalf("SetNX: %v; want failover to B on a pre-transmission error", err)
+	}
+	if !ok {
+		t.Fatalf("SetNX = false; want true after failover to B")
+	}
+	if n := callB.Load(); n != 1 {
+		t.Fatalf("server B calls = %d, want 1 (failover expected)", n)
+	}
+}
+
+// TestClientIdempotentOpStillReplaysAcrossAmbiguousFailure: an ambiguous failure
+// on an IDEMPOTENT op (get) MUST still transparently replay — the fix must not
+// over-restrict. Server A drops the response (EOF); server B answers ok.
+func TestClientIdempotentOpStillReplaysAcrossAmbiguousFailure(t *testing.T) {
+	var callB atomic.Int32
+	addrA, stopA := startDropAfterReadServer(t, nil)
+	defer stopA()
+	addrB, stopB := startFakeServer(t, func(_ []byte) (uint8, []byte) {
+		callB.Add(1)
+		return StatusOK, []byte("ok")
+	})
+	defer stopB()
+
+	c, err := New(Config{Servers: []string{addrA, addrB}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	res, err := c.Call(context.Background(), "get", wire.EncodeKeyArgs([]byte("k")))
+	if err != nil {
+		t.Fatalf("get: %v; want transparent replay onto B for an idempotent op", err)
+	}
+	if string(res) != "ok" {
+		t.Fatalf("get result = %q, want ok", res)
+	}
+	if n := callB.Load(); n != 1 {
+		t.Fatalf("server B calls = %d, want 1 (idempotent replay expected)", n)
+	}
+}
+
 // TestClientRespectsCanceledContext: a pre-canceled context must cause Call to
 // return immediately with a context error, before any server dial is attempted
 // on the second hop.
