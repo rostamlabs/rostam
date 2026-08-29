@@ -5,6 +5,17 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **Atomic conditional KV writes: `set_nx`, `cas`, and compare-and-delete.**
+  Three new key-value ops give you an atomic conditional write, the primitive
+  needed for correct distributed locks, once-only writes, and idempotency keys:
+  `set_nx` stores a value only if the key is absent (or expired); `cas`
+  (compare-and-swap) stores only if the current value equals an expected value;
+  and compare-and-delete removes a key only if it still holds an expected value
+  (a safe lock release). Each is a single atomic operation — two writers racing
+  on the same key can no longer both win — and an expired key reads as absent,
+  so a lock re-acquires cleanly once its TTL lapses. Available on the Go client
+  as `SetNX` / `CAS` / `CompareAndDelete` and on the Python client
+  (`rostam-client`) as `set_nx` / `cas` / `compare_and_delete`.
 - **Python client: Mem0, Semantic Router, CrewAI, and DSPy adapters
   (`rostam-client` 0.3.0).** Framework integrations join the existing LangChain,
   LlamaIndex, and Haystack adapters, each an optional in-package submodule behind
