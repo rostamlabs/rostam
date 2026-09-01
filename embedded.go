@@ -57,6 +57,15 @@ type EmbeddedConfig struct {
 	// Cache configures cache-layer behaviour (durability, mlock, msync).
 	Cache CacheConfig
 
+	// WriteTimeout is the EFFECTIVE client-facing TCP response WriteTimeout,
+	// threaded down from ServerConfig so the replicated shard's online-compaction
+	// alias-drain fence (cache AliasQuarantine = 2*WriteTimeout) tracks the real
+	// deadline instead of a hardcoded mirror. 0 ⇒ the shard falls back to its
+	// built-in default (matching server.Config's own WriteTimeout default). Set by
+	// rostam.NewServer; a direct NewEmbedded embedder may set it to match whatever
+	// WriteTimeout it gives its own transport.
+	WriteTimeout time.Duration
+
 	// RaftAddr is this node's multiplexed Raft transport endpoint.
 	// Required when len(Peers) > 1.
 	RaftAddr string
@@ -713,6 +722,11 @@ func NewEmbedded(cfg EmbeddedConfig) (Store, error) {
 
 	cc := cache.DefaultConfig()
 	cc.NumShards = 1 // forced per shard; cluster handles fanout
+	// Thread the effective server WriteTimeout so a replicated shard's alias-drain
+	// fence (AliasQuarantine = 2*WriteTimeout, enforced fail-closed in shard.New)
+	// tracks the real deadline rather than a hardcoded mirror. 0 stays 0 ⇒ shard.New
+	// uses its built-in default (matching the server's own WriteTimeout default).
+	cc.ServerWriteTimeout = cfg.WriteTimeout
 	cc.Durable = cfg.Cache.Durable
 	cc.Mlock = cfg.Cache.Mlock
 	cc.DisableColdCompaction = cfg.Cache.DisableColdCompaction

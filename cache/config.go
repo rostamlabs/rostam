@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"time"
 )
 
 // AtCapPolicy controls behavior when a shard is at MaxPages and all pages are full.
@@ -138,6 +139,60 @@ type Config struct {
 	//
 	// Ignored for heap shards, which have no pages file and reclaim online.
 	DisableColdCompaction bool
+
+	// OnlineCompaction opts a REPLICATED MMAP REJECT-WRITES shard into ONLINE
+	// relocating compaction (cache/compact_online.go): while the process runs, the
+	// TTL sweeper relocates the live entries out of fragmented pages and RETIRES the
+	// emptied source extents, WITHOUT disturbing the lock-free zero-copy read path.
+	// Default false.
+	//
+	// It is a no-op on every other shard (heap, single-node, ringbuf) — the online
+	// compactor is gated on isMmap && Replicated && AtCapPolicy==PolicyRejectWrites,
+	// the exact mode a cluster-replication shard is forced into (see shard/store.go).
+	//
+	// WHY OPT-IN, and why it is OFF by default. Stage 1 of the feature relocates the
+	// live entries into other pages' fresh tail bytes and marks the evacuated source
+	// pages RETIRED, but it does NOT yet recycle those retired extents into writable
+	// space (that is Stage 2's new-VA swap). So on its own, relocation only CONSUMES
+	// fresh tail without returning capacity — it is the reader-safe FOUNDATION plus its
+	// stress harness, not yet a cure for ErrFull. Enabling it today buys page-packing /
+	// observability and exercises the primitive; it should stay off in production until
+	// the retired-extent recycle lands. The reclaimable-bytes accounting and the trigger
+	// evaluation (Stage 0) run regardless — reclaimable is always visible in Stats — this
+	// flag only gates the relocation ACTION.
+	OnlineCompaction bool
+
+	// AliasQuarantine is how long online relocating compaction must let a RETIRED
+	// mmap page sit — bytes mapped and immutable — before it may RECYCLE that page
+	// (reset head/tail to 0 and hand its extent back to the write path). It is the
+	// drain fence for the lock-free zero-copy read path: a reject-writes/mmap Get
+	// returns a []byte aliasing the page bytes, and that alias escapes to a network
+	// response writer. Recycling overwrites the extent, so it is safe only once no
+	// reader can still hold an alias into the OLD content.
+	//
+	// The safe value is the maximum wall-clock lifetime of such an alias. The only
+	// consumer that holds the RAW alias across a blocking network flush is the TCP
+	// server's response writer, which arms a per-write deadline (server.Config.
+	// WriteTimeout, default 30s) — every other consumer (HTTP handler, WASM op,
+	// snapshot/replication read, read-modify-write op) copies the value synchronously
+	// before any blocking wait. So the alias-hold bound is WriteTimeout plus a
+	// CPU-only pipeline drain, and this should be set to a conservative multiple of
+	// that (shard/store.go threads in 2*WriteTimeout). 0 ⇒ a conservative built-in
+	// default (defaultAliasQuarantine). Only consulted on an OnlineCompaction-enabled
+	// eligible shard; ignored everywhere else.
+	AliasQuarantine time.Duration
+
+	// ServerWriteTimeout is the EFFECTIVE server.Config.WriteTimeout threaded down
+	// from the transport layer (rostam.ServerConfig → EmbeddedConfig → here). It is
+	// the single source of truth for the alias-hold bound: shard.New derives
+	// AliasQuarantine = 2*ServerWriteTimeout from it and FAILS CLOSED if an
+	// explicitly-set AliasQuarantine is smaller, so the drain fence can never silently
+	// fall below the real write deadline it must outlast (the hazard when the two were
+	// independent constants). 0 ⇒ shard.New falls back to its built-in default
+	// (defaultServerWriteTimeout), matching the server's own WriteTimeout default. Only
+	// consulted when building a replicated (online-compaction-eligible) shard; ignored
+	// everywhere else.
+	ServerWriteTimeout time.Duration
 
 	// NowFn overrides the WALL-CLOCK source for the non-apply expiry sites (client
 	// read filter, sweeper, warm-restart rebuild, Iterate). nil ⇒ the real clock

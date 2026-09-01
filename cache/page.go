@@ -5,6 +5,7 @@ package cache
 import (
 	"encoding/binary"
 	"errors"
+	"time"
 )
 
 // errPageFull is returned when a page has no remaining contiguous capacity
@@ -45,6 +46,29 @@ type page struct {
 	// to detect a retired page without reading its bytes. Never mutated after
 	// construction.
 	gen uint16
+
+	// retired marks an mmap page whose live entries were all relocated OUT by online
+	// relocating compaction (cache/compact_online.go): no index slot addresses it any
+	// more, so the write path must stop handing out its stale-framed tail
+	// (firstPageWithRoomLocked skips it). Its bytes stay mapped and IMMUTABLE — Stage 1
+	// never resets, reuses, unmaps, or punches them, so any in-flight lock-free reader
+	// alias into the extent stays valid; the extent is stranded until a recycle stage
+	// gives the slot a fresh extent. WRITE-PATH-ONLY state, guarded by shard.mu (the
+	// lock-free read path never consults it — it resolves pages through pageSlots + the
+	// generation gate). Always false on heap / single-node / ringbuf shards, so those
+	// paths are byte-for-byte unchanged.
+	retired bool
+
+	// retiredAt is the wall-clock instant this page was marked retired (set only
+	// when retired flips true). It starts the alias-drain QUARANTINE: the page's
+	// stranded extent may not be RECYCLED (reset + handed back to the write path)
+	// until at least Config.AliasQuarantine has elapsed since retiredAt, because a
+	// lock-free reader that resolved a slabRef into the old content just before
+	// retirement can still alias those bytes for up to the transport's write-deadline
+	// bound. WALL time (real elapsed seconds), never the injected/logical cache clock:
+	// the alias-hold bound is a real network-write duration. Zero on a non-retired
+	// page and on every heap / single-node / ringbuf shard. Guarded by shard.mu.
+	retiredAt time.Time
 }
 
 // newHeapPage allocates a heap-backed page of size bytes.

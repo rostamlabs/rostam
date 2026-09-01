@@ -65,6 +65,19 @@ type ServerConfig struct {
 	EpollTCP   bool
 	EpollLoops int
 
+	// WriteTimeout bounds how long a single TCP response write+flush may block on a
+	// stalled client before the connection is aborted (server.Config.WriteTimeout).
+	// 0 selects the server's default (30s). It is a CORRECTNESS bound, not just
+	// slow-loris hygiene: a reject-writes/mmap response payload is a zero-copy alias
+	// into live mmap page bytes, and the online page-recycle fence
+	// (cache.AliasQuarantine) must outlast the maximum alias hold. This one value is
+	// the SINGLE SOURCE OF TRUTH: NewServer passes it to the TCP transport AND threads
+	// it down to every replicated shard's cache (AliasQuarantine = 2*WriteTimeout,
+	// enforced fail-closed in shard.New), so the deadline and the fence can never
+	// drift apart. Applies to the goroutine-per-connection TCP server; the epoll
+	// transport copies each payload synchronously in its event loop (no queued hold).
+	WriteTimeout time.Duration
+
 	// TLSConfig, when non-nil, enables TLS on ALL THREE client-facing transports
 	// (HTTP, gRPC, TCP) using a single pre-built *tls.Config — typically built once
 	// via tlsutil.ServerTLS(cert, key, ca, requireClientCert). nil ⇒ every
@@ -221,6 +234,12 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		clusterCfg.InterNodeTLS = cfg.InterNodeTLS
 		clusterCfg.InterNodeServerTLS = cfg.InterNodeServerTLS
 		clusterCfg.NodeCNAllowlist = cfg.NodeCNAllowlist
+		// Thread the effective TCP WriteTimeout down to the replicated shards so their
+		// online-compaction alias-drain fence (AliasQuarantine = 2*WriteTimeout) is
+		// derived from the SAME value the TCP transport below arms as its write
+		// deadline — the two can never drift apart. 0 flows through and both sides apply
+		// their (matching) default.
+		clusterCfg.WriteTimeout = cfg.WriteTimeout
 		s, err := NewEmbedded(clusterCfg)
 		if err != nil {
 			return nil, err
@@ -286,6 +305,11 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 				Dispatcher:    disp,
 				Authenticator: cfg.Authenticator,
 				AccessLog:     cfg.AccessLog,
+				// Same value threaded into the replicated shards' AliasQuarantine above
+				// (clusterCfg.WriteTimeout): the write deadline and the recycle fence share
+				// one source. 0 ⇒ server.Config.applyDefaults uses 30s, matching shard.New's
+				// fallback, so an unset value keeps both sides consistent.
+				WriteTimeout: cfg.WriteTimeout,
 				// nil TLSConfig ⇒ the TCP server keeps its plaintext net.Listener; a
 				// non-nil one wraps the listener in tls.NewListener (the v1/v2 framing
 				// rides unchanged over the TLS conn). The verified client-cert CN is

@@ -32,6 +32,23 @@ type Config struct {
 	// IdleTimeout closes connections that send nothing for this duration. Default 5 min.
 	IdleTimeout time.Duration
 
+	// WriteTimeout bounds how long a single response write+flush may block on a
+	// stalled client before the connection is aborted. Default 30s.
+	//
+	// This is a CORRECTNESS bound, not just slow-loris hygiene: a response payload
+	// on a reject-writes/mmap shard is a ZERO-COPY []byte that ALIASES live mmap page
+	// bytes (handleGet returns the cache's alias verbatim). That alias is referenced
+	// by the write path across w.Flush(). With no write deadline a client that stops
+	// reading blocks the writer in Flush indefinitely, so the alias is held for an
+	// UNBOUNDED time — and the online page-recycle (cache/compact_online.go) can only
+	// be safe if every reader alias is released within a bounded wall-clock window.
+	// Arming this deadline before every response write guarantees the write either
+	// completes or aborts (and closes the conn) within WriteTimeout, which is the
+	// drain fence the cache's AliasQuarantine is derived from. 30s is generous enough
+	// for a legitimately slow client to drain a max-size (16 MiB) frame over a slow
+	// link while still bounding a wedged one to a small multiple of a heartbeat.
+	WriteTimeout time.Duration
+
 	// KeepAlivePeriod sets TCP keepalive interval. Default 30s.
 	KeepAlivePeriod time.Duration
 
@@ -64,6 +81,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.IdleTimeout == 0 {
 		c.IdleTimeout = 5 * time.Minute
+	}
+	if c.WriteTimeout == 0 {
+		c.WriteTimeout = 30 * time.Second
 	}
 	if c.KeepAlivePeriod == 0 {
 		c.KeepAlivePeriod = 30 * time.Second
@@ -253,6 +273,18 @@ func (s *Server) handleConn(c net.Conn) {
 		for rc := range pendingCh {
 			resp := <-rc
 			if !writerErr.Load() {
+				// Arm a write deadline BEFORE every write+flush. resp.payload may be a
+				// zero-copy alias into live mmap page bytes (handleGet on a reject-writes
+				// shard), and this goroutine references it across writeResponse/Flush. A
+				// client that stops reading would otherwise block Flush indefinitely, so
+				// the alias hold would be unbounded — the exact hazard the cache recycle
+				// must exclude. On a deadline the write/flush errors, we set writerErr +
+				// Close, and the loop below drains the rest of pendingCh WITHOUT writing
+				// (so writerWG.Wait() in the defer always completes — this also fixes the
+				// latent cleanup hang where a wedged Flush stalled Close). Re-armed per
+				// response: writes are far rarer than the read-deadline hot path, so the
+				// read-deadline's skip optimization is unnecessary here.
+				_ = c.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout))
 				if werr := writeResponse(w, &hdr, resp.status, resp.payload); werr != nil {
 					writerErr.Store(true)
 					_ = c.Close() // unblock the reader; conn is done
@@ -267,6 +299,12 @@ func (s *Server) handleConn(c net.Conn) {
 			}
 			if resp.reqBuf != nil {
 				putConnReqBuf(resp.reqBuf)
+			}
+			// Return the owned payload copy (Fix: pipelined alias recycle). Done
+			// unconditionally — including the writerErr drain path that skips the write
+			// above — so no buffer leaks when the connection is dying.
+			if resp.respBuf != nil {
+				putConnRespBuf(resp.respBuf)
 			}
 			outstanding.Add(-1)
 		}
@@ -343,7 +381,13 @@ func (s *Server) handleConn(c net.Conn) {
 			// unchanged — see dispatchpool.go.
 			dpool.run(func() {
 				status, payload := dispatch(s.cfg.Dispatcher, req, s.cfg.Authenticator, clientCN, s.cfg.AccessLog)
-				rc <- connPipeResp{status: status, payload: payload, reqBuf: reqBp}
+				// Copy the payload out of any zero-copy cache alias BEFORE enqueueing it
+				// on the ordered writer: a queued pipelined response can be held across a
+				// slow flush for far longer than the cache's AliasQuarantine, so handing
+				// the writer the raw mmap alias would let an online page recycle overwrite
+				// bytes it still references (torn read). See copyPipelinePayload.
+				owned, respBp := copyPipelinePayload(payload)
+				rc <- connPipeResp{status: status, payload: owned, reqBuf: reqBp, respBuf: respBp}
 			})
 			continue
 		}
@@ -358,6 +402,12 @@ func (s *Server) handleConn(c net.Conn) {
 			return
 		}
 		status, payload := dispatch(s.cfg.Dispatcher, reqBuf, s.cfg.Authenticator, clientCN, s.cfg.AccessLog)
+		// Bound the alias hold on the inline (non-pipelined) path too: payload may
+		// alias live mmap page bytes and is referenced across writeResponse/Flush, so
+		// a stalled reader must not pin it past WriteTimeout. On the deadline the
+		// write/flush errors and handleConn returns (its defer closes the conn),
+		// releasing the alias — same bound the pipelined writer goroutine enforces.
+		_ = c.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout))
 		if werr := writeResponse(w, &respHdr, status, payload); werr != nil {
 			slog.Error("write response", "transport", "tcp", "err", werr)
 			return
@@ -386,10 +436,18 @@ const connPipelineWindow = 64
 // wrapper, so putConnReqBuf can hand the SAME wrapper back to the pool instead
 // of boxing a fresh one) to recycle once the response has been written
 // (dispatch results may alias the buffer).
+//
+// respBuf is the pooled OWNED copy of the payload (see copyPipelinePayload): the
+// pipelined path copies the dispatch result out of any zero-copy cache alias at
+// dispatch time, so the ordered writer never references live mmap page bytes
+// across a QUEUED network flush (the alias-recycle hazard — see the copy site and
+// cache/compact_online.go). payload points into *respBuf; nil respBuf means an
+// empty payload that needed no buffer. Recycled after the write, next to reqBuf.
 type connPipeResp struct {
 	status  uint8
 	payload []byte
 	reqBuf  *[]byte
+	respBuf *[]byte
 }
 
 // connReqPool recycles pipelined request copies (the shared reqBuf cannot be
@@ -426,4 +484,67 @@ func putConnReqBuf(bp *[]byte) {
 	}
 	*bp = (*bp)[:0]
 	connReqPool.Put(bp)
+}
+
+// connRespPool recycles the OWNED payload copies the pipelined path makes (see
+// copyPipelinePayload). It mirrors connReqPool exactly — same *[]byte wrapper
+// discipline (getConnRespBuf mutates the pointee and returns the pointer;
+// putConnRespBuf takes that same pointer back, boxing the wrapper once per pool
+// item rather than once per response) and the same connBufRetainCap release
+// ceiling so a one-off large value is not pinned for the connection's lifetime.
+var connRespPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 512)
+		return &b
+	},
+}
+
+func getConnRespBuf(n int) *[]byte {
+	bp := connRespPool.Get().(*[]byte)
+	if cap(*bp) >= n {
+		*bp = (*bp)[:n]
+	} else {
+		*bp = make([]byte, n)
+	}
+	return bp
+}
+
+func putConnRespBuf(bp *[]byte) {
+	if cap(*bp) > connBufRetainCap {
+		return
+	}
+	*bp = (*bp)[:0]
+	connRespPool.Put(bp)
+}
+
+// copyPipelinePayload copies a dispatch payload out of any zero-copy cache alias
+// into an owned, pooled buffer, returning the owned copy and the pooled wrapper to
+// recycle after the write (an empty payload needs neither: nil, nil).
+//
+// This is THE fix for the pipelined alias-recycle hazard. On a reject-writes/mmap
+// shard handleGet returns a []byte that ALIASES live mmap page bytes; every other
+// consumer (HTTP, WASM, mget, getdel/getset, snapshot, and the INLINE non-pipelined
+// TCP path) copies or consumes that alias synchronously within one WriteTimeout, so
+// the online compactor's AliasQuarantine (>= 2*WriteTimeout) safely fences a page
+// recycle. The PIPELINED path is the exception: it QUEUES the response on pendingCh
+// (window depth connPipelineWindow), so the ordered writer could hold the raw alias
+// for up to (queued responses)*WriteTimeout before flushing it over a slow link —
+// far past the quarantine — and the compactor could then overwrite (recycle) the
+// backing extent while the writer still aliases it, shipping a TORN read to the
+// client. Copying here, at dispatch time, makes the writer reference only owned
+// bytes, so the pipelined alias-hold bound collapses to ~0 (copied before enqueue),
+// independent of pipeline depth and WriteTimeout. The inline path stays zero-copy —
+// it is bounded to a single WriteTimeout and drains before the next dispatch.
+//
+// TODO(perf): scope the pipelined copy to eligible shards — a payload that does not
+// alias online-compaction-eligible (reject-writes/mmap) cache memory cannot be
+// recycled and need not be copied. Threading that signal from dispatch is invasive,
+// so this conservatively copies every non-empty pipelined payload (correctness first).
+func copyPipelinePayload(payload []byte) ([]byte, *[]byte) {
+	if len(payload) == 0 {
+		return nil, nil
+	}
+	bp := getConnRespBuf(len(payload))
+	copy(*bp, payload)
+	return *bp, bp
 }

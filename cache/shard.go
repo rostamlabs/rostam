@@ -159,6 +159,14 @@ type shard struct {
 	compactBytesReclaimed atomic.Uint64
 	compactNanos          atomic.Uint64
 
+	// online relocating-compaction counters (cache/compact_online.go). Written under
+	// s.mu on the relocation path; atomic so Stats can read them from any goroutine.
+	// Zero on every shard that is not an mmap replicated reject-writes shard.
+	relocations           atomic.Uint64 // live entries relocated out of fragmented pages
+	relocatedBytes        atomic.Uint64 // their on-disk byte total
+	relocatePagesGone     atomic.Uint64 // source pages fully evacuated and marked retired
+	relocatePagesRecycled atomic.Uint64 // retired pages whose quarantine elapsed and were reset back into writable space
+
 	// mmapHighWaterWarned is the rising-edge latch for the replicated-mmap
 	// page-byte occupancy alert (#4 Option 3): a persistent replicated shard
 	// reclaims expired INDEX SLOTS deterministically but cannot reclaim page
@@ -950,6 +958,12 @@ func (s *shard) snapshot() Stats {
 		CompactionsAborted:       s.compactAborts.Load(),
 		CompactionBytesReclaimed: s.compactBytesReclaimed.Load(),
 		CompactionDurationMs:     s.compactNanos.Load() / uint64(time.Millisecond),
+
+		ReclaimableBytes:     s.reclaimableBytesForStats(),
+		OnlineRelocations:    s.relocations.Load(),
+		OnlineBytesRelocated: s.relocatedBytes.Load(),
+		OnlinePagesRetired:   s.relocatePagesGone.Load(),
+		OnlinePagesRecycled:  s.relocatePagesRecycled.Load(),
 	}
 }
 
@@ -1241,6 +1255,12 @@ func (s *shard) allocHeapPageLocked() int {
 // so the all-pages free-space scan lives in one place.
 func (s *shard) firstPageWithRoomLocked(need int) int {
 	for i := range s.pages {
+		// Skip pages retired by online relocating compaction: their stale-framed bytes
+		// are immutable and stranded (see page.retired). `retired` is always false on
+		// heap / single-node / ringbuf shards, so this is a no-op there.
+		if s.pages[i].retired {
+			continue
+		}
 		if s.pages[i].FreeTail() >= need {
 			return i
 		}
@@ -1442,6 +1462,13 @@ func (s *shard) sweepOnce() {
 		// ghost bytes accumulate until the next open compacts the file. Surface it
 		// before ErrFull so the restart happens on purpose, not on the cliff.
 		s.checkMmapOccupancy()
+		// Online relocating compaction (cache/compact_online.go): Stage 0 records the
+		// reclaimable-byte figure and evaluates the trigger; Stage 1 (when enabled)
+		// relocates live entries out of fragmented pages WITHOUT disturbing the lock-free
+		// read path. Gated to mmap replicated reject-writes shards, so it is a no-op for
+		// heap / single-node / ringbuf shards. Runs AFTER sweepIndex so logically-expired
+		// slots are already tombstoned and never relocated.
+		s.maybeRelocateCompact(stamp)
 		return
 	}
 	s.sweepIndex(s.now())

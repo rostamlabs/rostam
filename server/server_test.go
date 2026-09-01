@@ -20,7 +20,7 @@ import (
 // Compile-time guard: *shard.Store satisfies the Dispatcher interface.
 var _ Dispatcher = (*shard.Store)(nil)
 
-func newTestServer(t *testing.T) (*Server, *shard.Store) {
+func newTestStore(t *testing.T) *shard.Store {
 	t.Helper()
 	reg := ops.NewRegistry()
 	if err := ops.RegisterBuiltins(reg); err != nil {
@@ -48,7 +48,12 @@ func newTestServer(t *testing.T) (*Server, *shard.Store) {
 	if !store.IsLeader() {
 		t.Fatal("store never became leader")
 	}
+	return store
+}
 
+func newTestServer(t *testing.T) (*Server, *shard.Store) {
+	t.Helper()
+	store := newTestStore(t)
 	srv, err := New(Config{
 		Addr: "127.0.0.1:0", Dispatcher: store,
 		MaxConns: 100, IdleTimeout: 5 * time.Second,
