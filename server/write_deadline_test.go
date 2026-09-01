@@ -34,15 +34,32 @@ func startServer(t *testing.T, tweak func(*Config)) (*Server, string) {
 	return srv, srv.Addr().String()
 }
 
-// sendGetNoRead dials addr, sends a single get request frame for key, and returns
-// the connection WITHOUT reading the response — the caller drives a slow/absent
-// reader so the server's send path backs up and blocks in Flush.
-func sendGetNoRead(t *testing.T, addr string, key []byte) net.Conn {
+// dialStalled dials addr and pins the client's TCP receive buffer to 64 KiB, so that a
+// non-reading client cannot let the kernel absorb a multi-MiB response: the server's
+// send path fills and it genuinely blocks in Flush. Without pinning SO_RCVBUF,
+// receive-window autotuning can grow the client buffer past even a 15 MiB response on
+// some hosts, and the write would never stall (coderabbit). 64 KiB is small enough that
+// the deliverable-before-deadline bytes (this buffer plus the server's send buffer) stay
+// well under the tests' valLen/2 discriminator, yet above the tiny-SO_RCVBUF floor where
+// window scaling misbehaves and the deadline stops firing.
+func dialStalled(t *testing.T, addr string) net.Conn {
 	t.Helper()
 	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetReadBuffer(64 << 10)
+	}
+	return c
+}
+
+// sendGetNoRead dials addr, sends a single get request frame for key, and returns
+// the connection WITHOUT reading the response — the caller drives a slow/absent
+// reader so the server's send path backs up and blocks in Flush.
+func sendGetNoRead(t *testing.T, addr string, key []byte) net.Conn {
+	t.Helper()
+	c := dialStalled(t, addr)
 	w := bufio.NewWriter(c)
 	if err := writeFrame(w, EncodeRequest("get", ops.EncodeKeyArgs(key))); err != nil {
 		_ = c.Close()
@@ -65,10 +82,7 @@ func sendGetNoRead(t *testing.T, addr string, key []byte) net.Conn {
 // (its writerWG cleanup) sends a pair rather than relying on that timing.
 func sendGetsNoRead(t *testing.T, addr string, key []byte, count int) net.Conn {
 	t.Helper()
-	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
+	c := dialStalled(t, addr)
 	w := bufio.NewWriter(c)
 	for i := 0; i < count; i++ {
 		if err := writeFrame(w, EncodeRequest("get", ops.EncodeKeyArgs(key))); err != nil {

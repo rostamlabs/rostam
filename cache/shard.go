@@ -167,6 +167,15 @@ type shard struct {
 	relocatePagesGone     atomic.Uint64 // source pages fully evacuated and marked retired
 	relocatePagesRecycled atomic.Uint64 // retired pages whose quarantine elapsed and were reset back into writable space
 
+	// reclaimableCache holds the last-computed ghost-byte figure and the wall-clock
+	// nanos it was taken, so Stats() stays O(1) under frequent scraping: the O(entries)
+	// liveness walk (liveAndUsedBytes) runs at most once per reclaimableStatsTTL, not
+	// once per Stats() call. The sweeper refreshes it for free on every pass when online
+	// compaction is enabled; when disabled it is filled lazily by reclaimableBytesForStats.
+	// Wall time here is observability-only (a gauge freshness bound), never a logical clock.
+	reclaimableCache   atomic.Uint64
+	reclaimableCacheAt atomic.Int64
+
 	// mmapHighWaterWarned is the rising-edge latch for the replicated-mmap
 	// page-byte occupancy alert (#4 Option 3): a persistent replicated shard
 	// reclaims expired INDEX SLOTS deterministically but cannot reclaim page

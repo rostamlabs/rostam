@@ -404,7 +404,7 @@ func TestOnlineCompactionRunsBeforeApplyStamping(t *testing.T) {
 		t.Fatalf("logical clock = %d, want 0 (writes at nowMs 0 must not advance the stamp)", got)
 	}
 	// Reclaimable is visible with NO stamp: superseded dead space is judged at dropClock 0.
-	if got := s.reclaimableBytesForStats(); got == 0 {
+	if got := s.reclaimableBytesNow(); got == 0 {
 		t.Fatal("reclaimable is 0 at stamp 0 — superseded dead space must be accounted without a clock")
 	}
 

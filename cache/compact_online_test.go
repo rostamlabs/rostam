@@ -102,7 +102,7 @@ func TestOnlineReclaimableBytesAccounting(t *testing.T) {
 			t.Fatalf("put k%02d: %v", i, err)
 		}
 	}
-	if got := s.reclaimableBytesForStats(); got != 0 {
+	if got := s.reclaimableBytesNow(); got != 0 {
 		t.Fatalf("all-live shard: reclaimable=%d, want 0", got)
 	}
 
@@ -114,7 +114,7 @@ func TestOnlineReclaimableBytesAccounting(t *testing.T) {
 			t.Fatalf("overwrite k%02d: %v", i, err)
 		}
 	}
-	if got := s.reclaimableBytesForStats(); got != 5*perEntry {
+	if got := s.reclaimableBytesNow(); got != 5*perEntry {
 		t.Fatalf("after 5 overwrites: reclaimable=%d, want %d (5 dead duplicates)", got, 5*perEntry)
 	}
 
@@ -126,15 +126,53 @@ func TestOnlineReclaimableBytesAccounting(t *testing.T) {
 	}
 	// Logical clock (S) < exp (S+ttlMs): the key is LIVE, so it must NOT be reclaimable,
 	// even though the wall clock is far past its expiry. This is the logical-vs-wall proof.
-	if got := s.reclaimableBytesForStats(); got != 5*perEntry {
+	if got := s.reclaimableBytesNow(); got != 5*perEntry {
 		t.Fatalf("TTL key live at logical clock: reclaimable=%d, want %d (wall clock must NOT drop it)",
 			got, 5*perEntry)
 	}
 	// Advance the logical clock past the TTL: now the key is logically expired and its
 	// bytes become reclaimable.
 	advanceLogicalClock(c, S+ttlMs+1)
-	if got := s.reclaimableBytesForStats(); got != 6*perEntry {
+	if got := s.reclaimableBytesNow(); got != 6*perEntry {
 		t.Fatalf("after logical clock passes TTL: reclaimable=%d, want %d", got, 6*perEntry)
+	}
+}
+
+// TestReclaimableStatsCacheRateLimits proves the Stats gauge is O(1) under frequent
+// scraping: reclaimableBytesForStats serves a cached figure within reclaimableStatsTTL,
+// so a fresh burst of dead bytes is NOT re-walked on every call (while the always-fresh
+// reclaimableBytesNow does see it). This is the guard that keeps a metrics poll from
+// turning each Stats() into an O(entries) walk under the read lock.
+func TestReclaimableStatsCacheRateLimits(t *testing.T) {
+	const S = uint64(1_000_000)
+	c := eligibleOnlineCache(t, S+1_000_000, 1<<20, 8<<20)
+	s := c.shards[0]
+	val := bytes.Repeat([]byte("v"), 180_000)
+	perEntry := uint64(entrySize(len("k00"), len(val)))
+
+	for i := 0; i < 6; i++ {
+		if err := c.PutAt([]byte(fmt.Sprintf("k%02d", i)), val, 0, S); err != nil {
+			t.Fatalf("put k%02d: %v", i, err)
+		}
+	}
+	// First call computes fresh (cache empty) and caches: all-live ⇒ 0.
+	if got := s.reclaimableBytesForStats(); got != 0 {
+		t.Fatalf("first Stats call: reclaimable=%d, want 0", got)
+	}
+	// Create dead duplicates. The raw accounting sees them immediately...
+	for i := 0; i < 3; i++ {
+		if err := c.PutAt([]byte(fmt.Sprintf("k%02d", i)), val, 0, S); err != nil {
+			t.Fatalf("overwrite k%02d: %v", i, err)
+		}
+	}
+	if got := s.reclaimableBytesNow(); got != 3*perEntry {
+		t.Fatalf("raw accounting after overwrites: reclaimable=%d, want %d", got, 3*perEntry)
+	}
+	// ...but the Stats accessor keeps serving the cached 0 within the TTL (no re-walk),
+	// which is exactly the O(1) property. reclaimableStatsTTL (2s) far exceeds this test's
+	// runtime, so the second Stats call is always inside the window.
+	if got := s.reclaimableBytesForStats(); got != 0 {
+		t.Fatalf("Stats within TTL should serve the cached value, got reclaimable=%d, want 0", got)
 	}
 }
 
@@ -419,7 +457,7 @@ func TestOnlineCompactionActionGatedWhenDisabled(t *testing.T) {
 	advanceLogicalClock(c, 1_000)
 	// Stage 0 observability IS live: the dead duplicates are reported as reclaimable.
 	perEntry := uint64(entrySize(len("k00"), len(val)))
-	if got := s.reclaimableBytesForStats(); got != uint64(nKeys)*perEntry {
+	if got := s.reclaimableBytesNow(); got != uint64(nKeys)*perEntry {
 		t.Fatalf("reclaimable (observability) = %d, want %d", got, uint64(nKeys)*perEntry)
 	}
 	// But the ACTION is gated: driving the sweeper relocates/retires nothing.

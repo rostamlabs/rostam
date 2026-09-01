@@ -77,7 +77,7 @@ package cache
 // embedder that retains a raw Store.Get/Node.Call alias past the fence would see it
 // overwritten, so the feature stays operator opt-in (rostam.ServerConfig.
 // EnableOnlineCompaction) rather than forced on. The reclaimable-byte figure stays visible
-// in Stats regardless of the flag (reclaimableBytesForStats computes it on demand), but the
+// in Stats regardless of the flag (reclaimableBytesForStats serves a rate-limited cache), but the
 // sweep-path scan and trigger run ONLY when the flag is on — a not-opted-in shard adds zero
 // cost to the sweeper.
 
@@ -188,11 +188,22 @@ func (s *shard) pageLiveUsedLocked(idx int, t *indexTable, dropClock uint64) (li
 	return live, used
 }
 
-// reclaimableBytesForStats is the Stats view of ghost-byte pressure: the page bytes
-// that are not index-current-and-live at the shard's logical clock. Computed on
-// demand for eligible shards only (the walk is skipped — and 0 returned — for every
-// other shard, so Stats stays cheap for them and behaviorally unchanged).
-func (s *shard) reclaimableBytesForStats() uint64 {
+// reclaimableStatsTTL bounds how often reclaimableBytesForStats performs its
+// O(entries) liveness walk. Within this window Stats returns the cached figure, so a
+// frequent scraper (a metrics poll every second, say) cannot turn every Stats() call
+// into a full page/entry scan under the read lock. The sweeper refreshes the cache for
+// free on each pass when online compaction is enabled (recordReclaimable), so in that
+// mode this walk almost never runs; when compaction is disabled the walk happens here,
+// lazily, at most once per window. A few seconds of staleness on a dead-space GAUGE is
+// immaterial (it only guides the operator's decision to enable compaction).
+const reclaimableStatsTTL = 2 * time.Second
+
+// reclaimableBytesNow computes the CURRENT ghost-byte figure (used - live) with a full
+// O(entries) walk and no cache — the accounting primitive behind the Stats gauge.
+// Returns 0 for a non-eligible shard. reclaimableBytesForStats wraps it with a
+// short-lived cache; tests that assert the accounting reacts immediately to writes call
+// this directly.
+func (s *shard) reclaimableBytesNow() uint64 {
 	if !s.onlineCompactionEligible() {
 		return 0
 	}
@@ -201,6 +212,35 @@ func (s *shard) reclaimableBytesForStats() uint64 {
 		return 0
 	}
 	return used - live
+}
+
+// reclaimableBytesForStats is the Stats view of ghost-byte pressure. Returns 0 for every
+// non-eligible shard (no walk), so Stats stays cheap and behaviorally unchanged there.
+// For an eligible shard it returns the cached figure when fresh (within
+// reclaimableStatsTTL) and otherwise recomputes once (reclaimableBytesNow) and caches it
+// — keeping Stats() O(1) amortized regardless of scrape frequency. A concurrent stale
+// caller may recompute too; that is harmless (the walk is read-locked and idempotent, the
+// store is atomic).
+func (s *shard) reclaimableBytesForStats() uint64 {
+	if !s.onlineCompactionEligible() {
+		return 0
+	}
+	now := time.Now().UnixNano()
+	if at := s.reclaimableCacheAt.Load(); at != 0 && now-at < int64(reclaimableStatsTTL) {
+		return s.reclaimableCache.Load()
+	}
+	reclaimable := s.reclaimableBytesNow()
+	s.reclaimableCache.Store(reclaimable)
+	s.reclaimableCacheAt.Store(now)
+	return reclaimable
+}
+
+// recordReclaimable caches a reclaimable figure the sweeper already computed (from its
+// own liveAndUsedBytes walk), so Stats() serves it O(1) without a second walk. Called
+// only from the enabled sweep path, which holds no lock here; the stores are atomic.
+func (s *shard) recordReclaimable(reclaimable uint64) {
+	s.reclaimableCache.Store(reclaimable)
+	s.reclaimableCacheAt.Store(time.Now().UnixNano())
 }
 
 // maybeRelocateCompact is the sweeper hook. When Config.OnlineCompaction is off (the
@@ -245,6 +285,10 @@ func (s *shard) maybeRelocateCompact() {
 	if used > live {
 		reclaimable = used - live
 	}
+	// Refresh the Stats cache for free from this pass's walk, so a scraper served by
+	// reclaimableBytesForStats almost never has to run its own O(entries) walk while
+	// compaction is enabled and sweeping.
+	s.recordReclaimable(reclaimable)
 	deadRatio := float64(reclaimable) / float64(capacity)
 	occupancy := float64(used) / float64(capacity)
 	// TRIGGER: relocate only when there is enough dead space to be worth the work
