@@ -123,7 +123,12 @@ func TestPipelinedSlowReaderRecycleIntegrity(t *testing.T) {
 			t.Fatalf("only %d/%d requests dispatched — requests did not pipeline", i, n)
 		}
 	}
-	time.Sleep(300 * time.Millisecond)
+	// The copy+enqueue happens in the server's dispatch closure just AFTER Call
+	// returns (which is what signals d.dispatched), so this margin bridges that gap.
+	// Copying 3×12 MiB is a few ms of memcpy; 1s is a large headroom that keeps this
+	// robust on a loaded CI box (it can only ever cause a false FAIL, never a false
+	// pass — pre-fix the client has not read, so the alias is provably still held).
+	time.Sleep(1 * time.Second)
 
 	// Recycle: overwrite every backing extent, simulating the compactor resetting a
 	// retired page and future writes trampling its bytes.

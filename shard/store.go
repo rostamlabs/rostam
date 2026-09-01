@@ -159,7 +159,20 @@ func New(cfg Config) (*Store, error) {
 		// lockstep instead of silently defeating it.
 		effectiveWriteTimeout := cfg.Cache.ServerWriteTimeout
 		if effectiveWriteTimeout <= 0 {
-			effectiveWriteTimeout = defaultServerWriteTimeout // library embedder never threaded it; server default is the same
+			// rostam.NewServer always threads WriteTimeout (its own default is the same
+			// 30s), so this fallback is only reached by a library embedder building a
+			// REPLICATED shard directly via NewEmbedded without setting WriteTimeout. If
+			// that embedder runs a custom transport whose response write can block LONGER
+			// than 30s, this fence under-sizes the real alias-hold and a recycle could tear
+			// a read. We cannot see the embedder's transport, so warn loudly rather than
+			// assume — the safe action is for them to set WriteTimeout to their transport's
+			// write deadline (or set AliasQuarantine explicitly, which the fail-closed
+			// check below then validates).
+			slog.Warn("replicated shard has online compaction enabled but no server WriteTimeout was threaded; "+
+				"the alias-drain fence falls back to 2*30s — if your transport can hold a zero-copy read response "+
+				"longer than 30s, set Config.WriteTimeout (or an explicit Cache.AliasQuarantine) to your write deadline",
+				"component", "shard", "shard", cfg.ShardIndex)
+			effectiveWriteTimeout = defaultServerWriteTimeout
 		}
 		minAliasQuarantine := 2 * effectiveWriteTimeout
 		if cfg.Cache.AliasQuarantine == 0 {
