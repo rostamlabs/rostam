@@ -175,8 +175,7 @@ func TestReclaimableStatsCacheRateLimits(t *testing.T) {
 	// verbatim. A recompute would instead return 3*perEntry, so the sentinel can only be
 	// observed via the cache-hit path.
 	const sentinel = uint64(0xABCDEF)
-	s.reclaimableCache.Store(sentinel)
-	s.reclaimableCacheAt.Store(time.Now().UnixNano())
+	s.reclaimableCache.Store(&reclaimableSnapshot{bytes: sentinel, at: time.Now().UnixNano()})
 	if got := s.reclaimableBytesForStats(); got != sentinel {
 		t.Fatalf("Stats within TTL should serve the cached sentinel, got reclaimable=%d, want %d", got, sentinel)
 	}

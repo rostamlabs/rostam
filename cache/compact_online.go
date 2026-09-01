@@ -198,6 +198,34 @@ func (s *shard) pageLiveUsedLocked(idx int, t *indexTable, dropClock uint64) (li
 // immaterial (it only guides the operator's decision to enable compaction).
 const reclaimableStatsTTL = 2 * time.Second
 
+// reclaimableSnapshot is one published ghost-byte figure and the wall-clock nanos it was
+// taken. Held behind a single atomic.Pointer so the (bytes, at) pair is published
+// indivisibly and can be compare-and-swapped, which lets publishReclaimable reject a
+// stale writer rather than tearing the pair or regressing the cache.
+type reclaimableSnapshot struct {
+	bytes uint64
+	at    int64
+}
+
+// publishReclaimable installs a freshly computed snapshot, but only if it is NEWER than
+// whatever is currently published (CAS-if-newer). Two refreshers can race — a delayed
+// Stats caller and the sweeper, or two Stats callers — and without this guard the one
+// that sampled an OLDER `at` could overwrite the newer snapshot, regressing the cache and
+// its freshness stamp. The CAS loop makes the latest-timestamp snapshot win regardless of
+// store order; a loser simply drops its (still valid, just older) result.
+func (s *shard) publishReclaimable(bytes uint64, at int64) {
+	fresh := &reclaimableSnapshot{bytes: bytes, at: at}
+	for {
+		cur := s.reclaimableCache.Load()
+		if cur != nil && cur.at >= at {
+			return // a newer-or-equal snapshot is already published; do not regress it.
+		}
+		if s.reclaimableCache.CompareAndSwap(cur, fresh) {
+			return
+		}
+	}
+}
+
 // reclaimableBytesNow computes the CURRENT ghost-byte figure (used - live) with a full
 // O(entries) walk and no cache — the accounting primitive behind the Stats gauge.
 // Returns 0 for a non-eligible shard. reclaimableBytesForStats wraps it with a
@@ -226,24 +254,22 @@ func (s *shard) reclaimableBytesForStats() uint64 {
 		return 0
 	}
 	now := time.Now().UnixNano()
-	// now >= at guards a BACKWARD wall-clock jump (NTP step): without it, now-at goes
+	// now >= snap.at guards a BACKWARD wall-clock jump (NTP step): without it, now-at goes
 	// negative and would read as "fresh" for the whole rollback interval, pinning a stale
-	// gauge. On a backward step we simply recompute and re-stamp at the earlier now.
-	if at := s.reclaimableCacheAt.Load(); at != 0 && now >= at && now-at < int64(reclaimableStatsTTL) {
-		return s.reclaimableCache.Load()
+	// gauge. On a backward step we simply recompute and re-publish at the earlier now.
+	if snap := s.reclaimableCache.Load(); snap != nil && now >= snap.at && now-snap.at < int64(reclaimableStatsTTL) {
+		return snap.bytes
 	}
 	reclaimable := s.reclaimableBytesNow()
-	s.reclaimableCache.Store(reclaimable)
-	s.reclaimableCacheAt.Store(now)
+	s.publishReclaimable(reclaimable, now)
 	return reclaimable
 }
 
 // recordReclaimable caches a reclaimable figure the sweeper already computed (from its
 // own liveAndUsedBytes walk), so Stats() serves it O(1) without a second walk. Called
-// only from the enabled sweep path, which holds no lock here; the stores are atomic.
+// only from the enabled sweep path; publishReclaimable installs it CAS-if-newer.
 func (s *shard) recordReclaimable(reclaimable uint64) {
-	s.reclaimableCache.Store(reclaimable)
-	s.reclaimableCacheAt.Store(time.Now().UnixNano())
+	s.publishReclaimable(reclaimable, time.Now().UnixNano())
 }
 
 // maybeRelocateCompact is the sweeper hook. When Config.OnlineCompaction is off (the
