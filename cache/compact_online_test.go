@@ -168,11 +168,17 @@ func TestReclaimableStatsCacheRateLimits(t *testing.T) {
 	if got := s.reclaimableBytesNow(); got != 3*perEntry {
 		t.Fatalf("raw accounting after overwrites: reclaimable=%d, want %d", got, 3*perEntry)
 	}
-	// ...but the Stats accessor keeps serving the cached 0 within the TTL (no re-walk),
-	// which is exactly the O(1) property. reclaimableStatsTTL (2s) far exceeds this test's
-	// runtime, so the second Stats call is always inside the window.
-	if got := s.reclaimableBytesForStats(); got != 0 {
-		t.Fatalf("Stats within TTL should serve the cached value, got reclaimable=%d, want 0", got)
+	// ...but the Stats accessor serves the cache within the TTL instead of re-walking —
+	// the O(1) property. Prove the within-TTL branch DETERMINISTICALLY (not by racing the
+	// 2s TTL against however long this test takes under -race -count=3): stamp a distinct
+	// sentinel value with a fresh timestamp, then assert the accessor returns THAT value
+	// verbatim. A recompute would instead return 3*perEntry, so the sentinel can only be
+	// observed via the cache-hit path.
+	const sentinel = uint64(0xABCDEF)
+	s.reclaimableCache.Store(sentinel)
+	s.reclaimableCacheAt.Store(time.Now().UnixNano())
+	if got := s.reclaimableBytesForStats(); got != sentinel {
+		t.Fatalf("Stats within TTL should serve the cached sentinel, got reclaimable=%d, want %d", got, sentinel)
 	}
 }
 

@@ -48,8 +48,17 @@ func dialStalled(t *testing.T, addr string) net.Conn {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	if tc, ok := c.(*net.TCPConn); ok {
-		_ = tc.SetReadBuffer(64 << 10)
+	tc, ok := c.(*net.TCPConn)
+	if !ok {
+		_ = c.Close()
+		t.Fatalf("dialStalled: expected *net.TCPConn, got %T", c)
+	}
+	// Fail loudly rather than silently proceeding with an unbounded receive buffer: if the
+	// buffer is not pinned small, autotuning can absorb the whole response and the write
+	// never stalls, which would surface as a confusing false failure downstream.
+	if err := tc.SetReadBuffer(64 << 10); err != nil {
+		_ = c.Close()
+		t.Fatalf("dialStalled: set TCP receive buffer: %v", err)
 	}
 	return c
 }

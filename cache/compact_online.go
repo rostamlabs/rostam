@@ -226,7 +226,10 @@ func (s *shard) reclaimableBytesForStats() uint64 {
 		return 0
 	}
 	now := time.Now().UnixNano()
-	if at := s.reclaimableCacheAt.Load(); at != 0 && now-at < int64(reclaimableStatsTTL) {
+	// now >= at guards a BACKWARD wall-clock jump (NTP step): without it, now-at goes
+	// negative and would read as "fresh" for the whole rollback interval, pinning a stale
+	// gauge. On a backward step we simply recompute and re-stamp at the earlier now.
+	if at := s.reclaimableCacheAt.Load(); at != 0 && now >= at && now-at < int64(reclaimableStatsTTL) {
 		return s.reclaimableCache.Load()
 	}
 	reclaimable := s.reclaimableBytesNow()
