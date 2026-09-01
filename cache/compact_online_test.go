@@ -363,8 +363,8 @@ func TestOnlineCompactionGateNoOpForOtherShards(t *testing.T) {
 				_ = c.PutAt([]byte(fmt.Sprintf("k%02d", i)), val, 0, 1_000) // dead duplicate
 			}
 			advanceLogicalClock(c, 1_000)
-			s.sweepOnce()                 // must not relocate/retire on a non-eligible shard
-			s.maybeRelocateCompact(1_000) // direct call: also a no-op
+			s.sweepOnce()            // must not relocate/retire on a non-eligible shard
+			s.maybeRelocateCompact() // direct call: also a no-op
 			st := c.Stats()
 			if st.ReclaimableBytes != 0 {
 				t.Fatalf("non-eligible shard reported ReclaimableBytes=%d, want 0", st.ReclaimableBytes)
@@ -487,14 +487,19 @@ func TestOnlineRelocationHeavyRace(t *testing.T) {
 			var buf []byte
 			for !stop.Load() {
 				for i := 0; i < nKeys; i++ {
+					// Every key is always present (seeded up front, rewritten each round, no
+					// TTL, no delete), and relocation is miss-free by construction (the index
+					// repoint is atomic, the old copy stays resolvable until then). So a miss —
+					// a non-nil error — is a LOST key and a failure, exactly like a torn value;
+					// count both, not just the value mismatch.
 					if seed%2 == 0 {
 						out, gErr := c.GetInto(buf[:0], keyFor(i))
-						if gErr == nil && !bytes.Equal(out, valFor(i)) {
+						if gErr != nil || !bytes.Equal(out, valFor(i)) {
 							bad.Add(1)
 						}
 					} else {
 						v, gErr := c.Get(keyFor(i))
-						if gErr == nil && !bytes.Equal(v, valFor(i)) {
+						if gErr != nil || !bytes.Equal(v, valFor(i)) {
 							bad.Add(1)
 						}
 					}

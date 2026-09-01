@@ -65,6 +65,29 @@ type ServerConfig struct {
 	EpollTCP   bool
 	EpollLoops int
 
+	// EnableOnlineCompaction opts every REPLICATED mmap reject-writes shard into
+	// ONLINE relocating compaction with quarantine-then-reset recycle
+	// (cache/compact_online.go): while the process runs, the TTL sweeper relocates
+	// the live entries out of fragmented pages, RETIRES the emptied source extents,
+	// and — once the alias-drain fence has elapsed — RESETS those extents back into
+	// writable space, so a persistent replicated shard reclaims ghost page bytes
+	// WHILE running instead of only at restart (cold compaction). Off by default.
+	//
+	// SAFETY CONTRACT — READ BEFORE ENABLING. Recycling overwrites retired mmap page
+	// bytes after AliasQuarantine (= 2*WriteTimeout) has elapsed. It is ONLY
+	// memory-safe when every read of the shard is released within that window — i.e.
+	// all reads flow through the SERVER TRANSPORT, whose WriteTimeout bounds the
+	// zero-copy response alias. A reject-writes/mmap Get returns a []byte that ALIASES
+	// live mmap page bytes; the server response writer's write deadline is the only
+	// thing that bounds how long that alias can escape. Do NOT enable this if ANY
+	// in-process caller retains a raw cache alias past AliasQuarantine — e.g. an
+	// embedder that holds a `Store.Get` / `Node.Call` result (both return the alias
+	// verbatim) beyond the fence; such readers MUST copy the value out promptly. When
+	// unset the whole feature is a no-op (nothing relocates or recycles), exactly as
+	// before this flag existed. Threaded down to every replicated shard's cache
+	// (AliasQuarantine derived from WriteTimeout, enforced fail-closed in shard.New).
+	EnableOnlineCompaction bool
+
 	// WriteTimeout bounds how long a single TCP response write+flush may block on a
 	// stalled client before the connection is aborted (server.Config.WriteTimeout).
 	// 0 selects the server's default (30s). It is a CORRECTNESS bound, not just
@@ -240,6 +263,10 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		// deadline — the two can never drift apart. 0 flows through and both sides apply
 		// their (matching) default.
 		clusterCfg.WriteTimeout = cfg.WriteTimeout
+		// Opt-in online compaction (off by default). Only when set does a replicated
+		// shard recycle retired mmap extents; the fence that makes that safe is derived
+		// from WriteTimeout above (see ServerConfig.EnableOnlineCompaction's contract).
+		clusterCfg.EnableOnlineCompaction = cfg.EnableOnlineCompaction
 		s, err := NewEmbedded(clusterCfg)
 		if err != nil {
 			return nil, err
@@ -310,6 +337,13 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 				// one source. 0 ⇒ server.Config.applyDefaults uses 30s, matching shard.New's
 				// fallback, so an unset value keeps both sides consistent.
 				WriteTimeout: cfg.WriteTimeout,
+				// Same flag threaded into the replicated shards' caches above
+				// (clusterCfg.EnableOnlineCompaction → cache.OnlineCompaction): recycle and
+				// the pipelined copy that fences it share ONE source of truth, so the
+				// transport copies a zero-copy alias out before queueing it EXACTLY when a
+				// shard can recycle the extent behind it, and never otherwise (default off ⇒
+				// zero-copy pipeline, no per-conn amplification). See server.Config's field doc.
+				EnableOnlineCompaction: cfg.EnableOnlineCompaction,
 				// nil TLSConfig ⇒ the TCP server keeps its plaintext net.Listener; a
 				// non-nil one wraps the listener in tls.NewListener (the v1/v2 framing
 				// rides unchanged over the TLS conn). The verified client-cert CN is

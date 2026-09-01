@@ -66,6 +66,17 @@ type EmbeddedConfig struct {
 	// WriteTimeout it gives its own transport.
 	WriteTimeout time.Duration
 
+	// EnableOnlineCompaction opts every replicated mmap reject-writes shard into
+	// online relocating compaction with quarantine-then-reset recycle
+	// (cache/compact_online.go → cache.Config.OnlineCompaction). Off by default; a
+	// no-op on heap / single-node / ringbuf shards. It is ONLY memory-safe when every
+	// read is released within AliasQuarantine — i.e. all reads flow through the
+	// WriteTimeout-bounded server transport. An embedder that retains a raw
+	// `Store.Get`/`Node.Call` alias past the fence MUST NOT enable it (those readers
+	// must copy). Threaded down from rostam.ServerConfig.EnableOnlineCompaction; see
+	// its doc for the full contract.
+	EnableOnlineCompaction bool
+
 	// RaftAddr is this node's multiplexed Raft transport endpoint.
 	// Required when len(Peers) > 1.
 	RaftAddr string
@@ -727,6 +738,12 @@ func NewEmbedded(cfg EmbeddedConfig) (Store, error) {
 	// tracks the real deadline rather than a hardcoded mirror. 0 stays 0 ⇒ shard.New
 	// uses its built-in default (matching the server's own WriteTimeout default).
 	cc.ServerWriteTimeout = cfg.WriteTimeout
+	// Opt-in online compaction (off by default). The cache-side gate (isMmap &&
+	// Replicated && reject-writes, set in shard.New) makes this a no-op on heap /
+	// single-node / ringbuf shards even when set; shard.New derives and fail-closed
+	// enforces the alias-drain fence only when it is enabled. See
+	// EmbeddedConfig.EnableOnlineCompaction's contract.
+	cc.OnlineCompaction = cfg.EnableOnlineCompaction
 	cc.Durable = cfg.Cache.Durable
 	cc.Mlock = cfg.Cache.Mlock
 	cc.DisableColdCompaction = cfg.Cache.DisableColdCompaction

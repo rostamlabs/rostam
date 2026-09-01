@@ -3,8 +3,11 @@
 package cache
 
 // Stats is a snapshot of cache counters.
-// All fields are accumulated since cache creation. Use rate calculations
-// by sampling and diffing.
+// Every field EXCEPT ReclaimableBytes is a cumulative counter accumulated since cache
+// creation; use rate calculations by sampling and diffing them. ReclaimableBytes is a
+// point-in-time GAUGE (current ghost-byte pressure) that RISES and FALLS as writes
+// fragment pages and compaction reclaims them — do not diff it as a counter, and do not
+// read a compaction-driven decrease as counter wraparound.
 type Stats struct {
 	Gets             uint64
 	Hits             uint64
@@ -41,6 +44,8 @@ type Stats struct {
 	//     shard's LOGICAL clock (superseded / deleted / logically-expired) — the space
 	//     a compaction could reclaim. Computed on demand for eligible shards; 0 for
 	//     every other shard. This is the Stage 0 signal and needs no compactor enabled.
+	//     A point-in-time GAUGE (see the type comment): it falls when compaction
+	//     reclaims, so unlike every other field it is not a monotonic counter.
 	//   - OnlineRelocations: live entries relocated out of fragmented pages;
 	//   - OnlineBytesRelocated: their on-disk byte total;
 	//   - OnlinePagesRetired: source pages fully evacuated and marked retired (their

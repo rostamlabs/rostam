@@ -141,25 +141,30 @@ type Config struct {
 	DisableColdCompaction bool
 
 	// OnlineCompaction opts a REPLICATED MMAP REJECT-WRITES shard into ONLINE
-	// relocating compaction (cache/compact_online.go): while the process runs, the
-	// TTL sweeper relocates the live entries out of fragmented pages and RETIRES the
-	// emptied source extents, WITHOUT disturbing the lock-free zero-copy read path.
-	// Default false.
+	// relocating compaction with quarantine-then-reset recycle (cache/compact_online.go):
+	// while the process runs, the TTL sweeper relocates the live entries out of
+	// fragmented pages, RETIRES the emptied source extents, and — once the alias-drain
+	// quarantine has elapsed — RECYCLES a retired extent (resets head/tail to 0 with a
+	// bumped generation and hands it back to the write path), so a shard that hit ErrFull
+	// on accumulated dead versions recovers write capacity WHILE running instead of only
+	// at restart (cold compaction). Default false. Threaded from rostam.ServerConfig.
+	// EnableOnlineCompaction.
 	//
 	// It is a no-op on every other shard (heap, single-node, ringbuf) — the online
 	// compactor is gated on isMmap && Replicated && AtCapPolicy==PolicyRejectWrites,
 	// the exact mode a cluster-replication shard is forced into (see shard/store.go).
 	//
-	// WHY OPT-IN, and why it is OFF by default. Stage 1 of the feature relocates the
-	// live entries into other pages' fresh tail bytes and marks the evacuated source
-	// pages RETIRED, but it does NOT yet recycle those retired extents into writable
-	// space (that is Stage 2's new-VA swap). So on its own, relocation only CONSUMES
-	// fresh tail without returning capacity — it is the reader-safe FOUNDATION plus its
-	// stress harness, not yet a cure for ErrFull. Enabling it today buys page-packing /
-	// observability and exercises the primitive; it should stay off in production until
-	// the retired-extent recycle lands. The reclaimable-bytes accounting and the trigger
-	// evaluation (Stage 0) run regardless — reclaimable is always visible in Stats — this
-	// flag only gates the relocation ACTION.
+	// WHY OPT-IN, and why it is OFF by default. Recycle overwrites retired mmap page
+	// bytes after AliasQuarantine. It is memory-safe ONLY when every read of the shard is
+	// released within that window — i.e. all reads flow through the server transport,
+	// whose WriteTimeout bounds the zero-copy response alias (AliasQuarantine =
+	// 2*WriteTimeout, enforced fail-closed in shard.New). Do NOT enable it if any
+	// in-process caller holds a Store.Get / Node.Call result (a raw cache alias) past
+	// AliasQuarantine; those readers must copy the value out promptly. So the feature is
+	// an explicit operator opt-in, not a default, even though recycle is fully
+	// implemented. The reclaimable-bytes accounting and the trigger evaluation (Stage 0)
+	// run regardless — reclaimable is always visible in Stats — this flag only gates the
+	// relocate+recycle ACTION.
 	OnlineCompaction bool
 
 	// AliasQuarantine is how long online relocating compaction must let a RETIRED
@@ -275,6 +280,16 @@ func (c Config) Validate() error {
 	}
 	if c.MsyncIntervalMs < 1 {
 		return errors.New("cache.Config: MsyncIntervalMs must be >= 1")
+	}
+	// The online-compaction durations are safety knobs. A NEGATIVE value is always a
+	// typo — never a valid request — and must be rejected here rather than allowed to
+	// silently fall back to a safety default (AliasQuarantine) or invert a deadline
+	// (ServerWriteTimeout). 0 stays valid: it selects the built-in default downstream.
+	if c.AliasQuarantine < 0 {
+		return fmt.Errorf("cache.Config: AliasQuarantine=%s must be >= 0", c.AliasQuarantine)
+	}
+	if c.ServerWriteTimeout < 0 {
+		return fmt.Errorf("cache.Config: ServerWriteTimeout=%s must be >= 0", c.ServerWriteTimeout)
 	}
 	return nil
 }

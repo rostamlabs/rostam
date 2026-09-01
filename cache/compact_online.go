@@ -57,16 +57,27 @@ package cache
 // use, so a relocation pass can never drop a key a peer still considers live.
 //
 // ==========================================================================
-// HONEST SCOPE (Stage 1). This relocates live entries into EXISTING destination
-// tail space (another not-yet-full page, or a genuinely fresh sparse page) and
-// marks fully-evacuated source pages RETIRED. It does NOT recycle a retired page's
-// extent back into writable space — that requires giving the slot a fresh extent at
-// a different virtual address (the mmap analog of the heap frozen swap), which is a
-// later stage. So on its own, relocation CONSUMES fresh tail without returning
-// capacity, and therefore does NOT yet relieve ErrFull once all tails are consumed.
-// It is the reader-safe FOUNDATION plus its stress harness; Config.OnlineCompaction
-// keeps the relocation ACTION opt-in until the recycle stage lands. The
-// reclaimable-byte accounting and the trigger (Stage 0) run regardless.
+// SCOPE — RELOCATE THEN RECYCLE. This relocates live entries into EXISTING destination
+// tail space (another not-yet-full page, or a genuinely fresh sparse page), marks
+// fully-evacuated source pages RETIRED, and then — once the alias-drain QUARANTINE has
+// elapsed since retirement — RECYCLES a retired page (compactRecycleRetiredLocked): its
+// extent is reset (head/tail→0) with a bumped generation and handed back to the write
+// path, so a shard that hit ErrFull on accumulated dead versions recovers write capacity
+// WHILE running, not only at the next restart (cold compaction). Recycle is the exact
+// frozen-swap the heap ringbuf retire path uses — a fresh page object over the SAME mmap
+// extent, published atomically into pageSlots — the mmap being safe only because the
+// quarantine has drained every escaped reader alias first (see compactRecycleRetiredLocked).
+//
+// OPT-IN FOR READER-SAFETY, not because recycle is unfinished. Config.OnlineCompaction
+// gates the whole relocate+recycle ACTION and defaults OFF. The reason is the escaped
+// alias: a reject-writes/mmap Get returns a []byte aliasing page bytes, and recycle
+// overwrites those bytes after the quarantine. That is memory-safe ONLY when every read
+// is released within the quarantine — i.e. all reads flow through the server transport,
+// whose WriteTimeout bounds the alias (AliasQuarantine = 2*WriteTimeout). An in-process
+// embedder that retains a raw Store.Get/Node.Call alias past the fence would see it
+// overwritten, so the feature stays operator opt-in (rostam.ServerConfig.
+// EnableOnlineCompaction) rather than forced on. The reclaimable-byte accounting and the
+// trigger (Stage 0) run regardless of the flag — reclaimable is always visible in Stats.
 
 import "time"
 
@@ -148,6 +159,33 @@ func (s *shard) liveAndUsedBytes(dropClock uint64) (live, used uint64) {
 	return live, used
 }
 
+// pageLiveUsedLocked returns (liveBytes, usedBytes) for a SINGLE page idx, judged at
+// dropClock, using the same liveness predicate as liveAndUsedBytes: used is the page's
+// framed bytes (tail-head), live counts only index-current, not-expired-at-dropClock
+// entries. reclaimable = used - live is the page's dead (superseded / deleted /
+// logically-expired) share. O(entries-on-this-page). Must hold s.mu; used to decide
+// whether a page is fragmented enough to be worth relocating (see tryRelocatePageLocked).
+func (s *shard) pageLiveUsedLocked(idx int, t *indexTable, dropClock uint64) (live, used uint64) {
+	p := s.pages[idx]
+	head := p.head()
+	tail := p.tail()
+	used = uint64(tail - head) //nolint:gosec // tail >= head always
+	entries := p.entries()
+	for cursor := head; cursor < tail; {
+		key, value, exp, err := decodeEntryFast(entries[cursor:tail])
+		if err != nil {
+			break // crash-torn tail: stop the walk (mirrors liveAndUsedBytes / walkLiveAtOpen).
+		}
+		meta := entryMetaAt(entries[cursor:tail])
+		size := entrySize(len(key), len(value))
+		if s.entryIsLiveAtOpen(t, idx, p.gen, cursor, key, exp, meta, dropClock) {
+			live += uint64(size) //nolint:gosec // entrySize is non-negative
+		}
+		cursor += size
+	}
+	return live, used
+}
+
 // reclaimableBytesForStats is the Stats view of ghost-byte pressure: the page bytes
 // that are not index-current-and-live at the shard's logical clock. Computed on
 // demand for eligible shards only (the walk is skipped — and 0 returned — for every
@@ -170,20 +208,19 @@ func (s *shard) reclaimableBytesForStats() uint64 {
 // sweepIndex has tombstoned logically-expired slots (so relocation never moves an
 // expired entry) and reclaimExpiredHeapPages (a no-op for mmap).
 //
-// stamp is the shard's logical clock (lastAppliedStampMs), already loaded by
-// sweepOnce and known non-zero there — but re-guarded here so a direct caller is
-// safe too.
-func (s *shard) maybeRelocateCompact(stamp uint64) {
+// It runs even before apply-stamping advances the logical clock. dropClock is
+// compactDropClock() — the logical clock (lastAppliedStampMs), 0 on a not-yet-stamped
+// replicated shard. At 0, isExpired(exp, 0) is false for every entry, so NO key is
+// dropped by TTL; but SUPERSEDED / index-dead versions (the actual dead-space problem)
+// are still reclaimed and retired extents still recycled — so an opted-in shard is NOT
+// inert until EnableApplyStamp lands. Once stamping is on, TTL-expired entries reclaim
+// too. Using the logical clock (never wall time) is what keeps a replicated relocation
+// pass from dropping a key a peer still considers live.
+func (s *shard) maybeRelocateCompact() {
 	if !s.onlineCompactionEligible() {
 		return // gate: heap / single-node / ringbuf shards are entirely unaffected.
 	}
-	if stamp == 0 {
-		// No stamped apply has advanced the logical clock yet. isExpired(exp, 0) is
-		// always false, so nothing is judged expired and a relocation pass would be
-		// pure superseded-only churn; skip it, matching the logical sweeper.
-		return
-	}
-	dropClock := stamp // == compactDropClock() for a replicated shard (asserted by the gate).
+	dropClock := s.compactDropClock() // logical clock; 0 (⇒ no TTL drops) until stamping is on.
 	capacity := s.pageCapacityBytes()
 	if capacity == 0 {
 		return
@@ -332,6 +369,18 @@ func (s *shard) tryRelocatePageLocked(idx int, dropClock uint64) bool {
 		return false
 	}
 	t := s.tab.Load()
+	// SELECT only pages worth compacting. The shard-level trigger can fire on occupancy
+	// alone (occupancy >= warn-high with reclaimable ~0), which would otherwise make this
+	// pass relocate pages that are essentially ALL LIVE — pure copy/churn that consumes
+	// fresh tail without retiring anything. Skip a page whose reclaimable (superseded /
+	// deleted / logically-expired) share of its framed bytes is below the same
+	// mmapCompactMinReclaimRatio the cold compactor uses, so a nearly-all-live page is
+	// left alone and the budget is spent on genuinely fragmented pages. The pre-scan is
+	// O(page) — far cheaper than the relocation writes it avoids on a skipped page.
+	live, used := s.pageLiveUsedLocked(idx, t, dropClock)
+	if used == 0 || float64(used-live)/float64(used) < mmapCompactMinReclaimRatio {
+		return false
+	}
 	entries := p.entries()
 	tail := p.tail()
 	// pinned: an index-current entry could NOT be evacuated this pass — either it is
@@ -402,9 +451,10 @@ func (s *shard) tryRelocatePageLocked(idx int, dropClock uint64) bool {
 	}
 	// Every index-current entry was evacuated (or the page held only dead duplicates):
 	// no index slot addresses this page any more. Mark it RETIRED so the write path
-	// stops handing out its stale-framed tail. Stage 1 does NOT reset, reuse, unmap, or
-	// punch the bytes — they stay mapped and immutable so any in-flight reader alias
-	// stays valid; the extent is stranded until a recycle stage reuses the slot.
+	// stops handing out its stale-framed tail. Retiring does NOT touch the bytes — they
+	// stay mapped and immutable so any in-flight reader alias stays valid — and starts
+	// the alias-drain quarantine; only compactRecycleRetiredLocked, after the quarantine
+	// elapses, resets the extent in place and hands it back to the write path.
 	p.retired = true
 	p.retiredAt = time.Now() // start the alias-drain quarantine clock (WALL time; see page.retiredAt).
 	s.relocatePagesGone.Add(1)

@@ -1444,9 +1444,14 @@ func (s *shard) sweepOnce() {
 	if s.cfg.Replicated {
 		stamp := s.lastAppliedStampMs.Load()
 		if stamp == 0 {
-			// No stamped apply has advanced the logical clock yet — reclaiming
-			// against 0 would be both pointless (isExpired(exp,0) is always false)
-			// and, if we ever changed that, non-deterministic. Do nothing.
+			// No stamped apply has advanced the logical clock yet, so LOGICAL-clock TTL
+			// reclamation (sweepIndex / reclaimExpiredHeapPages) is pointless — isExpired
+			// (exp,0) is always false — and, if we ever changed that, non-deterministic. Do
+			// none of it. But online relocation/recycle of SUPERSEDED (index-dead) versions
+			// needs NO clock: it reclaims dead duplicates and recycles retired extents
+			// (compactDropClock()==0 ⇒ zero TTL drops, full superseded reclaim), so an
+			// opted-in shard must still run it here instead of being inert until stamping.
+			s.maybeRelocateCompact()
 			return
 		}
 		// Index-slot reclamation against the logical clock (removes expired keys
@@ -1468,7 +1473,7 @@ func (s *shard) sweepOnce() {
 		// read path. Gated to mmap replicated reject-writes shards, so it is a no-op for
 		// heap / single-node / ringbuf shards. Runs AFTER sweepIndex so logically-expired
 		// slots are already tombstoned and never relocated.
-		s.maybeRelocateCompact(stamp)
+		s.maybeRelocateCompact()
 		return
 	}
 	s.sweepIndex(s.now())

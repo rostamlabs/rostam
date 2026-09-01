@@ -105,16 +105,21 @@ func TestServerWriteDeadlineClosesStalledReader(t *testing.T) {
 	}
 }
 
-// TestServerCloseCompletesWithStalledWriter is the cleanup-hang gate. A stalled
-// reader leaves the connection's writer goroutine blocked in Flush; before the write
-// deadline this wedged the per-conn cleanup (writerWG.Wait) and therefore Server.Close
-// forever. With the deadline the write aborts, the writer drains and returns, so
-// Close completes. We assert Close returns well within a bound.
+// TestServerCloseCompletesWithStalledWriter is the cleanup-hang gate. A stalled reader
+// leaves the connection's writer goroutine blocked in Flush; before the write deadline
+// this wedged the per-conn cleanup (writerWG.Wait) forever. This test deliberately does
+// NOT let Server.Close's force-close be what unblocks the writer — otherwise it would pass
+// even with the deadline code deleted (cubic P2). Instead it first proves, WITHOUT calling
+// Close, that the WRITE DEADLINE alone unblocks the stalled (pipelined) writer, THEN checks
+// Close returns promptly with the writer already drained.
 func TestServerCloseCompletesWithStalledWriter(t *testing.T) {
 	const writeTimeout = 200 * time.Millisecond
 	srv, addr := startServer(t, func(c *Config) { c.WriteTimeout = writeTimeout })
 
-	const valLen = 8 << 20
+	// > any socket buffer, so the server MUST block in Flush against a non-reading client.
+	// Its body also overflows the 8 KiB conn bufio, so this get takes the PIPELINED path —
+	// the ordered writer goroutine whose writerWG.Wait cleanup is the historic hang site.
+	const valLen = 15 << 20
 	val := make([]byte, valLen)
 	key := []byte("big")
 	if status, _ := rawCall(t, addr, "put", ops.EncodePutArgs(key, val, 0)); status != StatusOK {
@@ -124,10 +129,32 @@ func TestServerCloseCompletesWithStalledWriter(t *testing.T) {
 	c := sendGetNoRead(t, addr, key)
 	defer func() { _ = c.Close() }()
 
-	// Give the server a moment to pick up the request and block in Flush against the
-	// non-reading client, so Close races a genuinely wedged writer.
-	time.Sleep(2 * writeTimeout)
+	// Stall as a NON-reading client past the write deadline: the server fills its buffers,
+	// blocks in Flush, the deadline fires (~writeTimeout) and the writer aborts and closes
+	// the conn — all WITHOUT us calling Server.Close. Sleeping >> writeTimeout but <<
+	// IdleTimeout ensures the closure is the WRITE deadline, not the idle timeout. (Draining
+	// without this stall would turn the client into a reader and the write would never
+	// block, so the deadline would never be the thing under test.)
+	time.Sleep(3 * writeTimeout)
 
+	// Now drain to EOF. Because the writer was cut off by the deadline, only the pre-deadline
+	// bytes (bounded by the socket buffers, well under valLen) are deliverable, then EOF. If
+	// the deadline were absent the writer would still be wedged and, as we drain, resume and
+	// deliver the FULL valLen before blocking again — so a near-full read (or a drain that
+	// never reaches EOF) is the failure signal. This makes the test actually gate the
+	// deadline rather than rely on Close's force-close. Reaching EOF also means the per-conn
+	// writerWG.Wait cleanup has already completed.
+	_ = c.SetReadDeadline(time.Now().Add(8 * time.Second))
+	start := time.Now()
+	n, _ := io.Copy(io.Discard, c)
+	if elapsed := time.Since(start); elapsed >= 8*time.Second {
+		t.Fatalf("drain took %v (hit the client read deadline): stalled writer was NOT unblocked by the deadline", elapsed)
+	}
+	if n >= valLen/2 {
+		t.Fatalf("read %d bytes (>= half of %d): writer was NOT cut off by the write deadline", n, valLen)
+	}
+
+	// With the writer already unblocked by the deadline, Server.Close must return promptly.
 	done := make(chan error, 1)
 	go func() { done <- srv.Close() }()
 	select {

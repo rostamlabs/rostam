@@ -90,7 +90,13 @@ func TestPipelinedSlowReaderRecycleIntegrity(t *testing.T) {
 	}
 
 	d := &aliasRecycleDispatcher{backings: backings, dispatched: make(chan struct{}, n)}
-	addr, stop := startPipelineTestServer(t, d)
+	// EnableOnlineCompaction ON: this is the opted-in configuration where recycle can
+	// occur, so the pipelined path must copy each payload out of its alias. The default
+	// (flag off) path enqueues the raw alias and would (correctly) fail this recycle
+	// simulation because nothing recycles in that mode — see TestPipelinedDefaultNoCopy.
+	// n*valLen = 36 MiB fits under connPipelineByteBudget (64 MiB), so all n admissions
+	// proceed without byte-budget backpressure and the stall reproduction is unchanged.
+	addr, stop := startPipelineTestServerCompaction(t, d, 0)
 	defer stop()
 
 	c, err := net.Dial("tcp", addr)

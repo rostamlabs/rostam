@@ -138,14 +138,20 @@ func New(cfg Config) (*Store, error) {
 	// (Replicated stays false).
 	if replicatedCacheShard(cfg) {
 		cfg.Cache.Replicated = true
-		// Enable ONLINE relocating compaction with quarantine-then-reset recycle
-		// (cache/compact_online.go) so a persistent replicated shard reclaims ghost
-		// page bytes WHILE running instead of only at restart (cold compaction) — the
-		// difference between eventually hitting ErrFull on dead versions and recovering
-		// write capacity online. The cache-side master gate (isMmap && Replicated &&
-		// reject-writes) means this is a no-op for a heap replicated shard (no DataDir)
-		// and for single-node / ringbuf shards, which stay byte-for-byte unchanged.
-		cfg.Cache.OnlineCompaction = true
+	}
+	// ONLINE relocating compaction with quarantine-then-reset recycle
+	// (cache/compact_online.go) is OPT-IN: cfg.Cache.OnlineCompaction is threaded in
+	// from rostam.ServerConfig.EnableOnlineCompaction (default false), NOT forced on
+	// here. It reclaims ghost page bytes WHILE the process runs instead of only at
+	// restart (cold compaction), but it is memory-safe ONLY when every read is released
+	// within the alias-drain fence — i.e. all reads flow through the WriteTimeout-bounded
+	// server transport (see ServerConfig.EnableOnlineCompaction's contract). A direct
+	// embedder that retains a raw Store.Get/Node.Call alias past the fence must NOT
+	// enable it. When it IS enabled on a replicated shard we derive and fail-closed
+	// enforce the fence below; the cache-side master gate (isMmap && Replicated &&
+	// reject-writes) makes it a no-op for heap replicated shards (no DataDir),
+	// single-node / ringbuf shards, and any non-replicated shard regardless.
+	if cfg.Cache.OnlineCompaction && cfg.Cache.Replicated {
 		// AliasQuarantine is the drain fence a retired page must sit through before its
 		// extent is reset and reused: it must exceed the maximum wall-clock lifetime of
 		// a zero-copy read alias. The only holder of a raw alias across a blocking

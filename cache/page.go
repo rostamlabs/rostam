@@ -50,13 +50,14 @@ type page struct {
 	// retired marks an mmap page whose live entries were all relocated OUT by online
 	// relocating compaction (cache/compact_online.go): no index slot addresses it any
 	// more, so the write path must stop handing out its stale-framed tail
-	// (firstPageWithRoomLocked skips it). Its bytes stay mapped and IMMUTABLE — Stage 1
-	// never resets, reuses, unmaps, or punches them, so any in-flight lock-free reader
-	// alias into the extent stays valid; the extent is stranded until a recycle stage
-	// gives the slot a fresh extent. WRITE-PATH-ONLY state, guarded by shard.mu (the
-	// lock-free read path never consults it — it resolves pages through pageSlots + the
-	// generation gate). Always false on heap / single-node / ringbuf shards, so those
-	// paths are byte-for-byte unchanged.
+	// (firstPageWithRoomLocked skips it). While retired its bytes stay mapped and
+	// IMMUTABLE so any in-flight lock-free reader alias into the extent stays valid; the
+	// extent is held this way only through the alias-drain QUARANTINE (see retiredAt),
+	// after which compactRecycleRetiredLocked RESETS the same extent in place (bumped
+	// generation) and hands it back to the write path. WRITE-PATH-ONLY state, guarded by
+	// shard.mu (the lock-free read path never consults it — it resolves pages through
+	// pageSlots + the generation gate). Always false on heap / single-node / ringbuf
+	// shards, so those paths are byte-for-byte unchanged.
 	retired bool
 
 	// retiredAt is the wall-clock instant this page was marked retired (set only

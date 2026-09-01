@@ -62,6 +62,10 @@ func TestOnlineRecycleRecoversCapacity(t *testing.T) {
 	const quarantine = 80 * time.Millisecond
 	c := eligibleOnlineCacheQ(t, 1, 1<<20, 8<<20, quarantine) // 8 pages
 	s := c.shards[0]
+	// Captured BEFORE any page is retired: used as the "not yet elapsed" clock in Phase C
+	// so that assertion is deterministic (t0 < every retiredAt) rather than a race against
+	// how long Phase A+B take on a loaded CI box.
+	t0 := time.Now()
 
 	// Phase A — fragment then relocate so pages retire. Write originals, then overwrite
 	// every key with a DISTINCT value: the early all-original pages become fully dead
@@ -96,20 +100,29 @@ func TestOnlineRecycleRecoversCapacity(t *testing.T) {
 	}
 
 	// Phase C — quarantine NOT yet elapsed: a recycle pass must reclaim nothing (a reader
-	// could still alias a retired page's bytes), so the shard stays full.
-	s.compactRelocateOnce(S)
-	if got := c.Stats().OnlinePagesRecycled; got != 0 {
-		t.Fatalf("recycled %d pages BEFORE quarantine elapsed — premature reset risks a torn read", got)
+	// could still alias a retired page's bytes), so the shard stays full. Driven with the
+	// explicit clock t0 (captured before retirement) so now.Sub(retiredAt) < 0 < quarantine
+	// DETERMINISTICALLY — the assertion no longer depends on Phase A+B finishing inside a
+	// short wall-clock window on a loaded box.
+	s.mu.Lock()
+	preRecycled := s.compactRecycleRetiredLocked(t0, quarantine)
+	s.mu.Unlock()
+	if preRecycled != 0 || c.Stats().OnlinePagesRecycled != 0 {
+		t.Fatalf("recycled %d pages BEFORE quarantine elapsed — premature reset risks a torn read", preRecycled)
 	}
 	if err := c.PutAt([]byte("probe"), bigVal, 0, S); err != ErrFull {
 		t.Fatalf("write must still be ErrFull before quarantine elapses: err=%v", err)
 	}
 
 	// Phase D — quarantine elapsed: recycling resets the retired extents and the
-	// previously-ErrFull write now succeeds.
-	time.Sleep(2 * quarantine)
-	s.compactRelocateOnce(S)
-	if got := c.Stats().OnlinePagesRecycled; got == 0 {
+	// previously-ErrFull write now succeeds. Driven with a clock 2*quarantine past now,
+	// which is strictly past retiredAt+quarantine, so the fence is elapsed DETERMINISTICALLY
+	// (no real sleep that a slow scheduler could under- or over-shoot).
+	future := time.Now().Add(2 * quarantine)
+	s.mu.Lock()
+	postRecycled := s.compactRecycleRetiredLocked(future, quarantine)
+	s.mu.Unlock()
+	if postRecycled == 0 || c.Stats().OnlinePagesRecycled == 0 {
 		t.Fatal("recycled nothing after the quarantine elapsed — capacity was not recovered")
 	}
 	if err := c.PutAt([]byte("probe"), bigVal, 0, S); err != nil {
@@ -242,7 +255,15 @@ func TestOnlineRecycleHeavyRace(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("mmap only on linux")
 	}
-	const quarantine = 20 * time.Millisecond
+	// The quarantine must exceed the longest a reader can hold an alias across its
+	// bytes.Equal check. Under -race a reader goroutine can be descheduled for tens of ms,
+	// so too short a fence lets recycle overwrite a still-aliased extent and the reader
+	// observes foreign bytes — a FALSE failure of an otherwise-correct config (production's
+	// fence is 2*WriteTimeout, orders of magnitude larger). 100ms is comfortably longer
+	// than a plausible -race deschedule yet far shorter than the ~3s writer runtime, so
+	// recycles still fire many times. Widening only risks a false FAIL, never a false PASS:
+	// a genuine torn read (overwrite racing a live alias) still trips -race and `bad`.
+	const quarantine = 100 * time.Millisecond
 	c := eligibleOnlineCacheQ(t, 1, 1<<20, 16<<20, quarantine) // 16 pages
 
 	const nKeys = 48
@@ -269,14 +290,17 @@ func TestOnlineRecycleHeavyRace(t *testing.T) {
 			var buf []byte
 			for !stop.Load() {
 				for i := 0; i < nKeys; i++ {
+					// Keys are always present (seeded, rewritten, no TTL/delete) and relocation+
+					// recycle are miss-free by construction, so a non-nil error is a LOST key —
+					// a failure like a torn value. Count both, not just the value mismatch.
 					if seed%2 == 0 {
 						out, gErr := c.GetInto(buf[:0], keyFor(i))
-						if gErr == nil && !bytes.Equal(out, valFor(i)) {
+						if gErr != nil || !bytes.Equal(out, valFor(i)) {
 							bad.Add(1)
 						}
 					} else {
 						v, gErr := c.Get(keyFor(i))
-						if gErr == nil && !bytes.Equal(v, valFor(i)) {
+						if gErr != nil || !bytes.Equal(v, valFor(i)) {
 							bad.Add(1)
 						}
 					}
@@ -339,6 +363,103 @@ func TestOnlineRecycleHeavyRace(t *testing.T) {
 		}
 		if !bytes.Equal(v, valFor(i)) {
 			t.Fatalf("final GetAt(%d): value mismatch", i)
+		}
+	}
+}
+
+// TestOnlineCompactionRunsBeforeApplyStamping is the "not inert at stamp 0" gate (the
+// inert-by-default bug). An opted-in replicated mmap reject-writes shard whose logical
+// clock has NOT advanced (EnableApplyStamp off ⇒ lastAppliedStampMs == 0) must still
+// relocate SUPERSEDED (index-dead) versions and recycle the emptied extents — reclaiming
+// dead duplicates needs no logical clock, only TTL drops do. Before the fix, sweepOnce
+// early-returned at stamp 0 and maybeRelocateCompact re-guarded stamp==0, so the whole
+// feature was inert until apply-stamping was enabled. Drives the SWEEPER (not
+// compactRelocateOnce directly) so it gates the real sweepOnce path; recycle timing is
+// driven deterministically via an explicit clock.
+func TestOnlineCompactionRunsBeforeApplyStamping(t *testing.T) {
+	const quarantine = 80 * time.Millisecond
+	c := eligibleOnlineCacheQ(t, 1, 1<<20, 8<<20, quarantine) // 8 pages
+	s := c.shards[0]
+	t0 := time.Now() // captured before retirement: the deterministic "not elapsed" clock.
+
+	// Write originals then overwrite with DISTINCT values — all at stamp 0 (nowMs 0), which
+	// (advanceAppliedStamp is a running max) leaves the logical clock at 0. The all-original
+	// early pages become fully dead superseded space.
+	const nKeys = 12
+	keyFor := func(i int) []byte { return []byte(fmt.Sprintf("live%03d", i)) }
+	origFor := func(i int) []byte { return bytes.Repeat([]byte{byte('A' + i)}, 180_000) }
+	liveFor := func(i int) []byte { return bytes.Repeat([]byte{byte('a' + i)}, 180_000) }
+	for i := 0; i < nKeys; i++ {
+		if err := c.PutAt(keyFor(i), origFor(i), 0, 0); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	for i := 0; i < nKeys; i++ {
+		if err := c.PutAt(keyFor(i), liveFor(i), 0, 0); err != nil {
+			t.Fatalf("overwrite %d: %v", i, err)
+		}
+	}
+	// The logical clock really is 0 — this IS the EnableApplyStamp=false case.
+	if got := s.LastAppliedStampMs(); got != 0 {
+		t.Fatalf("logical clock = %d, want 0 (writes at nowMs 0 must not advance the stamp)", got)
+	}
+	// Reclaimable is visible with NO stamp: superseded dead space is judged at dropClock 0.
+	if got := s.reclaimableBytesForStats(); got == 0 {
+		t.Fatal("reclaimable is 0 at stamp 0 — superseded dead space must be accounted without a clock")
+	}
+
+	// Drive the SWEEPER: it must NOT be inert at stamp 0 — it relocates then retires the
+	// fully-dead pages. Before the fix this loop would never retire anything.
+	retired := uint64(0)
+	for pass := 0; pass < 64; pass++ {
+		s.sweepOnce()
+		if retired = c.Stats().OnlinePagesRetired; retired > 0 {
+			break
+		}
+	}
+	if retired == 0 {
+		t.Fatal("sweepOnce retired no pages at stamp 0 — online compaction is inert (the bug)")
+	}
+
+	// Exhaust the remaining writable pages (retired extents are still stranded) so the shard
+	// is genuinely full, then confirm a full-size write is ErrFull.
+	bigVal := bytes.Repeat([]byte("z"), 180_000)
+	fillUntilFull(t, c, "fill", bigVal, 0)
+	if err := c.PutAt([]byte("probe"), bigVal, 0, 0); err != ErrFull {
+		t.Fatalf("shard should be full before recycle: err=%v, want ErrFull", err)
+	}
+
+	// Before the quarantine elapses nothing recycles (deterministic: t0 < every retiredAt).
+	s.mu.Lock()
+	pre := s.compactRecycleRetiredLocked(t0, quarantine)
+	s.mu.Unlock()
+	if pre != 0 {
+		t.Fatalf("recycled %d pages before the quarantine elapsed at stamp 0", pre)
+	}
+	if err := c.PutAt([]byte("probe"), bigVal, 0, 0); err != ErrFull {
+		t.Fatalf("write must still be ErrFull before quarantine elapses: err=%v", err)
+	}
+
+	// After the quarantine, recycle resets the retired extents at stamp 0 and the previously
+	// ErrFull write succeeds — capacity recovered WITHOUT any apply-stamp.
+	future := time.Now().Add(2 * quarantine)
+	s.mu.Lock()
+	post := s.compactRecycleRetiredLocked(future, quarantine)
+	s.mu.Unlock()
+	if post == 0 {
+		t.Fatal("recycled nothing after the quarantine at stamp 0 — capacity not recovered")
+	}
+	if err := c.PutAt([]byte("probe"), bigVal, 0, 0); err != nil {
+		t.Fatalf("post-recycle PutAt at stamp 0: %v, want success", err)
+	}
+	// Every live key still resolves to its exact overwrite value.
+	for i := 0; i < nKeys; i++ {
+		v, err := c.Get(keyFor(i))
+		if err != nil {
+			t.Fatalf("post-recycle Get(%d): %v", i, err)
+		}
+		if !bytes.Equal(v, liveFor(i)) {
+			t.Fatalf("post-recycle Get(%d): value mismatch (resolved a stale/recycled copy?)", i)
 		}
 	}
 }

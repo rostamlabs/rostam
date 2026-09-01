@@ -12,13 +12,15 @@ import (
 	"github.com/rostamlabs/rostam/ops"
 )
 
-// TestNewFailsClosedOnUnsafeAliasQuarantine proves Fix 2: on a REPLICATED shard the
-// online-compaction alias-drain fence is derived from the effective server
-// WriteTimeout (Cache.ServerWriteTimeout) as AliasQuarantine = 2*WriteTimeout, and an
-// explicitly-set AliasQuarantine below that floor makes New() refuse to start rather
-// than run an unsafe fence. This is the corruption invariant a comment alone cannot
-// enforce: a fence shorter than the worst-case inline alias hold could recycle a
-// retired mmap page while a response writer still aliases its bytes (torn read).
+// TestNewFailsClosedOnUnsafeAliasQuarantine proves the fence: on a REPLICATED shard with
+// online compaction ENABLED (it is opt-in), the alias-drain fence is derived from the
+// effective server WriteTimeout (Cache.ServerWriteTimeout) as AliasQuarantine =
+// 2*WriteTimeout, and an explicitly-set AliasQuarantine below that floor makes New()
+// refuse to start rather than run an unsafe fence. This is the corruption invariant a
+// comment alone cannot enforce: a fence shorter than the worst-case inline alias hold
+// could recycle a retired mmap page while a response writer still aliases its bytes (torn
+// read). The fence is only derived/enforced when online compaction is enabled, so mk sets
+// it.
 func TestNewFailsClosedOnUnsafeAliasQuarantine(t *testing.T) {
 	reg := ops.NewRegistry()
 	if err := ops.RegisterBuiltins(reg); err != nil {
@@ -35,6 +37,7 @@ func TestNewFailsClosedOnUnsafeAliasQuarantine(t *testing.T) {
 		cfg.NoSync = true
 		_, inmem := hraft.NewInmemTransport("")
 		cfg.RaftTransport = inmem
+		cfg.Cache.OnlineCompaction = true // opt in: the fence is only enforced when enabled.
 		cfg.Cache.ServerWriteTimeout = writeTimeout
 		cfg.Cache.AliasQuarantine = aliasQuarantine
 		return cfg
