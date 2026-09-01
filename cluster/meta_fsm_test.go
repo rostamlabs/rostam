@@ -116,19 +116,33 @@ func TestMetaFSMStateIsDeepCopy(t *testing.T) {
 	}
 }
 
-func TestMetaFSMStateShardFormerIsDeepCopy(t *testing.T) {
+func TestApplySetMembersRFChangeIsNotIdempotent(t *testing.T) {
 	f := NewMetaFSM()
-	data, _ := encodeLogEntry(LogEntry{Op: OpSetShardFormer, ShardID: 0, Node: "n1"})
-	// OpSetShardFormer returns true on first write (write-once designation), not nil.
-	resp := f.Apply(&raft.Log{Data: data})
-	if installed, ok := resp.(bool); !ok || !installed {
-		t.Fatalf("Apply: expected true, got %v", resp)
+	peers := []Peer{
+		{NodeID: "n1", RaftAddr: "a:1", ServerAddr: "a:2"},
+		{NodeID: "n2", RaftAddr: "b:1", ServerAddr: "b:2"},
+		{NodeID: "n3", RaftAddr: "c:1", ServerAddr: "c:2"},
 	}
-	st1 := f.State()
-	st1.ShardFormer[0] = "MUTATED"
-	st2 := f.State()
-	if st2.ShardFormer[0] != "n1" {
-		t.Errorf("ShardFormer not deep-copied: got %q, want %q", st2.ShardFormer[0], "n1")
+	apply := func(rf int) {
+		data, _ := encodeLogEntry(LogEntry{Op: OpSetMembers, Members: peers, NumShards: 2, ReplicationFactor: rf})
+		if resp := f.Apply(&raft.Log{Data: data}); resp != nil {
+			t.Fatalf("Apply(RF=%d): %v", rf, resp)
+		}
+	}
+	// Bootstrap with RF=3 (full replication on 3 nodes).
+	apply(3)
+	st := f.State()
+	if len(st.Placement[0]) != 3 {
+		t.Fatalf("after RF=3: Placement[0] len = %d, want 3", len(st.Placement[0]))
+	}
+	// Change only RF to 2. Placement must reflect the new RF.
+	apply(2)
+	st = f.State()
+	if len(st.Placement[0]) != 2 {
+		t.Fatalf("after RF=2: Placement[0] len = %d, want 2 (RF change was dropped)", len(st.Placement[0]))
+	}
+	if st.ReplicationFactor != 2 || !st.ReplicationFactorSet {
+		t.Fatalf("ReplicationFactor not recorded: got %d set=%v", st.ReplicationFactor, st.ReplicationFactorSet)
 	}
 }
 
@@ -548,6 +562,9 @@ func (n noopSink) Cancel() error               { return nil }
 
 func equalState(a, b State) bool {
 	if a.NumShards != b.NumShards || len(a.Members) != len(b.Members) || len(a.Placement) != len(b.Placement) {
+		return false
+	}
+	if a.ReplicationFactor != b.ReplicationFactor || a.ReplicationFactorSet != b.ReplicationFactorSet {
 		return false
 	}
 	for i := range a.Members {

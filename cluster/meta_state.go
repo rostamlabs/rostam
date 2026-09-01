@@ -130,7 +130,9 @@ type State struct {
 	// a per-shard floor is a later refinement. Guarded by the FSM lock like the
 	// rest of State. NEVER blocks the election reset (that is OpSetShardEpoch, which
 	// deliberately resets the ISR to {primary} — a different op, not floor-checked).
-	MinISR int
+	MinISR               int
+	ReplicationFactor    int
+	ReplicationFactorSet bool
 	// LastIndex carries the MetaFSM command frontier (its applied-command index)
 	// INTO a snapshot so a snapshot-restored follower does not under-report 0 and
 	// wait forever for the readIndex barrier. It is FSM-applied metadata, NOT

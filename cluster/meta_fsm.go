@@ -325,11 +325,22 @@ func (m *MetaFSM) Apply(log *raft.Log) any {
 		sort.Slice(sorted, func(i, j int) bool {
 			return sorted[i].NodeID < sorted[j].NodeID
 		})
+		// Backfill: if this is the first OpSetMembers to carry ReplicationFactor
+		// (ReplicationFactorSet was false on a legacy snapshot) and members/shard
+		// count are unchanged, only record the RF — do NOT recompute Placement,
+		// which would clobber any per-shard rebalance work stored in the snapshot.
+		backfill := !m.state.ReplicationFactorSet &&
+			m.state.NumShards == entry.NumShards &&
+			peerSlicesEqual(m.state.Members, sorted)
 		m.state.Members = sorted
 		m.state.NumShards = entry.NumShards
-		// Placement distributes shards across members in replica sets of
-		// ReplicationFactor nodes; rf 0 / >= len(members) = full replication.
-		m.state.Placement = computePlacement(sorted, entry.NumShards, entry.ReplicationFactor)
+		m.state.ReplicationFactor = entry.ReplicationFactor
+		m.state.ReplicationFactorSet = true
+		if !backfill {
+			// Placement distributes shards across members in replica sets of
+			// ReplicationFactor nodes; rf 0 / >= len(members) = full replication.
+			m.state.Placement = computePlacement(sorted, entry.NumShards, entry.ReplicationFactor)
+		}
 		// Seed the structural ISR floor (ISR hardening). Only RAISE it from a
 		// real seed (>0); a stray/old OpSetMembers carrying MinISR==0 (raft mode, or
 		// a pre-floor snapshot re-commit) must never clobber an established floor.
