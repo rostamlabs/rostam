@@ -85,6 +85,26 @@ func startPipelineTestServer(t *testing.T, d Dispatcher) (addr string, closeFn f
 	return srv.Addr().String(), func() { _ = srv.Close() }
 }
 
+// startPipelineTestServerCompaction starts a server with EnableOnlineCompaction on,
+// so the pipelined path COPIES each payload out of its cache alias and enforces the
+// per-connection byte budget — the opted-in configuration the recycle-integrity and
+// byte-budget tests exercise. WriteTimeout is set short so a wedged writer aborts the
+// connection quickly instead of pinning the test for the 30s default.
+func startPipelineTestServerCompaction(t *testing.T, d Dispatcher, writeTimeout time.Duration) (addr string, closeFn func()) {
+	t.Helper()
+	srv, err := New(Config{
+		Addr:                   "127.0.0.1:0",
+		Dispatcher:             d,
+		EnableOnlineCompaction: true,
+		WriteTimeout:           writeTimeout,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	go func() { _ = srv.Serve() }()
+	return srv.Addr().String(), func() { _ = srv.Close() }
+}
+
 // TestPipelinedRequestsAnswerInOrder sends a burst of requests on ONE conn
 // without reading responses, then asserts every response arrives in request
 // order with the right payload.

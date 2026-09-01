@@ -73,6 +73,17 @@ func (s *Store) SetLeaderFrontierFn(fn func(deadline time.Time) (uint64, error))
 	s.leaderFrontierFn = fn
 }
 
+// defaultServerWriteTimeout is the FALLBACK write-deadline used only when the
+// effective server.Config.WriteTimeout was not threaded into the cache config
+// (Cache.ServerWriteTimeout == 0). It matches server.Config's own default
+// WriteTimeout, so a library embedder that overrides neither gets the same 30s on
+// both sides. It is duplicated here rather than imported to avoid a shard→server
+// dependency. This is NO LONGER a silent mirror of a possibly-different operative
+// value: when the transport sets a non-default WriteTimeout, that value is threaded
+// in via Cache.ServerWriteTimeout and the derivation + fail-closed assertion below
+// track it, so the drain fence cannot drift out of step with the real deadline.
+const defaultServerWriteTimeout = 30 * time.Second
+
 // replicatedCacheShard reports whether cfg is a cluster-replication shard whose
 // cache must fail closed (reject) at capacity rather than silently evict (#4
 // Phase B / B2). True for PB mode or any Raft shard wired with a cluster
@@ -127,6 +138,64 @@ func New(cfg Config) (*Store, error) {
 	// (Replicated stays false).
 	if replicatedCacheShard(cfg) {
 		cfg.Cache.Replicated = true
+	}
+	// ONLINE relocating compaction with quarantine-then-reset recycle
+	// (cache/compact_online.go) is OPT-IN: cfg.Cache.OnlineCompaction is threaded in
+	// from rostam.ServerConfig.EnableOnlineCompaction (default false), NOT forced on
+	// here. It reclaims ghost page bytes WHILE the process runs instead of only at
+	// restart (cold compaction), but it is memory-safe ONLY when every read is released
+	// within the alias-drain fence — i.e. all reads flow through the WriteTimeout-bounded
+	// server transport (see ServerConfig.EnableOnlineCompaction's contract). A direct
+	// embedder that retains a raw Store.Get/Node.Call alias past the fence must NOT
+	// enable it. When it IS enabled on a replicated shard we derive and fail-closed
+	// enforce the fence below; the cache-side master gate (isMmap && Replicated &&
+	// reject-writes) makes it a no-op for heap replicated shards (no DataDir),
+	// single-node / ringbuf shards, and any non-replicated shard regardless.
+	if cfg.Cache.OnlineCompaction && cfg.Cache.Replicated {
+		// AliasQuarantine is the drain fence a retired page must sit through before its
+		// extent is reset and reused: it must exceed the maximum wall-clock lifetime of
+		// a zero-copy read alias. The only holder of a raw alias across a blocking
+		// network flush is the TCP response writer, bounded by the EFFECTIVE
+		// server.Config.WriteTimeout (the INLINE non-pipelined path; the pipelined path
+		// copies at dispatch, so its hold is ~0); every other consumer copies
+		// synchronously. So the fence must be at least 2*WriteTimeout — conservative
+		// headroom over the inline hold. We derive it from the effective WriteTimeout
+		// threaded in via Cache.ServerWriteTimeout (single source of truth), NOT a
+		// hardcoded mirror, so raising the server's WriteTimeout raises the fence in
+		// lockstep instead of silently defeating it.
+		effectiveWriteTimeout := cfg.Cache.ServerWriteTimeout
+		if effectiveWriteTimeout <= 0 {
+			// rostam.NewServer always threads WriteTimeout (its own default is the same
+			// 30s), so this fallback is only reached by a library embedder building a
+			// REPLICATED shard directly via NewEmbedded without setting WriteTimeout. If
+			// that embedder runs a custom transport whose response write can block LONGER
+			// than 30s, this fence under-sizes the real alias-hold and a recycle could tear
+			// a read. We cannot see the embedder's transport, so warn loudly rather than
+			// assume — the safe action is for them to set WriteTimeout to their transport's
+			// write deadline (or set AliasQuarantine explicitly, which the fail-closed
+			// check below then validates).
+			slog.Warn("replicated shard has online compaction enabled but no server WriteTimeout was threaded; "+
+				"the alias-drain fence falls back to 2*30s — if your transport can hold a zero-copy read response "+
+				"longer than 30s, set Config.WriteTimeout (or an explicit Cache.AliasQuarantine) to your write deadline",
+				"component", "shard", "shard", cfg.ShardIndex)
+			effectiveWriteTimeout = defaultServerWriteTimeout
+		}
+		minAliasQuarantine := 2 * effectiveWriteTimeout
+		if cfg.Cache.AliasQuarantine == 0 {
+			cfg.Cache.AliasQuarantine = minAliasQuarantine
+		}
+		// FAIL-CLOSED corruption invariant. An operator may set AliasQuarantine
+		// explicitly; if it is below 2*WriteTimeout the drain fence is shorter than the
+		// worst-case inline alias hold, so an online page recycle could overwrite bytes
+		// a response writer still aliases and ship a torn read. A comment cannot enforce
+		// a corruption invariant — refuse to start rather than run an unsafe fence.
+		if cfg.Cache.AliasQuarantine < minAliasQuarantine {
+			return nil, fmt.Errorf("shard: unsafe online-compaction fence on replicated shard %d: "+
+				"AliasQuarantine (%s) must be >= 2*server WriteTimeout (2*%s = %s); a shorter "+
+				"quarantine can recycle a retired mmap page while a zero-copy response alias still "+
+				"references its bytes (torn read)",
+				cfg.ShardIndex, cfg.Cache.AliasQuarantine, effectiveWriteTimeout, minAliasQuarantine)
+		}
 	}
 
 	c, err := cache.New(cfg.Cache)

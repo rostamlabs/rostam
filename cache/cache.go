@@ -300,6 +300,11 @@ func (c *Cache) Stats() Stats {
 		agg.CompactionsAborted += x.CompactionsAborted
 		agg.CompactionBytesReclaimed += x.CompactionBytesReclaimed
 		agg.CompactionDurationMs += x.CompactionDurationMs
+		agg.ReclaimableBytes += x.ReclaimableBytes
+		agg.OnlineRelocations += x.OnlineRelocations
+		agg.OnlineBytesRelocated += x.OnlineBytesRelocated
+		agg.OnlinePagesRetired += x.OnlinePagesRetired
+		agg.OnlinePagesRecycled += x.OnlinePagesRecycled
 	}
 	return agg
 }

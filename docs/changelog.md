@@ -5,6 +5,35 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **Online compaction for replicated shards (opt-in, off by default).** A
+  persistent (mmap) cluster-replicated shard is append-only under reject-writes:
+  an overwrite writes a new copy and leaves the old one as dead "ghost" bytes, so
+  under write/overwrite churn a shard could climb to capacity and reject writes
+  with "at capacity" until the next restart reclaimed the space (cold
+  compaction). With `ServerConfig.EnableOnlineCompaction` set, the background
+  sweeper now reclaims that dead space **while the process runs**: it relocates
+  the live entries out of fragmented pages, retires the emptied pages, and — once
+  an alias-drain fence has elapsed — resets those pages back into writable space,
+  so a shard recovers write capacity online instead of only at restart. It leaves
+  the lock-free zero-copy read path untouched and is a no-op on heap, single-node,
+  and ring-buffer shards. **It is off by default and must be enabled explicitly**
+  because of its safety contract: recycling overwrites retired page bytes, which
+  is memory-safe only when every read is released within the fence — i.e. when all
+  reads flow through the server transport, whose write timeout bounds the
+  zero-copy response. Do **not** enable it if an in-process embedder retains a raw
+  `Store.Get` / `Node.Call` result (a cache alias) past the fence; those readers
+  must copy the value out. The fence is derived from the new `WriteTimeout` and is
+  enforced fail-closed at startup, so it can never fall below the real write
+  deadline. `Stats.ReclaimableBytes` (a gauge) exposes the current ghost-byte
+  pressure whether or not compaction is enabled.
+
+- **New `ServerConfig.WriteTimeout`.** Bounds how long a single TCP response
+  write may block on a stalled client before the connection is aborted (default
+  30s). Besides slow-client hygiene it is the source of truth for the online-
+  compaction alias fence above, so raising it raises the fence in lockstep. A
+  consumer slower than this is disconnected rather than allowed to pin a
+  response buffer indefinitely.
+
 - **New key-value op: `flush`.** Wipes the entire KV keyspace in one call,
   in O(shards) rather than O(keys) — it swaps each shard's in-memory index for
   an empty one and records a small per-shard durability watermark, so pages are
