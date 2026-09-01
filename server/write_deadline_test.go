@@ -55,6 +55,34 @@ func sendGetNoRead(t *testing.T, addr string, key []byte) net.Conn {
 	return c
 }
 
+// sendGetsNoRead writes `count` get frames for the same key in ONE buffered flush and
+// returns the still-open, non-reading conn. Sending two or more frames together forces
+// the server onto the PIPELINED path DETERMINISTICALLY: the first frame's read leaves
+// the later frame(s) buffered (r.Buffered() > 0), and once the first large response
+// stalls the writer, every following frame sees outstanding > 0. A single small get is
+// only *usually* pipelined — whether the tiny body is buffered alongside its header
+// depends on TCP segmentation — so a test that must exercise the ordered-writer goroutine
+// (its writerWG cleanup) sends a pair rather than relying on that timing.
+func sendGetsNoRead(t *testing.T, addr string, key []byte, count int) net.Conn {
+	t.Helper()
+	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	w := bufio.NewWriter(c)
+	for i := 0; i < count; i++ {
+		if err := writeFrame(w, EncodeRequest("get", ops.EncodeKeyArgs(key))); err != nil {
+			_ = c.Close()
+			t.Fatalf("write get frame %d: %v", i, err)
+		}
+	}
+	if err := w.Flush(); err != nil {
+		_ = c.Close()
+		t.Fatalf("flush get frames: %v", err)
+	}
+	return c
+}
+
 // TestServerWriteDeadlineClosesStalledReader proves the response write deadline
 // bounds the alias hold: a client that sends a get for a large value and then stops
 // reading has its connection aborted within ~WriteTimeout (the server cannot be left
@@ -116,9 +144,11 @@ func TestServerCloseCompletesWithStalledWriter(t *testing.T) {
 	const writeTimeout = 200 * time.Millisecond
 	srv, addr := startServer(t, func(c *Config) { c.WriteTimeout = writeTimeout })
 
-	// > any socket buffer, so the server MUST block in Flush against a non-reading client.
-	// Its body also overflows the 8 KiB conn bufio, so this get takes the PIPELINED path —
-	// the ordered writer goroutine whose writerWG.Wait cleanup is the historic hang site.
+	// Each response is > any socket buffer, so the server MUST block in Flush against a
+	// non-reading client. Sending TWO gets in one write forces the PIPELINED path
+	// deterministically — the ordered writer goroutine whose writerWG.Wait cleanup is the
+	// historic hang site — rather than depending on whether a single small request's body
+	// happens to be buffered with its header (cubic P2).
 	const valLen = 15 << 20
 	val := make([]byte, valLen)
 	key := []byte("big")
@@ -126,7 +156,7 @@ func TestServerCloseCompletesWithStalledWriter(t *testing.T) {
 		t.Fatalf("put status = %d, want OK", status)
 	}
 
-	c := sendGetNoRead(t, addr, key)
+	c := sendGetsNoRead(t, addr, key, 2)
 	defer func() { _ = c.Close() }()
 
 	// Stall as a NON-reading client past the write deadline: the server fills its buffers,

@@ -76,8 +76,10 @@ package cache
 // whose WriteTimeout bounds the alias (AliasQuarantine = 2*WriteTimeout). An in-process
 // embedder that retains a raw Store.Get/Node.Call alias past the fence would see it
 // overwritten, so the feature stays operator opt-in (rostam.ServerConfig.
-// EnableOnlineCompaction) rather than forced on. The reclaimable-byte accounting and the
-// trigger (Stage 0) run regardless of the flag — reclaimable is always visible in Stats.
+// EnableOnlineCompaction) rather than forced on. The reclaimable-byte figure stays visible
+// in Stats regardless of the flag (reclaimableBytesForStats computes it on demand), but the
+// sweep-path scan and trigger run ONLY when the flag is on — a not-opted-in shard adds zero
+// cost to the sweeper.
 
 import "time"
 
@@ -201,14 +203,16 @@ func (s *shard) reclaimableBytesForStats() uint64 {
 	return used - live
 }
 
-// maybeRelocateCompact is the sweeper hook. STAGE 0: it records the reclaimable-byte
-// figure (already exposed via Stats) and evaluates the relocation TRIGGER. STAGE 1:
-// when Config.OnlineCompaction is set and the trigger fires, it runs one budgeted,
-// reader-safe relocation pass. Called from sweepOnce's replicated branch, AFTER
+// maybeRelocateCompact is the sweeper hook. When Config.OnlineCompaction is off (the
+// default) it returns immediately WITHOUT scanning — the reclaimable gauge Stats reports
+// is computed separately, on demand, by reclaimableBytesForStats(), so an eligible but
+// not-opted-in shard pays nothing on the sweep path. When the flag is on it evaluates the
+// relocation TRIGGER (reclaimable dead-ratio / occupancy) and, if it fires, runs one
+// budgeted, reader-safe relocation pass. Called from sweepOnce's replicated branch, AFTER
 // sweepIndex has tombstoned logically-expired slots (so relocation never moves an
 // expired entry) and reclaimExpiredHeapPages (a no-op for mmap).
 //
-// It runs even before apply-stamping advances the logical clock. dropClock is
+// When enabled it runs even before apply-stamping advances the logical clock. dropClock is
 // compactDropClock() — the logical clock (lastAppliedStampMs), 0 on a not-yet-stamped
 // replicated shard. At 0, isExpired(exp, 0) is false for every entry, so NO key is
 // dropped by TTL; but SUPERSEDED / index-dead versions (the actual dead-space problem)
@@ -219,6 +223,17 @@ func (s *shard) reclaimableBytesForStats() uint64 {
 func (s *shard) maybeRelocateCompact() {
 	if !s.onlineCompactionEligible() {
 		return // gate: heap / single-node / ringbuf shards are entirely unaffected.
+	}
+	if !s.cfg.OnlineCompaction {
+		// The relocation ACTION is opt-in (see Config.OnlineCompaction), and it is OFF by
+		// default. When off, skip the whole O(entries) liveness scan on this sweep hot
+		// path: its only outputs are the relocation trigger (moot when the action is off)
+		// and a LOCAL reclaimable figure that Stats does NOT read — Stats computes its
+		// reclaimable gauge on demand via reclaimableBytesForStats(). So nothing
+		// observable is lost, and an eligible-but-not-opted-in shard sweeps exactly as
+		// cheaply as it did before this feature existed. (Previously this ran the full
+		// scan every tick only to discard its result once the flag proved off.)
+		return
 	}
 	dropClock := s.compactDropClock() // logical clock; 0 (⇒ no TTL drops) until stamping is on.
 	capacity := s.pageCapacityBytes()
@@ -236,12 +251,6 @@ func (s *shard) maybeRelocateCompact() {
 	// (dead-ratio ≥ min-reclaim) OR the shard is running hot (occupancy ≥ warn-high) —
 	// the same two marks the restart-time cold compactor and the occupancy alert use.
 	if deadRatio < mmapCompactMinReclaimRatio && occupancy < mmapOccupancyWarnHigh {
-		return
-	}
-	if !s.cfg.OnlineCompaction {
-		// Stage 0 only: the trigger fired and the reclaimable figure is live in Stats,
-		// but the relocation ACTION is opt-in (see Config.OnlineCompaction — without a
-		// retired-extent recycle stage, relocation alone only consumes fresh tail).
 		return
 	}
 	s.compactRelocateOnce(dropClock)

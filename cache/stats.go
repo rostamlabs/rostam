@@ -3,11 +3,12 @@
 package cache
 
 // Stats is a snapshot of cache counters.
-// Every field EXCEPT ReclaimableBytes is a cumulative counter accumulated since cache
-// creation; use rate calculations by sampling and diffing them. ReclaimableBytes is a
-// point-in-time GAUGE (current ghost-byte pressure) that RISES and FALLS as writes
-// fragment pages and compaction reclaims them — do not diff it as a counter, and do not
-// read a compaction-driven decrease as counter wraparound.
+// Most fields are cumulative counters accumulated since cache creation (Gets, Hits,
+// Puts, Evictions, the Compaction* totals, …); sample and diff them for rates. The
+// exceptions are point-in-time GAUGES that RISE and FALL and must NOT be diffed as
+// counters (a decrease is not wraparound): PagesAllocated, BytesAllocated and BytesUsed
+// report current capacity/occupancy, and ReclaimableBytes reports current ghost-byte
+// pressure (which compaction actively drives back down).
 type Stats struct {
 	Gets             uint64
 	Hits             uint64

@@ -236,6 +236,15 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.HTTPAddr == "" && cfg.GRPCAddr == "" && cfg.TCPAddr == "" {
 		return nil, errors.New("rostam: NewServer requires at least one of HTTPAddr/GRPCAddr/TCPAddr")
 	}
+	// A negative WriteTimeout is a misconfiguration; fold it to 0 (== unset) so it flows
+	// through the SAME "<=0 means default" path on BOTH sides — the TCP transport
+	// (server.Config.applyDefaults → 30s) and the replicated shards' alias-drain fence
+	// (shard.New's 30s fallback). Without this, a negative value threaded raw into
+	// clusterCfg.WriteTimeout below would derive a negative AliasQuarantine and fail shard
+	// startup with a fence error that names the wrong knob (0 keeps the two sides matched).
+	if cfg.WriteTimeout < 0 {
+		cfg.WriteTimeout = 0
+	}
 
 	// Build the backing store and a dispatcher onto it, shared by every
 	// transport. Cluster mode (Raft replication) when cfg.Cluster is set, else
