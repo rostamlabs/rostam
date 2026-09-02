@@ -156,6 +156,14 @@ jobs:
   image-manifest:
     name: image manifest
     needs: image
+    # Explicit condition, not the implicit success(): the `image` job carries an
+    # always()-guarded `if`, and on a tag push the upstream validate-tag job is
+    # skipped — that combination poisons a downstream default success() check and
+    # silently SKIPS this job, so the per-arch digests never get combined into the
+    # tagged `:vX.Y.Z` / `:latest` manifest (the binaries still publish, so the gap
+    # is easy to miss). Gate on image succeeding regardless of how validate-tag
+    # resolved, matching the always() pattern the binaries/image jobs already use.
+    if: ${{ always() && needs.image.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
