@@ -5,6 +5,8 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+## v0.6.0 — 2026-09-02
+
 - **Online compaction for replicated shards (opt-in, off by default).** A
   persistent (mmap) cluster-replicated shard is append-only under reject-writes:
   an overwrite writes a new copy and leaves the old one as dead "ghost" bytes, so
@@ -70,6 +72,16 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   existing reservation needs the Windows 10 1803 placeholder API, which is not
   wired up. Nothing changes for Linux, and a reservation remains an optimization
   — where it cannot be made, growth simply falls back.
+
+- **Cluster metadata stability fixes.** Three correctness fixes in the
+  Raft-replicated metadata plane: `Node.Close()` now waits for its background
+  cluster-management goroutines (the PB control-plane seeder and the
+  shard-formation seeder/driver) to exit before tearing down shared resources,
+  removing a shutdown use-after-free; `MetaFSM.State()` returns a deep copy of
+  `ShardFormer` so a caller can no longer mutate the internal map or race a
+  concurrent `Apply`; and the `ApplySetMembersIfLeader` idempotency check now
+  accounts for `ReplicationFactor`, so an RF change is no longer silently skipped
+  when members, shard count, and MinISR are unchanged.
 
 ## v0.5.0 — 2026-08-30
 
