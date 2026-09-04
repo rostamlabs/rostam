@@ -21,12 +21,12 @@ Jump to [Code, side by side](#code-side-by-side).
 
 | Qdrant | Rostam | Notes |
 |---|---|---|
-| `QdrantClient(url=…)` | `Rostam(url, api_key=…)` | REST on `:8080`, native TCP on `:7000`. |
+| `QdrantClient(url=…)` | `Rostam(url, api_key=…)` | REST on `:8080`; native TCP on `:7000` is opt-in (start with `-tcp :7000`). |
 | Collection | **Collection** | `create_collection(name, dim, metric)`. |
 | `VectorParams(size, distance)` | `dim=…, metric=…` | Distance mapping [below](#distance-metrics). |
-| `PointStruct(id, vector, payload)` | Point (`id`, embedding, `metadata`, optional `content`) | `payload` → `metadata`; ids are integers, see [IDs](#ids). |
+| `PointStruct(id, vector, payload)` | Point (`id`, embedding, `metadata`, optional `content`) | `payload` → `metadata` (scalar values only); ids are integers, see [IDs](#ids). |
 | `Filter` / `FieldCondition` | `filters` helpers (`f.eq`, …) | Full table [below](#translating-filters). |
-| Multitenancy via a payload field | **Tenant** (`<tenant>/<collection>`) | A real primitive + optional auth boundary; see [Multitenancy](#multitenancy-tenants). |
+| Multitenancy via a payload field | **Tenant** (`<tenant>/<collection>`) | A real primitive + optional auth boundary; see [Multitenancy](#multitenancy). |
 | `ScoredPoint.score` | `hit.distance` (and `hit.score`) | Rostam's `distance` is unambiguous (smaller = closer); see [Scores](#scores-vs-distances). |
 | Cluster / sharding | Raft cluster, online resharding | [Clustering](../server/clustering.md). |
 
@@ -36,7 +36,7 @@ Jump to [Code, side by side](#code-side-by-side).
 # one static binary; no separate services to run. Pass the token via env, not a
 # flag (a -api-key flag secret leaks via /proc and shell history):
 export ROSTAM_API_KEY="a-strong-token"
-rostam-server -http :8080 -data ./data
+rostam-server -http :8080 -data ./data          # add -tcp :7000 to also serve the native TCP protocol
 ```
 
 The server refuses to bind a reachable address without auth. See
@@ -81,7 +81,7 @@ client.upsert("docs", points=[
     models.PointStruct(id=1, vector=embedding, payload={"doc_id": 7, "lang": "en"}),
 ])
 
-# Rostam  (payload -> metadata; content is an optional stored text payload)
+# Rostam  (payload -> metadata, scalar values only; content is an optional stored text payload)
 c.upsert("docs", 1, embedding, content="the chunk text",
          metadata={"doc_id": 7, "lang": "en"})
 ```
@@ -133,36 +133,48 @@ helpers (`from rostam import filters as f`).
 | Qdrant | Rostam |
 |---|---|
 | `FieldCondition(key="g", match=MatchValue(value="x"))` | `f.eq("g", "x")` |
-| `FieldCondition(key="g", match=MatchAny(any=["a","b"]))` | `f.in_("g", ["a", "b"])` |
-| `FieldCondition(key="g", match=MatchExcept(**{"except": ["a"]}))` | `f.not_(f.in_("g", ["a"]))` |
-| `FieldCondition(key="n", range=Range(gte=3, lte=9))` | `f.and_(f.gte("n", 3), f.lte("n", 9))` |
+| `MatchAny(any=[…])` on a **scalar** field | `f.in_("g", [...])` |
+| `MatchAny(any=[…])` on an **array** field | `f.or_(f.contains("g", a), f.contains("g", b), …)` |
+| `MatchExcept(except=[…])` (scalar field) | `f.not_(f.in_("g", [...]))` |
+| `range=Range(gte=3, lte=9)` | `f.and_(f.gte("n", 3), f.lte("n", 9))` |
 | `Filter(must=[A, B])` | `f.and_(A, B)` |
 | `Filter(should=[A, B])` | `f.or_(A, B)` |
 | `Filter(must_not=[A])` | `f.not_(A)` |
 
-Qdrant's `IsEmptyCondition` / `IsNullCondition` (matching on key presence) have no
-direct Rostam equivalent — Rostam filters match on values. Emulate by writing an
-explicit sentinel field (e.g. a boolean `has_x`) and filtering on it.
+Two mapping caveats worth checking against your data:
+
+- **`MatchAny` semantics depend on the field.** On a scalar field it means "value is
+  one of these" → `f.in_`. On an **array** payload field it means "the array contains
+  any of these" → use `f.contains` (which tests array membership), OR'd across the
+  values. Rostam's `f.in_` is for scalar fields.
+- **`is-empty` / `is-null`** have no Rostam equivalent — Rostam filters match on
+  values, not key presence. Emulate by writing an explicit sentinel field (e.g. a
+  boolean `has_x`) at upsert time and filtering on it.
 
 Rostam runs filters through an **exact, filter-first path**, so a selective filter
 does not degrade recall. See [Filtering](../vector/filtering.md).
 
-## Multitenancy → tenants
+## Multitenancy
 
 Qdrant's recommended multitenancy is a single collection with a tenant payload
-field and a payload index. Rostam offers that pattern too (store the tenant in
-`metadata` and add `f.eq("tenant", "user-42")` to every query), but it also has a
+field and a payload index. Rostam supports that pattern (store the tenant in
+`metadata` and add `f.eq("tenant", "user-42")` to every query), and it also has a
 first-class **tenant** primitive: collection names can be written
-`<tenant>/<collection>`, and with `-tenant-isolation` a tenant becomes an
-**authoritative security boundary** — an API key bound to a tenant can only see
-that tenant's collections.
+`<tenant>/<collection>`.
 
 ```python
 c.create_collection("user-42/docs", dim=384, metric="cosine")
 c.search_docs("user-42/docs", v, k=5)
 ```
 
-See [Collections, tenants & aliases](../concepts/collections.md).
+For an **enforced** isolation boundary (a key that can only see its own tenant),
+the `<tenant>/<collection>` naming alone is not enough — you need **tenant-bound
+keys**. Issue keys via `-keys-file` (per-key RBAC, each key carrying a tenant) and
+run with `-tenant-isolation`; then that boundary is enforced after scope checks.
+The single static `-api-key`/`ROSTAM_API_KEY` used elsewhere in this guide is a
+**superuser** and sees every tenant, so use it for setup, not for tenant isolation.
+See [Security](../server/security.md#tenant-isolation) and
+[Collections, tenants & aliases](../concepts/collections.md).
 
 ## Scores vs. distances
 
@@ -186,24 +198,41 @@ c.upsert("docs", to_uint64("2f1c…"), embedding, metadata={"qdrant_id": "2f1c�
 `to_uint64` is one-way; neither the client nor `TextStore` preserves the original
 string for you, so store it yourself (pick a metadata key your data doesn't use).
 
+!!! warning "Mixed integer and UUID ids in one collection"
+    If a source collection mixes plain integer ids with UUIDs, writing ints verbatim
+    while hashing UUIDs puts both in the same `uint64` space, where a hashed UUID
+    could collide with a verbatim int. For a mixed collection, hash **every** id
+    (`to_uint64(str(p.id))`) so they share one consistent mapping, and keep the
+    original in metadata.
+
 ## Migrating your data
 
 There is no import tool — you re-upsert. Page through the source with Qdrant's
-`scroll` and write each point across, preserving the id:
+`scroll` and write each point across. Rostam metadata values must be **scalars**
+(str / int / float / bool), so coerce anything nested, null, or list-valued in the
+payload before upserting:
 
 ```python
+import json
 from rostam._ids import to_uint64
+
+def scalarize(payload):
+    out = {}
+    for k, v in (payload or {}).items():
+        if v is None or isinstance(v, (dict, list)):
+            out[k] = json.dumps(v)          # keep it, but as a scalar string
+        else:
+            out[k] = v
+    return out
 
 next_page = None
 while True:
     points, next_page = client.scroll("docs", limit=256, offset=next_page,
                                        with_vectors=True, with_payload=True)
     for p in points:
-        meta = dict(p.payload or {})
-        pid = p.id if isinstance(p.id, int) else to_uint64(str(p.id))
-        if not isinstance(p.id, int):
-            meta["qdrant_id"] = str(p.id)
-        c.upsert("docs", pid, p.vector, metadata=meta)
+        meta = scalarize(p.payload)
+        meta["qdrant_id"] = str(p.id)       # preserve the original id
+        c.upsert("docs", to_uint64(str(p.id)), p.vector, metadata=meta)
     if next_page is None:
         break
 ```
@@ -219,7 +248,8 @@ hosted embedders).
   ([Backups](../server/backups.md)), secure it ([Security](../server/security.md)).
 - **`distance`, not `score`**, as the primary ranking field (see above).
 - **Integer ids** — map UUIDs with `to_uint64`, keep the original in metadata.
-- **No `is-empty`/`is-null` filter** and no server-side embedding (see above).
+- **Scalar-only metadata** — coerce nested/list/null payload values (see above).
+- **No `is-empty`/`is-null` filter**, and no server-side embedding.
 - **Named/sparse vectors:** Rostam does hybrid dense+sparse and full-text (BM25) —
   see [Hybrid & full-text](../vector/hybrid-search.md) — but the API shape differs
   from Qdrant's named vectors; check that doc before porting a multi-vector schema.
