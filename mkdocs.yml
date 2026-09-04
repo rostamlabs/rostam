@@ -75,6 +75,8 @@ markdown_extensions:
   - pymdownx.keys
   - pymdownx.tabbed:
       alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
   - pymdownx.superfences:
       custom_fences:
         - name: mermaid
@@ -105,6 +107,7 @@ nav:
       - Cache tuning: kv/cache.md
   - Server & operations:
       - Running the server: server/running.md
+      - Production readiness: server/production-readiness.md
       - Clustering: server/clustering.md
       - Security: server/security.md
       - Backups & cold tier: server/backups.md
