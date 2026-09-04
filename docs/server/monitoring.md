@@ -60,7 +60,8 @@ readiness always answers ready.
 With `-audit-log`, every authorization decision is emitted to stderr as a
 structured JSON record — principal redacted to a token fingerprint, decision,
 op, and resource. Ship stderr to your log pipeline to get a security audit
-trail. See [Security](security.md).
+trail. This applies only under `-keys-file` RBAC; with a single `-api-key` the
+flag is a no-op. See [Security](security.md).
 
 ## Operational signals worth alerting on
 
