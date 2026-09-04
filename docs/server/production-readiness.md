@@ -46,11 +46,12 @@ topology.
 - [ ] **Replication factor ≥ 2 for HA.** With a majority intact, a follower
   failure is invisible; a leader election briefly fails that shard's writes with
   retryable errors. [Failure behavior](clustering.md#failure-behavior)
-- [ ] **PB mode configured for no-acked-loss** (if using `-replication-mode=pb`,
-  which is **experimental**). Set `-min-isr ≥ 2` — `=1` can lose acknowledged
-  writes across failover — and leave `-pb-commit-primary` at its default unless
-  per-write latency matters more than durability. Review `shard/pbisr/BENCHMARK.md`
-  first. [Replication engine](clustering.md#replication-engine)
+- [ ] **Replication mode is `raft`** (the default) for production. Per-shard Raft
+  is the production replication engine. `-replication-mode=pb` (primary-backup /
+  ISR) is **experimental** — the docs say not to use it "beyond experimentation,"
+  so keep it out of production. If you are *evaluating* PB in a non-production
+  cluster, `-min-isr ≥ 2` is mandatory (`=1` can lose acknowledged writes across
+  failover) and leave `-pb-commit-primary` at its default. [Replication engine](clustering.md#replication-engine)
 - [ ] **Shard count has headroom.** `-shards` is fixed for the life of the
   cluster; choose shards ≫ nodes if you expect to grow (membership/RF changes
   redistribute the fixed shards, they don't add more).
