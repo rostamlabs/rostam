@@ -84,6 +84,8 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Quickstart: quickstart.md
+  - Migrating:
+      - From Pinecone: migrate/from-pinecone.md
   - Concepts:
       - Architecture: concepts/architecture.md
       - Deployment modes: concepts/deployment-modes.md
