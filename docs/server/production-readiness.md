@@ -21,13 +21,17 @@ topology.
   superuser that sees every tenant. [Tenant isolation](security.md#tenant-isolation)
 - [ ] **TLS on client listeners.** `-tls-cert`/`-tls-key` cover HTTP, gRPC, and
   TCP (≥ 1.2); misconfiguration fails at startup rather than falling back to
-  plaintext. Add `-tls-ca` [+ `-tls-require-client-cert`] for mTLS identity. [TLS](security.md#tls)
+  plaintext. For mTLS, add `-tls-ca` — and to make a client certificate the
+  *required* identity (not merely an accepted one: `-tls-ca` alone still lets a
+  certless client fall back to token auth), also set `-tls-require-client-cert`. [TLS](security.md#tls)
 - [ ] **Inter-node auth set** (cluster). `-internal-token` (prefer
   `ROSTAM_INTERNAL_TOKEN`) must be the same on every node — an authenticated
   cluster cannot function without it. Consider inter-node TLS
   (`-tls-node-cert`, `-node-cn-allowlist`). [Inter-node auth](security.md#inter-node-auth)
 - [ ] **Audit trail shipped.** `-audit-log` emits a JSON record per authorization
-  decision to stderr; route it to your log pipeline. [Audit log](monitoring.md#audit-log)
+  decision to stderr — **only under `-keys-file` RBAC** (it is a no-op with a
+  single `-api-key`, so don't tick this box while running the static key); route
+  stderr to your log pipeline. [Audit log](monitoring.md#audit-log)
 
 ## Durability & replication
 
