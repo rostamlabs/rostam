@@ -107,15 +107,21 @@ func newMetaFSMForNode(nodeID string) *MetaFSM {
 // nil in production ⇒ zero overhead, behaviour byte-identical. It fires BEFORE the
 // FSM write lock is taken, so a blocking gate stalls only THIS node's apply of the
 // cutover entry while its prior catalog state stays readable (it keeps reporting
-// the old gen) — the intended lag, not a hang. Set/reset under no concurrency.
-var metaApplyCatalogGate func(nodeID, collection string, partitions, generation uint32)
+// the old gen) — the intended lag, not a hang.
+// Protected by atomic.Pointer so concurrent Apply reads and test-goroutine writes
+// do not race under -race.
+var metaApplyCatalogGate atomic.Pointer[func(nodeID, collection string, partitions, generation uint32)]
 
 // SetMetaApplyCatalogGate installs (or clears with nil) the test-only catalog-gen
 // apply observer (metaApplyCatalogGate). Exported so the root-package integration
 // tests (different package) can deterministically lag ONE node's cutover apply.
-// Test-only; nil in production. Set/reset under no concurrency.
+// Test-only; nil in production.
 func SetMetaApplyCatalogGate(fn func(nodeID, collection string, partitions, generation uint32)) {
-	metaApplyCatalogGate = fn
+	if fn == nil {
+		metaApplyCatalogGate.Store(nil)
+	} else {
+		metaApplyCatalogGate.Store(&fn)
+	}
 }
 
 // State returns a deep copy of the current FSM state.
@@ -311,8 +317,8 @@ func (m *MetaFSM) Apply(log *raft.Log) any {
 	// gen) while this node's apply of the cutover is deferred. That is precisely the
 	// lagging-follower window: the node routes reads to the still-fresh old gen until
 	// the test releases the gate. nil ⇒ no-op, no lock-ordering effect.
-	if entry.Op == OpSetCatalogEntry && metaApplyCatalogGate != nil {
-		metaApplyCatalogGate(m.nodeID, entry.Collection, entry.Partitions, entry.Generation)
+	if gate := metaApplyCatalogGate.Load(); gate != nil && entry.Op == OpSetCatalogEntry {
+		(*gate)(m.nodeID, entry.Collection, entry.Partitions, entry.Generation)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
