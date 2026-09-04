@@ -11,8 +11,10 @@ modes, and the Go embedding paths.
 Zero to a filtered vector search — one container, the Python client, no build.
 
 ```sh
-# 1. Start the server (Docker). The image binds 0.0.0.0, so it needs a token.
-docker run -p 8080:8080 -e ROSTAM_API_KEY=secret ghcr.io/rostamlabs/rostam
+# 1. Start the server (Docker), published on loopback only for local use. The
+#    image binds 0.0.0.0 inside the container so it needs a token; 'secret' is a
+#    demo placeholder — use a generated token + TLS for anything remote.
+docker run -p 127.0.0.1:8080:8080 -e ROSTAM_API_KEY=secret ghcr.io/rostamlabs/rostam
 ```
 
 ```sh
