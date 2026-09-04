@@ -4,15 +4,21 @@ This guide maps Pinecone concepts and API calls to Rostam so you can move an
 existing workload over. Rostam is open source (Apache-2.0) and **self-hosted** —
 one Go binary you run in your own environment — so the main reasons teams make
 this move are cost control and keeping vector data inside a boundary you own
-(data residency, on-prem, air-gapped). There is no per-project minimum, and the
-database itself makes no outbound calls: nothing Rostam stores leaves your
-network.
+(data residency, on-prem, air-gapped). There is no per-project minimum, and
+Rostam makes no outbound calls on its own — data leaves only through egress you
+explicitly configure, which you control.
 
-!!! note "One caveat about egress"
-    Rostam has no egress, but *embedding* is a separate step. If you generate
-    embeddings with a hosted API (OpenAI, Cohere, …), your text leaves your
-    network at that step regardless of where the vectors are stored. For a fully
-    in-boundary pipeline, embed with a local/self-hosted model.
+!!! note "The two places data can leave — both under your control"
+    1. **Backups / cold tier.** If you configure S3 backups or a cold tier
+       ([Backups](../server/backups.md)), Rostam writes snapshots to that object
+       store. Point it at an in-boundary store (e.g. MinIO) to keep everything
+       inside your network, or leave it unconfigured.
+    2. **Embedding.** Embedding is a separate step from storage. If you generate
+       embeddings with a hosted API (OpenAI, Cohere, …), your text leaves your
+       network there regardless of where the vectors live. Embed with a
+       local/self-hosted model for a fully in-boundary pipeline.
+
+    Neither happens unless you set it up — Rostam initiates no egress by default.
 
 If you just want the API side by side, jump to [Code, side by side](#code-side-by-side).
 
