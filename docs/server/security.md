@@ -49,7 +49,9 @@ GET    /v1/admin/keys                          # redacted: fingerprints only
 ```
 
 `-audit-log` emits a structured JSON record to stderr for every authorization
-decision (principals redacted to token fingerprints).
+decision (principals redacted to token fingerprints). It applies only under
+`-keys-file` RBAC — with a single `-api-key` there is no per-decision record to
+emit, so the flag is a no-op.
 
 ## Tenant isolation
 
