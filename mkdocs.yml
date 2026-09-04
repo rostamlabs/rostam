@@ -86,6 +86,7 @@ nav:
   - Quickstart: quickstart.md
   - Migrating:
       - From Pinecone: migrate/from-pinecone.md
+      - From Qdrant: migrate/from-qdrant.md
   - Concepts:
       - Architecture: concepts/architecture.md
       - Deployment modes: concepts/deployment-modes.md
