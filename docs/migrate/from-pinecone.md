@@ -216,8 +216,9 @@ caveat above).
 - **Integer ids** — map strings with `to_uint64`, keep the original in metadata (see above).
 - **Distance, not score** — hits carry `distance` (smaller = closer), not a Pinecone-style
   similarity `score`. Convert if your app expects scores.
-- **No server-side embedding** — see the sections above (`$exists` maps to the
-  `is_empty`/`is_null` predicates, with the presence-semantics caveat noted there).
+- **No server-side embedding** — generate embeddings before you upsert (see above).
+  (`$exists` is covered — it maps to the `is_empty`/`is_null` predicates in
+  [Translating metadata filters](#translating-metadata-filters).)
 
 ## Next steps
 
