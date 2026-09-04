@@ -2,8 +2,50 @@
 
 Rostam can run three ways: as a **single-node server** speaking HTTP/gRPC/TCP,
 as a **replicated Raft cluster**, or as a **Go library** embedded in your binary
-(no server at all). This page gets you from zero to a working search in each
-mode — the server and Python paths first, the Go embedding paths after.
+(no server at all). If you just want to see it work, start with the five-minute
+path below; the rest of the page covers every install method, the three run
+modes, and the Go embedding paths.
+
+## Try it in 5 minutes
+
+Zero to a filtered vector search — one container, the Python client, no build.
+
+```sh
+# 1. Start the server (Docker), published on loopback only for local use. The
+#    image binds 0.0.0.0 inside the container so it needs a token; 'secret' is a
+#    demo placeholder — use a generated token + TLS for anything remote.
+docker run -p 127.0.0.1:8080:8080 -e ROSTAM_API_KEY=secret ghcr.io/rostamlabs/rostam
+```
+
+```sh
+# 2. In another terminal, install the client:
+pip install rostam-client
+```
+
+```python
+# 3. Create a collection, add a point, search it:
+from rostam import Rostam, filters as f
+
+c = Rostam("http://localhost:8080", api_key="secret")
+
+c.create_collection("docs", dim=4, metric="cosine")
+c.upsert("docs", 1, [0.1, 0.2, 0.3, 0.4],
+         content="hello rostam", metadata={"tenant": "acme"})
+
+hits = c.search_docs("docs", [0.1, 0.2, 0.3, 0.4], k=3,
+                     filter=f.eq("tenant", "acme"))
+print([(h.id, h.content) for h in hits])   # -> [(1, 'hello rostam')]
+```
+
+That's a running server and an exact, filter-first vector search. Real data uses
+a real embedding model — swap the 4-number vectors for your model's output and
+set `dim` to match. From here:
+
+- **No Docker?** Install the binary directly — [Install the server](#install-the-server).
+- **Embed it in Go** instead of running a server — [Embedded vector search](#embedded-vector-search-go-library).
+- **Bulk-load** a large dataset fast — [Large initial loads](#large-initial-loads).
+
+The sections below go deeper on each.
 
 ## Requirements
 
