@@ -24,7 +24,7 @@ Jump to [Code, side by side](#code-side-by-side).
 | `QdrantClient(url=…)` | `Rostam(url, api_key=…)` | REST on `:8080`; native TCP on `:7000` is opt-in (start with `-tcp :7000`). |
 | Collection | **Collection** | `create_collection(name, dim, metric)`. |
 | `VectorParams(size, distance)` | `dim=…, metric=…` | Distance mapping [below](#distance-metrics). |
-| `PointStruct(id, vector, payload)` | Point (`id`, embedding, `metadata`, optional `content`) | `payload` → `metadata` (scalar values only); ids are integers, see [IDs](#ids). |
+| `PointStruct(id, vector, payload)` | Point (`id`, embedding, `metadata`, optional `content`) | `payload` → `metadata` (scalars + homogeneous scalar lists); ids are integers, see [IDs](#ids). |
 | `Filter` / `FieldCondition` | `filters` helpers (`f.eq`, …) | Full table [below](#translating-filters). |
 | Multitenancy via a payload field | **Tenant** (`<tenant>/<collection>`) | A real primitive + optional auth boundary; see [Multitenancy](#multitenancy). |
 | `ScoredPoint.score` | `hit.distance` (and `hit.score`) | Rostam's `distance` is unambiguous (smaller = closer); see [Scores](#scores-vs-distances). |
@@ -81,7 +81,7 @@ client.upsert("docs", points=[
     models.PointStruct(id=1, vector=embedding, payload={"doc_id": 7, "lang": "en"}),
 ])
 
-# Rostam  (payload -> metadata, scalar values only; content is an optional stored text payload)
+# Rostam  (payload -> metadata: scalars or homogeneous scalar lists; content is an optional stored text payload)
 c.upsert("docs", 1, embedding, content="the chunk text",
          metadata={"doc_id": 7, "lang": "en"})
 ```
@@ -147,9 +147,12 @@ Two mapping caveats worth checking against your data:
   one of these" → `f.in_`. On an **array** payload field it means "the array contains
   any of these" → use `f.contains` (which tests array membership), OR'd across the
   values. Rostam's `f.in_` is for scalar fields.
-- **`is-empty` / `is-null`** have no Rostam equivalent — Rostam filters match on
-  values, not key presence. Emulate by writing an explicit sentinel field (e.g. a
-  boolean `has_x`) at upsert time and filtering on it.
+- **`is-empty` / `is-null`** *are* supported by the engine — the Python `filters`
+  helpers just don't have a dedicated builder for them. A filter is a plain dict, so
+  pass the raw predicate: Qdrant's `IsEmpty(key="x")` → `{"op": "is_empty", "field": "x"}`
+  (field absent, null, `""`, or empty array) and `IsNull(key="x")` →
+  `{"op": "is_null", "field": "x"}` (present and explicitly null). These compose with
+  the `f.*` helpers (`f.and_`, `f.not_`, …) like any other predicate.
 
 Rostam runs filters through an **exact, filter-first path**, so a selective filter
 does not degrade recall. See [Filtering](../vector/filtering.md).
@@ -208,21 +211,34 @@ string for you, so store it yourself (pick a metadata key your data doesn't use)
 ## Migrating your data
 
 There is no import tool — you re-upsert. Page through the source with Qdrant's
-`scroll` and write each point across. Rostam metadata values must be **scalars**
-(str / int / float / bool), so coerce anything nested, null, or list-valued in the
-payload before upserting:
+`scroll` and write each point across. Rostam metadata values are scalars
+(str / int / float / bool) **or homogeneous scalar lists** (all-int, all-float, or
+all-str — these stay filterable with `f.contains`). What it can't store is a nested
+object, a mixed-type or empty list, or an explicit null, so coerce only those before
+upserting:
 
 ```python
 import json
 from rostam._ids import to_uint64
 
+def _scalar_list(v):
+    """True if v is a non-empty, homogeneous int/float/str list Rostam can store."""
+    v = list(v)
+    if not v or all(isinstance(x, bool) for x in v):   # no bool-list kind
+        return False
+    return (all(isinstance(x, int) and not isinstance(x, bool) for x in v)
+            or all(isinstance(x, float) for x in v)
+            or all(isinstance(x, str) for x in v))
+
 def scalarize(payload):
     out = {}
     for k, v in (payload or {}).items():
-        if v is None or isinstance(v, (dict, list)):
-            out[k] = json.dumps(v)          # keep it, but as a scalar string
+        if isinstance(v, (bool, int, float, str)):
+            out[k] = v                                 # scalar -> as-is
+        elif isinstance(v, (list, tuple)) and _scalar_list(v):
+            out[k] = list(v)                           # keep the array; f.contains still works
         else:
-            out[k] = v
+            out[k] = json.dumps(v)                     # nested / mixed / empty / null -> string
     return out
 
 next_page = None
@@ -248,8 +264,9 @@ hosted embedders).
   ([Backups](../server/backups.md)), secure it ([Security](../server/security.md)).
 - **`distance`, not `score`**, as the primary ranking field (see above).
 - **Integer ids** — map UUIDs with `to_uint64`, keep the original in metadata.
-- **Scalar-only metadata** — coerce nested/list/null payload values (see above).
-- **No `is-empty`/`is-null` filter**, and no server-side embedding.
+- **Scalar or homogeneous-scalar-list metadata** — coerce only nested/mixed/null
+  payload values (see above).
+- **No server-side embedding** (`is-empty`/`is-null` *are* supported — see Filters).
 - **Named/sparse vectors:** Rostam does hybrid dense+sparse and full-text (BM25) —
   see [Hybrid & full-text](../vector/hybrid-search.md) — but the API shape differs
   from Qdrant's named vectors; check that doc before porting a multi-vector schema.
