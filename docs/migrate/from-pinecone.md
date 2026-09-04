@@ -135,11 +135,18 @@ Pinecone filters are dicts of operators; Rostam uses the `filters` helpers
 | `{"g": {"$nin": ["a","b"]}}` | `f.not_(f.in_("g", ["a", "b"]))` |
 | `{"$and": [A, B]}` | `f.and_(A, B)` |
 | `{"$or": [A, B]}` | `f.or_(A, B)` |
+| `{"g": {"$exists": false}}` | `{"op": "is_empty", "field": "g"}` (raw dict) |
+| `{"g": {"$exists": true}}` | `f.not_({"op": "is_empty", "field": "g"})` |
 | implicit `{"a": 1, "b": 2}` (AND) | `f.and_(f.eq("a", 1), f.eq("b", 2))` |
 
-Pinecone's **`$exists`** has no direct equivalent — Rostam filters match on values,
-not key presence. Emulate it by storing an explicit sentinel (e.g. a boolean
-`has_x` field) at write time and filtering on that.
+Rostam has **`is_empty`** and **`is_null`** predicates for this — the Python
+`filters` helpers just don't expose builders for them, so pass the raw predicate
+dict (a filter is a plain dict). `is_empty` matches a field that is absent, null,
+`""`, or an empty array; `is_null` matches a field that is present and explicitly
+null. Note the semantic gap from Pinecone's `$exists`, which tests key presence
+alone: `is_empty` treats a present-but-empty value as "empty" too. If you need
+exact key-presence semantics, a boolean sentinel field (`has_x`) written at upsert
+time is still the precise option.
 
 Rostam runs filters through an **exact, filter-first path** — a selective filter
 does not degrade recall. See [Filtering](../vector/filtering.md).
@@ -209,7 +216,9 @@ caveat above).
 - **Integer ids** — map strings with `to_uint64`, keep the original in metadata (see above).
 - **Distance, not score** — hits carry `distance` (smaller = closer), not a Pinecone-style
   similarity `score`. Convert if your app expects scores.
-- **No `$exists` filter** and no server-side embedding — see the sections above.
+- **No server-side embedding** — generate embeddings before you upsert (see above).
+  (`$exists` is covered — it maps to the `is_empty`/`is_null` predicates in
+  [Translating metadata filters](#translating-metadata-filters).)
 
 ## Next steps
 
