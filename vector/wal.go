@@ -409,8 +409,18 @@ func (w *wal) appendFramedStaged(payload []byte) (uint64, error) {
 	w.mu.Lock()
 	// AUTHORITATIVE fail-closed check, under w.mu: a sync leader can poison the WAL
 	// (in commitWait) between the early check above and here. Re-check before
-	// writing ANY bytes so a poisoned WAL never appends a new, un-ackable record
-	// (which would replay after reopen despite never being acked).
+	// writing ANY bytes so a poisoned WAL never appends a new record.
+	//
+	// This does NOT close the window where a write's bytes are appended while an
+	// in-flight leader Sync (running under NEITHER lock — that overlap is the whole
+	// point of group commit) then fails and poisons: such a writer's commitWait
+	// returns ErrWALPoisoned, so it is NEVER acked, but its bytes are already in the
+	// file and may replay on reopen. That is intended at-least-once semantics for an
+	// errored/in-flight write — identical to a crash mid-append — NOT a false ack.
+	// Durability is promised only for a write that returned nil: syncedSeq advances
+	// solely after a SUCCESSFUL Sync (see commitWait), so no errored write is ever
+	// acknowledged. Closing this residual would require serializing appends through
+	// f.Sync(), which would destroy group commit.
 	if w.poisoned.Load() {
 		w.mu.Unlock()
 		return 0, ErrWALPoisoned
@@ -531,6 +541,11 @@ func (w *wal) truncate() error {
 	// durability state unknown, and — like commitWait — a later writer must never
 	// be allowed to retry an fsync that could falsely succeed after the kernel
 	// dropped a prior failure's dirty pages (fsyncgate). Fail closed on any error.
+	// Already-poisoned ⇒ don't issue another Sync at all (a poisoned WAL never
+	// retries fsync); fail closed for symmetry with the append/commit entry points.
+	if w.poisoned.Load() {
+		return ErrWALPoisoned
+	}
 	if err := w.f.Truncate(0); err != nil {
 		w.poisoned.Store(true)
 		return err
