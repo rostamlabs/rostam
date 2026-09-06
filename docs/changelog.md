@@ -13,10 +13,11 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   resets to the lone new primary), the default full-ISR commit
   (`-pb-commit-primary=false` — the opt-in `-pb-commit-primary` is a durability
   downgrade), and a bounded cross-node clock rate. It is **recommended at
-  replication-factor 2**, where it beat the default raft path ~1.7× on throughput
-  (and p50 latency) in the 2026-07 real-network gate — but that gate's raft
-  baseline ran under the old epoll default, so the margin is unverified under the
-  current server; re-verify on your hardware. At RF=3 its full-ISR commit (wait
+  replication-factor 2**, where it beat raft RF=3 (both `-nosync -volatile-log`)
+  ~1.7× on throughput (and p50 latency) in the 2026-07 real-network gate — a
+  cross-RF comparison (PB RF=2 holds one fewer copy), whose raft baseline also ran
+  under the old epoll default, so the margin is unverified under the current
+  server; re-verify on your hardware. At RF=3 its full-ISR commit (wait
   for the slowest of every replica) is slower than raft's majority, so raft stays
   the default. Automatic failover is on via the `-pb-auto-failover` server flag;
   `cluster.Config` / `rostam.EmbeddedConfig` users must set `PBAutoFailover: true`.

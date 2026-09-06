@@ -167,16 +167,25 @@ sufficient defense on its own. These were tracked as gating non-experimental use
   NOTE: H2 linearizable reads will share this SAME lease (a fenced primary whose
   lease lapsed must not serve a stale linearizable read either).
 
-- **OH2 — apply-before-quorum uncommitted tail. CLOSED (2026-09-06; the
-  "partially enforced" wording below is historical — the provisos are now fully in
-  code: separate `committed` watermark, P3 reads + P4 election key off `committed`
-  only, demoted ex-primary snapshot-reloaded).** The primary applies locally
-  before quorum; a quorum-timeout write is applied but not committed. Safety
-  provisos, now partially enforced in code: `committed` (the min-ISR
-  high-watermark) is tracked separately from `lastSeq`/`lastApplied`; P3
-  linearizable reads and P4 failover election MUST key off `committed` only. An
-  in-memory FSM cannot truncate an uncommitted tail, so a demoted ex-primary
-  MUST be snapshot-reloaded, never ring-delta rejoined (P4 constraint).
+- **OH2 — apply-before-quorum uncommitted tail. Acked-loss-safe (2026-09-06),
+  but read the precise mechanism — the "P4 election keys off committed" proviso
+  below was NOT implemented literally.** `committed` (the min-ISR high-watermark)
+  is tracked separately from `lastSeq`/`lastApplied` (engine.go). **Reads DO key
+  off `committed` only:** `pbReplicator.CommitIndex()` and `AppliedIndex()` both
+  return `Engine.Committed()` (shard/pb_replicator.go:58-59), so a read never sees
+  the uncommitted tail. **Failover election does NOT rank by `committed`** — it
+  ranks ISR survivors by applied high-water (`pbCandidateHighWater` →
+  `Engine.LastApplied()` / the remote `AppliedSeq`, cluster/pb_grow.go), and
+  `Promote` then commits the winner's tail (`committed = lastApplied`,
+  engine.go). That is still **no-acked-loss** because full-ISR commit means every
+  current-ISR member already holds every *acked* (committed) write, so promoting
+  any reachable ISR survivor preserves all acked writes; the extra tail it commits
+  was in-flight and never client-acked (resolving it as "succeeded" is
+  linearizable). Net: the guarantee holds via full-ISR completeness, not via
+  committed-ranked election. A demoted ex-primary MUST be snapshot-reloaded, never
+  ring-delta rejoined (enforced by the log-match + poison fence). Historical
+  proviso text follows; treat "MUST key off committed only" as the original design
+  intent, not what shipped.
 
 - **OH3 — epoch-blind gap check.** `lastApplied` is a bare seq; the gap check is
   numeric. On an epoch increase a snapshot/rebase is required rather than
@@ -184,11 +193,19 @@ sufficient defense on its own. These were tracked as gating non-experimental use
 
 ## Read barrier
 
+> **AS SHIPPED (2026-09-06): lease-based, not the ISR-quorum RTT below.** The
+> implemented linearizable read barrier is the OH1 primary lease, reused: a read
+> is served only when this node is the primary AND its lease is valid
+> (`pbReplicator.VerifyLeader` → `Engine.LeaseValid()`), and it reads at
+> `Engine.Committed()` (`AppliedIndex()`), never the uncommitted tail. This is the
+> cheaper design OH1 opted into (no per-read ISR round-trip); the ISR-quorum
+> approach below is the original, superseded design.
+
 - AnyReplica / LeaderOnly (default paths): unchanged, cheap (no consensus).
-- Linearizable: `pbReplicator.verifyPrimaryAndCatchUp(deadline)` — confirm
-  current epoch with an ISR quorum, then ensure local FSM has applied through
-  the high-water `seq` the quorum reports. Mirrors the existing
-  `verifyLeaderAndCatchUp` (shard/store.go:389) one-for-one.
+- Linearizable (original design, NOT shipped): `verifyPrimaryAndCatchUp(deadline)`
+  — confirm current epoch with an ISR quorum, then ensure local FSM has applied
+  through the high-water `seq` the quorum reports. Superseded by the lease barrier
+  above.
 
 ## Durability tiers
 

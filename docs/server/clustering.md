@@ -99,9 +99,10 @@ by what you can afford to lose, not by the benchmark number.
   bounded cross-node clock rate. With `-min-isr 1` a post-failover ISR can reset
   to the lone new primary and lose its write if that node then fails; with
   `-pb-commit-primary` an acked write can be lost if the primary dies before a
-  backup has it. **Recommended at replication-factor 2**, where it beat raft
-  ~1.7× on throughput (and on p50 latency) in the 2026-07 real-network gate —
-  but that gate's raft baseline ran under the old epoll default, so the margin is
+  backup has it. **Recommended at replication-factor 2**, where it beat raft RF=3
+  (both `-nosync -volatile-log`) ~1.7× on throughput (and on p50 latency) in the
+  2026-07 real-network gate — a cross-RF comparison (PB RF=2 holds one fewer copy),
+  whose raft baseline also ran under the old epoll default, so the margin is
   unverified under the current server; re-verify on your hardware. At RF=3 its
   full-ISR commit (wait for the slowest of every replica) is slower than raft's
   majority (fastest of a majority), so raft stays the default. Other caveats: PB

@@ -51,10 +51,11 @@ topology.
   for production — its correctness hazards are closed. The no-acked-loss-across-
   failover guarantee holds **only under all of**: `-min-isr ≥ 2`, the default
   full-ISR commit (`-pb-commit-primary=false`), and a bounded cross-node clock
-  rate. It is **recommended at RF=2**, where it beat raft ~1.7× on throughput (and
-  p50 latency) in the 2026-07 real-network gate — but that baseline ran under the
-  old epoll default, so re-verify the margin on your hardware; at RF=3 its full-ISR
-  commit is slower than raft's majority. If you run PB: set
+  rate. It is **recommended at RF=2**, where it beat raft RF=3 (both `-nosync
+  -volatile-log`) ~1.7× on throughput (and p50 latency) in the 2026-07 real-network
+  gate — a cross-RF comparison (PB RF=2 holds one fewer copy), whose raft baseline
+  also ran under the old epoll default, so re-verify the margin on your hardware; at
+  RF=3 its full-ISR commit is slower than raft's majority. If you run PB: set
   `-min-isr ≥ 2` (keeps every acked write on ≥2 nodes — `=1` can lose acked writes
   across failover — and requires at least that many replicas; the default `0` is
   rejected in pb mode), set `PBAutoFailover: true` if you construct `cluster.Config`
