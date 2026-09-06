@@ -115,7 +115,7 @@ TTLs.
 **Clustering** — `-cluster`, `-node-id`, `-raft-addr`, `-bootstrap`, `-peers`,
 `-replication-factor`, `-persistent-vectors`, `-reconfigure`; durability
 posture: `-nosync`, `-volatile-log`; replication engine: `-replication-mode`
-(`raft` | experimental `pb`, with `-min-isr`, `-pb-addr`, `-pb-commit-primary`,
+(`raft` | `pb`, with `-min-isr`, `-pb-addr`, `-pb-commit-primary`,
 `-pb-auto-failover`); Raft transport: `-raft-transport`
 (`mux` | experimental `fabric`).
 → [Clustering](clustering.md)

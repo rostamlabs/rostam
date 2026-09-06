@@ -91,15 +91,18 @@ by what you can afford to lose, not by the benchmark number.
 
 - **`raft`** (default) — per-shard Raft groups, exactly as described above.
 - **`pb`** — primary-backup / in-sync-replica (ISR) replication for every
-  shard, with automatic failover on by default. Its blocking correctness hazards
-  are closed: a lease-fenced primary plus full-ISR commit means no acked-write
-  loss across a failover. **Recommended at replication-factor 2**, where it beats
-  raft on throughput and tail latency; at RF=3 its full-ISR commit (wait for the
-  slowest of every replica) is slower than raft's majority (fastest of a
-  majority), so raft stays the default. Two caveats: PB's no-acked-loss guarantee
-  assumes a bounded cross-node clock rate, and the mode is newer than the raft
-  path — validate it on your workload before relying on it. Requires `-min-isr`
-  and `-pb-addr`; see the measured comparison in `shard/pbisr/BENCHMARK.md`.
+  shard, with automatic failover on by default (via the `-pb-auto-failover`
+  server flag; embedded/library `cluster.Config` users must set it explicitly).
+  Its blocking correctness hazards are closed: a lease-fenced primary plus
+  full-ISR commit means no acked-write loss across a failover. **Recommended at
+  replication-factor 2**, where it beats raft on throughput and median (p50)
+  latency; at RF=3 its full-ISR commit (wait for the slowest of every replica) is
+  slower than raft's majority (fastest of a majority), so raft stays the default.
+  Two caveats: PB's no-acked-loss guarantee assumes a bounded cross-node clock
+  rate, and the mode is newer than the raft path — validate it on your workload
+  before relying on it. Set `-min-isr ≥ 2` (keeps every acked write on ≥2 nodes;
+  `=1` can lose acked writes across a failover) and one `-pb-addr` per node; see
+  the measured comparison in `shard/pbisr/BENCHMARK.md`.
 
 PB mode requires two extra pieces of configuration:
 

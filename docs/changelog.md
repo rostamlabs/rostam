@@ -10,12 +10,14 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   primary plus full-ISR commit guarantee no acked-write loss across an automatic
   failover (on by default), backed by partition and crash-stop failover tests.
   It is **recommended at replication-factor 2**, where it beats the default raft
-  path on throughput and tail latency; at RF=3 its full-ISR commit (wait for the
-  slowest of every replica) is slower than raft's majority, so raft stays the
-  default. Two honest caveats: PB's no-acked-loss guarantee assumes a bounded
+  path on throughput and median (p50) latency; at RF=3 its full-ISR commit (wait
+  for the slowest of every replica) is slower than raft's majority, so raft stays
+  the default. Two honest caveats: PB's no-acked-loss guarantee assumes a bounded
   cross-node clock rate, and the mode is newer than the raft path — validate it
-  on your workload. Set `-min-isr` to the replication factor for the no-acked-loss
-  guarantee; `-pb-commit-primary` remains an opt-in durability downgrade.
+  on your workload. Set `-min-isr ≥ 2` for the no-acked-loss guarantee (`=1` can
+  lose acked writes across a failover); `-pb-commit-primary` remains an opt-in
+  durability downgrade. Automatic failover is on by the `-pb-auto-failover` server
+  flag; embedded `cluster.Config` users must enable it explicitly.
 
 ## v0.6.0 — 2026-09-02
 

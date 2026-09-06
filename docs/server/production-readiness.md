@@ -50,13 +50,15 @@ topology.
   proven choice. `-replication-mode=pb` (primary-backup / ISR) is also supported
   for production — its correctness hazards are closed (lease-fenced primary +
   full-ISR commit ⇒ no acked-write loss across failover) — and is **recommended
-  at RF=2**, where it beats raft on throughput and tail latency; at RF=3 its
-  full-ISR commit is slower than raft's majority. If you run PB: set `-min-isr` to
-  the replication factor so every replica must ack (the no-acked-loss guarantee;
-  a lower floor can lose acked writes across failover), leave `-pb-commit-primary`
-  at its default (setting it is a durability downgrade), and note PB's guarantee
-  assumes a bounded cross-node clock rate. It's newer than raft — validate on your
-  workload. [Replication engine](clustering.md#replication-engine)
+  at RF=2**, where it beats raft on throughput and median (p50) latency; at RF=3
+  its full-ISR commit is slower than raft's majority. If you run PB: set
+  `-min-isr ≥ 2` (keeps every acked write on ≥2 nodes — `=1` can lose acked writes
+  across failover — and requires at least that many replicas; the default `0` is
+  rejected in pb mode), enable `-pb-auto-failover` if you use `cluster.Config`
+  directly (the server flag defaults on, the struct field does not), leave
+  `-pb-commit-primary` at its default (setting it is a durability downgrade), and
+  note PB's guarantee assumes a bounded cross-node clock rate. It's newer than
+  raft — validate on your workload. [Replication engine](clustering.md#replication-engine)
 - [ ] **Shard count has headroom.** `-shards` is fixed for the life of the
   cluster; choose shards ≫ nodes if you expect to grow (membership/RF changes
   redistribute the fixed shards, they don't add more).

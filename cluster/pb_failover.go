@@ -285,9 +285,15 @@ func pbFailoverDecisions(state State, t *pbFailoverTracker, nowNs, failoverTimeo
 //	self-fence unit test + the crash-stop no-acked-loss gate (TestPBFailoverNoAckedLoss)
 //	AND the full network-partition e2e (TestPBFailoverPartitionNoDoublePrimary,
 //	cluster/pb_partition_test.go: isolates one node's meta path while it keeps taking
-//	writes, and asserts its last ack precedes the epoch bump). PBAutoFailover is now
-//	default-on. Remaining hardening (not a correctness hole): a PB-mode linearizable
-//	stale-primary-READ e2e mirroring shard/linearizable_partition_test.go.
+//	writes, and asserts its last ack precedes OBSERVATION of the epoch bump — the test
+//	polls for the survivor's new epoch, which is at or after the OpSetShardEpoch apply).
+//	The server's -pb-auto-failover flag defaults ON; direct cluster.Config /
+//	EmbeddedConfig users must still opt in (the struct field is false by zero value).
+//	Note the lease-lapse precondition is enforced by THIS promotion path (the
+//	failoverTimeout gate in decidePBPromotions + the construction-time honor rule),
+//	not inside ApplySetShardEpoch itself — any future promotion path must reuse the
+//	same timing gate. Remaining hardening (not a correctness hole): a PB-mode
+//	linearizable stale-primary-READ e2e mirroring shard/linearizable_partition_test.go.
 //
 //	DETECTION LATENCY: when the dead primary was ALSO the meta leader, the surviving
 //	nodes must first elect a new meta leader, whose election-floor reset then requires

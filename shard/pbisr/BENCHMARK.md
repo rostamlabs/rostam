@@ -1,13 +1,17 @@
 # A/B Benchmark: Primary-Backup vs Raft
 
-> **STATUS 2026-09-06 — outcome.** The decisive real-separate-machine gate below
-> settled it: **PB RF=2 beats raft ~1.7×** (and wins co-located too), while **PB
-> RF=3 full-ISR loses to raft's majority** — so `-replication-mode=pb` is
-> promoted out of experimental with **RF=2 as the recommended config**, and raft
-> stays the default (it wins at RF=3). The many "stays EXPERIMENTAL / off"
-> conclusions in the historical sections below predate the pipelined engine and
-> the RF=2 finding; read them as the record of how the verdict evolved, not the
-> current status.
+> **STATUS 2026-09-06 — outcome.** The real-separate-machine gate below, with the
+> pipelined engine, found **PB RF=2 beats raft ~1.7× on throughput** (median/p50
+> latency also better; note PB's p99 is comparable-to-slightly-worse there, while
+> co-located runs show PB p99.9 far better — so the honest tail story is
+> mixed), while **PB RF=3 full-ISR loses to raft's majority**. This RF=2
+> throughput win reproduced on later 12-vCPU-box runs (2026-08). On that basis
+> `-replication-mode=pb` is promoted out of experimental with **RF=2 as the
+> recommended config**; raft stays the default (it wins at RF=3). The "stays
+> EXPERIMENTAL / off" conclusions in the historical sections below predate the
+> pipelined engine and the RF=2 finding — read them as the record of how the
+> verdict evolved, not the current status. A rerun under the current cluster
+> default is still worthwhile but has not overturned the RF=2 result.
 
 This document is the go/no-go **gate** for the dual-mode replication feature
 (see `DUAL-MODE-DESIGN.md`). A launchable static 3-node
