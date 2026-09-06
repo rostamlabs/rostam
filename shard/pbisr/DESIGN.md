@@ -154,9 +154,9 @@ sufficient defense on its own. These were tracked as gating non-experimental use
   `TestPBFailoverPartitionNoDoublePrimary` (P's last ack strictly precedes Q's
   promotion). IMPORTANT SCOPE: the lease-lapse precondition lives in that
   promotion PATH, not inside `ApplySetShardEpoch` itself (the raw op only enforces
-  epoch monotonicity) — `pb_failover.go:410` is the sole promotion caller today,
-  and any future promotion path MUST reuse the same timing gate or the intersection
-  argument breaks. The engine fix is
+  epoch monotonicity) — `pbFailover.tick` → `decidePBPromotions` (cluster/pb_failover.go)
+  is the sole production promotion caller today, and any future promotion path MUST
+  reuse the same `failoverTimeout` timing gate or the intersection argument breaks. The engine fix is
   necessary but NOT sufficient on its own. Promotion-completeness is enforced at
   MetaRaft, not here: MetaRaft MUST NOT grant epoch E+1 to any node until the
   epoch-E lease has PROVABLY lapsed (grant the next lease strictly after the prior

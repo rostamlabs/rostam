@@ -54,11 +54,14 @@ topology.
   its full-ISR commit is slower than raft's majority. If you run PB: set
   `-min-isr ≥ 2` (keeps every acked write on ≥2 nodes — `=1` can lose acked writes
   across failover — and requires at least that many replicas; the default `0` is
-  rejected in pb mode), enable `-pb-auto-failover` if you use `cluster.Config`
-  directly (the server flag defaults on, the struct field does not), leave
-  `-pb-commit-primary` at its default (setting it is a durability downgrade), and
-  note PB's guarantee assumes a bounded cross-node clock rate. It's newer than
-  raft — validate on your workload. [Replication engine](clustering.md#replication-engine)
+  rejected in pb mode), enable `-pb-auto-failover` if you use `cluster.Config` or
+  `rostam.EmbeddedConfig` directly (the server flag defaults on, the struct fields
+  do not — otherwise a failed primary stays down), and leave `-pb-commit-primary`
+  at its default (setting it is a durability downgrade). Note PB is **nosync** (no
+  per-shard WAL/fsync): durability is "acked on ≥ min-ISR nodes in memory," so the
+  guarantee covers losing individual nodes, not the simultaneous loss of every
+  in-sync node for a shard — and it assumes a bounded cross-node clock rate. It's
+  newer than raft — validate on your workload. [Replication engine](clustering.md#replication-engine)
 - [ ] **Shard count has headroom.** `-shards` is fixed for the life of the
   cluster; choose shards ≫ nodes if you expect to grow (membership/RF changes
   redistribute the fixed shards, they don't add more).

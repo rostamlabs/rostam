@@ -16,8 +16,12 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   cross-node clock rate, and the mode is newer than the raft path — validate it
   on your workload. Set `-min-isr ≥ 2` for the no-acked-loss guarantee (`=1` can
   lose acked writes across a failover); `-pb-commit-primary` remains an opt-in
-  durability downgrade. Automatic failover is on by the `-pb-auto-failover` server
-  flag; embedded `cluster.Config` users must enable it explicitly.
+  durability downgrade. Automatic failover is on via the `-pb-auto-failover`
+  server flag; embedded `cluster.Config` / `rostam.EmbeddedConfig` users must
+  enable it explicitly. **Durability scope:** PB is nosync (no per-shard WAL /
+  fsync) — durability is "acked on ≥ min-ISR nodes in memory," so the guarantee
+  covers losing individual nodes, not the simultaneous loss of every in-sync node
+  for a shard.
 
 ## v0.6.0 — 2026-09-02
 
