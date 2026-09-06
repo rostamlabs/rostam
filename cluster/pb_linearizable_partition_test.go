@@ -4,6 +4,7 @@ package cluster
 
 import (
 	"errors"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -117,11 +118,15 @@ func TestPBLinearizableRejectsStalePrimary(t *testing.T) {
 	t.Cleanup(func() { shard.SetReadServedHook(nil) })
 
 	// docs collection: 8 points at {i,0,0}; query {8,0,0} is uniquely nearest id=8.
-	const collection = "docs"
 	colCfg := vector.Config{Dim: 3, Metric: vector.L2, M: 8, EfConstruction: 50, EfSearch: 32, Seed: 1}
 	query := []float32{8, 0, 0}
-	linArgs := ops.EncodeVectorSearchArgsOpts(collection, 5, query, vector.Filter{}, ops.ConsistencyLinearizable, 0, 0)
-	leaderOnlyArgs := ops.EncodeVectorSearchArgsOpts(collection, 5, query, vector.Filter{}, ops.ConsistencyLeaderOnly, 0, 0)
+	// collection gets a FRESH name per setup attempt (below). A retry after a primary
+	// change must not re-create an existing collection: vector_create_collection would
+	// return ErrCollectionExists, and the PB Call path rebuilds errors so that sentinel
+	// is not matchable by errors.Is — a unique name per attempt sidesteps both, so the
+	// loop can never dead-loop into the 45s SKIP while a stable primary is actually
+	// available. linArgs/leaderOnlyArgs are built once the winning name is known.
+	var collection string
 
 	// --- Establish a stable, leased shard-0 primary AND seed the collection on it.
 	// Mirror the no-double-primary gate's SEQUENTIAL two-ack discovery (a probe put,
@@ -135,6 +140,7 @@ func TestPBLinearizableRejectsStalePrimary(t *testing.T) {
 	var primaryIdx = -1
 	var origPrimary string
 	setupDeadline := time.Now().Add(45 * time.Second)
+	attempt := 0
 	for time.Now().Before(setupDeadline) && primaryIdx < 0 {
 		primary := tc.nodes[0].meta.FSM.ShardPrimary(sh)
 		if primary == "" {
@@ -162,14 +168,18 @@ func TestPBLinearizableRejectsStalePrimary(t *testing.T) {
 		if store == nil {
 			t.Fatalf("primary node %d hosts no store for shard %d", idx, sh)
 		}
-		// Seed the collection + points (full-ISR writes) on this leased primary.
-		if _, err := store.Call("vector_create_collection", ops.EncodeCreateCollectionArgs(collection, colCfg)); err != nil {
+		// Seed a FRESH collection + points (full-ISR writes) on this leased primary.
+		// A fresh name per attempt means a retry after a primary change never hits
+		// ErrCollectionExists (see the note where collection is declared).
+		attempt++
+		cand := "docs-" + strconv.Itoa(attempt)
+		if _, err := store.Call("vector_create_collection", ops.EncodeCreateCollectionArgs(cand, colCfg)); err != nil {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
 		seeded := true
 		for i := 1; i <= 8; i++ {
-			up := ops.EncodeVectorUpsertArgs(collection, uint64(i), []float32{float32(i), 0, 0}, "chunk", 0, nil, vector.SparseVector{})
+			up := ops.EncodeVectorUpsertArgs(cand, uint64(i), []float32{float32(i), 0, 0}, "chunk", 0, nil, vector.SparseVector{})
 			if _, err := store.Call("vector_upsert", up); err != nil {
 				seeded = false
 				break
@@ -182,6 +192,7 @@ func TestPBLinearizableRejectsStalePrimary(t *testing.T) {
 		if tc.nodes[0].meta.FSM.ShardPrimary(sh) != primary {
 			continue // primary changed during seeding; redo on the new one
 		}
+		collection = cand
 		primaryIdx = idx
 		origPrimary = primary
 	}
@@ -192,6 +203,9 @@ func TestPBLinearizableRejectsStalePrimary(t *testing.T) {
 		// never a false red.
 		t.Skip("SKIP: could not establish an alive, leased PB primary and seed the collection within 45s (host too loaded); stale-primary-read invariant not exercised this run")
 	}
+	// The winning attempt's collection name is now fixed; build the read args from it.
+	linArgs := ops.EncodeVectorSearchArgsOpts(collection, 5, query, vector.Filter{}, ops.ConsistencyLinearizable, 0, 0)
+	leaderOnlyArgs := ops.EncodeVectorSearchArgsOpts(collection, 5, query, vector.Filter{}, ops.ConsistencyLeaderOnly, 0, 0)
 	oldPrimary := tc.nodes[primaryIdx].getShard(sh)
 	eng := tc.nodes[primaryIdx].pbEngines[sh]
 	if eng == nil {
@@ -267,25 +281,25 @@ func TestPBLinearizableRejectsStalePrimary(t *testing.T) {
 	// a bound tied to the lease: ~ partition + staleness (500ms) + leaseTTL (1000ms),
 	// plus renew slack — well under the 6s deadline below.
 	var linErr error
+	gotNotLeader := false
 	rejectDeadline := time.Now().Add(6 * time.Second)
 	for time.Now().Before(rejectDeadline) {
 		rec.reset()
-		if _, linErr = oldPrimary.Call("vector_search", linArgs); linErr != nil {
-			break // rejected — assertions below run on THIS attempt
+		_, linErr = oldPrimary.Call("vector_search", linArgs)
+		if errors.Is(linErr, shard.ErrNotLeader) {
+			gotNotLeader = true
+			break // the required lease-lapse rejection — assertions below run on THIS attempt
 		}
+		// A nil (still serving via a not-yet-lapsed lease) or a transient
+		// ErrLinearizableTimeout during the expiry window is NOT yet the proof: the
+		// contract is that the lapsed lease maps to NotLeader. Keep polling for it.
 		time.Sleep(50 * time.Millisecond)
 	}
 	sinceCut := time.Since(partitionAt)
-	if linErr == nil {
-		t.Fatalf("(c) CORRECTNESS HOLE: Linearizable read on the PARTITIONED old primary kept SERVING "+
-			"and NEVER rejected within %s — VerifyLeader did not gate the read (a persistent stale "+
-			"serve). This is exactly the bug the lease read-barrier must prevent.", sinceCut)
-	}
-	// The rejection must be leadership-related (lease lapsed → NotLeader), never a
-	// silent stale serve.
-	if !errors.Is(linErr, shard.ErrNotLeader) && !errors.Is(linErr, shard.ErrLinearizableTimeout) {
-		t.Fatalf("(c) Linearizable rejection error = %v; want a *NotLeaderError (lease lapsed) or "+
-			"ErrLinearizableTimeout (fail-loud), never a stale serve", linErr)
+	if !gotNotLeader {
+		t.Fatalf("(c) CORRECTNESS HOLE: within %s a Linearizable read on the PARTITIONED old primary "+
+			"never rejected with shard.ErrNotLeader (last result: %v) — the lease self-fence must gate the "+
+			"read via VerifyLeader→NotLeader once the lease lapses, never serve stale (nil) or merely time out.", sinceCut, linErr)
 	}
 	if ls, _ := rec.counts(); ls != 0 {
 		t.Fatalf("(c) the REJECTING Linearizable read produced %d local leader serve(s) despite "+

@@ -101,9 +101,11 @@ caught-up member, (c) the H2 read confirmation. All three are mandatory for v1.
 > `cluster/config.go:394-401` (the OH1 honor-rule construction guard) +
 > `cluster/pb_partition_test.go` (the partition e2e). `-replication-mode=pb` is
 > no longer experimental (raft stays the default for RF=3 performance reasons).
-> The PB-mode linearizable stale-primary-read e2e now exists and passes
-> (`cluster.TestPBLinearizableRejectsStalePrimary`). Remaining hardening, not a
-> correctness hole: a long nosync bake.
+> The PB-mode linearizable stale-primary-read e2e now exists and passes when its
+> setup preconditions are met — `cluster.TestPBLinearizableRejectsStalePrimary`
+> (like the no-double-primary gate it `t.Skip`s only on a host too loaded to keep a
+> primary leased long enough to seed, never a false pass). Remaining hardening, not
+> a correctness hole: a long nosync bake.
 
 An adversarial review (2026-07-20) found the backup-side epoch fence is NOT a
 sufficient defense on its own. These were tracked as gating non-experimental use
@@ -260,6 +262,7 @@ sufficient defense on its own. These were tracked as gating non-experimental use
 Default stays `raft` (for RF=3 performance — PB's full-ISR commit loses to raft's
 majority there; PB's win is at RF=2). PB is promoted out of experimental as of
 2026-09-06: P6 is green — the last lane, a PB-mode linearizable stale-primary-read
-e2e, now exists and passes (`cluster.TestPBLinearizableRejectsStalePrimary`). A
-long nosync bake is still recommended before relying on PB for critical data. No
-in-place hot switch on a live shard.
+e2e, now exists and passes when its preconditions are met
+(`cluster.TestPBLinearizableRejectsStalePrimary`; skips only under host overload,
+never a false pass). A long nosync bake is still recommended before relying on PB
+for critical data. No in-place hot switch on a live shard.
