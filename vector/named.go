@@ -1096,14 +1096,25 @@ func (nc *NamedCollection) DeleteCAS(id uint64, cas CASCond) (removed bool, prev
 			return derr
 		}
 		if removed {
-			seq, _ = nc.wal.appendNamedDeleteStaged(id) // delete replay is idempotent (best-effort)
+			// Propagate the WAL append error (mirrors dense DeleteCAS): idempotent
+			// replay tolerates torn duplicates, but a durability failure must fail
+			// the delete rather than falsely ack a point that may resurrect on crash.
+			var serr error
+			seq, serr = nc.wal.appendNamedDeleteStaged(id)
+			if serr != nil {
+				return serr
+			}
 		}
 		return nil
 	}()
 	if err != nil {
 		return false, 0, err
 	}
-	_ = nc.wal.commitWaitStaged(seq) // best-effort, matching the append above
+	// seq == 0 (no-op delete) makes commitWaitStaged a no-op returning nil; a real
+	// fsync failure propagates and fails the delete.
+	if werr := nc.wal.commitWaitStaged(seq); werr != nil {
+		return false, 0, werr
+	}
 	return removed, prevVersion, nil
 }
 

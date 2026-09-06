@@ -1097,14 +1097,25 @@ func (m *MultiVectorIndex) DeleteCAS(docID uint64, cas CASCond) (removed bool, p
 			return derr
 		}
 		if removed {
-			seq, _ = m.wal.appendMVDeleteStaged(docID) // delete replay is idempotent (best-effort)
+			// Propagate the WAL append error (mirrors dense DeleteCAS): idempotent
+			// replay tolerates torn duplicates, but a durability failure must fail
+			// the delete rather than falsely ack a doc that may resurrect on crash.
+			var serr error
+			seq, serr = m.wal.appendMVDeleteStaged(docID)
+			if serr != nil {
+				return serr
+			}
 		}
 		return nil
 	}()
 	if err != nil {
 		return false, 0, err
 	}
-	_ = m.wal.commitWaitStaged(seq) // best-effort, matching the append above
+	// seq == 0 (no-op delete) makes commitWaitStaged a no-op returning nil; a real
+	// fsync failure propagates and fails the delete.
+	if werr := m.wal.commitWaitStaged(seq); werr != nil {
+		return false, 0, werr
+	}
 	return removed, prevVersion, nil
 }
 

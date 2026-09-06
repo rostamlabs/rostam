@@ -848,8 +848,12 @@ func (c *Collection) UpsertCASKeyTTL(id uint64, vec []float32, content string, t
 		}
 		// Unconditional delete-then-insert; the CAS was already enforced above
 		// (passing the engine cas here would re-check against the post-delete
-		// version of 0).
-		delSeq := c.idxDeleteLogged(id)
+		// version of 0). A failed delete-WAL-append fails the upsert (delSeq is 0
+		// on error, so nothing is left to wait on).
+		delSeq, derr := c.idxDeleteLogged(id)
+		if derr != nil {
+			return 0, 0, derr
+		}
 		version, keyExpires, err := c.idx.Insert(id, vec, ttl, withContent(meta, content), sparse, keyTTLMs, CASCond{})
 		if err != nil {
 			return 0, delSeq, err
@@ -887,9 +891,13 @@ func (c *Collection) UpsertCASKeyTTL(id uint64, vec []float32, content string, t
 
 // idxDeleteLogged deletes id (unconditionally) and, on a WAL-mode collection,
 // stages the delete's WAL write. Caller holds opMu. Returns the assigned staged
-// sequence, or 0 when nothing was staged (no WAL, the delete was a no-op, or the
-// staged write itself failed — best-effort: delete replay is idempotent, so a
-// failed delete write is not fatal, but there is then nothing to wait on).
+// sequence (0 when nothing was staged: no WAL, or the delete was a no-op) and
+// the WAL append error, if any.
+//
+// The append error is PROPAGATED, not swallowed: idempotent replay tolerates a
+// torn/duplicate delete record, but it must not mask a durability FAILURE — the
+// caller fails the whole upsert so the client is never acked on a replace whose
+// tombstone never reached disk.
 //
 // Does NOT wait on this write's own sequence — the upsert replace path folds it
 // into the FOLLOWING insert's single commit-wait (fix for the double-fsync-per-
@@ -898,16 +906,12 @@ func (c *Collection) UpsertCASKeyTTL(id uint64, vec []float32, content string, t
 // if the insert never reaches its own append, the CALLER must explicitly wait on
 // the returned seq before returning (see UpsertCASKeyTTL): a staged write is
 // never itself durable without a later wait on its seq or a larger one.
-func (c *Collection) idxDeleteLogged(id uint64) uint64 {
+func (c *Collection) idxDeleteLogged(id uint64) (uint64, error) {
 	ok, _ := c.idx.Delete(id, CASCond{})
 	if !ok || c.wal == nil {
-		return 0
+		return 0, nil
 	}
-	seq, err := c.wal.appendDeleteStaged(id)
-	if err != nil {
-		return 0 // best-effort write; nothing durably staged to wait on
-	}
-	return seq
+	return c.wal.appendDeleteStaged(id)
 }
 
 // SearchDocs runs a filtered KNN search and returns each hit enriched with its
@@ -1043,16 +1047,28 @@ func (c *Collection) DeleteCAS(id uint64, cas CASCond) (bool, error) {
 			return derr
 		}
 		if ok {
-			seq, _ = c.wal.appendDeleteStaged(id) // best-effort; delete replay is idempotent
+			// Propagate the WAL append error (mirrors InsertCASKeyTTL). Replay is
+			// idempotent — a torn/duplicate delete record on replay is tolerated —
+			// but that is NOT a licence to swallow a durability FAILURE: a client
+			// acked on a delete whose record never reached disk would see the point
+			// resurrect after a crash. A real append error fails the delete.
+			var serr error
+			seq, serr = c.wal.appendDeleteStaged(id)
+			if serr != nil {
+				return serr
+			}
 		}
 		return nil
 	}()
 	if err != nil {
 		return false, err
 	}
-	// Wait outside opMu. seq == 0 means nothing was staged (no-op delete, or a
-	// failed best-effort write) — commitWaitStaged(0) is a no-op either way.
-	_ = c.wal.commitWaitStaged(seq) // best-effort, matching the append above
+	// Wait outside opMu. seq == 0 means nothing was staged (no-op delete: id was
+	// not live) — commitWaitStaged(0) is a legit no-op returning nil, so a
+	// not-removed delete stays a success. A real fsync failure propagates.
+	if werr := c.wal.commitWaitStaged(seq); werr != nil {
+		return false, werr
+	}
 	return ok, nil
 }
 
@@ -1213,14 +1229,25 @@ func (c *Collection) DeleteCASAt(id uint64, cas CASCond, nowMs int64) (bool, err
 			return derr
 		}
 		if ok {
-			seq, _ = c.wal.appendDeleteStaged(id) // best-effort; delete replay is idempotent
+			// Propagate the WAL append error (mirrors DeleteCAS / InsertCASKeyTTL):
+			// idempotent replay tolerates torn duplicates, but a durability failure
+			// must fail the delete, not silently ack it.
+			var serr error
+			seq, serr = c.wal.appendDeleteStaged(id)
+			if serr != nil {
+				return serr
+			}
 		}
 		return nil
 	}()
 	if err != nil {
 		return false, err
 	}
-	_ = c.wal.commitWaitStaged(seq) // best-effort, matching the append above
+	// seq == 0 (no-op delete) makes commitWaitStaged a no-op returning nil; a real
+	// fsync failure propagates and fails the delete.
+	if werr := c.wal.commitWaitStaged(seq); werr != nil {
+		return false, werr
+	}
 	return ok, nil
 }
 
@@ -1277,7 +1304,14 @@ func (c *Collection) UpsertCASKeyTTLAt(id uint64, vec []float32, content string,
 		// or explicitly waited on by the caller below otherwise.
 		var delSeq uint64
 		if removed && c.wal != nil {
-			delSeq, _ = c.wal.appendDeleteStaged(id) // best-effort write; 0 on failure
+			// Propagate the delete-WAL-append error (mirrors UpsertCASKeyTTL): a
+			// durability failure fails the upsert rather than silently acking a
+			// replace whose tombstone never reached disk. delSeq stays 0 on error.
+			var derr error
+			delSeq, derr = c.wal.appendDeleteStaged(id)
+			if derr != nil {
+				return 0, delSeq, derr
+			}
 		}
 		version, keyExpires, err := c.idx.InsertAt(id, vec, ttl, withContent(meta, content), sparse, keyTTLMs, CASCond{}, nowMs)
 		if err != nil {
