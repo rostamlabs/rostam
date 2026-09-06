@@ -46,12 +46,17 @@ topology.
 - [ ] **Replication factor ≥ 2 for HA.** With a majority intact, a follower
   failure is invisible; a leader election briefly fails that shard's writes with
   retryable errors. [Failure behavior](clustering.md#failure-behavior)
-- [ ] **Replication mode is `raft`** (the default) for production. Per-shard Raft
-  is the production replication engine. `-replication-mode=pb` (primary-backup /
-  ISR) is **experimental** — the docs say not to use it "beyond experimentation,"
-  so keep it out of production. If you are *evaluating* PB in a non-production
-  cluster, `-min-isr ≥ 2` is mandatory (`=1` can lose acknowledged writes across
-  failover) and leave `-pb-commit-primary` at its default. [Replication engine](clustering.md#replication-engine)
+- [ ] **Replication mode chosen deliberately.** `raft` (default) is the safe,
+  proven choice. `-replication-mode=pb` (primary-backup / ISR) is also supported
+  for production — its correctness hazards are closed (lease-fenced primary +
+  full-ISR commit ⇒ no acked-write loss across failover) — and is **recommended
+  at RF=2**, where it beats raft on throughput and tail latency; at RF=3 its
+  full-ISR commit is slower than raft's majority. If you run PB: set `-min-isr` to
+  the replication factor so every replica must ack (the no-acked-loss guarantee;
+  a lower floor can lose acked writes across failover), leave `-pb-commit-primary`
+  at its default (setting it is a durability downgrade), and note PB's guarantee
+  assumes a bounded cross-node clock rate. It's newer than raft — validate on your
+  workload. [Replication engine](clustering.md#replication-engine)
 - [ ] **Shard count has headroom.** `-shards` is fixed for the life of the
   cluster; choose shards ≫ nodes if you expect to grow (membership/RF changes
   redistribute the fixed shards, they don't add more).

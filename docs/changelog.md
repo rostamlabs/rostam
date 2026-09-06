@@ -5,6 +5,18 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **Primary-backup / ISR replication (`-replication-mode=pb`) is no longer
+  experimental.** Its blocking correctness hazards are closed — a lease-fenced
+  primary plus full-ISR commit guarantee no acked-write loss across an automatic
+  failover (on by default), backed by partition and crash-stop failover tests.
+  It is **recommended at replication-factor 2**, where it beats the default raft
+  path on throughput and tail latency; at RF=3 its full-ISR commit (wait for the
+  slowest of every replica) is slower than raft's majority, so raft stays the
+  default. Two honest caveats: PB's no-acked-loss guarantee assumes a bounded
+  cross-node clock rate, and the mode is newer than the raft path — validate it
+  on your workload. Set `-min-isr` to the replication factor for the no-acked-loss
+  guarantee; `-pb-commit-primary` remains an opt-in durability downgrade.
+
 ## v0.6.0 — 2026-09-02
 
 - **Online compaction for replicated shards (opt-in, off by default).** A

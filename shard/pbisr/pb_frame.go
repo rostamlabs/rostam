@@ -63,8 +63,8 @@ const (
 	// instead of reusing the AckMsg codec. Both are INCOMPATIBLE payload-layout
 	// changes, so the version is bumped: a v1 peer's frames are rejected outright
 	// (errPBBadVersion) rather than misparsed into a plausible-looking write. PB is
-	// cluster-homogeneous and flagged EXPERIMENTAL, so no negotiation/downgrade
-	// path is offered — a mixed-version cluster fails loudly at the frame boundary,
+	// cluster-homogeneous (whole cluster runs one -replication-mode), so no
+	// negotiation/downgrade path is offered — a mixed-version cluster fails loudly at the frame boundary,
 	// which is the only safe answer for a protocol whose whole job is deciding
 	// which writes are real.
 	pbFrameVersion uint8 = 2

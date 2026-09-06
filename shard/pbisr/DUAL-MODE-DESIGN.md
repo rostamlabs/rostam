@@ -181,6 +181,11 @@ per-collection surface is gone.
 PB measurably beats Raft on the A/B benchmark. If PB does not beat Raft, stop —
 the feature's premise is false and the flag ships as experimental/off.
 
+> **Outcome (2026-09-06):** gate passed at **RF=2** (PB ~1.7× raft, real separate
+> machines); PB **RF=3** full-ISR loses to raft's majority. `-replication-mode=pb`
+> is promoted out of experimental with RF=2 as the recommended config; raft stays
+> the default. See `BENCHMARK.md` and `DESIGN.md`.
+
 ## 8. Verification
 
 - **Linearizability.** Porcupine/Jepsen-style history checking under concurrent

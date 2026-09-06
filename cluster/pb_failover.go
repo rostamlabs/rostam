@@ -281,12 +281,13 @@ func pbFailoverDecisions(state State, t *pbFailoverTracker, nowNs, failoverTimeo
 //	every pre-τ acked write is on every ISR member (full-ISR commit) and Q is chosen
 //	from that ISR, Q holds every acked write ⇒ no acked-loss, no double-ack.
 //
-//	COVERAGE CAVEAT: this partition property is currently backed by the corrected
-//	construction assertion + the self-fence unit test + the crash-stop no-acked-loss
-//	gate (TestPBFailoverNoAckedLoss). A full network-partition e2e test (isolate one
-//	node's meta path while it keeps taking writes, and assert its lease lapses BEFORE
-//	the epoch bump) is the explicit REMAINING gate item before PBAutoFailover may be
-//	flipped default-on — see shard/pbisr/DESIGN.md.
+//	COVERAGE: this partition property is backed by the construction assertion + the
+//	self-fence unit test + the crash-stop no-acked-loss gate (TestPBFailoverNoAckedLoss)
+//	AND the full network-partition e2e (TestPBFailoverPartitionNoDoublePrimary,
+//	cluster/pb_partition_test.go: isolates one node's meta path while it keeps taking
+//	writes, and asserts its last ack precedes the epoch bump). PBAutoFailover is now
+//	default-on. Remaining hardening (not a correctness hole): a PB-mode linearizable
+//	stale-primary-READ e2e mirroring shard/linearizable_partition_test.go.
 //
 //	DETECTION LATENCY: when the dead primary was ALSO the meta leader, the surviving
 //	nodes must first elect a new meta leader, whose election-floor reset then requires

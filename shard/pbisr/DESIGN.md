@@ -94,9 +94,19 @@ caught-up member, (c) the H2 read confirmation. All three are mandatory for v1.
 
 ## Open hazards (MUST be closed before pb-isr is trusted with data)
 
+> **STATUS 2026-09-06 — all three CLOSED in code.** OH1 (incl. the MetaRaft
+> half), OH2, and OH3 are closed with named guards and passing tests; the
+> per-hazard "STILL PENDING" notes below are historical. See the STATUS block at
+> the top of this repo's pbisr work and `cluster/pb_failover.go` /
+> `cluster/config.go:394-401` (the OH1 honor-rule construction guard) +
+> `cluster/pb_partition_test.go` (the partition e2e). `-replication-mode=pb` is
+> no longer experimental (raft stays the default for RF=3 performance reasons).
+> Remaining hardening, not correctness holes: a PB-mode linearizable
+> stale-primary-read e2e, and a long nosync bake.
+
 An adversarial review (2026-07-20) found the backup-side epoch fence is NOT a
-sufficient defense on its own. These are tracked, unresolved, and gate any
-non-experimental use:
+sufficient defense on its own. These were tracked as gating non-experimental use
+(now closed — see the status note above):
 
 - **OH1 — co-partitioned stale quorum loses an acked write (CRITICAL). —
   WRITE PATH CLOSED IN-ENGINE (2026-07-20); MetaRaft half PENDING.**
@@ -135,7 +145,12 @@ non-experimental use:
     shrink (out of scope here). See `TestOH1StalePrimarySelfFencesOnLeaseExpiry`,
     `TestLeaseRenewalReenablesPropose`, `TestFullISRCommitRequiresEveryMember`.
 
-  **STILL PENDING (MetaRaft half — NOT in this engine):** the engine fix is
+  **MetaRaft half — CLOSED (2026-09-06; this text below is the original
+  requirement, now implemented).** Enforced by construction in
+  `cluster/config.go:394-401` (`failoverTimeout > pbLeaseTTL +
+  metaContactStaleness + renewInterval + failoverTick`) + the failover ticker in
+  `cluster/pb_failover.go`, and verified by `TestPBFailoverPartitionNoDoublePrimary`
+  (P's last ack strictly precedes Q's promotion). The engine fix is
   necessary but NOT sufficient on its own. Promotion-completeness is enforced at
   MetaRaft, not here: MetaRaft MUST NOT grant epoch E+1 to any node until the
   epoch-E lease has PROVABLY lapsed (grant the next lease strictly after the prior
@@ -215,5 +230,8 @@ non-experimental use:
   stale-primary-read, lagging-backup — the H1–H6 acceptance gate. Must match the
   existing shard/linearizable_*_test.go and cluster/partition_test.go rigor.
 
-Default stays `raft` until P6 is green and a long nosync bake passes. No in-place
-hot switch on a live shard.
+Default stays `raft` (for RF=3 performance — PB's full-ISR commit loses to raft's
+majority there; PB's win is at RF=2). PB is promoted out of experimental as of
+2026-09-06: P6 is green except a PB-mode linearizable stale-primary-read e2e
+(remaining hardening), and a long nosync bake is still recommended before
+relying on PB for critical data. No in-place hot switch on a live shard.
