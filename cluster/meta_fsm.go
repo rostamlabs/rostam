@@ -311,8 +311,10 @@ func (m *MetaFSM) Apply(log *raft.Log) any {
 	// gen) while this node's apply of the cutover is deferred. That is precisely the
 	// lagging-follower window: the node routes reads to the still-fresh old gen until
 	// the test releases the gate. nil ⇒ no-op, no lock-ordering effect.
-	if gate := metaApplyCatalogGate.Load(); gate != nil && entry.Op == OpSetCatalogEntry {
-		(*gate)(m.nodeID, entry.Collection, entry.Partitions, entry.Generation)
+	if entry.Op == OpSetCatalogEntry {
+		if gate := metaApplyCatalogGate.Load(); gate != nil {
+			(*gate)(m.nodeID, entry.Collection, entry.Partitions, entry.Generation)
+		}
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
