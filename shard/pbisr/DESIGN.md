@@ -167,7 +167,10 @@ sufficient defense on its own. These were tracked as gating non-experimental use
   NOTE: H2 linearizable reads will share this SAME lease (a fenced primary whose
   lease lapsed must not serve a stale linearizable read either).
 
-- **OH2 — apply-before-quorum uncommitted tail.** The primary applies locally
+- **OH2 — apply-before-quorum uncommitted tail. CLOSED (2026-09-06; the
+  "partially enforced" wording below is historical — the provisos are now fully in
+  code: separate `committed` watermark, P3 reads + P4 election key off `committed`
+  only, demoted ex-primary snapshot-reloaded).** The primary applies locally
   before quorum; a quorum-timeout write is applied but not committed. Safety
   provisos, now partially enforced in code: `committed` (the min-ISR
   high-watermark) is tracked separately from `lastSeq`/`lastApplied`; P3

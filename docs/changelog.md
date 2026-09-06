@@ -7,21 +7,23 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 - **Primary-backup / ISR replication (`-replication-mode=pb`) is no longer
   experimental.** Its blocking correctness hazards are closed — a lease-fenced
-  primary plus full-ISR commit guarantee no acked-write loss across an automatic
-  failover (on by default), backed by partition and crash-stop failover tests.
-  It is **recommended at replication-factor 2**, where it beats the default raft
-  path on throughput and median (p50) latency; at RF=3 its full-ISR commit (wait
+  primary plus full-ISR commit, backed by partition and crash-stop failover tests.
+  The **no acked-write loss across an automatic failover** guarantee holds under
+  all of: `-min-isr ≥ 2` (`=1` can lose acked writes when a post-failover ISR
+  resets to the lone new primary), the default full-ISR commit
+  (`-pb-commit-primary=false` — the opt-in `-pb-commit-primary` is a durability
+  downgrade), and a bounded cross-node clock rate. It is **recommended at
+  replication-factor 2**, where it beat the default raft path ~1.7× on throughput
+  (and p50 latency) in the 2026-07 real-network gate — but that gate's raft
+  baseline ran under the old epoll default, so the margin is unverified under the
+  current server; re-verify on your hardware. At RF=3 its full-ISR commit (wait
   for the slowest of every replica) is slower than raft's majority, so raft stays
-  the default. Two honest caveats: PB's no-acked-loss guarantee assumes a bounded
-  cross-node clock rate, and the mode is newer than the raft path — validate it
-  on your workload. Set `-min-isr ≥ 2` for the no-acked-loss guarantee (`=1` can
-  lose acked writes across a failover); `-pb-commit-primary` remains an opt-in
-  durability downgrade. Automatic failover is on via the `-pb-auto-failover`
-  server flag; embedded `cluster.Config` / `rostam.EmbeddedConfig` users must
-  enable it explicitly. **Durability scope:** PB is nosync (no per-shard WAL /
-  fsync) — durability is "acked on ≥ min-ISR nodes in memory," so the guarantee
-  covers losing individual nodes, not the simultaneous loss of every in-sync node
-  for a shard.
+  the default. Automatic failover is on via the `-pb-auto-failover` server flag;
+  `cluster.Config` / `rostam.EmbeddedConfig` users must set `PBAutoFailover: true`.
+  **Durability scope:** PB is nosync (no per-shard WAL / fsync) — durability is
+  "acked on ≥ min-ISR nodes in memory," so the guarantee covers losing individual
+  nodes, not the simultaneous loss of every in-sync node for a shard. The mode is
+  newer than raft — validate on your workload.
 
 ## v0.6.0 — 2026-09-02
 

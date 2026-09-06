@@ -15,7 +15,9 @@
 > PB-vs-Aerospike (no raft control), not a raft reproduction. The "stays
 > EXPERIMENTAL / off" conclusions in the historical sections predate the pipelined
 > engine and the RF=2 finding — read them as the record of how the verdict
-> evolved, not the current status.
+> evolved, not the current status. NOTE ON THE PROCEDURE BELOW: the gate runbook
+> and most tables use `replication-factor=3` (the comparison config); the
+> recommended production rollout is `-replication-factor 2` with `-min-isr 2`.
 
 This document is the go/no-go **gate** for the dual-mode replication feature
 (see `DUAL-MODE-DESIGN.md`). A launchable static 3-node

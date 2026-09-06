@@ -94,19 +94,24 @@ by what you can afford to lose, not by the benchmark number.
   shard, with automatic failover on by default (via the `-pb-auto-failover`
   server flag; embedded/library `cluster.Config` users must set it explicitly).
   Its blocking correctness hazards are closed: a lease-fenced primary plus
-  full-ISR commit means no acked-write loss across a failover. **Recommended at
-  replication-factor 2**, where it beats raft on throughput and median (p50)
-  latency; at RF=3 its full-ISR commit (wait for the slowest of every replica) is
-  slower than raft's majority (fastest of a majority), so raft stays the default.
-  Caveats: PB is **nosync** (no per-shard WAL/fsync) — durability is "acked on
-  ≥ min-ISR nodes in memory," so the no-acked-loss guarantee covers losing
-  individual nodes, not the simultaneous loss of every in-sync node for a shard;
-  it also assumes a bounded cross-node clock rate; and the mode is newer than the
-  raft path — validate it on your workload. `-pb-auto-failover` defaults on only
-  as the server flag; `cluster.Config` / `rostam.EmbeddedConfig` users must set it.
-  Set `-min-isr ≥ 2` (keeps every acked write on ≥2 nodes;
-  `=1` can lose acked writes across a failover) and one `-pb-addr` per node; see
-  the measured comparison in `shard/pbisr/BENCHMARK.md`.
+  full-ISR commit means **no acked-write loss across a failover — under all of:**
+  `-min-isr ≥ 2`, the default full-ISR commit (`-pb-commit-primary=false`), and a
+  bounded cross-node clock rate. With `-min-isr 1` a post-failover ISR can reset
+  to the lone new primary and lose its write if that node then fails; with
+  `-pb-commit-primary` an acked write can be lost if the primary dies before a
+  backup has it. **Recommended at replication-factor 2**, where it beat raft
+  ~1.7× on throughput (and on p50 latency) in the 2026-07 real-network gate —
+  but that gate's raft baseline ran under the old epoll default, so the margin is
+  unverified under the current server; re-verify on your hardware. At RF=3 its
+  full-ISR commit (wait for the slowest of every replica) is slower than raft's
+  majority (fastest of a majority), so raft stays the default. Other caveats: PB
+  is **nosync** (no per-shard WAL/fsync) — durability is "acked on ≥ min-ISR nodes
+  in memory," so the guarantee covers losing individual nodes, not the
+  simultaneous loss of every in-sync node for a shard; and the mode is newer than
+  the raft path — validate it on your workload. Automatic failover is on only via
+  the `-pb-auto-failover` server flag; `cluster.Config` / `rostam.EmbeddedConfig`
+  users must set `PBAutoFailover: true`. Give each node one `-pb-addr`; see the
+  measured comparison in `shard/pbisr/BENCHMARK.md`.
 
 PB mode requires two extra pieces of configuration:
 
