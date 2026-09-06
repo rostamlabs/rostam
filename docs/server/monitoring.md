@@ -58,10 +58,12 @@ readiness always answers ready.
 ## Audit log
 
 With `-audit-log`, every authorization decision is emitted to stderr as a
-structured JSON record — principal redacted to a token fingerprint, decision,
-op, and resource. Ship stderr to your log pipeline to get a security audit
-trail. This applies only under `-keys-file` RBAC; with a single `-api-key` the
-flag is a no-op. See [Security](security.md).
+structured JSON record — decision, op, resource, and a redacted principal (a raw
+bearer token is never logged, only a non-reversible fingerprint; a
+client-certificate CN, JWT subject, or `internal` appears as itself). Ship
+stderr to your log pipeline to get a security audit trail. This applies only
+under `-keys-file` RBAC; with a single `-api-key` the flag is a no-op. See
+[Security](security.md).
 
 ## Operational signals worth alerting on
 
