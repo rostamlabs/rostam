@@ -202,7 +202,9 @@ func TestWALPoisonWakesParkedFollower(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	if !ready {
-		close(gate) // release the parked leader so it doesn't hang after we fail
+		close(gate)   // release the parked leader so it can finish its in-flight Sync
+		<-leaderErr   // drain it BEFORE t.Fatal so the deferred w.close() can't race the leader's f.Sync()
+		<-followerErr // and the follower, for the same reason
 		t.Fatal("follower never wrote its record (writeSeq did not reach 2) — parked-follower path not exercised")
 	}
 	close(gate) // let the leader's Sync run (and fail)
