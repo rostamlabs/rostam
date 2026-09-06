@@ -301,7 +301,7 @@ func TestPBLinearizableRejectsStalePrimary(t *testing.T) {
 
 	// (c') DURABILITY of the rejection: a partitioned primary can never renew, so the
 	// Linearizable read must keep rejecting. Sample a few more times.
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if _, err := oldPrimary.Call("vector_search", linArgs); err == nil {
 			t.Fatalf("(c') Linearizable read on the still-partitioned old primary SERVED again on "+
 				"probe %d — the rejection is not durable (lease must stay dead while cut)", i)

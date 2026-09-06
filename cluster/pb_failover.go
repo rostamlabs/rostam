@@ -292,8 +292,10 @@ func pbFailoverDecisions(state State, t *pbFailoverTracker, nowNs, failoverTimeo
 //	Note the lease-lapse precondition is enforced by THIS promotion path (the
 //	failoverTimeout gate in decidePBPromotions + the construction-time honor rule),
 //	not inside ApplySetShardEpoch itself — any future promotion path must reuse the
-//	same timing gate. Remaining hardening (not a correctness hole): a PB-mode
-//	linearizable stale-primary-READ e2e mirroring shard/linearizable_partition_test.go.
+//	same timing gate. The PB-mode linearizable stale-primary-READ e2e now exists
+//	and passes: cluster.TestPBLinearizableRejectsStalePrimary (a partitioned old
+//	primary whose lease lapsed rejects a Linearizable read while a LeaderOnly read
+//	still serves stale), mirroring shard/linearizable_partition_test.go.
 //
 //	DETECTION LATENCY: when the dead primary was ALSO the meta leader, the surviving
 //	nodes must first elect a new meta leader, whose election-floor reset then requires
