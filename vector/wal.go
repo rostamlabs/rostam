@@ -348,13 +348,20 @@ func (w *wal) appendDeleteStaged(id uint64) (uint64, error) {
 // call it from production code; use the staged pair.
 func (w *wal) appendFramed(payload []byte) error {
 	if w.poisoned.Load() {
-		return ErrWALPoisoned // fail closed: a prior fsync failure poisoned the log.
+		return ErrWALPoisoned // fast fail-closed: a prior fsync failure poisoned the log.
 	}
 	// WRITE phase: under mu, append the framed record and assign this writer's
 	// commit sequence (the post-write writeSeq). mu is released BEFORE the fsync so
 	// a concurrent appender can overlap this writer's commit-wait, and a leader's
 	// f.Sync() never holds mu.
 	w.mu.Lock()
+	// AUTHORITATIVE fail-closed re-check under w.mu (see appendFramedStaged): a
+	// leader may have poisoned the WAL after the early check above; never write a
+	// new record into a poisoned log.
+	if w.poisoned.Load() {
+		w.mu.Unlock()
+		return ErrWALPoisoned
+	}
 	var hdr [8]byte
 	binary.BigEndian.PutUint32(hdr[0:4], uint32(len(payload))) //nolint:gosec
 	binary.BigEndian.PutUint32(hdr[4:8], crc32.ChecksumIEEE(payload))
@@ -397,9 +404,17 @@ func (w *wal) appendFramed(payload []byte) error {
 // batches them.
 func (w *wal) appendFramedStaged(payload []byte) (uint64, error) {
 	if w.poisoned.Load() {
-		return 0, ErrWALPoisoned // fail closed: a prior fsync failure poisoned the log.
+		return 0, ErrWALPoisoned // fast fail-closed: a prior fsync failure poisoned the log.
 	}
 	w.mu.Lock()
+	// AUTHORITATIVE fail-closed check, under w.mu: a sync leader can poison the WAL
+	// (in commitWait) between the early check above and here. Re-check before
+	// writing ANY bytes so a poisoned WAL never appends a new, un-ackable record
+	// (which would replay after reopen despite never being acked).
+	if w.poisoned.Load() {
+		w.mu.Unlock()
+		return 0, ErrWALPoisoned
+	}
 	var hdr [8]byte
 	binary.BigEndian.PutUint32(hdr[0:4], uint32(len(payload))) //nolint:gosec
 	binary.BigEndian.PutUint32(hdr[4:8], crc32.ChecksumIEEE(payload))
@@ -424,6 +439,9 @@ func (w *wal) appendFramedStaged(payload []byte) (uint64, error) {
 // own noSync short-circuit), so waiting on syncedSeq would block forever.
 // Staged callers use this instead of calling commitWait directly.
 func (w *wal) commitWaitStaged(seq uint64) error {
+	if seq == 0 {
+		return nil // nothing was staged (e.g. a no-op delete) — a success, even poisoned.
+	}
 	if w.noSync {
 		return nil
 	}
@@ -436,6 +454,12 @@ func (w *wal) commitWaitStaged(seq uint64) error {
 // flight (those whose bytes it covers) or wait for the next flight. f.Sync() runs
 // holding NEITHER mu NOR syncMu so writes overlap the in-flight fsync.
 func (w *wal) commitWait(seq uint64) error {
+	if seq == 0 {
+		// A no-op write (nothing staged) touches no durability, so it stays a
+		// success even on a poisoned WAL — this fast path MUST precede the poison
+		// gate so a no-op delete of an absent id is not turned into ErrWALPoisoned.
+		return nil
+	}
 	w.syncMu.Lock()
 	for {
 		if w.poisoned.Load() {

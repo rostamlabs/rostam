@@ -65,6 +65,16 @@ func TestDeleteCASPropagatesWALSyncError(t *testing.T) {
 	if !c.wal.poisoned.Load() {
 		t.Fatal("WAL not poisoned after the delete's fsync failed")
 	}
+	// A no-op delete of an absent id on the NOW-POISONED WAL stages nothing
+	// (commitWaitStaged(0) is a no-op), so it must still succeed as (false, nil):
+	// a no-op touches no durability and must not be turned into ErrWALPoisoned.
+	noop, nerr := c.DeleteCAS(4242, CASCond{})
+	if nerr != nil {
+		t.Fatalf("no-op DeleteCAS on a poisoned WAL returned %v, want nil (no-op touches no durability)", nerr)
+	}
+	if noop {
+		t.Fatal("no-op DeleteCAS reported removed=true for an absent id")
+	}
 }
 
 // TestDeleteCASNoOpStillSucceeds guards the seq==0 no-op case: deleting an absent
@@ -176,16 +186,24 @@ func TestWALPoisonWakesParkedFollower(t *testing.T) {
 	go func() { followerErr <- w.appendFramed([]byte{byte(walDelete), 2}) }()
 
 	// Wait until the follower has written its bytes (writeSeq == 2) so it is
-	// queued behind the in-flight leader before we let the leader's Sync fail.
+	// queued behind the in-flight leader before we let the leader's Sync fail. A
+	// deadline expiry means the follower never parked — the path under test was
+	// NOT exercised, so this must FAIL (not a silent break / false pass).
+	ready := false
 	deadline := time.Now().Add(2 * time.Second)
-	for {
+	for time.Now().Before(deadline) {
 		w.syncMu.Lock()
 		ws := w.writeSeq
 		w.syncMu.Unlock()
-		if ws == 2 || time.Now().After(deadline) {
+		if ws == 2 {
+			ready = true
 			break
 		}
 		time.Sleep(time.Millisecond)
+	}
+	if !ready {
+		close(gate) // release the parked leader so it doesn't hang after we fail
+		t.Fatal("follower never wrote its record (writeSeq did not reach 2) — parked-follower path not exercised")
 	}
 	close(gate) // let the leader's Sync run (and fail)
 

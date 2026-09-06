@@ -1006,7 +1006,14 @@ func (c *Collection) DeleteByFilter(filter Filter) (int, error) {
 	}
 	n := 0
 	for _, id := range ids {
-		if c.Delete(id) {
+		// Use the error-returning delete: a durability failure mid-batch (WAL
+		// append/fsync error, or a poisoned WAL) must surface, not report a clean
+		// batch. Return the count removed so far plus the first error.
+		removed, derr := c.DeleteCAS(id, CASCond{})
+		if derr != nil {
+			return n, derr
+		}
+		if removed {
 			n++
 		}
 	}
@@ -1269,7 +1276,13 @@ func (c *Collection) DeleteByFilterAt(filter Filter, nowMs int64) (int, error) {
 	}
 	n := 0
 	for _, id := range ids {
-		if ok, derr := c.DeleteCASAt(id, CASCond{}, nowMs); derr == nil && ok {
+		// Surface the first durability failure mid-batch instead of silently
+		// reporting a clean batch (mirrors DeleteByFilter).
+		ok, derr := c.DeleteCASAt(id, CASCond{}, nowMs)
+		if derr != nil {
+			return n, derr
+		}
+		if ok {
 			n++
 		}
 	}
