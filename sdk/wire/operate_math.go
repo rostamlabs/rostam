@@ -29,6 +29,14 @@ type Operand struct {
 // (see CompareCell). An opcode not valid for c.Type's domain, or unknown
 // outright, returns ErrOperateType / ErrOperateOpcode and a zero Cell.
 func ApplyScalar(opcode uint8, c Cell, present bool, op Operand) (Cell, error) { //nolint:revive // present kept for API symmetry with CompareCell; unused here by design, see doc comment
+	if !isScalarOpcode(opcode) {
+		// An opcode outside the whole scalar vocabulary (e.g. DEL, a table/
+		// control opcode, or garbage) is unknown regardless of the target's
+		// type — never conflate this with a real-but-domain-inapplicable
+		// opcode (e.g. SHL on a float), which the per-domain functions below
+		// report as ErrOperateType.
+		return Cell{}, ErrOperateOpcode
+	}
 	switch {
 	case TypeIsFloat(c.Type):
 		return applyFloat(opcode, c, op)
@@ -38,6 +46,20 @@ func ApplyScalar(opcode uint8, c Cell, present bool, op Operand) (Cell, error) {
 		return applyBytes(opcode, c, op)
 	default:
 		return Cell{}, ErrOperateType
+	}
+}
+
+// isScalarOpcode reports whether opcode is one of the scalar ops (design doc
+// §3.1) ApplyScalar can ever apply — regardless of whether it is valid for
+// any particular field's type. DEL (a structural op handled by the tree
+// engine, not by scalar math) and every table/control opcode are excluded.
+func isScalarOpcode(opcode uint8) bool {
+	switch opcode {
+	case OperateOpSET, OperateOpADD, OperateOpMUL, OperateOpMIN, OperateOpMAX,
+		OperateOpAND, OperateOpOR, OperateOpXOR, OperateOpSHL, OperateOpSHR, OperateOpSTAMP:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -97,8 +119,13 @@ func applyInt(opcode uint8, c Cell, op Operand) (Cell, error) {
 
 	case OperateOpSTAMP:
 		ms := op.StampMs
-		if op.Aux == OperateStampS {
+		switch op.Aux {
+		case OperateStampMs:
+			// ms is already in milliseconds
+		case OperateStampS:
 			ms /= 1000
+		default:
+			return Cell{}, ErrOperateType
 		}
 		c.U = storeIntOperand(c.Type, unsigned, ms)
 		return c, nil

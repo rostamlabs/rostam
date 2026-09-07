@@ -3,6 +3,7 @@
 package wire
 
 import (
+	"errors"
 	"math"
 	"testing"
 )
@@ -36,6 +37,7 @@ func TestApplyScalarSaturates(t *testing.T) {
 		{OperateTypeI8, su64(-128), OperateOpSHR, 1, su64(-64)},    // arithmetic
 		{OperateTypeU8, 0x80, OperateOpSHR, 1, 0x40},               // logical
 		{OperateTypeU8, 1, OperateOpSHL, 64, 0},
+		{OperateTypeI8, su64(-5), OperateOpSHR, 64, su64(-1)}, // negative signed, full shift-out -> -1
 		{OperateTypeUVarint, 1 << 40, OperateOpADD, 1, 1<<40 + 1},
 	}
 	for _, c := range cases {
@@ -75,7 +77,7 @@ func TestApplyScalarFloatsAndBytes(t *testing.T) {
 func TestApplyScalarRejects(t *testing.T) {
 	bad := []struct{ typ, op uint8 }{
 		{OperateTypeF32, OperateOpSHL}, {OperateTypeF64, OperateOpAND}, {OperateTypeUVarint, OperateOpSHL},
-		{OperateTypeBytes, OperateOpADD}, {OperateTypeU8, 99},
+		{OperateTypeBytes, OperateOpADD},
 	}
 	for _, b := range bad {
 		if _, err := ApplyScalar(b.op, ZeroCell(b.typ, 0), true, Operand{A: 1}); err == nil {
@@ -84,6 +86,14 @@ func TestApplyScalarRejects(t *testing.T) {
 	}
 	if _, err := ApplyScalar(OperateOpSHL, Cell{Type: OperateTypeU8}, true, Operand{A: -1}); err == nil {
 		t.Fatal("negative shift accepted")
+	}
+	// An unknown opcode is ErrOperateOpcode in EVERY domain, not just int —
+	// it must never be reported as ErrOperateType just because the target
+	// field happens to be a float or bytes cell.
+	for _, typ := range []uint8{OperateTypeU8, OperateTypeF64, OperateTypeBytes} {
+		if _, err := ApplyScalar(99, ZeroCell(typ, 0), true, Operand{A: 1}); !errors.Is(err, ErrOperateOpcode) {
+			t.Errorf("type %d: unknown opcode: got %v want ErrOperateOpcode", typ, err)
+		}
 	}
 }
 
@@ -95,6 +105,9 @@ func TestApplyScalarStamp(t *testing.T) {
 	got, _ = ApplyScalar(OperateOpSTAMP, ZeroCell(OperateTypeU16, 0), false, Operand{Aux: OperateStampMs, StampMs: 1_700_000_000_123})
 	if got.U != 65535 {
 		t.Fatal("stamp did not saturate")
+	}
+	if _, err := ApplyScalar(OperateOpSTAMP, ZeroCell(OperateTypeU32, 0), false, Operand{Aux: 99, StampMs: 1}); !errors.Is(err, ErrOperateType) {
+		t.Fatalf("bad stamp aux: got %v want ErrOperateType", err)
 	}
 }
 
