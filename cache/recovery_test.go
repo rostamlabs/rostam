@@ -172,6 +172,54 @@ func TestRebuildCountsCorruptEntries(t *testing.T) {
 	}
 }
 
+// TestRebuildRejectsCorruptPageTail covers the crash-loop hazard: an on-disk
+// page tail that has been corrupted (bit-rot, or a crash mid-setTail) past the
+// page's own capacity must not be trusted straight into entries[cursor:tail] —
+// that slice expression panics before decodeEntry's CRC ever gets a chance to
+// reject it, producing a permanent, unrecoverable crash loop. rebuildIndexFromPages
+// must instead validate 0 <= head <= tail <= len(entries) and treat a violation
+// like any other torn/corrupt page: reset it and bump the corruption counter.
+func TestRebuildRejectsCorruptPageTail(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.NumShards = 1
+	cfg.PageSize = 1 << 20
+	cfg.MaxMemoryPerShard = 1 << 20 // 1 page
+	cfg.TTLSweepIntervalMs = 0      // no sweeper interference
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pages.dat")
+	writeCurrentFileWithEntries(t, path, cfg.PageSize, 1, [][2][]byte{
+		{[]byte("k0"), []byte("AAAA")},
+	})
+
+	// Corrupt page 0's on-disk tail field to a huge garbage value, as a bit-flip
+	// or a crash mid-setTail could produce.
+	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tailAt := int64(headerSize + 4)
+	if _, err := f.WriteAt([]byte{0xF0, 0xFF, 0xFF, 0xFF}, tailAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := newShard(cfg, dir)
+	if err != nil {
+		t.Fatalf("newShard: %v, want a clean error/reset instead of a panic", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	if got := s.snapshot().CorruptionErrors; got == 0 {
+		t.Error("CorruptionErrors = 0 after recovering a page with a corrupt tail; corruption was swallowed silently")
+	}
+	if _, err := s.Get([]byte("k0")); err != ErrNotFound {
+		t.Errorf("Get(k0) = %v, want ErrNotFound (page reset after corrupt tail)", err)
+	}
+}
+
 // TestTornEntrySurvivesEviction reproduces the wedged-shard scenario: a page
 // recovered with a torn entry inside [head, tail) must not fail every
 // eviction-triggering Put forever. rebuildIndexFromPages truncates the page to

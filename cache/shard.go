@@ -1055,6 +1055,19 @@ func (s *shard) rebuildIndexFromPages() {
 			continue
 		}
 		entries := p.entries()
+		if head < 0 || tail < head || tail > len(entries) {
+			// Corrupt head/tail (e.g. bit-rot or a crash mid-setTail): trusting
+			// these raw values into entries[cursor:tail] below would either panic
+			// (tail beyond the mmap region) or silently skip the whole page
+			// (head > tail, so the walk below never runs). Treat it like the
+			// torn-entry path: drop the page and count the loss instead of
+			// crash-looping or losing data with no signal.
+			s.corrupt.Add(1)
+			slog.Warn("corrupt page head/tail during recovery; resetting page",
+				"component", "cache", "page", pageIdx, "head", head, "tail", tail, "cap", len(entries))
+			p.Reset()
+			continue
+		}
 		cursor := head
 		for cursor < tail {
 			key, value, _, meta, err := decodeEntry(entries[cursor:tail])
