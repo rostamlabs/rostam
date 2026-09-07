@@ -122,7 +122,11 @@ import (
     "github.com/rostamlabs/rostam/sdk/wire"
 )
 
-c, _ := client.New(client.Config{Servers: []string{"127.0.0.1:7000"}})
+c, err := client.New(client.Config{Servers: []string{"127.0.0.1:7000"}})
+if err != nil {
+    panic(err)
+}
+defer c.Close()
 
 ops := []wire.OperateOp{
     {Target: wire.OperateTargetGlobal, FieldIdx: 0, Type: wire.OperateTypeU8, Opcode: wire.OperateOpHALVEGRP, Arg: 255, Arg2: 2}, // guard
@@ -140,14 +144,21 @@ the result is the requested field values as i64 **big-endian** in request order.
 the *stored* record, by contrast, fixed-width int/float fields are **little-endian**
 and UVARINT/IVARINT are LEB128.
 
-Every mutation is integer/float arithmetic driven only by the leader-stamped clock,
-and IEEE float encodings are deterministic — so **when apply-stamping is enabled
-(`EnableApplyStamp`)** a replicated apply is byte-identical across the group. On the
-unstamped `Direct` (single-node) path the per-entry `touchMs` falls back to the
-local wall clock (there is no follower to diverge, and it keeps LRU cap-eviction
-meaningful). The whole op-list is all-or-nothing: an invalid op (unknown
-opcode/type, negative shift, SHIFTOR on a non-fixed-int field, an out-of-range
-field or group length) aborts it with the record unchanged.
+Every mutation is integer/float arithmetic whose only external input is the
+apply-stamp clock, and IEEE float encodings are deterministic, so a replicated
+apply is byte-identical across the group. The handler never reads a wall clock —
+that would diverge, since an unstamped apply is not necessarily single-node. The
+consequence is a deliberate trade-off on the per-entry `touchMs` used for LRU
+cap-eviction: **with apply-stamping enabled (`EnableApplyStamp`)** it is the
+leader-stamped time, giving true least-recently-used eviction; **with stamping off**
+every entry shares `touchMs = 0`, so cap-eviction degrades to deterministic
+lowest-key eviction (determinism is never sacrificed for LRU quality). The entry
+map is also bounded by a hard ceiling regardless of `maxEntries`, and the record's
+total field count and size are capped, so a crafted op-list cannot exhaust memory.
+The whole op-list is all-or-nothing: an invalid op (unknown opcode/type, negative
+shift, SHIFTOR on a non-fixed-int field, an out-of-range field or group length, or
+one that would exceed the record's field/size budget) aborts it with the record
+unchanged.
 
 ## TTL semantics
 

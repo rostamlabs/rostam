@@ -34,11 +34,16 @@ import (
 //     old bits fall off); it is rejected on varint and float types.
 //   - HALVE_GRP halves each field in the group per that field's own type.
 //
-// DETERMINISM (RF>1 safety): every mutation is integer/float-only; touchMs and the
-// TTL come solely from tx.applyStamp() (the leader-stamped nowMs); float encodings
-// are IEEE-deterministic; the record encodes entries sorted by key and fields in
-// index order; eviction picks the smallest touchMs (ties → smallest key). A
-// follower re-applying the same committed op-list recomputes byte-identical state.
+// DETERMINISM (RF>1 safety): every mutation is integer/float-only; the ONLY
+// external input is tx.applyStamp() — the leader-stamped nowMs when apply-stamping
+// is enabled, else 0 — used for touchMs and the TTL; float encodings are
+// IEEE-deterministic; the record encodes entries sorted by key and fields in index
+// order; eviction picks the smallest touchMs (ties → smallest key). A follower
+// re-applying the same committed op-list recomputes byte-identical state. We never
+// read a wall clock: applyStamp==false does NOT imply single-node (a replicated
+// apply with EnableApplyStamp off lands there too), so a per-replica wall clock
+// would diverge. The cost is that with stamping off every entry shares touchMs=0
+// and cap-eviction degrades to deterministic lowest-key; true-LRU needs stamping.
 
 // maxOperateFields caps a globals/entry-fields array LENGTH. The record encoding
 // prefixes each array with a u16 count, so an array holds at most 65535 fields; a
@@ -56,13 +61,31 @@ const (
 	minOperateFieldBytes = 1
 )
 
-// maxOperateRecordBytes caps the encoded record size. It guards against a
-// pathological op-list (up to 65535 entries × 65535 fields) building a value so
-// large the Put would fail cryptically deep in the cache write path; instead the
-// op returns errOperateRecordTooLarge cleanly, atomically (before the Put), with
-// the record unchanged. 16 MiB is far beyond any real session record yet well
-// under the cache's hard value limit (~4 GiB). A var (not const) only so a focused
-// test can lower it to exercise the guard cheaply.
+// maxOperateEntries is the HARD ceiling on the entry map, enforced regardless of
+// the wire maxEntries (which is a u16, and where 0 means "no app cap"). It bounds
+// the entry-map allocation for a maxEntries=0 op-list; beyond it, upsert evicts the
+// LRU victim so the map never grows past the ceiling. 65535 matches the u16
+// maxEntries range, so maxEntries=0 behaves as maxEntries=65535 (LRU-capped).
+const maxOperateEntries = 65535
+
+// maxOperateTotalFields is the HARD ceiling on the TOTAL number of fields
+// materialized across the whole record (globals + every entry). It is enforced
+// INCREMENTALLY as arrays grow (grow()), BEFORE any allocation, so a crafted
+// op-list of many entries each growing a large UNSET-hole array cannot allocate
+// gigabytes of operateField before a post-encode check — the classic amplification
+// DoS. 1<<20 fields bounds the in-memory record to a few tens of MiB and is far
+// beyond any real session record (hundreds of counters). maxOperateFields still
+// caps EACH array; this caps their sum.
+const maxOperateTotalFields = 1 << 20
+
+// maxOperateRecordBytes is a BACKSTOP cap on the encoded record size, checked
+// after encodeRec. The incremental entry/field ceilings above are the primary
+// defence (they reject before the big allocation); this catches a record whose
+// bytes exceed the cache-value budget even within those counts (e.g. many wide
+// fields), returning errOperateRecordTooLarge cleanly and atomically (before the
+// Put) rather than failing cryptically deep in the cache write path. 16 MiB is far
+// beyond any real session record yet well under the cache's hard value limit
+// (~4 GiB). A var (not const) only so a focused test can lower it cheaply.
 var maxOperateRecordBytes = 16 << 20
 
 var (
@@ -91,10 +114,13 @@ type operateEntry struct {
 	fields  []operateField
 }
 
-// operateRec is the decoded value: the globals array and the entry map.
+// operateRec is the decoded value: the globals array and the entry map. fieldTotal
+// tracks the sum of all array lengths (globals + every entry's fields) so grow()
+// can enforce maxOperateTotalFields incrementally, before allocating.
 type operateRec struct {
-	globals []operateField
-	entries map[uint64]*operateEntry
+	globals    []operateField
+	entries    map[uint64]*operateEntry
+	fieldTotal int
 }
 
 // handleOperate applies a client op-list to one record atomically under the shard
@@ -117,17 +143,18 @@ func handleOperate(tx *TxContext, args []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// touchMs source: the leader-stamped clock on the replicated path (deterministic
-	// across replicas — every follower re-applies with the identical stamp), else
-	// the cache's effective wall clock on the Direct/single-node path. Using the
-	// wall clock when unstamped is safe (no follower to diverge) and gives real LRU
-	// ordering for cap-eviction — without it every Direct entry would share touchMs=0
-	// and eviction would degrade to lowest-key. It is the same clock ttl/get read on
-	// the unstamped path (tx.Cache().NowMs()), so liveness and touch agree.
-	nowMs, stamped := tx.applyStamp()
-	if !stamped {
-		nowMs = int64(tx.Cache().NowMs()) //nolint:gosec // ms timestamp fits int64
-	}
+	// touchMs is the ONLY external input, and it MUST be identical on every replica
+	// or the encoded record diverges. applyStamp returns the leader-stamped clock
+	// when apply-stamping is enabled (deterministic — every replica re-applies with
+	// the identical stamp) and 0 otherwise. We deliberately do NOT fall back to a
+	// wall clock when unstamped: applyStamp==false does NOT mean single-node — a
+	// REPLICATED apply with EnableApplyStamp off also lands here, and reading each
+	// replica's own wall clock would write divergent touchMs → divergent record bytes
+	// → possibly different LRU victims → cluster divergence. Determinism wins over LRU
+	// quality: with stamping off every entry shares touchMs=0, so cap-eviction
+	// degrades to deterministic lowest-key (documented in docs/kv/overview.md).
+	// True-LRU cap-eviction therefore requires apply-stamping (EnableApplyStamp).
+	nowMs, _ := tx.applyStamp()
 	for _, o := range opsList {
 		if err := applyOp(&rec, o, nowMs, int(maxEntries)); err != nil {
 			return nil, err
@@ -155,11 +182,10 @@ func applyOp(rec *operateRec, o wire.OperateOp, nowMs int64, maxEntries int) err
 	switch o.Opcode {
 	case wire.OperateOpINCR, wire.OperateOpINCRF, wire.OperateOpSETMAX, wire.OperateOpSHIFTOR:
 		idx := int(o.FieldIdx)
-		arr, ok := ensureLen(*arrp, idx+1)
-		if !ok {
+		if !rec.grow(arrp, idx+1) {
 			return errOperateFieldRange
 		}
-		*arrp = arr
+		arr := *arrp
 		adoptType(&arr[idx], o.Type) // a hole or new slot takes this write's type; a real type stays
 		return applyScalar(&arr[idx], o.Opcode, o.Arg, o.Arg2)
 	case wire.OperateOpHALVEGRP:
@@ -179,11 +205,17 @@ func applyOp(rec *operateRec, o wire.OperateOp, nowMs int64, maxEntries int) err
 		}
 		idx := int(o.FieldIdx)
 		end := idx + int(o.Arg2) // safe: idx <= 65535, Arg2 <= 65535 ⇒ no int overflow
-		arr, ok := ensureLen(*arrp, end)
-		if !ok {
+		if !rec.grow(arrp, end) {
 			return errOperateFieldRange
 		}
-		*arrp = arr
+		arr := *arrp
+		// The group carries ONE declared type (o.Type). Any UNSET slot the group
+		// materializes adopts it now, so the field's effective type is fixed by this
+		// op and a later write can't adopt a different (e.g. wider) type and bypass the
+		// group's saturation. A slot that already has a real type keeps it.
+		for i := idx; i < end; i++ {
+			adoptType(&arr[i], o.Type)
+		}
 		if guardTriggered(&arr[idx], o.Arg) {
 			for i := idx; i < end; i++ {
 				halveField(&arr[i])
@@ -326,15 +358,23 @@ func (rec *operateRec) targetArray(o wire.OperateOp, nowMs int64, maxEntries int
 }
 
 // upsertEntry returns the entry for key, creating an empty one (stamped
-// touchMs=nowMs) if absent. When creating would exceed maxEntries (>0) it first
-// evicts the deterministic LRU victim, so the cap holds under concurrency without
-// app coordination.
+// touchMs=nowMs) if absent. The entry map is bounded by a HARD ceiling
+// (maxOperateEntries) as well as any app-supplied maxEntries (>0): before creating
+// a new entry it evicts LRU victims until the map is below the effective cap, so a
+// maxEntries=0 ("no app cap") op-list still cannot grow the map without bound. The
+// loop also trims a stored record whose entry count already exceeds the cap.
 func (rec *operateRec) upsertEntry(key uint64, nowMs int64, maxEntries int) *operateEntry {
 	if e, ok := rec.entries[key]; ok {
 		return e
 	}
-	if maxEntries > 0 && len(rec.entries) >= maxEntries {
-		rec.evictOne()
+	effCap := maxOperateEntries
+	if maxEntries > 0 && maxEntries < effCap {
+		effCap = maxEntries
+	}
+	for len(rec.entries) >= effCap {
+		if !rec.evictOne() {
+			break
+		}
 	}
 	e := &operateEntry{touchMs: nowMs}
 	rec.entries[key] = e
@@ -343,8 +383,10 @@ func (rec *operateRec) upsertEntry(key uint64, nowMs int64, maxEntries int) *ope
 
 // evictOne removes the entry with the smallest touchMs, ties broken by the
 // smallest key — a deterministic function of the (already deterministic) map
-// contents, so every replica evicts the same entry regardless of map order.
-func (rec *operateRec) evictOne() {
+// contents, so every replica evicts the same entry regardless of map order. It
+// subtracts the victim's field count from fieldTotal and reports whether an entry
+// was removed (false only when the map is already empty).
+func (rec *operateRec) evictOne() bool {
 	var (
 		victim uint64
 		bestMs int64
@@ -355,25 +397,40 @@ func (rec *operateRec) evictOne() {
 			victim, bestMs, found = k, e.touchMs, true
 		}
 	}
-	if found {
-		delete(rec.entries, victim)
+	if !found {
+		return false
 	}
+	rec.fieldTotal -= len(rec.entries[victim].fields)
+	delete(rec.entries, victim)
+	return true
 }
 
-// ensureLen grows arr to at least length n, filling every new slot with an UNSET
-// hole (a 1-byte zero-valued placeholder that adopts its real type on first
-// write). It returns arr unchanged when already long enough. ok=false when n
-// exceeds maxOperateFields. Growth NEVER assigns a real type — so a field's type
-// is set only by its first real write (adoptType), never by the order in which
+// grow grows the array *arrp to at least length n, filling every new slot with an
+// UNSET hole (a 1-byte zero-valued placeholder that adopts its real type on first
+// write). It returns false — WITHOUT allocating — when n would exceed the per-array
+// cap (maxOperateFields) or the whole-record field budget (maxOperateTotalFields),
+// so a crafted op-list cannot amplify a small request into a gigabyte allocation.
+// On success it updates rec.fieldTotal. Growth NEVER assigns a real type: a field's
+// type is set only by its first real write (adoptType), never by the order in which
 // higher indices were touched.
-func ensureLen(arr []operateField, n int) ([]operateField, bool) {
+func (rec *operateRec) grow(arrp *[]operateField, n int) bool {
+	arr := *arrp
+	if n <= len(arr) {
+		return true
+	}
 	if n > maxOperateFields {
-		return arr, false
+		return false
+	}
+	delta := n - len(arr)
+	if rec.fieldTotal+delta > maxOperateTotalFields {
+		return false
 	}
 	for len(arr) < n {
 		arr = append(arr, operateField{typ: wire.OperateTypeUnset})
 	}
-	return arr, true
+	rec.fieldTotal += delta
+	*arrp = arr
+	return true
 }
 
 // adoptType sets an UNSET hole's type to newType (its first real write); a field
@@ -579,9 +636,16 @@ func decodeRec(b []byte) (operateRec, error) {
 	}
 	nGlobals := int(binary.LittleEndian.Uint16(b[off : off+2]))
 	off += 2
-	if !wire.CountFitsIn(nGlobals, len(b)-off, minOperateFieldBytes) {
+	// Two guards beyond CountFitsIn's byte bound: cap the whole-record field count and
+	// the entry count at the SAME hard ceilings the write path enforces, so a hostile
+	// raw put of a huge value (operate reads whatever bytes are stored under the key)
+	// cannot make decodeRec itself allocate gigabytes of fields/entries. operate never
+	// writes past these ceilings, so a record exceeding them is corrupt/hostile and is
+	// rejected rather than materialized.
+	if !wire.CountFitsIn(nGlobals, len(b)-off, minOperateFieldBytes) || nGlobals > maxOperateTotalFields {
 		return operateRec{}, wire.ErrShortArgs
 	}
+	total := nGlobals
 	if nGlobals > 0 {
 		rec.globals = make([]operateField, nGlobals)
 		for i := range rec.globals {
@@ -598,7 +662,7 @@ func decodeRec(b []byte) (operateRec, error) {
 	}
 	nEntries := int(binary.LittleEndian.Uint32(b[off : off+4]))
 	off += 4
-	if !wire.CountFitsIn(nEntries, len(b)-off, minOperateEntryBytes) {
+	if !wire.CountFitsIn(nEntries, len(b)-off, minOperateEntryBytes) || nEntries > maxOperateEntries {
 		return operateRec{}, wire.ErrShortArgs
 	}
 	for range nEntries {
@@ -611,9 +675,11 @@ func decodeRec(b []byte) (operateRec, error) {
 		off += 8
 		nFields := int(binary.LittleEndian.Uint16(b[off : off+2]))
 		off += 2
-		if !wire.CountFitsIn(nFields, len(b)-off, minOperateFieldBytes) {
+		// Bound the cumulative field count before allocating this entry's array.
+		if !wire.CountFitsIn(nFields, len(b)-off, minOperateFieldBytes) || total+nFields > maxOperateTotalFields {
 			return operateRec{}, wire.ErrShortArgs
 		}
+		total += nFields
 		e := &operateEntry{touchMs: touchMs}
 		if nFields > 0 {
 			e.fields = make([]operateField, nFields)
@@ -628,6 +694,7 @@ func decodeRec(b []byte) (operateRec, error) {
 		}
 		rec.entries[key] = e
 	}
+	rec.fieldTotal = total
 	return rec, nil
 }
 

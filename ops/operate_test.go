@@ -8,7 +8,6 @@ import (
 	"math"
 	"testing"
 
-	"github.com/rostamlabs/rostam/cache"
 	"github.com/rostamlabs/rostam/sdk/wire"
 )
 
@@ -469,23 +468,13 @@ func TestOperateRecordTooLargeRejected(t *testing.T) {
 	}
 }
 
-// TestOperateDirectModeLRU: on the UNSTAMPED (Direct) path touchMs comes from the
-// cache wall clock, so cap-eviction still evicts the least-recently-touched entry
-// rather than degrading to lowest-key. The cache clock is injected so the test is
-// deterministic.
-func TestOperateDirectModeLRU(t *testing.T) {
-	cfg := cache.DefaultConfig()
-	cfg.NumShards = 1
-	c, err := cache.New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = c.Close() })
-	var now uint64 = 1000
-	c.SetNowFunc(func() uint64 { return now })
-	tx := NewTxContext(c) // UNSTAMPED (Direct) TxContext
-	key := []byte("direct")
-
+// TestOperateUnstampedEvictionIsDeterministicLowestKey: on the UNSTAMPED path
+// touchMs is 0 for every entry (never a per-replica wall clock), so cap-eviction
+// deterministically evicts the smallest key. This is the documented trade-off:
+// determinism over LRU quality when apply-stamping is off.
+func TestOperateUnstampedEvictionIsDeterministicLowestKey(t *testing.T) {
+	_, tx := newTestSetup(t) // NewTxContext ⇒ unstamped
+	key := []byte("unstamped")
 	do := func(ops []wire.OperateOp, ret []wire.OperateRet) []int64 {
 		res, err := handleOperate(tx, wire.EncodeOperateArgs(key, 0, 2, ops, ret))
 		if err != nil {
@@ -494,20 +483,94 @@ func TestOperateDirectModeLRU(t *testing.T) {
 		vals, _ := wire.DecodeOperateResult(res)
 		return vals
 	}
-	now = 1000
-	do([]wire.OperateOp{eOp(9, 0, wire.OperateTypeU8, wire.OperateOpINCR, 90, 0)}, nil) // touch entry 9 (high key) recently-ish
-	now = 2000
-	do([]wire.OperateOp{eOp(1, 0, wire.OperateTypeU8, wire.OperateOpINCR, 10, 0)}, nil) // touch entry 1 (low key) LATER
-	now = 3000
-	// Insert entry 5 over the cap of 2: the LRU victim is entry 9 (oldest touchMs),
-	// NOT the lowest key (which would wrongly evict entry 1).
+	// Touch entry 9 first, then entry 1 (later) — but unstamped, both touchMs=0.
+	do([]wire.OperateOp{eOp(9, 0, wire.OperateTypeU8, wire.OperateOpINCR, 90, 0)}, nil)
+	do([]wire.OperateOp{eOp(1, 0, wire.OperateTypeU8, wire.OperateOpINCR, 10, 0)}, nil)
+	// Insert entry 5 over the cap of 2: tie on touchMs=0 ⇒ smallest KEY (1) evicted.
 	got := do([]wire.OperateOp{eOp(5, 0, wire.OperateTypeU8, wire.OperateOpINCR, 50, 0)},
-		[]wire.OperateRet{eRet(9, 0), eRet(1, 0), eRet(5, 0)})
+		[]wire.OperateRet{eRet(1, 0), eRet(9, 0), eRet(5, 0)})
 	if got[0] != 0 {
-		t.Fatalf("Direct LRU: entry 9 (oldest) should be evicted, got %d", got[0])
+		t.Fatalf("unstamped eviction: smallest key 1 should be evicted, got %d", got[0])
 	}
-	if got[1] != 10 || got[2] != 50 {
-		t.Fatalf("Direct LRU: entry 1/5 = %d/%d, want 10/50", got[1], got[2])
+	if got[1] != 90 || got[2] != 50 {
+		t.Fatalf("unstamped eviction: entry 9/5 = %d/%d, want 90/50", got[1], got[2])
+	}
+}
+
+// TestOperateUnstampedReplicaReapplyMatches: two independent "replicas" (separate
+// caches) applying the SAME committed op-list on the UNSTAMPED path produce
+// byte-identical stored records — the regression guard for the wall-clock
+// divergence bug (a per-replica wall clock would write different touchMs).
+func TestOperateUnstampedReplicaReapplyMatches(t *testing.T) {
+	opsList := []wire.OperateOp{
+		gOp(0, wire.OperateTypeU16, wire.OperateOpINCR, 7, 0),
+		eOp(100, 0, wire.OperateTypeUVARINT, wire.OperateOpINCR, 1, 0),
+		eOp(5, 0, wire.OperateTypeU8, wire.OperateOpINCR, 3, 0),
+		eOp(100, 1, wire.OperateTypeI64, wire.OperateOpSETMAX, 9, 0),
+	}
+	key := []byte("repl")
+	stored := func() []byte {
+		_, tx := newTestSetup(t) // unstamped, fresh cache = one "replica"
+		if _, err := handleOperate(tx, wire.EncodeOperateArgs(key, 0, 0, opsList, nil)); err != nil {
+			t.Fatalf("handleOperate: %v", err)
+		}
+		v, err := tx.Get(key)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		out := make([]byte, len(v))
+		copy(out, v)
+		return out
+	}
+	if a, b := stored(), stored(); !bytes.Equal(a, b) {
+		t.Fatal("two unstamped replicas produced divergent record bytes")
+	}
+}
+
+// TestOperateAmplificationDoSRejected: an op-list that tries to materialize more
+// than the whole-record field budget is rejected INCREMENTALLY (before allocating
+// gigabytes). Each op grows a distinct entry's array to the per-array max; the op
+// that would push the record's total field count past maxOperateTotalFields fails,
+// aborting the whole op-list with nothing written.
+func TestOperateAmplificationDoSRejected(t *testing.T) {
+	_, tx := newTestSetup(t)
+	// Each op grows entry k's array to maxOperateFields; after ~16 of them the total
+	// crosses maxOperateTotalFields (1<<20). Build a few more than needed.
+	nOps := maxOperateTotalFields/maxOperateFields + 3
+	ops := make([]wire.OperateOp, nOps)
+	for k := range ops {
+		ops[k] = eOp(uint64(k), uint16(maxOperateFields-1), wire.OperateTypeU8, wire.OperateOpINCR, 1, 0)
+	}
+	tx.SetApplyStamp(1, true)
+	_, err := handleOperate(tx, wire.EncodeOperateArgs([]byte("dos"), 0, 0, ops, nil))
+	tx.SetApplyStamp(0, false)
+	if err != errOperateFieldRange {
+		t.Fatalf("amplification op-list: err = %v, want errOperateFieldRange", err)
+	}
+	// Atomic: nothing written.
+	got := callOperate(t, tx, 2, []byte("dos"), 0, nil, []wire.OperateRet{eRet(0, uint16(maxOperateFields-1))})
+	if got[0] != 0 {
+		t.Fatalf("record written despite DoS rejection: got %d", got[0])
+	}
+}
+
+// TestOperateHalveGroupTypesUnsetSlots: a HALVE_GRP that first materializes a field
+// must fix that field's type to the group's declared type, so a LATER wider write
+// cannot adopt a different type and bypass the group's saturation.
+func TestOperateHalveGroupTypesUnsetSlots(t *testing.T) {
+	_, tx := newTestSetup(t)
+	key := []byte("hgtype")
+	// HALVE_GRP declares U8 for fields [0,2); it creates them as U8 (threshold 0
+	// fires, halving 0→0). A subsequent INCR declaring U32 must NOT re-type field 0:
+	// the U8 saturation must hold (300 → 255).
+	callOperate(t, tx, 1, key, 0, []wire.OperateOp{
+		gOp(0, wire.OperateTypeU8, wire.OperateOpHALVEGRP, 0, 2),
+	}, nil)
+	got := callOperate(t, tx, 2, key, 0,
+		[]wire.OperateOp{gOp(0, wire.OperateTypeU32, wire.OperateOpINCR, 300, 0)},
+		[]wire.OperateRet{gRet(0)})
+	if got[0] != 255 {
+		t.Fatalf("HALVE_GRP-typed field = %d, want 255 (U8 saturation held, not re-typed to U32)", got[0])
 	}
 }
 
