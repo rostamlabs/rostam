@@ -541,8 +541,16 @@ func (w *wal) truncate() error {
 	// durability state unknown, and — like commitWait — a later writer must never
 	// be allowed to retry an fsync that could falsely succeed after the kernel
 	// dropped a prior failure's dirty pages (fsyncgate). Fail closed on any error.
-	// Already-poisoned ⇒ don't issue another Sync at all (a poisoned WAL never
-	// retries fsync); fail closed for symmetry with the append/commit entry points.
+	//
+	// Best-effort fast-fail if the WAL is ALREADY poisoned: skip a pointless
+	// rotation of a known-dead log. This is NOT a full barrier — poison is set
+	// under syncMu (in commitWait) while this checks under w.mu, so a leader Sync
+	// failing between here and truncate's own Sync below can still let one truncate
+	// Sync through. That is harmless: a failed truncate Sync itself poisons and
+	// never advances syncedSeq, and poisoned waiters hit the poison gate before the
+	// syncedSeq check, so no errored write is ever acked. (In practice Flush holds
+	// the caller's opMu across snapshot+truncate, so no concurrent writer op runs
+	// here at all — see the truncate doc comment above.)
 	if w.poisoned.Load() {
 		return ErrWALPoisoned
 	}
