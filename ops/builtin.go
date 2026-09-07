@@ -71,6 +71,11 @@ var builtinHandlers = map[string]Handler{
 	"incr_ex": handleIncrEx,
 	"caex":    handleCAEX,
 	"mget":    handleMGet,
+	// operate is the generic atomic multi-field update op: it decodes ONE Rostam
+	// value into {globals []i64; entries map[u64]*entry}, applies a client-supplied
+	// op-list (pure integer arithmetic, leader-stamped clock only) under the shard
+	// write lock, and writes it back in one round-trip. See handleOperate.
+	"operate": handleOperate,
 	// flush wipes the ENTIRE KV keyspace (keyless, no args). The cluster path
 	// broadcasts it to every shard group; each group applies it here against its own
 	// cache. See handleFlush.

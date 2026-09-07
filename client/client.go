@@ -360,6 +360,27 @@ func (c *Client) CompareAndExpire(ctx context.Context, key, expected []byte, ttl
 	return wire.DecodeCASResult(res)
 }
 
+// Operate applies a list of pure-integer ops (INCR / INCRF / SETMAX / SHIFTOR /
+// HALVE_GRP, built as wire.OperateOp with the wire.OperateOp* opcodes and
+// wire.OperateTarget* targets) to ONE record atomically, server-side, in a single
+// round-trip — the primitive for a HOT key where a client CAS-retry loop would
+// livelock. The record models a small globals array plus a capped map of entry
+// sub-records; maxEntries==0 leaves the map unbounded, and ttl (0 = no expiry) is
+// applied to the whole record on every call. ret names the fields to read back
+// after the ops apply; the returned i64 slice aligns with ret in order (0 for an
+// absent field). Because the whole op-list commits under the shard write lock, NO
+// concurrent increment is lost.
+//
+// Like the other conditional writes, an ambiguous transport failure returns a
+// non-nil error rather than a possibly-wrong result; the op is not replayed.
+func (c *Client) Operate(ctx context.Context, key []byte, ttl time.Duration, maxEntries uint16, ops []wire.OperateOp, ret []wire.OperateRet) ([]int64, error) {
+	res, err := c.Call(ctx, "operate", wire.EncodeOperateArgs(key, ttl, maxEntries, ops, ret))
+	if err != nil {
+		return nil, err
+	}
+	return wire.DecodeOperateResult(res)
+}
+
 // maxMGetKeys caps how many keys ride in one mget call — the u16 count field's
 // range. MGet chunks each shard's key group to this size.
 const maxMGetKeys = 65535

@@ -108,6 +108,53 @@ Inside a handler, `tx` gives you the shard-local store:
 | `tx.Cache()` | escape hatch to the underlying cache (stats, iteration) |
 | `tx.Vectors()` | the vector `CollectionStore` (nil if the dispatcher has none) |
 
+## Built-in generic op: `operate`
+
+If you don't want to compile a custom handler, the built-in **`operate`** op is a
+ready-made generic version of the `match` example above: the client sends a *list*
+of pure-integer ops and the server applies them to one record atomically, in one
+round-trip, under the shard lock — so a **hot key updated by many callers in
+parallel loses no update** (what a client CAS-retry loop can't guarantee). The
+business logic stays in your app (the op-list is data), so adding a counter never
+rebuilds Rostam.
+
+One record decodes as a small **globals** array (`[]i64`) plus a capped map of
+**entries** (`u64 → []i64` sub-records, each with a leader-stamped `touchMs` for
+deterministic LRU eviction). Opcodes:
+
+| opcode | effect |
+|---|---|
+| `INCR(f, n)` / `INCRF(f, n)` | `f += n` (i64 / fixed-point) |
+| `SETMAX(f, v)` | `f = max(f, v)` |
+| `SHIFTOR(f, b, v)` | `f = (f << b) \| v` (rolling bitfield; `b` must be ≥ 0) |
+| `HALVE_GRP(f, thr, len)` | if `f ≥ thr`, halve the contiguous fields `[f, f+len)` (overflow guard) |
+
+A target is a **global** field or a **(entryKey, field)** inside the map;
+referencing an absent entry upserts it (subject to `maxEntries` — `0` = unbounded —
+evicting the smallest `touchMs`, ties by smallest key). Return specs read fields
+back after the ops apply, so one call can update *and* read the record.
+
+```go
+import "github.com/rostamlabs/rostam/sdk/wire"
+
+ops := []wire.OperateOp{
+    {Target: wire.OperateTargetGlobal, FieldIdx: 0, Opcode: wire.OperateOpHALVEGRP, Arg: 255, Arg2: 2}, // guard
+    {Target: wire.OperateTargetGlobal, FieldIdx: 0, Opcode: wire.OperateOpINCR, Arg: 1},                 // request count
+    {Target: wire.OperateTargetEntry, EntryKey: bidderID, FieldIdx: 0, Opcode: wire.OperateOpINCR, Arg: 1},
+}
+ret := []wire.OperateRet{{Target: wire.OperateTargetGlobal, FieldIdx: 0}}
+vals, err := c.Operate(ctx, []byte("session:42"), 90*time.Second, 1024, ops, ret) // vals[i] ← ret[i], i64
+```
+
+Wire (args): `[keyLen u16][key][ttlMs u64][maxEntries u16][nOps u32]` then per op
+`[tgt u8][entryKey u64 iff tgt=1][fieldIdx u16][opcode u8][arg i64][arg2 i64]`,
+then `[nReturn u16]` and per return `[tgt u8][entryKey u64 iff tgt=1][fieldIdx u16]`;
+the result is the requested field values as i64 big-endian in request order. Every
+mutation is pure integer arithmetic stamped only by the leader clock, so a
+replicated apply is byte-identical across the group. The whole op-list is
+all-or-nothing: an invalid op (unknown opcode, negative shift) aborts it with the
+record unchanged.
+
 ## Native Go vs WASM
 
 A native Go op lives in the server process, so it works on `Direct` and

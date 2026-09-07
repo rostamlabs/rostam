@@ -175,6 +175,93 @@ func TestClientIncrAccumulates(t *testing.T) {
 	}
 }
 
+// TestClientOperateNoLostIncrement is the whole point of operate: many goroutines
+// hammer INCR on ONE hot key/field concurrently, and every increment must survive.
+// A client CAS-retry loop would livelock here; operate applies each op-list under
+// the shard write lock, so the final value equals the exact number of increments.
+func TestClientOperateNoLostIncrement(t *testing.T) {
+	addr, stop := startTestStack(t)
+	defer stop()
+	c, _ := client.New(client.Config{Servers: []string{addr}, MaxConnsPerServer: 8})
+	defer func() { _ = c.Close() }()
+
+	const goroutines = 24
+	const iters = 50
+	key := []byte("hot-session")
+	incr := []wire.OperateOp{{Target: wire.OperateTargetGlobal, FieldIdx: 0, Opcode: wire.OperateOpINCR, Arg: 1}}
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for range goroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for range iters {
+				if _, err := c.Operate(context.Background(), key, 0, 0, incr, nil); err != nil {
+					t.Errorf("Operate: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	got, err := c.Operate(context.Background(), key, 0, 0, nil,
+		[]wire.OperateRet{{Target: wire.OperateTargetGlobal, FieldIdx: 0}})
+	if err != nil {
+		t.Fatalf("Operate read-back: %v", err)
+	}
+	if want := int64(goroutines * iters); got[0] != want {
+		t.Fatalf("counter = %d, want %d (increments were lost)", got[0], want)
+	}
+}
+
+// TestClientOperateUpdateAndReadBack exercises the multi-opcode update-and-read
+// round trip across globals and entry sub-records, plus the deterministic entry
+// cap.
+func TestClientOperateUpdateAndReadBack(t *testing.T) {
+	addr, stop := startTestStack(t)
+	defer stop()
+	c, _ := client.New(client.Config{Servers: []string{addr}})
+	defer func() { _ = c.Close() }()
+	ctx := context.Background()
+	key := []byte("rec")
+
+	// Guard-then-increment (HALVE_GRP overflow guard ahead of the increments), a
+	// SETMAX, and an entry counter — all in one atomic op-list.
+	ops := []wire.OperateOp{
+		{Target: wire.OperateTargetGlobal, FieldIdx: 0, Opcode: wire.OperateOpINCR, Arg: 10},
+		{Target: wire.OperateTargetGlobal, FieldIdx: 1, Opcode: wire.OperateOpSETMAX, Arg: 7},
+		{Target: wire.OperateTargetGlobal, FieldIdx: 1, Opcode: wire.OperateOpSETMAX, Arg: 3},
+		{Target: wire.OperateTargetEntry, EntryKey: 42, FieldIdx: 0, Opcode: wire.OperateOpINCR, Arg: 100},
+	}
+	ret := []wire.OperateRet{
+		{Target: wire.OperateTargetGlobal, FieldIdx: 0},
+		{Target: wire.OperateTargetGlobal, FieldIdx: 1},
+		{Target: wire.OperateTargetEntry, EntryKey: 42, FieldIdx: 0},
+	}
+	got, err := c.Operate(ctx, key, 0, 0, ops, ret)
+	if err != nil {
+		t.Fatalf("Operate: %v", err)
+	}
+	if len(got) != 3 || got[0] != 10 || got[1] != 7 || got[2] != 100 {
+		t.Fatalf("read-back = %v, want [10 7 100]", got)
+	}
+
+	// A second op-list accumulates on the committed state.
+	got, err = c.Operate(ctx, key, 0, 0,
+		[]wire.OperateOp{{Target: wire.OperateTargetGlobal, FieldIdx: 0, Opcode: wire.OperateOpINCR, Arg: 5}},
+		[]wire.OperateRet{{Target: wire.OperateTargetGlobal, FieldIdx: 0}})
+	if err != nil {
+		t.Fatalf("Operate 2: %v", err)
+	}
+	if got[0] != 15 {
+		t.Fatalf("accumulated global[0] = %d, want 15", got[0])
+	}
+}
+
 func TestClientConditionalWrites(t *testing.T) {
 	addr, stop := startTestStack(t)
 	defer stop()

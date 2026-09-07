@@ -45,6 +45,11 @@ var BuiltinOps = []BuiltinOp{
 	{"ttl", OpReadOnly, StdKeyExtractor, RouteLayoutNone, false},
 	{"incr_ex", OpReadWrite, StdKeyExtractor, RouteLayoutNone, false},
 	{"caex", OpReadWrite, StdKeyExtractor, RouteLayoutNone, false},
+	// operate is the generic atomic multi-field update op. Its args lead with
+	// [keyLen u16][key], so it routes by that key via StdKeyExtractor exactly like
+	// get/put/incr; it is a write (applies its whole op-list under the shard write
+	// lock in one round-trip).
+	{"operate", OpReadWrite, StdKeyExtractor, RouteLayoutNone, false},
 	// put_batch packs N puts into one Raft log entry. It routes by its FIRST key,
 	// so every key in a batch must hash to the same shard — the cluster fan-out
 	// (Node.PutBatch) guarantees that by grouping before it calls.

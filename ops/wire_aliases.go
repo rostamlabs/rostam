@@ -29,6 +29,8 @@ type (
 	KeysAddArgs          = wire.KeysAddArgs
 	MVGetBatchRow        = wire.MVGetBatchRow
 	NamedGetBatchRow     = wire.NamedGetBatchRow
+	OperateOp            = wire.OperateOp
+	OperateRet           = wire.OperateRet
 	OrderKeyVal          = wire.OrderKeyVal
 	PutEntry             = wire.PutEntry
 	RedactedKeyEntry     = wire.RedactedKeyEntry
@@ -123,6 +125,10 @@ var (
 	EncodeCollectionsResult                   = wire.EncodeCollectionsResult
 	DecodeIncrExArgs                          = wire.DecodeIncrExArgs
 	EncodeIncrExArgs                          = wire.EncodeIncrExArgs
+	DecodeOperateArgs                         = wire.DecodeOperateArgs
+	EncodeOperateArgs                         = wire.EncodeOperateArgs
+	DecodeOperateResult                       = wire.DecodeOperateResult
+	EncodeOperateResult                       = wire.EncodeOperateResult
 	DecodeMGetArgs                            = wire.DecodeMGetArgs
 	EncodeMGetArgs                            = wire.EncodeMGetArgs
 	DecodeMGetResult                          = wire.DecodeMGetResult
