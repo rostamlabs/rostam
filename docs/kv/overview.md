@@ -75,6 +75,63 @@ shard's Raft log on `Embedded` (and under the shard lock on `Direct`). This is
 the extension point for [custom ops](custom-ops.md) and
 [WASM procedures](wasm.md).
 
+## Atomic multi-field updates: `operate`
+
+The built-in **`operate`** op applies a *list* of pure-integer ops to one record
+atomically, server-side, in one round-trip under the shard lock — so a **hot key
+updated by many callers in parallel loses no update** (what a client CAS-retry
+loop can't guarantee). The op-list is data, so the update logic lives in your app
+and adding a counter never rebuilds Rostam. (For arbitrary Go logic, a
+[custom op](custom-ops.md) is the escape hatch; `operate` is the ready-made
+generic form.)
+
+One record decodes as a small **globals** array plus a capped map of **entries**
+(`u64` → sub-record, each with a leader-stamped `touchMs` for deterministic LRU
+eviction). Fields are **typed** for memory efficiency — each field is stored
+self-describing as `[type u8][data]`, so a `u8` counter costs 2 bytes instead of 8
+(a typed record is ~50% smaller than an all-i64 one). The app assigns each field
+index a type; the type rides the op so a field is created on first touch, and the
+**stored type wins** for a field that already exists.
+
+Field types (`wire.OperateType*`): `U8 U16 U32 U64 I8 I16 I32 I64 F32 F64 UVARINT
+IVARINT`. Fixed-width data is native little-endian; `UVARINT`/`IVARINT` are LEB128
+(IVARINT zigzag), a compact growable counter. Opcodes:
+
+| opcode | effect |
+|---|---|
+| `INCR(f, n)` / `INCRF(f, n)` | `f += n`; fixed-width ints **saturate** at the type's min/max (never wrap), floats use IEEE add (operand `n` rides `Arg` as the IEEE bit pattern) |
+| `SETMAX(f, v)` | `f = max(f, v)` in the field's domain |
+| `SHIFTOR(f, b, v)` | `f = ((f << b) \| v)` **masked to the field's bit width** (rolling window; fixed-width int only; `b` ≥ 0) |
+| `HALVE_GRP(f, thr, len)` | if `f ≥ thr`, halve the contiguous fields `[f, f+len)` per each field's type (overflow guard) |
+
+A target is a **global** field or a **(entryKey, field)** inside the map;
+referencing an absent entry upserts it (subject to `maxEntries` — `0` = unbounded —
+evicting the smallest `touchMs`, ties by smallest key). Return specs read fields
+back after the ops apply (the returned i64 is the field's raw bits — interpret per
+its type), so one call can update *and* read the record.
+
+```go
+import "github.com/rostamlabs/rostam/sdk/wire"
+
+ops := []wire.OperateOp{
+    {Target: wire.OperateTargetGlobal, FieldIdx: 0, Type: wire.OperateTypeU8, Opcode: wire.OperateOpHALVEGRP, Arg: 255, Arg2: 2}, // guard
+    {Target: wire.OperateTargetGlobal, FieldIdx: 0, Type: wire.OperateTypeU8, Opcode: wire.OperateOpINCR, Arg: 1},                 // request count (saturates at 255)
+    {Target: wire.OperateTargetEntry, EntryKey: bidderID, FieldIdx: 0, Type: wire.OperateTypeU16, Opcode: wire.OperateOpINCR, Arg: 1},
+}
+ret := []wire.OperateRet{{Target: wire.OperateTargetGlobal, FieldIdx: 0}}
+vals, err := c.Operate(ctx, []byte("session:42"), 90*time.Second, 1024, ops, ret) // vals[i] ← ret[i]
+```
+
+Wire (args): `[keyLen u16][key][ttlMs u64][maxEntries u16][nOps u32]` then per op
+`[tgt u8][entryKey u64 iff tgt=1][fieldIdx u16][opcode u8][ftype u8][arg i64][arg2 i64]`,
+then `[nReturn u16]` and per return `[tgt u8][entryKey u64 iff tgt=1][fieldIdx u16]`;
+the result is the requested field values as i64 big-endian in request order. Every
+mutation is pure integer/float arithmetic stamped only by the leader clock (and
+IEEE float encodings are deterministic), so a replicated apply is byte-identical
+across the group. The whole op-list is all-or-nothing: an invalid op (unknown
+opcode/type, negative shift, SHIFTOR on a non-fixed-int field) aborts it with the
+record unchanged.
+
 ## TTL semantics
 
 TTLs are absolute deadlines computed at write time. Expiry is enforced lazily on
