@@ -104,6 +104,18 @@ func TypeIsUnsigned(t uint8) bool {
 	}
 }
 
+// TypeIsFloat reports whether t is F32 or F64 — the types ApplyScalar's
+// float path handles, stored in Cell.F.
+func TypeIsFloat(t uint8) bool {
+	return t == OperateTypeF32 || t == OperateTypeF64
+}
+
+// TypeIsBytes reports whether t is BYTES or FIXED — the types ApplyScalar's
+// bytewise path handles, stored in Cell.B.
+func TypeIsBytes(t uint8) bool {
+	return t == OperateTypeBytes || t == OperateTypeFixed
+}
+
 // AppendCellData appends c's data-only encoding (no type tag, no FIXED
 // width) to dst: little-endian for the fixed-width int and float types,
 // binary.AppendUvarint for UVARINT, zigzagged binary.AppendUvarint for
