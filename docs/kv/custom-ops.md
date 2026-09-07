@@ -112,7 +112,8 @@ Inside a handler, `tx` gives you the shard-local store:
 
 If your update is just atomic counter/bitfield math (like the `match` example
 above), you don't need to compile a handler at all — the built-in **`operate`** op
-is a ready-made generic version: the client sends a *list* of typed integer ops and
+is a ready-made generic version: the client sends a *list* of typed numeric ops
+(integer and IEEE float) and
 the server applies them to one record atomically under the shard lock. The op-list
 is data, so the logic stays in your app. See
 [Atomic multi-field updates: `operate`](overview.md#atomic-multi-field-updates-operate).

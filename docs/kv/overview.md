@@ -43,8 +43,10 @@ protocol over a socket.
     `r.kv.<operation>` raises `TransportError` on an HTTP-connected client (`Rostam("http://...")`);
     KV has no REST surface.
 
-Beyond get/put/del, two built-in atomic ops run server-side — no
-read-modify-write race, no extra round trips:
+Beyond get/put/del, several built-in atomic ops run server-side — no
+read-modify-write race, no extra round trips. `incr` and `expire` are shown here;
+the generic multi-field [`operate`](#atomic-multi-field-updates-operate) is below,
+and there are conditional writes (`set_nx`, `cas`, `cad`, `caex`) and more:
 
 === "Go"
 
@@ -77,7 +79,8 @@ the extension point for [custom ops](custom-ops.md) and
 
 ## Atomic multi-field updates: `operate`
 
-The built-in **`operate`** op applies a *list* of pure-integer ops to one record
+The built-in **`operate`** op applies a *list* of typed numeric ops (integer and
+IEEE float — see the type table) to one record
 atomically, server-side, in one round-trip under the shard lock — so a **hot key
 updated by many callers in parallel loses no update** (what a client CAS-retry
 loop can't guarantee). The op-list is data, so the update logic lives in your app
@@ -110,8 +113,16 @@ evicting the smallest `touchMs`, ties by smallest key). Return specs read fields
 back after the ops apply (the returned i64 is the field's raw bits — interpret per
 its type), so one call can update *and* read the record.
 
+`Operate` is a method on the smart **`client.Client`** (from `client.New`), not the
+`rostam.Store` facade:
+
 ```go
-import "github.com/rostamlabs/rostam/sdk/wire"
+import (
+    "github.com/rostamlabs/rostam/client"
+    "github.com/rostamlabs/rostam/sdk/wire"
+)
+
+c, _ := client.New(client.Config{Servers: []string{"127.0.0.1:7000"}})
 
 ops := []wire.OperateOp{
     {Target: wire.OperateTargetGlobal, FieldIdx: 0, Type: wire.OperateTypeU8, Opcode: wire.OperateOpHALVEGRP, Arg: 255, Arg2: 2}, // guard
@@ -122,15 +133,21 @@ ret := []wire.OperateRet{{Target: wire.OperateTargetGlobal, FieldIdx: 0}}
 vals, err := c.Operate(ctx, []byte("session:42"), 90*time.Second, 1024, ops, ret) // vals[i] ← ret[i]
 ```
 
-Wire (args): `[keyLen u16][key][ttlMs u64][maxEntries u16][nOps u32]` then per op
-`[tgt u8][entryKey u64 iff tgt=1][fieldIdx u16][opcode u8][ftype u8][arg i64][arg2 i64]`,
+Wire (args, **big-endian**): `[keyLen u16][key][ttlMs u64][maxEntries u16][nOps u32]`
+then per op `[tgt u8][entryKey u64 iff tgt=1][fieldIdx u16][opcode u8][ftype u8][arg i64][arg2 i64]`,
 then `[nReturn u16]` and per return `[tgt u8][entryKey u64 iff tgt=1][fieldIdx u16]`;
-the result is the requested field values as i64 big-endian in request order. Every
-mutation is pure integer/float arithmetic stamped only by the leader clock (and
-IEEE float encodings are deterministic), so a replicated apply is byte-identical
-across the group. The whole op-list is all-or-nothing: an invalid op (unknown
-opcode/type, negative shift, SHIFTOR on a non-fixed-int field) aborts it with the
-record unchanged.
+the result is the requested field values as i64 **big-endian** in request order. In
+the *stored* record, by contrast, fixed-width int/float fields are **little-endian**
+and UVARINT/IVARINT are LEB128.
+
+Every mutation is integer/float arithmetic driven only by the leader-stamped clock,
+and IEEE float encodings are deterministic — so **when apply-stamping is enabled
+(`EnableApplyStamp`)** a replicated apply is byte-identical across the group. On the
+unstamped `Direct` (single-node) path the per-entry `touchMs` falls back to the
+local wall clock (there is no follower to diverge, and it keeps LRU cap-eviction
+meaningful). The whole op-list is all-or-nothing: an invalid op (unknown
+opcode/type, negative shift, SHIFTOR on a non-fixed-int field, an out-of-range
+field or group length) aborts it with the record unchanged.
 
 ## TTL semantics
 

@@ -8,6 +8,7 @@ import (
 	"math"
 	"testing"
 
+	"github.com/rostamlabs/rostam/cache"
 	"github.com/rostamlabs/rostam/sdk/wire"
 )
 
@@ -394,6 +395,122 @@ func TestOperateFieldIndexOverflowRejected(t *testing.T) {
 	}
 }
 
+func TestOperateHalveGroupHostileLengthRejected(t *testing.T) {
+	// A huge/overflowing HALVE_GRP group length must be rejected (no idx+len overflow,
+	// no index-out-of-range panic on the replicated apply path), leaving the record
+	// unchanged.
+	for _, arg2 := range []int64{math.MaxInt64, math.MinInt64, -1, 0, int64(maxOperateFields) + 1} {
+		_, tx := newTestSetup(t)
+		key := []byte("hg")
+		callOperate(t, tx, 1, key, 0, []wire.OperateOp{gOp(0, wire.OperateTypeU8, wire.OperateOpINCR, 5, 0)}, nil)
+		tx.SetApplyStamp(2, true)
+		_, err := handleOperate(tx, wire.EncodeOperateArgs(key, 0, 0,
+			[]wire.OperateOp{gOp(0, wire.OperateTypeU8, wire.OperateOpHALVEGRP, 1, arg2)}, nil))
+		tx.SetApplyStamp(0, false)
+		if err == nil {
+			t.Fatalf("HALVE_GRP arg2=%d accepted, want error", arg2)
+		}
+		// Record unchanged: field 0 still 5.
+		got := callOperate(t, tx, 3, key, 0, nil, []wire.OperateRet{gRet(0)})
+		if got[0] != 5 {
+			t.Fatalf("record mutated by rejected HALVE_GRP arg2=%d: got %d, want 5", arg2, got[0])
+		}
+	}
+}
+
+// TestOperateHoleTypeOrderIndependent: creating a high field index first must NOT
+// force the lower (hole) indices to a narrow type — a later write to a hole adopts
+// ITS declared type, independent of order (no silent truncation).
+func TestOperateHoleTypeOrderIndependent(t *testing.T) {
+	_, tx := newTestSetup(t)
+	key := []byte("holes")
+	// Create field 5 (U8) first, which materializes 0..4 as holes.
+	callOperate(t, tx, 1, key, 0, []wire.OperateOp{gOp(5, wire.OperateTypeU8, wire.OperateOpINCR, 1, 0)}, nil)
+	// Now write field 0 as U32 with a value that would truncate under U8.
+	got := callOperate(t, tx, 2, key, 0,
+		[]wire.OperateOp{gOp(0, wire.OperateTypeU32, wire.OperateOpINCR, 100000, 0)},
+		[]wire.OperateRet{gRet(0), gRet(5)})
+	if got[0] != 100000 {
+		t.Fatalf("hole field 0 = %d, want 100000 (U32, not truncated to U8)", got[0])
+	}
+	if got[1] != 1 {
+		t.Fatalf("field 5 = %d, want 1", got[1])
+	}
+	// The other holes (1..4) read as 0 and are still untyped: writing field 2 as
+	// IVARINT with a negative value must hold the negative, not a U8 clamp.
+	got = callOperate(t, tx, 3, key, 0,
+		[]wire.OperateOp{gOp(2, wire.OperateTypeIVARINT, wire.OperateOpINCR, -7, 0)},
+		[]wire.OperateRet{gRet(2)})
+	if got[0] != -7 {
+		t.Fatalf("hole field 2 = %d, want -7 (IVARINT adopted)", got[0])
+	}
+}
+
+func TestOperateRecordTooLargeRejected(t *testing.T) {
+	old := maxOperateRecordBytes
+	maxOperateRecordBytes = 8 // tiny cap so a couple of fields exceed it
+	defer func() { maxOperateRecordBytes = old }()
+
+	_, tx := newTestSetup(t)
+	key := []byte("big")
+	tx.SetApplyStamp(1, true)
+	_, err := handleOperate(tx, wire.EncodeOperateArgs(key, 0, 0, []wire.OperateOp{
+		gOp(0, wire.OperateTypeU64, wire.OperateOpINCR, 1, 0),
+		gOp(1, wire.OperateTypeU64, wire.OperateOpINCR, 1, 0),
+	}, nil))
+	tx.SetApplyStamp(0, false)
+	if err != errOperateRecordTooLarge {
+		t.Fatalf("oversized record: err = %v, want errOperateRecordTooLarge", err)
+	}
+	// Atomic: nothing was written.
+	got := callOperate(t, tx, 2, key, 0, nil, []wire.OperateRet{gRet(0)})
+	if got[0] != 0 {
+		t.Fatalf("record written despite size rejection: got %d, want 0", got[0])
+	}
+}
+
+// TestOperateDirectModeLRU: on the UNSTAMPED (Direct) path touchMs comes from the
+// cache wall clock, so cap-eviction still evicts the least-recently-touched entry
+// rather than degrading to lowest-key. The cache clock is injected so the test is
+// deterministic.
+func TestOperateDirectModeLRU(t *testing.T) {
+	cfg := cache.DefaultConfig()
+	cfg.NumShards = 1
+	c, err := cache.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	var now uint64 = 1000
+	c.SetNowFunc(func() uint64 { return now })
+	tx := NewTxContext(c) // UNSTAMPED (Direct) TxContext
+	key := []byte("direct")
+
+	do := func(ops []wire.OperateOp, ret []wire.OperateRet) []int64 {
+		res, err := handleOperate(tx, wire.EncodeOperateArgs(key, 0, 2, ops, ret))
+		if err != nil {
+			t.Fatalf("handleOperate: %v", err)
+		}
+		vals, _ := wire.DecodeOperateResult(res)
+		return vals
+	}
+	now = 1000
+	do([]wire.OperateOp{eOp(9, 0, wire.OperateTypeU8, wire.OperateOpINCR, 90, 0)}, nil) // touch entry 9 (high key) recently-ish
+	now = 2000
+	do([]wire.OperateOp{eOp(1, 0, wire.OperateTypeU8, wire.OperateOpINCR, 10, 0)}, nil) // touch entry 1 (low key) LATER
+	now = 3000
+	// Insert entry 5 over the cap of 2: the LRU victim is entry 9 (oldest touchMs),
+	// NOT the lowest key (which would wrongly evict entry 1).
+	got := do([]wire.OperateOp{eOp(5, 0, wire.OperateTypeU8, wire.OperateOpINCR, 50, 0)},
+		[]wire.OperateRet{eRet(9, 0), eRet(1, 0), eRet(5, 0)})
+	if got[0] != 0 {
+		t.Fatalf("Direct LRU: entry 9 (oldest) should be evicted, got %d", got[0])
+	}
+	if got[1] != 10 || got[2] != 50 {
+		t.Fatalf("Direct LRU: entry 1/5 = %d/%d, want 10/50", got[1], got[2])
+	}
+}
+
 // TestOperateEncodeDeterministic: encodeRec is a pure function of record contents,
 // independent of Go map iteration order, and stable across a decode/encode cycle.
 func TestOperateEncodeDeterministic(t *testing.T) {
@@ -492,9 +609,8 @@ func TestDecodeRecHostile(t *testing.T) {
 			return b
 		}(),
 	}
-	for range seeds {
-		// The assertion is simply that decodeRec returns (no panic) on each seed.
-	}
+	// The contract is simply that decodeRec RETURNS (never panics) on each hostile
+	// seed — reaching the end of the loop is the assertion.
 	for _, s := range seeds {
 		_, _ = decodeRec(s)
 	}

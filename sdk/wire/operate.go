@@ -51,7 +51,14 @@ const (
 	OperateTypeF64     uint8 = 9
 	OperateTypeUVARINT uint8 = 10
 	OperateTypeIVARINT uint8 = 11
-	OperateTypeCount   uint8 = 12 // exclusive bound: a tag >= this is unknown
+	// OperateTypeUnset marks an unaddressed HOLE in a dense stored field array — a
+	// slot that has never had a real write. It encodes as just its 1-byte tag (no
+	// data), reads back as 0, and ADOPTS the type of its first real write regardless
+	// of op order (so creating field 5 before field 0 never forces 0 to a narrow
+	// type). It is a valid STORED type but is NEVER valid on an op-entry (an op must
+	// declare a real numeric type), so the arg decoder rejects it.
+	OperateTypeUnset uint8 = 12
+	OperateTypeCount uint8 = 13 // exclusive bound: a stored tag >= this is unknown
 )
 
 // Operate targets (the op / return-spec target byte). A target byte outside this
@@ -74,8 +81,9 @@ var ErrBadOperateType = errors.New("wire: operate field type invalid")
 
 // OperateOp is one op-list entry. For a global target EntryKey is ignored; for an
 // entry target it selects the sub-record. Type is the field's type, used to CREATE
-// the field on first touch (ignored if the field already exists — the stored type
-// wins); it must be a valid OperateType*. Arg/Arg2 carry the per-opcode operands
+// the field on first touch or to type a previously-unset hole (ignored once the
+// field has a real type — the stored type then wins); it must be a real numeric
+// OperateType* (0..IVARINT), never OperateTypeUnset. Arg/Arg2 carry the per-opcode operands
 // (INCR/INCRF/SETMAX use only Arg — for a float field Arg is the IEEE bit pattern
 // of the operand; SHIFTOR uses Arg=shift, Arg2=value; HALVE_GRP uses Arg=threshold,
 // Arg2=group length).
@@ -235,7 +243,9 @@ func DecodeOperateArgs(args []byte) (key []byte, ttl time.Duration, maxEntries u
 		off++
 		o.Type = args[off]
 		off++
-		if o.Type >= OperateTypeCount {
+		// An op must declare a real numeric type: reject unknown tags AND the
+		// internal UNSET hole marker (which is a stored-only type).
+		if o.Type >= OperateTypeUnset {
 			return nil, 0, 0, nil, nil, ErrBadOperateType
 		}
 		o.Arg = int64(binary.BigEndian.Uint64(args[off : off+8])) //nolint:gosec // reinterpret stored u64 as i64

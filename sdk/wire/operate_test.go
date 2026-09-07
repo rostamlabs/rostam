@@ -143,6 +143,10 @@ func TestDecodeOperateArgsBadType(t *testing.T) {
 	if _, _, _, _, _, err := DecodeOperateArgs(buildOperateFrame(OperateTargetGlobal, OperateOpINCR, 200)); err != ErrBadOperateType {
 		t.Fatalf("bad type 200: err = %v, want ErrBadOperateType", err)
 	}
+	// The UNSET hole marker is a stored-only type; it must be rejected on an op-entry.
+	if _, _, _, _, _, err := DecodeOperateArgs(buildOperateFrame(OperateTargetGlobal, OperateOpINCR, OperateTypeUnset)); err != ErrBadOperateType {
+		t.Fatalf("UNSET on op: err = %v, want ErrBadOperateType", err)
+	}
 }
 
 func TestDecodeOperateArgsHostileNOps(t *testing.T) {
@@ -174,8 +178,9 @@ func FuzzDecodeOperateArgs(f *testing.F) {
 	f.Add(EncodeOperateArgs([]byte("k"), time.Second, 4,
 		[]OperateOp{{Target: OperateTargetGlobal, FieldIdx: 0, Opcode: OperateOpINCR, Type: OperateTypeU8, Arg: 1}},
 		[]OperateRet{{Target: OperateTargetGlobal, FieldIdx: 0}}))
-	// One seed per field type so the corpus exercises every tag.
-	for ty := uint8(0); ty < OperateTypeCount; ty++ {
+	// One seed per real op field type so the corpus exercises every tag (UNSET is
+	// stored-only and invalid on an op, so stop below it).
+	for ty := uint8(0); ty < OperateTypeUnset; ty++ {
 		f.Add(EncodeOperateArgs([]byte("t"), 0, 2,
 			[]OperateOp{{Target: OperateTargetEntry, EntryKey: 1, FieldIdx: 0, Opcode: OperateOpINCR, Type: ty, Arg: 3}},
 			[]OperateRet{{Target: OperateTargetEntry, EntryKey: 1, FieldIdx: 0}}))

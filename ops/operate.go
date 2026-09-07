@@ -47,22 +47,32 @@ import (
 const maxOperateFields = 65535
 
 // minOperateEntryBytes is the smallest honest encoded entry: key(8) + touchMs(8) +
-// nFields(2), with zero fields. minOperateFieldBytes is the smallest field: a
-// type tag + one data byte (U8/I8, or a 1-byte varint). Both bound declared counts
-// in decodeRec before any allocation (CountFitsIn), the wire batch-decoder
+// nFields(2), with zero fields. minOperateFieldBytes is the smallest field: a bare
+// type tag with no data (an UNSET hole is exactly 1 byte). Both bound declared
+// counts in decodeRec before any allocation (CountFitsIn), the wire batch-decoder
 // discipline.
 const (
 	minOperateEntryBytes = 18
-	minOperateFieldBytes = 2
+	minOperateFieldBytes = 1
 )
 
+// maxOperateRecordBytes caps the encoded record size. It guards against a
+// pathological op-list (up to 65535 entries × 65535 fields) building a value so
+// large the Put would fail cryptically deep in the cache write path; instead the
+// op returns errOperateRecordTooLarge cleanly, atomically (before the Put), with
+// the record unchanged. 16 MiB is far beyond any real session record yet well
+// under the cache's hard value limit (~4 GiB). A var (not const) only so a focused
+// test can lower it to exercise the guard cheaply.
+var maxOperateRecordBytes = 16 << 20
+
 var (
-	errOperateOpcode     = errors.New("ops: operate unknown opcode")
-	errOperateShift      = errors.New("ops: operate SHIFTOR negative shift")
-	errOperateShiftType  = errors.New("ops: operate SHIFTOR requires a fixed-width int field")
-	errOperateGroup      = errors.New("ops: operate HALVE_GRP group length < 1")
-	errOperateFieldRange = errors.New("ops: operate field index out of range")
-	errOperateType       = errors.New("ops: operate unknown field type")
+	errOperateOpcode         = errors.New("ops: operate unknown opcode")
+	errOperateShift          = errors.New("ops: operate SHIFTOR negative shift")
+	errOperateShiftType      = errors.New("ops: operate SHIFTOR requires a fixed-width int field")
+	errOperateGroup          = errors.New("ops: operate HALVE_GRP group length out of range")
+	errOperateFieldRange     = errors.New("ops: operate field index out of range")
+	errOperateType           = errors.New("ops: operate unknown field type")
+	errOperateRecordTooLarge = errors.New("ops: operate record exceeds max size")
 )
 
 // operateField is one typed field. Integer/varint values live in u (unsigned types
@@ -107,13 +117,27 @@ func handleOperate(tx *TxContext, args []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	nowMs, _ := tx.applyStamp() // leader-stamped ⇒ deterministic on followers (0 on the unstamped Direct path)
+	// touchMs source: the leader-stamped clock on the replicated path (deterministic
+	// across replicas — every follower re-applies with the identical stamp), else
+	// the cache's effective wall clock on the Direct/single-node path. Using the
+	// wall clock when unstamped is safe (no follower to diverge) and gives real LRU
+	// ordering for cap-eviction — without it every Direct entry would share touchMs=0
+	// and eviction would degrade to lowest-key. It is the same clock ttl/get read on
+	// the unstamped path (tx.Cache().NowMs()), so liveness and touch agree.
+	nowMs, stamped := tx.applyStamp()
+	if !stamped {
+		nowMs = int64(tx.Cache().NowMs()) //nolint:gosec // ms timestamp fits int64
+	}
 	for _, o := range opsList {
 		if err := applyOp(&rec, o, nowMs, int(maxEntries)); err != nil {
 			return nil, err
 		}
 	}
-	if err := tx.Put(key, encodeRec(rec), ttl); err != nil {
+	enc := encodeRec(rec)
+	if len(enc) > maxOperateRecordBytes {
+		return nil, errOperateRecordTooLarge
+	}
+	if err := tx.Put(key, enc, ttl); err != nil {
 		return nil, err
 	}
 	return encodeReturn(&rec, ret), nil
@@ -131,11 +155,12 @@ func applyOp(rec *operateRec, o wire.OperateOp, nowMs int64, maxEntries int) err
 	switch o.Opcode {
 	case wire.OperateOpINCR, wire.OperateOpINCRF, wire.OperateOpSETMAX, wire.OperateOpSHIFTOR:
 		idx := int(o.FieldIdx)
-		arr, ok := ensureLen(*arrp, idx+1, o.Type)
+		arr, ok := ensureLen(*arrp, idx+1)
 		if !ok {
 			return errOperateFieldRange
 		}
 		*arrp = arr
+		adoptType(&arr[idx], o.Type) // a hole or new slot takes this write's type; a real type stays
 		return applyScalar(&arr[idx], o.Opcode, o.Arg, o.Arg2)
 	case wire.OperateOpHALVEGRP:
 		// HALVE_GRP(thr=Arg, len=Arg2): the group is the contiguous field range
@@ -144,12 +169,17 @@ func applyOp(rec *operateRec, o wire.OperateOp, nowMs int64, maxEntries int) err
 		// wire carries one fieldIdx + two i64 args, so a group is a contiguous range
 		// rather than an explicit field list — the design's `HALVE_GRP(thr, f…)` with
 		// f… the range starting at the guard.)
-		if o.Arg2 < 1 {
+		//
+		// Bound Arg2 BEFORE computing end: an unbounded group length would overflow
+		// `idx + int(Arg2)` (CWE-190) and then index out of range in the loop below —
+		// on the replicated apply path that would panic every replica's FSM. Rejecting
+		// aborts the whole op-list atomically with the record unchanged.
+		if o.Arg2 < 1 || o.Arg2 > maxOperateFields {
 			return errOperateGroup
 		}
 		idx := int(o.FieldIdx)
-		end := idx + int(o.Arg2)
-		arr, ok := ensureLen(*arrp, end, o.Type)
+		end := idx + int(o.Arg2) // safe: idx <= 65535, Arg2 <= 65535 ⇒ no int overflow
+		arr, ok := ensureLen(*arrp, end)
 		if !ok {
 			return errOperateFieldRange
 		}
@@ -330,29 +360,29 @@ func (rec *operateRec) evictOne() {
 	}
 }
 
-// ensureLen grows arr to at least length n, filling holes below the top with a U8
-// zero and creating the top slot (index n-1) with newType. It returns arr
-// unchanged when already long enough (the STORED field type wins for an existing
-// index). ok=false when n exceeds maxOperateFields or a to-be-created top slot's
-// newType is unknown.
-func ensureLen(arr []operateField, n int, newType uint8) ([]operateField, bool) {
+// ensureLen grows arr to at least length n, filling every new slot with an UNSET
+// hole (a 1-byte zero-valued placeholder that adopts its real type on first
+// write). It returns arr unchanged when already long enough. ok=false when n
+// exceeds maxOperateFields. Growth NEVER assigns a real type — so a field's type
+// is set only by its first real write (adoptType), never by the order in which
+// higher indices were touched.
+func ensureLen(arr []operateField, n int) ([]operateField, bool) {
 	if n > maxOperateFields {
 		return arr, false
 	}
-	if n <= len(arr) {
-		return arr, true
-	}
-	if newType >= wire.OperateTypeCount {
-		return arr, false
-	}
 	for len(arr) < n {
-		if len(arr) == n-1 {
-			arr = append(arr, operateField{typ: newType}) // the addressed field
-		} else {
-			arr = append(arr, operateField{typ: wire.OperateTypeU8}) // a hole
-		}
+		arr = append(arr, operateField{typ: wire.OperateTypeUnset})
 	}
 	return arr, true
+}
+
+// adoptType sets an UNSET hole's type to newType (its first real write); a field
+// that already has a real type keeps it (the stored type wins), so a repeated or
+// wider-then-narrower write cannot change a field's type or silently truncate.
+func adoptType(f *operateField, newType uint8) {
+	if f.typ == wire.OperateTypeUnset {
+		f.typ = newType
+	}
 }
 
 // encodeReturn reads each requested field's post-apply raw bits (0 if the index /
@@ -616,6 +646,8 @@ func decodeField(b []byte) (operateField, int, error) {
 	f := operateField{typ: t}
 	need := func(n int) bool { return len(b)-off >= n }
 	switch t {
+	case wire.OperateTypeUnset:
+		// A hole: the 1-byte tag carries no data and decodes to a zero value.
 	case wire.OperateTypeU8:
 		if !need(1) {
 			return operateField{}, 0, wire.ErrShortArgs
@@ -724,6 +756,8 @@ func encodeRec(rec operateRec) []byte {
 func encodeField(buf []byte, f operateField) []byte {
 	buf = append(buf, f.typ)
 	switch f.typ {
+	case wire.OperateTypeUnset:
+		// A hole: just the 1-byte tag, no data.
 	case wire.OperateTypeU8, wire.OperateTypeI8:
 		buf = append(buf, byte(f.u))
 	case wire.OperateTypeU16, wire.OperateTypeI16:

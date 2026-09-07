@@ -30,6 +30,11 @@ var (
 	// ErrUnauthorized indicates the server rejected the request because the
 	// supplied auth token was missing or invalid.
 	ErrUnauthorized = errors.New("client: unauthorized")
+	// ErrOperateArgsTooLarge indicates an Operate call whose key (u16 keyLen),
+	// op count (u32 nOps), or return-spec count (u16 nReturn) exceeds the wire
+	// field's range — rejected before encoding so a silent length wrap can never
+	// desync the client and server.
+	ErrOperateArgsTooLarge = errors.New("client: operate args exceed wire limits")
 )
 
 // RemoteError represents a StatusError response from the server.
@@ -210,7 +215,7 @@ func (c *Client) Call(ctx context.Context, op string, args []byte) ([]byte, erro
 		// another server and retry within the hop budget — but never
 		// replay a non-replayable conditional write across an ambiguous
 		// (post-transmission) failure, which could report a wrong outcome.
-		if isTransportError(err) && hop < maxHops && !(nonReplayableOp(op) && isAmbiguous(err)) {
+		if isTransportError(err) && hop < maxHops && (!nonReplayableOp(op) || !isAmbiguous(err)) {
 			next := c.nextServer()
 			if next != "" && next != target {
 				target = next
@@ -360,7 +365,7 @@ func (c *Client) CompareAndExpire(ctx context.Context, key, expected []byte, ttl
 	return wire.DecodeCASResult(res)
 }
 
-// Operate applies a list of pure-integer ops (INCR / INCRF / SETMAX / SHIFTOR /
+// Operate applies a list of typed numeric ops (INCR / INCRF / SETMAX / SHIFTOR /
 // HALVE_GRP, built as wire.OperateOp with the wire.OperateOp* opcodes and
 // wire.OperateTarget* targets) to ONE record atomically, server-side, in a single
 // round-trip — the primitive for a HOT key where a client CAS-retry loop would
@@ -378,6 +383,11 @@ func (c *Client) CompareAndExpire(ctx context.Context, key, expected []byte, ttl
 // Like the other conditional writes, an ambiguous transport failure returns a
 // non-nil error rather than a possibly-wrong result; the op is not replayed.
 func (c *Client) Operate(ctx context.Context, key []byte, ttl time.Duration, maxEntries uint16, ops []wire.OperateOp, ret []wire.OperateRet) ([]int64, error) {
+	// Reject anything that would overflow a wire length field before encoding, so a
+	// silent u16/u32 wrap can never truncate the frame and desync client and server.
+	if len(key) > 0xFFFF || len(ret) > 0xFFFF || uint64(len(ops)) > 0xFFFFFFFF {
+		return nil, ErrOperateArgsTooLarge
+	}
 	res, err := c.Call(ctx, "operate", wire.EncodeOperateArgs(key, ttl, maxEntries, ops, ret))
 	if err != nil {
 		return nil, err
@@ -561,7 +571,11 @@ func (e *ambiguousError) Unwrap() error { return e.err }
 // surface an ambiguous per-group flush instead of the peer Client re-sending it.
 func nonReplayableOp(op string) bool {
 	switch op {
-	case "set_nx", "cas", "cad", "getdel", "getset", "incr_ex", "caex", "persist", "flush", "__flush_shard__":
+	case "set_nx", "cas", "cad", "getdel", "getset", "incr_ex", "caex", "persist", "flush", "__flush_shard__", "operate":
+		// operate mutates counters non-idempotently (an op-list of increments), so a
+		// blind replay after an ambiguous (post-commit) failure would apply every
+		// increment twice. It surfaces the ambiguous error instead — the whole
+		// no-double-increment guarantee, exactly like incr_ex.
 		return true
 	}
 	return false
@@ -762,7 +776,7 @@ func (c *Client) CallFunc(ctx context.Context, op string, args []byte, fn func(p
 		}
 		// See Call: a non-replayable conditional write is not retried across
 		// an ambiguous (post-transmission) transport failure.
-		if isTransportError(err) && hop < maxHops && !(nonReplayableOp(op) && isAmbiguous(err)) {
+		if isTransportError(err) && hop < maxHops && (!nonReplayableOp(op) || !isAmbiguous(err)) {
 			next := c.nextServer()
 			if next != "" && next != target {
 				target = next

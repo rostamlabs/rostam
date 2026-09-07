@@ -500,6 +500,11 @@ func TestClientNewMutationsNotReplayedAcrossAmbiguousFailure(t *testing.T) {
 			return err
 		}},
 		{"persist", func(c *Client) error { _, err := c.Persist(ctx, []byte("k")); return err }},
+		{"operate", func(c *Client) error {
+			_, err := c.Operate(ctx, []byte("k"), 0, 0,
+				[]wire.OperateOp{{Target: wire.OperateTargetGlobal, FieldIdx: 0, Opcode: wire.OperateOpINCR, Type: wire.OperateTypeU64, Arg: 1}}, nil)
+			return err
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -528,6 +533,25 @@ func TestClientNewMutationsNotReplayedAcrossAmbiguousFailure(t *testing.T) {
 				t.Fatalf("%s: server B calls = %d, want 0 (non-replayable mutation must not replay)", tc.name, n)
 			}
 		})
+	}
+}
+
+// TestOperateRejectsOversizedArgs: Operate rejects a key, op count, or return
+// count that would overflow its wire length field, BEFORE encoding — a silent u16/
+// u32 wrap would truncate the frame and desync client and server.
+func TestOperateRejectsOversizedArgs(t *testing.T) {
+	c, err := New(Config{Servers: []string{"127.0.0.1:1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	ctx := context.Background()
+
+	if _, err := c.Operate(ctx, make([]byte, 0x10000), 0, 0, nil, nil); err != ErrOperateArgsTooLarge {
+		t.Fatalf("oversized key: err = %v, want ErrOperateArgsTooLarge", err)
+	}
+	if _, err := c.Operate(ctx, []byte("k"), 0, 0, nil, make([]wire.OperateRet, 0x10000)); err != ErrOperateArgsTooLarge {
+		t.Fatalf("oversized return count: err = %v, want ErrOperateArgsTooLarge", err)
 	}
 }
 

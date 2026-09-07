@@ -229,9 +229,11 @@ func TestClientOperateUpdateAndReadBack(t *testing.T) {
 	ctx := context.Background()
 	key := []byte("rec")
 
-	// Guard-then-increment (HALVE_GRP overflow guard ahead of the increments), a
-	// SETMAX, and an entry counter — all in one atomic op-list.
+	// Guard-then-increment (a HALVE_GRP overflow guard ahead of the increment — a
+	// no-op here since field 0 starts at 0), a SETMAX, and an entry counter — all in
+	// one atomic op-list.
 	ops := []wire.OperateOp{
+		{Target: wire.OperateTargetGlobal, FieldIdx: 0, Opcode: wire.OperateOpHALVEGRP, Type: wire.OperateTypeU16, Arg: 255, Arg2: 1},
 		{Target: wire.OperateTargetGlobal, FieldIdx: 0, Opcode: wire.OperateOpINCR, Type: wire.OperateTypeU16, Arg: 10},
 		{Target: wire.OperateTargetGlobal, FieldIdx: 1, Opcode: wire.OperateOpSETMAX, Type: wire.OperateTypeU16, Arg: 7},
 		{Target: wire.OperateTargetGlobal, FieldIdx: 1, Opcode: wire.OperateOpSETMAX, Type: wire.OperateTypeU16, Arg: 3},
