@@ -5,6 +5,16 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **New `-online-compaction` flag.** Opts every replicated mmap reject-writes
+  shard into online relocating compaction, so a write/overwrite-heavy replicated
+  shard reclaims dead ("ghost") bytes while the process runs instead of only at
+  restart (cold compaction). Off by default — recycling retired page bytes is
+  memory-safe only when every read is released within the alias fence
+  (`2×WriteTimeout`, default 60s), which holds for the standalone server since all
+  reads go through the transport. No-op on heap/single-node/ring-buffer shards.
+  Validated under a 9-hour nosync write-endurance soak (memory held flat, zero
+  errors).
+
 - **Primary-backup / ISR replication (`-replication-mode=pb`) is no longer
   experimental.** Its blocking correctness hazards are closed — a lease-fenced
   primary plus full-ISR commit, backed by partition and crash-stop failover tests.
