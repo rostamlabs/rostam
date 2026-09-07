@@ -9,22 +9,49 @@ import (
 )
 
 // operate is a generic atomic multi-field update op: the client sends a list of
-// pure-integer ops (INCR/INCRF/SETMAX/SHIFTOR/HALVE_GRP) against one Rostam value
-// modelled as a small globals array + a dynamic map of entry sub-records, and the
-// server applies them all atomically under the shard write lock in one round-trip
-// (no client CAS-retry). This file carries only the WIRE codec (args + result);
-// the value model (decodeRec/encodeRec) and the arithmetic (applyOp) live in the
-// ops package, which is the sole authority on opcode semantics.
+// pure-integer/float ops (INCR/INCRF/SETMAX/SHIFTOR/HALVE_GRP) against one Rostam
+// value modelled as a small globals array + a dynamic map of entry sub-records,
+// and the server applies them all atomically under the shard write lock in one
+// round-trip (no client CAS-retry). This file carries only the WIRE codec (args +
+// result); the value model (decodeRec/encodeRec) and the arithmetic (applyOp) live
+// in the ops package, which is the sole authority on opcode/type semantics.
+//
+// Fields are TYPED for memory efficiency: each field carries a 1-byte type tag so
+// a u8 counter costs 2 bytes stored (tag + data) instead of 8. The app owns which
+// type each field is; the type rides the op-entry so a field can be created on
+// first touch, and the STORED type wins for a field that already exists.
 
 // Operate opcodes (the op-list entry's opcode byte). The decoder passes the
 // opcode through verbatim; the ops-package handler validates it and is the
 // authority on its arithmetic.
 const (
-	OperateOpINCR     uint8 = 0 // f += arg (i64)
-	OperateOpINCRF    uint8 = 1 // fixed-point add: f += arg (same integer add; distinct for app clarity)
+	OperateOpINCR     uint8 = 0 // f += arg (integer add, or float add on a float field)
+	OperateOpINCRF    uint8 = 1 // same as INCR (kept distinct for app clarity; float fields do IEEE add)
 	OperateOpSETMAX   uint8 = 2 // f = max(f, arg)
-	OperateOpSHIFTOR  uint8 = 3 // f = (f << arg) | arg2  (arg = shift bits, arg2 = value)
+	OperateOpSHIFTOR  uint8 = 3 // f = ((f << arg) | arg2) masked to the field width (fixed-width int only)
 	OperateOpHALVEGRP uint8 = 4 // if f[fieldIdx] >= arg, halve fields [fieldIdx, fieldIdx+arg2)
+)
+
+// Operate field types (the type tag on an op-entry and on every stored field). The
+// app assigns each field index a type; INCR/INCRF/SETMAX on a fixed-width int
+// SATURATE at that type's range, SHIFTOR masks to its bit width, and floats use
+// IEEE math. UVARINT/IVARINT are LEB128 (IVARINT zigzag) with no fixed width — a
+// compact, growable counter. OperateTypeCount is the exclusive upper bound used to
+// reject an unknown tag.
+const (
+	OperateTypeU8      uint8 = 0
+	OperateTypeU16     uint8 = 1
+	OperateTypeU32     uint8 = 2
+	OperateTypeU64     uint8 = 3
+	OperateTypeI8      uint8 = 4
+	OperateTypeI16     uint8 = 5
+	OperateTypeI32     uint8 = 6
+	OperateTypeI64     uint8 = 7
+	OperateTypeF32     uint8 = 8
+	OperateTypeF64     uint8 = 9
+	OperateTypeUVARINT uint8 = 10
+	OperateTypeIVARINT uint8 = 11
+	OperateTypeCount   uint8 = 12 // exclusive bound: a tag >= this is unknown
 )
 
 // Operate targets (the op / return-spec target byte). A target byte outside this
@@ -40,36 +67,46 @@ const (
 // whether an 8-byte entryKey follows.
 var ErrBadOperateTarget = errors.New("wire: operate target byte invalid")
 
+// ErrBadOperateType indicates an op-entry whose field type tag is unknown (>=
+// OperateTypeCount) — rejected at decode so an op can never create a field of an
+// unknown type.
+var ErrBadOperateType = errors.New("wire: operate field type invalid")
+
 // OperateOp is one op-list entry. For a global target EntryKey is ignored; for an
-// entry target it selects the sub-record. Arg/Arg2 carry the per-opcode operands
-// (INCR/INCRF/SETMAX use only Arg; SHIFTOR uses Arg=shift, Arg2=value; HALVE_GRP
-// uses Arg=threshold, Arg2=group length).
+// entry target it selects the sub-record. Type is the field's type, used to CREATE
+// the field on first touch (ignored if the field already exists — the stored type
+// wins); it must be a valid OperateType*. Arg/Arg2 carry the per-opcode operands
+// (INCR/INCRF/SETMAX use only Arg — for a float field Arg is the IEEE bit pattern
+// of the operand; SHIFTOR uses Arg=shift, Arg2=value; HALVE_GRP uses Arg=threshold,
+// Arg2=group length).
 type OperateOp struct {
 	Target   uint8
 	EntryKey uint64
 	FieldIdx uint16
 	Opcode   uint8
+	Type     uint8
 	Arg      int64
 	Arg2     int64
 }
 
-// OperateRet is one return spec: the field whose post-apply i64 value the op
-// should read back (so a single round-trip can update and read like Aerospike's
-// Operate returning the record). EntryKey is ignored for a global target.
+// OperateRet is one return spec: the field whose post-apply value the op reads
+// back (so one round-trip can update and read like Aerospike's Operate returning
+// the record). EntryKey is ignored for a global target. The returned i64 is the
+// field's RAW bits — the integer value for int/varint types, or the IEEE bit
+// pattern for F32 (low 32 bits) / F64 — interpreted by the caller per the type.
 type OperateRet struct {
 	Target   uint8
 	EntryKey uint64
 	FieldIdx uint16
 }
 
-// operateOpWireLen is the encoded size of one op: [tgt u8][entryKey u64 iff
-// entry][fieldIdx u16][opcode u8][arg i64][arg2 i64]. A global op omits the
-// entryKey (20 bytes); an entry op includes it (28 bytes). operateMinOpBytes is
-// the smallest honest per-op size, used to bound the declared nOps before any
-// allocation (CountFitsIn), exactly like the batch decoders.
+// operateMinOpBytes is the smallest honest per-op size — a global op:
+// [tgt u8][fieldIdx u16][opcode u8][ftype u8][arg i64][arg2 i64] = 21. An entry op
+// adds an 8-byte entryKey. operateMinRetBytes is the smallest return spec (global,
+// [tgt u8][fieldIdx u16] = 3). Both bound a declared count before allocation.
 const (
-	operateMinOpBytes  = 20 // global op: 1 + 2 + 1 + 8 + 8
-	operateMinRetBytes = 3  // global return spec: 1 + 2
+	operateMinOpBytes  = 21
+	operateMinRetBytes = 3
 )
 
 func operateOpWireLen(o OperateOp) int {
@@ -91,7 +128,7 @@ func operateRetWireLen(r OperateRet) int {
 // EncodeOperateArgs encodes the operate args:
 //
 //	[keyLen u16][key][ttlMs u64][maxEntries u16][nOps u32]
-//	  per op: [tgt u8][entryKey u64 iff tgt=1][fieldIdx u16][opcode u8][arg i64][arg2 i64]
+//	  per op: [tgt u8][entryKey u64 iff tgt=1][fieldIdx u16][opcode u8][ftype u8][arg i64][arg2 i64]
 //	[nReturn u16][ per return: [tgt u8][entryKey u64 iff tgt=1][fieldIdx u16] ]
 //
 // maxEntries==0 means the entry map is unbounded; ttl==0 stores the record with
@@ -118,6 +155,7 @@ func EncodeOperateArgs(key []byte, ttl time.Duration, maxEntries uint16, ops []O
 		}
 		buf = binary.BigEndian.AppendUint16(buf, o.FieldIdx)
 		buf = append(buf, o.Opcode)
+		buf = append(buf, o.Type)
 		buf = binary.BigEndian.AppendUint64(buf, uint64(o.Arg))  //nolint:gosec // reinterpret i64 as u64 for binary write
 		buf = binary.BigEndian.AppendUint64(buf, uint64(o.Arg2)) //nolint:gosec // reinterpret i64 as u64 for binary write
 	}
@@ -137,9 +175,11 @@ func EncodeOperateArgs(key []byte, ttl time.Duration, maxEntries uint16, ops []O
 // nOps (a u32, the real overflow hazard) is bounded by CountFitsIn against the
 // smallest honest op size before the ops slice is reserved, so a hostile count
 // cannot drive an out-of-memory reservation; each op/return spec is then read
-// with per-field truncation checks. A malformed frame returns an error — never a
-// panic or an over-read (see ops.TestNoDecoderPanicsOnHostileBytes). ttlMs is
-// rejected via ttlFromMs if it would overflow the time.Duration.
+// with per-field truncation checks. Each op's field type tag is validated (unknown
+// → ErrBadOperateType) so an op can never create an unknown-typed field. A
+// malformed frame returns an error — never a panic or an over-read (see
+// ops.TestNoDecoderPanicsOnHostileBytes). ttlMs is rejected via ttlFromMs if it
+// would overflow the time.Duration.
 func DecodeOperateArgs(args []byte) (key []byte, ttl time.Duration, maxEntries uint16, ops []OperateOp, ret []OperateRet, err error) {
 	if len(args) < 2 {
 		return nil, 0, 0, nil, nil, ErrShortArgs
@@ -186,13 +226,18 @@ func DecodeOperateArgs(args []byte) (key []byte, ttl time.Duration, maxEntries u
 		default:
 			return nil, 0, 0, nil, nil, ErrBadOperateTarget
 		}
-		if len(args)-off < 2+1+8+8 { // fieldIdx(2) + opcode(1) + arg(8) + arg2(8)
+		if len(args)-off < 2+1+1+8+8 { // fieldIdx(2) + opcode(1) + ftype(1) + arg(8) + arg2(8)
 			return nil, 0, 0, nil, nil, ErrShortArgs
 		}
 		o.FieldIdx = binary.BigEndian.Uint16(args[off : off+2])
 		off += 2
 		o.Opcode = args[off]
 		off++
+		o.Type = args[off]
+		off++
+		if o.Type >= OperateTypeCount {
+			return nil, 0, 0, nil, nil, ErrBadOperateType
+		}
 		o.Arg = int64(binary.BigEndian.Uint64(args[off : off+8])) //nolint:gosec // reinterpret stored u64 as i64
 		off += 8
 		o.Arg2 = int64(binary.BigEndian.Uint64(args[off : off+8])) //nolint:gosec // reinterpret stored u64 as i64
@@ -240,7 +285,8 @@ func DecodeOperateArgs(args []byte) (key []byte, ttl time.Duration, maxEntries u
 }
 
 // EncodeOperateResult encodes the operate result: the requested field values as
-// i64 BE in request order (one 8-byte slot per return spec).
+// i64 BE in request order (one 8-byte slot per return spec). Each value is the
+// field's raw bits (see OperateRet).
 func EncodeOperateResult(vals []int64) []byte {
 	buf := make([]byte, 0, len(vals)*8)
 	for _, v := range vals {

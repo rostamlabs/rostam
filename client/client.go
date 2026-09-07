@@ -364,7 +364,11 @@ func (c *Client) CompareAndExpire(ctx context.Context, key, expected []byte, ttl
 // HALVE_GRP, built as wire.OperateOp with the wire.OperateOp* opcodes and
 // wire.OperateTarget* targets) to ONE record atomically, server-side, in a single
 // round-trip — the primitive for a HOT key where a client CAS-retry loop would
-// livelock. The record models a small globals array plus a capped map of entry
+// livelock. Each op carries the field's TYPE (wire.OperateType*, e.g. U8/U16/F32/
+// UVARINT) used to create the field on first touch (the stored type wins for an
+// existing field); narrow types pack the record compactly. Fixed-width int ops
+// saturate at the type's range and SHIFTOR masks to its bit width.
+// The record models a small globals array plus a capped map of entry
 // sub-records; maxEntries==0 leaves the map unbounded, and ttl (0 = no expiry) is
 // applied to the whole record on every call. ret names the fields to read back
 // after the ops apply; the returned i64 slice aligns with ret in order (0 for an

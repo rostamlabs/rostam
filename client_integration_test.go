@@ -188,7 +188,7 @@ func TestClientOperateNoLostIncrement(t *testing.T) {
 	const goroutines = 24
 	const iters = 50
 	key := []byte("hot-session")
-	incr := []wire.OperateOp{{Target: wire.OperateTargetGlobal, FieldIdx: 0, Opcode: wire.OperateOpINCR, Arg: 1}}
+	incr := []wire.OperateOp{{Target: wire.OperateTargetGlobal, FieldIdx: 0, Opcode: wire.OperateOpINCR, Type: wire.OperateTypeU64, Arg: 1}}
 
 	var wg sync.WaitGroup
 	start := make(chan struct{})
@@ -232,10 +232,10 @@ func TestClientOperateUpdateAndReadBack(t *testing.T) {
 	// Guard-then-increment (HALVE_GRP overflow guard ahead of the increments), a
 	// SETMAX, and an entry counter — all in one atomic op-list.
 	ops := []wire.OperateOp{
-		{Target: wire.OperateTargetGlobal, FieldIdx: 0, Opcode: wire.OperateOpINCR, Arg: 10},
-		{Target: wire.OperateTargetGlobal, FieldIdx: 1, Opcode: wire.OperateOpSETMAX, Arg: 7},
-		{Target: wire.OperateTargetGlobal, FieldIdx: 1, Opcode: wire.OperateOpSETMAX, Arg: 3},
-		{Target: wire.OperateTargetEntry, EntryKey: 42, FieldIdx: 0, Opcode: wire.OperateOpINCR, Arg: 100},
+		{Target: wire.OperateTargetGlobal, FieldIdx: 0, Opcode: wire.OperateOpINCR, Type: wire.OperateTypeU16, Arg: 10},
+		{Target: wire.OperateTargetGlobal, FieldIdx: 1, Opcode: wire.OperateOpSETMAX, Type: wire.OperateTypeU16, Arg: 7},
+		{Target: wire.OperateTargetGlobal, FieldIdx: 1, Opcode: wire.OperateOpSETMAX, Type: wire.OperateTypeU16, Arg: 3},
+		{Target: wire.OperateTargetEntry, EntryKey: 42, FieldIdx: 0, Opcode: wire.OperateOpINCR, Type: wire.OperateTypeU8, Arg: 100},
 	}
 	ret := []wire.OperateRet{
 		{Target: wire.OperateTargetGlobal, FieldIdx: 0},
@@ -252,7 +252,7 @@ func TestClientOperateUpdateAndReadBack(t *testing.T) {
 
 	// A second op-list accumulates on the committed state.
 	got, err = c.Operate(ctx, key, 0, 0,
-		[]wire.OperateOp{{Target: wire.OperateTargetGlobal, FieldIdx: 0, Opcode: wire.OperateOpINCR, Arg: 5}},
+		[]wire.OperateOp{{Target: wire.OperateTargetGlobal, FieldIdx: 0, Opcode: wire.OperateOpINCR, Type: wire.OperateTypeU16, Arg: 5}},
 		[]wire.OperateRet{{Target: wire.OperateTargetGlobal, FieldIdx: 0}})
 	if err != nil {
 		t.Fatalf("Operate 2: %v", err)

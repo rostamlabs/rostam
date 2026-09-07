@@ -38,11 +38,11 @@ func TestOperateArgsRoundtrip(t *testing.T) {
 	ttl := 90 * time.Second
 	maxEntries := uint16(1024)
 	ops := []OperateOp{
-		{Target: OperateTargetGlobal, FieldIdx: 0, Opcode: OperateOpINCR, Arg: 1},
-		{Target: OperateTargetGlobal, FieldIdx: 3, Opcode: OperateOpINCRF, Arg: 12345},
-		{Target: OperateTargetGlobal, FieldIdx: 2, Opcode: OperateOpSETMAX, Arg: -7},
-		{Target: OperateTargetEntry, EntryKey: 0xDEADBEEF, FieldIdx: 1, Opcode: OperateOpSHIFTOR, Arg: 4, Arg2: 0xF},
-		{Target: OperateTargetEntry, EntryKey: 99, FieldIdx: 0, Opcode: OperateOpHALVEGRP, Arg: 255, Arg2: 2},
+		{Target: OperateTargetGlobal, FieldIdx: 0, Opcode: OperateOpINCR, Type: OperateTypeU8, Arg: 1},
+		{Target: OperateTargetGlobal, FieldIdx: 3, Opcode: OperateOpINCRF, Type: OperateTypeF32, Arg: 12345},
+		{Target: OperateTargetGlobal, FieldIdx: 2, Opcode: OperateOpSETMAX, Type: OperateTypeI16, Arg: -7},
+		{Target: OperateTargetEntry, EntryKey: 0xDEADBEEF, FieldIdx: 1, Opcode: OperateOpSHIFTOR, Type: OperateTypeU32, Arg: 4, Arg2: 0xF},
+		{Target: OperateTargetEntry, EntryKey: 99, FieldIdx: 0, Opcode: OperateOpHALVEGRP, Type: OperateTypeUVARINT, Arg: 255, Arg2: 2},
 	}
 	ret := []OperateRet{
 		{Target: OperateTargetGlobal, FieldIdx: 0},
@@ -102,7 +102,7 @@ func TestOperateResultRejectsRagged(t *testing.T) {
 
 func TestDecodeOperateArgsTruncation(t *testing.T) {
 	full := EncodeOperateArgs([]byte("abc"), time.Second, 8,
-		[]OperateOp{{Target: OperateTargetEntry, EntryKey: 5, FieldIdx: 1, Opcode: OperateOpINCR, Arg: 1}},
+		[]OperateOp{{Target: OperateTargetEntry, EntryKey: 5, FieldIdx: 1, Opcode: OperateOpINCR, Type: OperateTypeU16, Arg: 1}},
 		[]OperateRet{{Target: OperateTargetEntry, EntryKey: 5, FieldIdx: 1}})
 	// Every prefix short of the whole frame must be rejected, never panic.
 	for n := 0; n < len(full); n++ {
@@ -112,20 +112,36 @@ func TestDecodeOperateArgsTruncation(t *testing.T) {
 	}
 }
 
-func TestDecodeOperateArgsBadTarget(t *testing.T) {
-	// One op with an out-of-range target byte (2).
+// buildOperateFrame assembles an args frame with one global op carrying the given
+// target/opcode/type bytes, for the malformed-tag tests.
+func buildOperateFrame(target, opcode, ftype uint8) []byte {
 	frame := make([]byte, 0)
 	frame = binary.BigEndian.AppendUint16(frame, 0) // keyLen=0
 	frame = binary.BigEndian.AppendUint64(frame, 0) // ttlMs
 	frame = binary.BigEndian.AppendUint16(frame, 0) // maxEntries
 	frame = binary.BigEndian.AppendUint32(frame, 1) // nOps=1
-	frame = append(frame, 2)                        // tgt=2 (invalid)
+	frame = append(frame, target)
 	frame = binary.BigEndian.AppendUint16(frame, 0) // fieldIdx
-	frame = append(frame, OperateOpINCR)            // opcode
+	frame = append(frame, opcode)
+	frame = append(frame, ftype)
 	frame = binary.BigEndian.AppendUint64(frame, 0) // arg
 	frame = binary.BigEndian.AppendUint64(frame, 0) // arg2
-	if _, _, _, _, _, err := DecodeOperateArgs(frame); err != ErrBadOperateTarget {
+	frame = binary.BigEndian.AppendUint16(frame, 0) // nRet=0
+	return frame
+}
+
+func TestDecodeOperateArgsBadTarget(t *testing.T) {
+	if _, _, _, _, _, err := DecodeOperateArgs(buildOperateFrame(2, OperateOpINCR, OperateTypeU8)); err != ErrBadOperateTarget {
 		t.Fatalf("bad target: err = %v, want ErrBadOperateTarget", err)
+	}
+}
+
+func TestDecodeOperateArgsBadType(t *testing.T) {
+	if _, _, _, _, _, err := DecodeOperateArgs(buildOperateFrame(OperateTargetGlobal, OperateOpINCR, OperateTypeCount)); err != ErrBadOperateType {
+		t.Fatalf("bad type: err = %v, want ErrBadOperateType", err)
+	}
+	if _, _, _, _, _, err := DecodeOperateArgs(buildOperateFrame(OperateTargetGlobal, OperateOpINCR, 200)); err != ErrBadOperateType {
+		t.Fatalf("bad type 200: err = %v, want ErrBadOperateType", err)
 	}
 }
 
@@ -156,8 +172,14 @@ func TestDecodeOperateArgsTTLOverflow(t *testing.T) {
 
 func FuzzDecodeOperateArgs(f *testing.F) {
 	f.Add(EncodeOperateArgs([]byte("k"), time.Second, 4,
-		[]OperateOp{{Target: OperateTargetGlobal, FieldIdx: 0, Opcode: OperateOpINCR, Arg: 1}},
+		[]OperateOp{{Target: OperateTargetGlobal, FieldIdx: 0, Opcode: OperateOpINCR, Type: OperateTypeU8, Arg: 1}},
 		[]OperateRet{{Target: OperateTargetGlobal, FieldIdx: 0}}))
+	// One seed per field type so the corpus exercises every tag.
+	for ty := uint8(0); ty < OperateTypeCount; ty++ {
+		f.Add(EncodeOperateArgs([]byte("t"), 0, 2,
+			[]OperateOp{{Target: OperateTargetEntry, EntryKey: 1, FieldIdx: 0, Opcode: OperateOpINCR, Type: ty, Arg: 3}},
+			[]OperateRet{{Target: OperateTargetEntry, EntryKey: 1, FieldIdx: 0}}))
+	}
 	f.Add([]byte{})
 	f.Add([]byte{0, 1})
 	f.Fuzz(func(t *testing.T, b []byte) {
