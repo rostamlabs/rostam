@@ -71,6 +71,10 @@ var builtinHandlers = map[string]Handler{
 	"incr_ex": handleIncrEx,
 	"caex":    handleCAEX,
 	"mget":    handleMGet,
+	// operate is a generic atomic multi-field read/check/write op against one
+	// stored record, addressed and typed by the call's schema (design doc
+	// operate-v2-design.md).
+	"operate": handleOperate,
 	// flush wipes the ENTIRE KV keyspace (keyless, no args). The cluster path
 	// broadcasts it to every shard group; each group applies it here against its own
 	// cache. See handleFlush.
@@ -198,6 +202,7 @@ var builtinHandlers = map[string]Handler{
 //   - "incr_ex" (read-write) args: [keyLen u16][key][delta i64][ttlMs u64] → new value as i64 BE (TTL set on create only)
 //   - "caex"    (read-write) args: [keyLen u16][key][expLen u32][expected][ttlMs u64] → 1-byte 1=TTL refreshed/0=mismatch|absent
 //   - "mget"    (read-only)  args: [count u16]([keyLen u16][key])*         → [count u16]([found u8](+[valLen u32][val] if found))*
+//   - "operate" (read-write) args: see sdk/wire/operate.go → [status u8][failedOp u16?][nRet u16]{[vlen u32][value]}*
 //   - "flush"   (read-write) args: (ignored)                               → empty (wipes the ENTIRE keyspace; broadcast to every shard group in cluster mode)
 //   - "__ping__" (read-only) args: (ignored)                             → empty
 //
