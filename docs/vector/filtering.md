@@ -245,11 +245,20 @@ SDK encoder, never by hand.
   string field literally named `"a/b"`) still resolves and indexes exactly —
   but the planner decides whether to accelerate a filter purely from the
   field *name*'s shape, which cannot tell a literal key from a record path
-  apart. Such a key gets full `eq`/`in`/range acceleration but not
-  `match`/`contains`/geo acceleration, even though the underlying value is
-  an ordinary string. This is a deliberate, accepted phase-1 cost: the
-  filter still answers correctly, just via the graph-traversal fallback
-  instead of the payload index for those operators.
+  apart. How much acceleration such a key loses depends on the shape its
+  tail parses as:
+    - **One indexed segment** (`a/b`, `a/b#count`) — keeps `eq`, `in` and
+      range acceleration, loses `match`/`contains`/geo.
+    - **Anything else that still parses as a path** — a multi-segment tail
+      (`metrics/q1/42`, a row or a cell) or a positional segment
+      (`a/#0`) — loses index acceleration for **every** operator, `eq` and
+      range included, because those shapes are not posted at all.
+    - **A tail that is not a valid path** (e.g. `metrics/2024/q1`, whose
+      middle segment is not a legal row key) is treated as an ordinary
+      literal key and keeps full acceleration.
+  This is a deliberate, accepted phase-1 cost. In every case the filter
+  still answers **correctly**; it just falls back to graph traversal instead
+  of the payload index for the operators it cannot narrow.
 - A positional field (`#N`) is always evaluated live, regardless of
   selectivity, per the indexing rule above.
 

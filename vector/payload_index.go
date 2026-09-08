@@ -841,15 +841,31 @@ var emptySlotSet = map[uint32]struct{}{}
 // leaf's op (already lowered to the plain ordering spelling where a caller
 // lowers FilterDt*, which is harmless: both spellings are narrowable).
 //
-// A KNOWN, ACCEPTED PHASE-1 COST. A LITERAL payload key that merely LOOKS like
-// a record path ("a/b", "loc/home") loses match / contains / geo acceleration
-// here, even though reindex builds its tokens, contains entries and geo cells
-// exactly as for any other literal key. The decision is per FIELD NAME, and a
-// field name cannot tell the two apart: whether "a/b" is a literal key or a
-// path into a record under "a" is a per-POINT fact, and one collection may hold
-// both. Declining costs a graph fallback (and some dead index weight); guessing
-// the other way would cost correctness on the synthetic side. Making this exact
-// would need a per-field record of how each name was posted, which is Phase 2.
+// A KNOWN, ACCEPTED PHASE-1 COST, AND IT IS NOT UNIFORM ACROSS SHAPES. A
+// LITERAL payload key that merely LOOKS like a record path loses acceleration
+// here even though reindex builds its tokens, contains entries and geo cells
+// exactly as for any other literal key. HOW MUCH it loses depends on what its
+// tail parses as, because the shape guard runs before the op guard:
+//
+//   - ONE INDEXED SEGMENT ("a/b", "a/b#count"): recordShapeIndexed passes, so
+//     the op guard decides — eq / in / range still accelerate, and only
+//     match / contains / geo are declined.
+//   - ANY OTHER PARSEABLE PATH — a longer path ("metrics/q1/42", naming a row
+//     or a cell) or a positional segment ("a/#0") — fails recordShapeIndexed,
+//     so EVERY op is declined, eq and range included. These shapes have no
+//     postings at all, synthetic or otherwise, so there is nothing to be exact
+//     about.
+//   - A TAIL THAT IS NOT A VALID PATH ("metrics/2024/q1": "2024" is a legal
+//     field but "q1" is not a legal row key) never reaches either guard — the
+//     ParsePath failure above returns true and the key narrows like any other
+//     literal key, at full acceleration.
+//
+// The decision is per FIELD NAME, and a field name cannot tell the two apart:
+// whether "a/b" is a literal key or a path into a record under "a" is a
+// per-POINT fact, and one collection may hold both. Declining costs a graph
+// fallback (and some dead index weight); guessing the other way would cost
+// correctness on the synthetic side. Making this exact would need a per-field
+// record of how each name was posted, which is Phase 2.
 //
 // Declining is always safe: an un-narrowed conjunct is simply re-checked by
 // the predicate, and a filter that narrows on nothing else falls back to graph
