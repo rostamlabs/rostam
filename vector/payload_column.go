@@ -370,7 +370,7 @@ func (p *payloadIndex) collectColumnTerms(f Filter, capacity int, budget int64, 
 	// build (and then maintain forever) a column for the range leaf before the eq
 	// leaf declined the whole filter — a permanent per-slot cost bought for a
 	// query that cannot use it.
-	if !columnExpressible(f) {
+	if !columnExpressible(f, p.badRecords) {
 		return acc, false
 	}
 	acc, _, ok := p.appendColumnTerms(f, capacity, budget, acc)
@@ -380,20 +380,20 @@ func (p *payloadIndex) collectColumnTerms(f Filter, capacity int, budget int64, 
 // columnExpressible reports whether f's SHAPE can be answered from columns,
 // touching nothing but the filter itself. It must stay in exact agreement with
 // appendColumnTerms' op coverage; the two are adjacent for that reason.
-func columnExpressible(f Filter) bool {
+func columnExpressible(f Filter, poison recordPoison) bool {
 	switch f.Op {
 	case FilterGt, FilterGte, FilterLt, FilterLte:
 		bound, ok := numericValue(f.Value)
-		return ok && bound == bound && indexNarrowable(f.Field, f.Op)
+		return ok && bound == bound && indexNarrowable(f.Field, f.Op, poison)
 	case FilterDtGt, FilterDtGte, FilterDtLt, FilterDtLte:
 		_, ok := datetimeBound(f.Value)
-		return ok && indexNarrowable(f.Field, f.Op)
+		return ok && indexNarrowable(f.Field, f.Op, poison)
 	case FilterAnd:
 		if len(f.And) == 0 {
 			return false
 		}
 		for i := range f.And {
-			if !columnExpressible(f.And[i]) {
+			if !columnExpressible(f.And[i], poison) {
 				return false
 			}
 		}
@@ -441,7 +441,7 @@ func (p *payloadIndex) appendColumnTerms(f Filter, capacity int, budget int64, a
 // appendColumnTerm resolves one leaf's column and appends its term, returning
 // the budget less whatever the resolution had to allocate.
 func (p *payloadIndex) appendColumnTerm(acc []columnTerm, field string, op FilterOp, bound float64, capacity int, budget int64) ([]columnTerm, int64, bool) {
-	if !indexNarrowable(field, op) {
+	if !indexNarrowable(field, op, p.badRecords) {
 		// $content is readable by the predicate but never indexed, so its posting
 		// map is empty for a reason that has nothing to do with what matches — the
 		// same asymmetry that makes it un-narrowable makes it un-columnisable.

@@ -139,12 +139,21 @@ func TestReindexRecordSyntheticFieldsID(t *testing.T) {
 	}
 }
 
-// recordCorpus builds the shared 500-point fixture the brute-force tests use:
+// recordCorpus builds the shared 500-point fixture the brute-force tests use.
+// Every shape that resolves differently from how it indexes is represented:
 // most points carry a "session" record whose rc varies, some carry a plain
 // STRING under "session" (so a record path must reject a non-record payload
-// key), some carry no session at all, some carry a LITERAL payload key spelled
-// "session/rc" (which shadows the record's rc on both sides), and some carry a
-// literal "a/b" that parses as a record path but names no record.
+// key), some carry no session at all, some carry a NAMES-LESS schema record
+// (whose fields IndexEntries labels positionally, and which no by-name path
+// can address), some carry a LITERAL payload key spelled "session/rc" (which
+// shadows the record's rc on both sides), and some carry a literal "a/b" that
+// parses as a record path but names no record.
+//
+// Separately, EVERY point carries a record under "torn", and a few of those
+// are DAMAGED — one byte short, so IndexEntries fails while the intact leading
+// field still resolves. That key is therefore permanently poisoned in this
+// corpus, which is the point: every filter over "torn/..." must come back
+// correct through the predicate, and nothing may accelerate it.
 func recordCorpus(t *testing.T, n, dim int) (*hnsw, map[uint64][]float32, map[uint64]Metadata) {
 	t.Helper()
 	rng := rand.New(rand.NewSource(20260908))
@@ -170,8 +179,23 @@ func recordCorpus(t *testing.T, n, dim int) (*hnsw, map[uint64][]float32, map[ui
 		case i%7 == 0:
 			m["session"] = NewString("not a record at all")
 		case i%11 == 0: // no session key at all
+		case i%17 == 0:
+			// A names-less schema: "session/rc" cannot resolve for these
+			// points at all, and "session/#0" can — the exact pair that makes
+			// positional paths unindexable.
+			m["session"] = NewRecord(namelessSchemaRecord(t, int64(i%13)))
 		default:
 			m["session"] = NewRecord(sessionRecordBytesRC(t, uint8(i%13))) //nolint:gosec // i%13 fits uint8
+		}
+		// A second payload key that is POISONED: a handful of its records are
+		// damaged, so no path under it may ever be accelerated.
+		switch {
+		case i%97 == 0:
+			m["torn"] = NewRecord(tornDynamicRecord(t))
+		case i%89 == 0:
+			m["torn"] = NewRecord(tornSchemaRecord(t))
+		default:
+			m["torn"] = NewRecord(goodDynamicRecord(t, int64(i%9))) //nolint:gosec // bounded
 		}
 		if i%23 == 0 {
 			m["session/rc"] = NewInt(99) // literal key; shadows the record's rc
@@ -225,6 +249,15 @@ func recordFilterCases() []recordFilterCase {
 		{name: "row_absent", f: Filter{Op: FilterRowAbsent, Field: "session/b/7"}},
 		{name: "eq literal shadowing key", f: Filter{Op: FilterEq, Field: "session/rc", Value: NewInt(99)}},
 		{name: "eq literal path-shaped key", f: Filter{Op: FilterEq, Field: "a/b", Value: NewString("lit")}},
+		// Under the poisoned key: the damaged records still resolve their
+		// leading field, so these must return the damaged points too.
+		{name: "eq poisoned key", f: Filter{Op: FilterEq, Field: "torn/a", Value: NewInt(5)}},
+		{name: "gt poisoned key", f: Filter{Op: FilterGt, Field: "torn/a", Value: NewInt(3)}},
+		{name: "in poisoned key", f: Filter{Op: FilterIn, Field: "torn/a", Value: NewInts([]int64{5, 8})}},
+		// A names-less schema record: addressable only by position, never by
+		// name, and the positional spelling is never indexed.
+		{name: "eq nameless positional", f: Filter{Op: FilterEq, Field: "session/#0", Value: NewInt(3)}},
+		{name: "eq nameless by name", f: Filter{Op: FilterEq, Field: "session/zz", Value: NewInt(3)}, wantEmpty: true},
 	}
 	out := make([]recordFilterCase, 0, 2*len(base))
 	for _, c := range base {
@@ -457,6 +490,8 @@ func TestRecordFilterFirstActuallyNarrows(t *testing.T) {
 		{"match on a record string", Filter{Op: FilterMatch, Field: "session/tag", Value: NewString("de")}},
 		{"contains on a record string", Filter{Op: FilterContains, Field: "session/tag", Value: NewString("de")}},
 		{"row_exists", Filter{Op: FilterRowExists, Field: "session/b/42"}},
+		{"poisoned payload key", Filter{Op: FilterEq, Field: "torn/a", Value: NewInt(5)}},
+		{"range under a poisoned payload key", Filter{Op: FilterGt, Field: "torn/a", Value: NewInt(3)}},
 	}
 	for _, c := range declining {
 		if cands, ok := h.payloadIdx.candidates(c.f, limit); ok {

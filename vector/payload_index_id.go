@@ -75,6 +75,14 @@ type payloadIndexID struct {
 	// lock, which excludes writers but not other readers).
 	sorted   map[string]*sortedKeys
 	sortedMu sync.Mutex
+
+	// badRecords counts, per PAYLOAD KEY, the live ids holding a ValueRecord
+	// that IndexEntries could not enumerate; badIDKeys records which keys each
+	// id contributes so reindex removes its contribution exactly once. A
+	// non-zero count makes every path under that key un-narrowable — see
+	// recordPoison. The id-keyed mirror of payloadIndex.badRecords/badSlotKeys.
+	badRecords recordPoison
+	badIDKeys  map[uint64][]string
 }
 
 func newPayloadIndexID() *payloadIndexID {
@@ -88,6 +96,8 @@ func newPayloadIndexID() *payloadIndexID {
 		tokenIDKeys:    make(map[uint64][]fieldToken),
 		contains:       make(map[string]map[scalarKey]map[uint64]struct{}),
 		containsIDKeys: make(map[uint64][]fieldKey),
+		badRecords:     make(recordPoison),
+		badIDKeys:      make(map[uint64][]string),
 	}
 }
 
@@ -165,6 +175,14 @@ func (p *payloadIndexID) reindex(id uint64, meta Metadata) {
 		}
 		delete(p.containsIDKeys, id)
 	}
+	// Malformed-record markers are reverse entries like any other: dropped
+	// FIRST, so a repaired (or cleared) payload stops poisoning its key.
+	if old, ok := p.badIDKeys[id]; ok {
+		for _, key := range old {
+			p.dropBadRecord(key)
+		}
+		delete(p.badIDKeys, id)
+	}
 	if len(meta) == 0 {
 		return
 	}
@@ -173,6 +191,7 @@ func (p *payloadIndexID) reindex(id uint64, meta Metadata) {
 	var idTokens []fieldToken
 	var idContains []fieldKey
 	var recKeys []fieldKey // scratch, reused across this id's record fields
+	var badKeys []string   // payload keys whose record this id could not index
 	for field, v := range meta {
 		if field == contentField {
 			continue // document content is not a filterable field; never index it
@@ -200,7 +219,15 @@ func (p *payloadIndexID) reindex(id uint64, meta Metadata) {
 		// — and into nothing else, exactly as the dense index does (they share
 		// appendRecordIndexKeys, so the two can never index different things).
 		if v.Kind == ValueRecord {
-			recKeys = appendRecordIndexKeys(recKeys[:0], meta, field, v.Rec)
+			var whole bool
+			recKeys, whole = appendRecordIndexKeys(recKeys[:0], meta, field, v.Rec)
+			if !whole {
+				// Not enumerable in full: poison the payload key rather than
+				// index a partial view Resolve will contradict (recordPoison).
+				p.addBadRecord(field)
+				badKeys = append(badKeys, field)
+				continue
+			}
 			for _, rk := range recKeys {
 				if p.postScalar(rk.field, rk.key, id) {
 					keys = append(keys, rk)
@@ -249,6 +276,22 @@ func (p *payloadIndexID) reindex(id uint64, meta Metadata) {
 	}
 	if idContains != nil {
 		p.containsIDKeys[id] = idContains
+	}
+	if badKeys != nil {
+		p.badIDKeys[id] = badKeys
+	}
+}
+
+// addBadRecord records that one more live id holds an unindexable record under
+// payloadKey. dropBadRecord removes one such contribution, deleting the entry
+// at zero. Mirrors payloadIndex's pair; must hold the owner's write lock.
+func (p *payloadIndexID) addBadRecord(payloadKey string) { p.badRecords[payloadKey]++ }
+
+func (p *payloadIndexID) dropBadRecord(payloadKey string) {
+	if n := p.badRecords[payloadKey]; n > 1 {
+		p.badRecords[payloadKey] = n - 1
+	} else {
+		delete(p.badRecords, payloadKey)
 	}
 }
 
@@ -417,6 +460,11 @@ func (p *payloadIndexID) rebuild(meta map[uint64]Metadata) {
 	p.tokenIDKeys = make(map[uint64][]fieldToken)
 	p.contains = make(map[string]map[scalarKey]map[uint64]struct{})
 	p.containsIDKeys = make(map[uint64][]fieldKey)
+	// Reset the malformed-record counters too: reindex below refills them from
+	// the metadata that survives, so a key poisoned by an id that is gone does
+	// not stay poisoned forever.
+	p.badRecords = make(recordPoison)
+	p.badIDKeys = make(map[uint64][]string)
 	for id, m := range meta {
 		p.reindex(id, m)
 	}
@@ -452,7 +500,7 @@ func (p *payloadIndexID) candidatesCapped(f Filter, limit, maxCand int) ([]uint6
 		// Intersect the geo sets with any equality sets in the same And so the most
 		// selective conjunct(s) drive the candidate set; the predicate re-checks
 		// everything else. A pure geo filter just returns the geo union.
-		if eqTerms, ok := collectEqTerms(f); ok {
+		if eqTerms, ok := collectEqTerms(f, p.badRecords); ok {
 			for _, t := range eqTerms {
 				vals := p.fields[t.field]
 				if vals == nil {
@@ -478,7 +526,7 @@ func (p *payloadIndexID) candidatesCapped(f Filter, limit, maxCand int) ([]uint6
 
 	// Equality narrowing. Also covers And(eq, range): the eq terms narrow and the
 	// predicate re-checks the range conjuncts.
-	if terms, ok := collectEqTerms(f); ok {
+	if terms, ok := collectEqTerms(f, p.badRecords); ok {
 		sets := make([]map[uint64]struct{}, 0, len(terms))
 		for _, t := range terms {
 			vals := p.fields[t.field]
@@ -676,7 +724,7 @@ func (p *payloadIndexID) collectMatchSets(f Filter, limit int) ([]map[uint64]str
 // postings yields the empty sentinel (ok=true). The id-keyed mirror of
 // payloadIndex.containsSet.
 func (p *payloadIndexID) containsSet(field string, want Value, limit int) (map[uint64]struct{}, bool) {
-	if !indexNarrowable(field, FilterContains) {
+	if !indexNarrowable(field, FilterContains, p.badRecords) {
 		return nil, false
 	}
 	key, ok := scalarKeyOf(want)
@@ -748,7 +796,7 @@ func (p *payloadIndexID) collectContainsSets(f Filter, limit int) ([]map[uint64]
 // corpus set — never a truncated set). A missing query token yields an empty set
 // (ok=true): no id has all tokens. The id-keyed mirror of payloadIndex.matchSet.
 func (p *payloadIndexID) matchSet(field string, want Value, limit int) (map[uint64]struct{}, bool) {
-	if !indexNarrowable(field, FilterMatch) {
+	if !indexNarrowable(field, FilterMatch, p.badRecords) {
 		return nil, false
 	}
 	if want.Kind != ValueString {
@@ -808,7 +856,7 @@ func (p *payloadIndexID) matchSet(field string, want Value, limit int) (map[uint
 // overflow bail). The returned set is ALWAYS a superset of the true predicate
 // match set. Mirrors dense geoSet (reuses radiusBBox/polygonBBox/coverCells).
 func (p *payloadIndexID) geoSet(field string, op FilterOp, g *GeoCondition, limit int) (map[uint64]struct{}, bool) {
-	if !indexNarrowable(field, op) {
+	if !indexNarrowable(field, op, p.badRecords) {
 		return nil, false
 	}
 	if g == nil {
@@ -917,7 +965,7 @@ func (p *payloadIndexID) collectRangeSets(f Filter, limit int) ([]map[uint64]str
 // eqSet returns the posting set for field == v (the shared stored map, not a
 // copy). ok=false when v is not equality-indexable. Mirrors dense eqSet.
 func (p *payloadIndexID) eqSet(field string, v Value) (map[uint64]struct{}, bool) {
-	if !indexNarrowable(field, FilterEq) {
+	if !indexNarrowable(field, FilterEq, p.badRecords) {
 		return nil, false
 	}
 	key, ok := scalarKeyOf(v)
@@ -940,7 +988,7 @@ func (p *payloadIndexID) eqSet(field string, v Value) (map[uint64]struct{}, bool
 // when the union exceeds `limit`. Mirrors dense orderingSet (reuses
 // numericValue/numRange/strRange).
 func (p *payloadIndexID) orderingSet(field string, op FilterOp, want Value, limit int) (map[uint64]struct{}, bool) {
-	if !indexNarrowable(field, op) {
+	if !indexNarrowable(field, op, p.badRecords) {
 		return nil, false
 	}
 	vals := p.fields[field]
@@ -983,7 +1031,7 @@ func (p *payloadIndexID) orderingSet(field string, op FilterOp, want Value, limi
 // (strings/ints/floats). ok=false for a non-array value or when the union
 // exceeds `limit`. Mirrors dense inSet.
 func (p *payloadIndexID) inSet(field string, want Value, limit int) (map[uint64]struct{}, bool) {
-	if !indexNarrowable(field, FilterIn) {
+	if !indexNarrowable(field, FilterIn, p.badRecords) {
 		return nil, false
 	}
 	vals := p.fields[field]

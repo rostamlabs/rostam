@@ -876,7 +876,7 @@ func TestAdmitGateExactClassification(t *testing.T) {
 		{"not", Filter{Op: FilterNot, Not: &Filter{Op: FilterEq, Field: "a", Value: NewString("x")}}, false},
 	}
 	for _, tc := range cases {
-		if got := filterIndexExact(tc.f); got != tc.want {
+		if got := filterIndexExact(tc.f, nil); got != tc.want {
 			t.Errorf("filterIndexExact(%s) = %v, want %v", tc.name, got, tc.want)
 		}
 	}
@@ -897,7 +897,7 @@ func TestAdmitGateSkippedConjunctIsNotExact(t *testing.T) {
 		{Op: FilterEq, Field: "color", Value: NewString("red")},
 		{Op: FilterIn, Field: "size", Value: NewInts([]int64{1, 2, 3})},
 	}}
-	if !filterIndexExact(f) {
+	if !filterIndexExact(f, nil) {
 		t.Fatal("precondition: both conjunct ops should be classified EXACT by op")
 	}
 	armed, exact := gateExactFor(t, h, f)
