@@ -210,6 +210,8 @@ var (
 	DecodeNamedSearchArgsOpts                 = wire.DecodeNamedSearchArgsOpts
 	DecodeNamedSparseSearchArgs               = wire.DecodeNamedSparseSearchArgs
 	DecodeNamedSparseSearchArgsOpts           = wire.DecodeNamedSparseSearchArgsOpts
+	DecodeOperateArgs                         = wire.DecodeOperateArgs
+	DecodeOperateResult                       = wire.DecodeOperateResult
 	DecodePayloadResult                       = wire.DecodePayloadResult
 	DecodePutArgs                             = wire.DecodePutArgs
 	DecodePutBatchArgs                        = wire.DecodePutBatchArgs
@@ -220,6 +222,7 @@ var (
 	DecodeQueryResultGroupedFanOut            = wire.DecodeQueryResultGroupedFanOut
 	DecodeQuerySpecArgs                       = wire.DecodeQuerySpecArgs
 	DecodeQueryTreeLanes                      = wire.DecodeQueryTreeLanes
+	DecodeRecord                              = wire.DecodeRecord
 	DecodeReshardAbortArgs                    = wire.DecodeReshardAbortArgs
 	DecodeReshardArgs                         = wire.DecodeReshardArgs
 	DecodeResplitArgs                         = wire.DecodeResplitArgs
@@ -227,6 +230,7 @@ var (
 	DecodeResplitCleanupResult                = wire.DecodeResplitCleanupResult
 	DecodeScanVectorsArgs                     = wire.DecodeScanVectorsArgs
 	DecodeScanVectorsResult                   = wire.DecodeScanVectorsResult
+	DecodeSchema                              = wire.DecodeSchema
 	DecodeScrollArgs                          = wire.DecodeScrollArgs
 	DecodeScrollArgsCursor                    = wire.DecodeScrollArgsCursor
 	DecodeScrollArgsOpts                      = wire.DecodeScrollArgsOpts
