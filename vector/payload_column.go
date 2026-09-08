@@ -384,10 +384,10 @@ func columnExpressible(f Filter) bool {
 	switch f.Op {
 	case FilterGt, FilterGte, FilterLt, FilterLte:
 		bound, ok := numericValue(f.Value)
-		return ok && bound == bound && indexNarrowable(f.Field)
+		return ok && bound == bound && indexNarrowable(f.Field, f.Op)
 	case FilterDtGt, FilterDtGte, FilterDtLt, FilterDtLte:
 		_, ok := datetimeBound(f.Value)
-		return ok && indexNarrowable(f.Field)
+		return ok && indexNarrowable(f.Field, f.Op)
 	case FilterAnd:
 		if len(f.And) == 0 {
 			return false
@@ -441,7 +441,7 @@ func (p *payloadIndex) appendColumnTerms(f Filter, capacity int, budget int64, a
 // appendColumnTerm resolves one leaf's column and appends its term, returning
 // the budget less whatever the resolution had to allocate.
 func (p *payloadIndex) appendColumnTerm(acc []columnTerm, field string, op FilterOp, bound float64, capacity int, budget int64) ([]columnTerm, int64, bool) {
-	if !indexNarrowable(field) {
+	if !indexNarrowable(field, op) {
 		// $content is readable by the predicate but never indexed, so its posting
 		// map is empty for a reason that has nothing to do with what matches — the
 		// same asymmetry that makes it un-narrowable makes it un-columnisable.

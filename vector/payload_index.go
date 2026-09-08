@@ -363,6 +363,7 @@ func (p *payloadIndex) reindex(slot uint32, meta Metadata) {
 	var geoCells []geoSlotCell
 	var slotTokens []fieldToken
 	var slotContains []fieldKey
+	var recKeys []fieldKey // scratch, reused across this slot's record fields
 	for field, v := range meta {
 		if field == contentField {
 			continue // document content is not a filterable field; never index it
@@ -383,6 +384,22 @@ func (p *payloadIndex) reindex(slot uint32, meta Metadata) {
 			}
 			set[slot] = struct{}{}
 			geoCells = append(geoCells, geoSlotCell{field, cell})
+			continue
+		}
+		// Record values expand into SYNTHETIC eq entries — one per top-level
+		// scalar field and per table row count, named "<field>/<recordField>"
+		// — and into nothing else. They take no other branch below anyway
+		// (scalarKeyOf declines a record, it is not a string or an array, so
+		// neither the token nor the contains index would see it), so the
+		// `continue` here changes nothing for the other sub-indexes; it just
+		// says so once.
+		if v.Kind == ValueRecord {
+			recKeys = appendRecordIndexKeys(recKeys[:0], meta, field, v.Rec)
+			for _, rk := range recKeys {
+				if p.postScalar(rk.field, rk.key, slot) {
+					keys = append(keys, rk)
+				}
+			}
 			continue
 		}
 		// Token index: a string/strings field is tokenized (same tokenize() as
@@ -412,20 +429,9 @@ func (p *payloadIndex) reindex(slot uint32, meta Metadata) {
 		if !ok {
 			continue
 		}
-		vals := p.fields[field]
-		if vals == nil {
-			vals = make(map[scalarKey]map[uint32]struct{})
-			p.fields[field] = vals
+		if p.postScalar(field, key, slot) {
+			keys = append(keys, fieldKey{field, key})
 		}
-		set := vals[key]
-		if set == nil {
-			set = make(map[uint32]struct{})
-			vals[key] = set
-			p.markDirty(field) // new distinct key -> sorted cache stale
-		}
-		set[slot] = struct{}{}
-		p.addPost(field, key.kind, 1)
-		keys = append(keys, fieldKey{field, key})
 	}
 	if keys != nil {
 		p.slotKeys[slot] = keys
@@ -439,6 +445,103 @@ func (p *payloadIndex) reindex(slot uint32, meta Metadata) {
 	if slotContains != nil {
 		p.containsSlotKeys[slot] = slotContains
 	}
+}
+
+// postScalar posts slot under (field, key) in the eq index, maintaining the
+// distinct-key bookkeeping (sorted-cache invalidation and the per-kind slot
+// counter). It reports whether the entry was NEW for this slot, i.e. whether
+// the caller must record a reverse entry for it.
+//
+// THE DUPLICATE CHECK IS THE ONE-KEY-PER-(SLOT, FIELD) INVARIANT, which two
+// separate proofs in this file rest on: posts[field] counts SLOTS (see
+// fieldTotalNumeric), and two distinct keys of one field have DISJOINT posting
+// sets (see unionRange's key-count pre-check). A literal field cannot violate
+// it — reindex walks `meta` once per field — but a record CAN: two entries of
+// one record can carry the same synthetic name (a table "b" and a scalar
+// literally named "b#count" both spell "b#count"). Both resolve through
+// lookupPath to the SAME value, so the second post is a pure duplicate; it is
+// dropped here rather than double-counted. reindex has already dropped this
+// slot's previous keys by the time anything is posted, so a slot found in the
+// set can only have been put there by this same call.
+func (p *payloadIndex) postScalar(field string, key scalarKey, slot uint32) bool {
+	vals := p.fields[field]
+	if vals == nil {
+		vals = make(map[scalarKey]map[uint32]struct{})
+		p.fields[field] = vals
+	}
+	set := vals[key]
+	if set == nil {
+		set = make(map[uint32]struct{})
+		vals[key] = set
+		p.markDirty(field) // new distinct key -> sorted cache stale
+	}
+	if _, dup := set[slot]; dup {
+		return false
+	}
+	set[slot] = struct{}{}
+	p.addPost(field, key.kind, 1)
+	return true
+}
+
+// appendRecordIndexKeys appends the synthetic eq entries a ValueRecord payload
+// key contributes to the index: for each top-level field and table row count
+// record.Resolver.IndexEntries enumerates, the pair (payloadKey + "/" + entry
+// name, that field's scalar key). Shared by both reindex implementations (the
+// slot-keyed dense index and the id-keyed named/MV mirror) so the two can
+// never index different things.
+//
+// THE VALUE COMES FROM lookupPath, NOT FROM THE ENTRY. IndexEntries is used
+// only to ENUMERATE the names; what is posted under each name is whatever
+// lookupPath resolves for it — which is, verbatim, the function the compiled
+// predicate reads the field through. That makes the exactness invariant
+// ("the posting set is exactly the slots whose lookupPath value matches")
+// true by construction rather than by an argument about two independent
+// walks agreeing, and it settles every awkward corner for free:
+//
+//   - Exact-key precedence. A literal payload key spelled "session/rc"
+//     shadows the record's rc for lookupPath, so it must shadow it here too.
+//     The literal is indexed by reindex's own loop under the SAME field name,
+//     so the synthetic entry is skipped outright rather than posted twice.
+//   - Ambiguous spellings. A record field named "b#count" and a table named
+//     "b" produce the same synthetic name; a schema carrying two fields of the
+//     same name (possible from hostile bytes — DecodeSchema does not Validate)
+//     produces the same name twice. lookupPath answers ONE value for the name
+//     either way, and that one value is what gets posted.
+//   - Malformed records. IndexEntries errors, nothing is enumerated, nothing
+//     is indexed — and lookupPath resolves nothing through the same bytes, so
+//     both sides agree the field is absent.
+//   - NaN. IndexEntries skips a NaN float and scalarKeyOf declines one, so it
+//     is unindexed on both counts; the comparators reject NaN, so "unindexed"
+//     and "matches nothing" say the same thing (see scalarKeyOf).
+//
+// The cost is one record resolution per enumerated entry, on the write path.
+// For the records this is built for (a handful of fields over a cached
+// schema) that is a few map probes; it scales with (entries × record size)
+// for a pathologically wide record.
+func appendRecordIndexKeys(acc []fieldKey, meta Metadata, payloadKey string, rec []byte) []fieldKey {
+	entries, err := recordResolver.IndexEntries(rec)
+	if err != nil {
+		return acc // malformed record: indexes nothing, resolves nothing
+	}
+	for i := range entries {
+		name := payloadKey + "/" + entries[i].Field
+		if !recordPathIndexedShape(name) {
+			continue // a shape the planner will never trust; posting it would be dead weight
+		}
+		if _, literal := meta[name]; literal {
+			continue // an exact payload key of this name wins, and is indexed as itself
+		}
+		v, ok := lookupPath(meta, name)
+		if !ok {
+			continue
+		}
+		key, ok := scalarKeyOf(v)
+		if !ok {
+			continue
+		}
+		acc = append(acc, fieldKey{name, key})
+	}
+	return acc
 }
 
 // addContains posts slot under each (already DISTINCT) element key in keys within
@@ -647,23 +750,33 @@ var emptySlotSet = map[uint32]struct{}{}
 // set as a superset silently drops every matching row.
 //
 // A record path (isRecordPath — a "payloadKey/path" field naming a location
-// inside a ValueRecord payload key, per sdk/record) breaks the SAME inference
-// the SAME way, for the same underlying reason: reindex only posts LITERAL
-// scalar keys (scalarKeyOf declines ValueRecord outright, per the
-// ValueRecord-considered comments throughout this file), so
-// p.fields["session/rc"] is always nil — even though lookupPath resolves
-// "session/rc" through the record perfectly well at predicate-evaluation
-// time. "No postings" therefore means "never indexed" here too, not "no
-// matches". This is a Phase-1 scoping choice, not a permanent one: Task 6
-// adds indexing for the shapes IndexEntries extracts (top-level scalar fields
-// and #count), and can re-enable indexNarrowable for exactly those shapes
-// once postings exist for them to prove anything from.
+// inside a ValueRecord payload key, per sdk/record) can break the SAME
+// inference the SAME way, and used to break it for every shape: reindex posted
+// only LITERAL scalar keys, so p.fields["session/rc"] was always nil even
+// though lookupPath resolves "session/rc" through the record perfectly well at
+// predicate-evaluation time.
 //
-// Declining instead is always safe: an un-narrowed conjunct is simply re-checked
-// by the predicate, and a filter that narrows on nothing else falls back to
-// graph traversal, which evaluates $content and record paths correctly.
-func indexNarrowable(field string) bool {
-	return field != contentField && !isRecordPath(field)
+// reindex now expands a record's top-level fields and table row counts into
+// synthetic postings named "<payloadKey>/<field>" (appendRecordIndexKeys), so
+// SOME record paths have postings and some still do not — and the ops differ
+// too, because a record scalar gets an eq key and nothing else. That decision
+// is not made here: recordPathIndexed owns it, per shape AND per op, and
+// filterIndexExact and columnExpressible route through this same function so
+// no consumer can disagree with the writer about what was indexed. `op` is
+// the leaf's op (already lowered to the plain ordering spelling where a caller
+// lowers FilterDt*, which is harmless: both spellings are narrowable).
+//
+// Declining is always safe: an un-narrowed conjunct is simply re-checked by
+// the predicate, and a filter that narrows on nothing else falls back to graph
+// traversal, which evaluates $content and every record path correctly.
+func indexNarrowable(field string, op FilterOp) bool {
+	if field == contentField {
+		return false
+	}
+	if !isRecordPath(field) {
+		return true
+	}
+	return recordPathIndexed(field, op)
 }
 
 // candidates returns (slots, true) when filter can be narrowed by the payload
@@ -941,7 +1054,7 @@ func intersectSlotSets(sets []narrowSet, maxCand int) ([]uint32, bool) {
 func collectEqTerms(f Filter) ([]fieldKey, bool) {
 	switch f.Op {
 	case FilterEq:
-		if !indexNarrowable(f.Field) {
+		if !indexNarrowable(f.Field, FilterEq) {
 			return nil, false
 		}
 		if key, ok := scalarKeyOf(f.Value); ok {
@@ -953,7 +1066,7 @@ func collectEqTerms(f Filter) ([]fieldKey, bool) {
 		for _, c := range f.And {
 			switch c.Op {
 			case FilterEq:
-				if !indexNarrowable(c.Field) {
+				if !indexNarrowable(c.Field, FilterEq) {
 					continue // $content is never indexed; the predicate re-checks it
 				}
 				if key, ok := scalarKeyOf(c.Value); ok {
@@ -1089,7 +1202,7 @@ func (p *payloadIndex) collectMatchSets(f Filter, limit int) ([]map[uint32]struc
 // postings, or a missing element key, yields the empty sentinel set (ok=true): no
 // doc's array contains want, so the exact superset is empty.
 func (p *payloadIndex) containsSet(field string, want Value, limit int) (map[uint32]struct{}, bool) {
-	if !indexNarrowable(field) {
+	if !indexNarrowable(field, FilterContains) {
 		return nil, false
 	}
 	key, ok := scalarKeyOf(want)
@@ -1169,7 +1282,7 @@ func (p *payloadIndex) collectContainsSets(f Filter, limit int) ([]map[uint32]st
 // A missing query token yields an empty set (ok=true): no doc has all tokens, so
 // the exact superset is empty. The returned set is a fresh map the caller owns.
 func (p *payloadIndex) matchSet(field string, want Value, limit int) (map[uint32]struct{}, bool) {
-	if !indexNarrowable(field) {
+	if !indexNarrowable(field, FilterMatch) {
 		return nil, false
 	}
 	if want.Kind != ValueString {
@@ -1237,7 +1350,7 @@ func (p *payloadIndex) matchSet(field string, want Value, limit int) (map[uint32
 // SUPERSET INVARIANT): the bbox fully contains the region and the cover fully
 // contains the bbox.
 func (p *payloadIndex) geoSet(field string, op FilterOp, g *GeoCondition, limit int) (map[uint32]struct{}, bool) {
-	if !indexNarrowable(field) {
+	if !indexNarrowable(field, op) {
 		return nil, false
 	}
 	if g == nil {
@@ -1350,7 +1463,7 @@ func (p *payloadIndex) collectRangeSets(f Filter, limit int) ([]narrowSet, bool)
 // eqSet returns the posting set for field == v (the shared stored map, not a
 // copy). ok=false when v is not equality-indexable.
 func (p *payloadIndex) eqSet(field string, v Value) (map[uint32]struct{}, bool) {
-	if !indexNarrowable(field) {
+	if !indexNarrowable(field, FilterEq) {
 		return nil, false
 	}
 	key, ok := scalarKeyOf(v)
@@ -1392,7 +1505,7 @@ func (p *payloadIndex) orderingSet(field string, op FilterOp, want Value, limit 
 // and a single budget cannot tell those two apart. The gate declines the first
 // shape and arms on the second; see gateRangeKeyDNS.
 func (p *payloadIndex) orderingSetCapped(field string, op FilterOp, want Value, massLimit, keyLimit int) (map[uint32]struct{}, bool) {
-	if !indexNarrowable(field) {
+	if !indexNarrowable(field, op) {
 		return nil, false
 	}
 	vals := p.fields[field]
@@ -1605,7 +1718,7 @@ func (p *payloadIndex) appendComplementSets(f Filter, liveCount, massLimit, keyL
 // cannot be complemented exactly. See collectComplementSets for why every guard
 // here is a hard bail.
 func (p *payloadIndex) complementLeaf(field string, op FilterOp, want Value, liveCount, massLimit, keyLimit int, acc []map[uint32]struct{}, mass int) ([]map[uint32]struct{}, int, bool) {
-	if !indexNarrowable(field) {
+	if !indexNarrowable(field, op) {
 		return acc, mass, false
 	}
 	neg, ok := negateOrdering(op)
@@ -1724,7 +1837,7 @@ func strRange(s []scalarKey, op FilterOp, want string) (lo, hi int) {
 // array (strings/ints/floats). ok=false for a non-array value or when the union
 // exceeds `limit`.
 func (p *payloadIndex) inSet(field string, want Value, limit int) (map[uint32]struct{}, bool) {
-	if !indexNarrowable(field) {
+	if !indexNarrowable(field, FilterIn) {
 		return nil, false
 	}
 	vals := p.fields[field]

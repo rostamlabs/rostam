@@ -172,6 +172,7 @@ func (p *payloadIndexID) reindex(id uint64, meta Metadata) {
 	var geoCells []geoSlotCell
 	var idTokens []fieldToken
 	var idContains []fieldKey
+	var recKeys []fieldKey // scratch, reused across this id's record fields
 	for field, v := range meta {
 		if field == contentField {
 			continue // document content is not a filterable field; never index it
@@ -192,6 +193,19 @@ func (p *payloadIndexID) reindex(id uint64, meta Metadata) {
 			}
 			set[id] = struct{}{}
 			geoCells = append(geoCells, geoSlotCell{field, cell})
+			continue
+		}
+		// Record values expand into SYNTHETIC eq entries — one per top-level
+		// scalar field and per table row count, named "<field>/<recordField>"
+		// — and into nothing else, exactly as the dense index does (they share
+		// appendRecordIndexKeys, so the two can never index different things).
+		if v.Kind == ValueRecord {
+			recKeys = appendRecordIndexKeys(recKeys[:0], meta, field, v.Rec)
+			for _, rk := range recKeys {
+				if p.postScalar(rk.field, rk.key, id) {
+					keys = append(keys, rk)
+				}
+			}
 			continue
 		}
 		// Token index: a string/strings field is tokenized (same tokenize() as the
@@ -220,19 +234,9 @@ func (p *payloadIndexID) reindex(id uint64, meta Metadata) {
 		if !ok {
 			continue
 		}
-		vals := p.fields[field]
-		if vals == nil {
-			vals = make(map[scalarKey]map[uint64]struct{})
-			p.fields[field] = vals
+		if p.postScalar(field, key, id) {
+			keys = append(keys, fieldKey{field, key})
 		}
-		set := vals[key]
-		if set == nil {
-			set = make(map[uint64]struct{})
-			vals[key] = set
-			p.markDirty(field) // new distinct key -> sorted cache stale
-		}
-		set[id] = struct{}{}
-		keys = append(keys, fieldKey{field, key})
 	}
 	if keys != nil {
 		p.idKeys[id] = keys
@@ -246,6 +250,32 @@ func (p *payloadIndexID) reindex(id uint64, meta Metadata) {
 	if idContains != nil {
 		p.containsIDKeys[id] = idContains
 	}
+}
+
+// postScalar posts id under (field, key) in the eq index, invalidating the
+// sorted-key cache when the key is new, and reports whether the entry was NEW
+// for this id (i.e. whether the caller must record a reverse entry). The
+// duplicate check keeps the one-key-per-(id, field) invariant that a record's
+// synthetic entries could otherwise break; see payloadIndex.postScalar for the
+// argument in full. The id-keyed mirror of payloadIndex.postScalar, minus the
+// posts counter (this index has none — it feeds no complement gate).
+func (p *payloadIndexID) postScalar(field string, key scalarKey, id uint64) bool {
+	vals := p.fields[field]
+	if vals == nil {
+		vals = make(map[scalarKey]map[uint64]struct{})
+		p.fields[field] = vals
+	}
+	set := vals[key]
+	if set == nil {
+		set = make(map[uint64]struct{})
+		vals[key] = set
+		p.markDirty(field) // new distinct key -> sorted cache stale
+	}
+	if _, dup := set[id]; dup {
+		return false
+	}
+	set[id] = struct{}{}
+	return true
 }
 
 // addContains posts id under each (already DISTINCT) element key in keys within
@@ -646,7 +676,7 @@ func (p *payloadIndexID) collectMatchSets(f Filter, limit int) ([]map[uint64]str
 // postings yields the empty sentinel (ok=true). The id-keyed mirror of
 // payloadIndex.containsSet.
 func (p *payloadIndexID) containsSet(field string, want Value, limit int) (map[uint64]struct{}, bool) {
-	if !indexNarrowable(field) {
+	if !indexNarrowable(field, FilterContains) {
 		return nil, false
 	}
 	key, ok := scalarKeyOf(want)
@@ -718,7 +748,7 @@ func (p *payloadIndexID) collectContainsSets(f Filter, limit int) ([]map[uint64]
 // corpus set — never a truncated set). A missing query token yields an empty set
 // (ok=true): no id has all tokens. The id-keyed mirror of payloadIndex.matchSet.
 func (p *payloadIndexID) matchSet(field string, want Value, limit int) (map[uint64]struct{}, bool) {
-	if !indexNarrowable(field) {
+	if !indexNarrowable(field, FilterMatch) {
 		return nil, false
 	}
 	if want.Kind != ValueString {
@@ -778,7 +808,7 @@ func (p *payloadIndexID) matchSet(field string, want Value, limit int) (map[uint
 // overflow bail). The returned set is ALWAYS a superset of the true predicate
 // match set. Mirrors dense geoSet (reuses radiusBBox/polygonBBox/coverCells).
 func (p *payloadIndexID) geoSet(field string, op FilterOp, g *GeoCondition, limit int) (map[uint64]struct{}, bool) {
-	if !indexNarrowable(field) {
+	if !indexNarrowable(field, op) {
 		return nil, false
 	}
 	if g == nil {
@@ -887,7 +917,7 @@ func (p *payloadIndexID) collectRangeSets(f Filter, limit int) ([]map[uint64]str
 // eqSet returns the posting set for field == v (the shared stored map, not a
 // copy). ok=false when v is not equality-indexable. Mirrors dense eqSet.
 func (p *payloadIndexID) eqSet(field string, v Value) (map[uint64]struct{}, bool) {
-	if !indexNarrowable(field) {
+	if !indexNarrowable(field, FilterEq) {
 		return nil, false
 	}
 	key, ok := scalarKeyOf(v)
@@ -910,7 +940,7 @@ func (p *payloadIndexID) eqSet(field string, v Value) (map[uint64]struct{}, bool
 // when the union exceeds `limit`. Mirrors dense orderingSet (reuses
 // numericValue/numRange/strRange).
 func (p *payloadIndexID) orderingSet(field string, op FilterOp, want Value, limit int) (map[uint64]struct{}, bool) {
-	if !indexNarrowable(field) {
+	if !indexNarrowable(field, op) {
 		return nil, false
 	}
 	vals := p.fields[field]
@@ -953,7 +983,7 @@ func (p *payloadIndexID) orderingSet(field string, op FilterOp, want Value, limi
 // (strings/ints/floats). ok=false for a non-array value or when the union
 // exceeds `limit`. Mirrors dense inSet.
 func (p *payloadIndexID) inSet(field string, want Value, limit int) (map[uint64]struct{}, bool) {
-	if !indexNarrowable(field) {
+	if !indexNarrowable(field, FilterIn) {
 		return nil, false
 	}
 	vals := p.fields[field]

@@ -469,13 +469,13 @@ func (h *hnsw) gateProfitable(minSize, nsets, k int) bool {
 func filterIndexExact(f Filter) bool {
 	switch f.Op {
 	case FilterEq, FilterContains:
-		if f.Field == contentField || isRecordPath(f.Field) {
+		if !indexNarrowable(f.Field, f.Op) {
 			return false
 		}
 		_, ok := scalarKeyOf(f.Value)
 		return ok
 	case FilterIn:
-		if f.Field == contentField || isRecordPath(f.Field) {
+		if !indexNarrowable(f.Field, f.Op) {
 			return false
 		}
 		switch f.Value.Kind {
@@ -487,7 +487,7 @@ func filterIndexExact(f Filter) bool {
 			return false
 		}
 	case FilterGt, FilterGte, FilterLt, FilterLte:
-		if f.Field == contentField || isRecordPath(f.Field) {
+		if !indexNarrowable(f.Field, f.Op) {
 			return false
 		}
 		// Mirror orderingSet's own kind test: a want that can drive neither the
@@ -501,7 +501,7 @@ func filterIndexExact(f Filter) bool {
 		}
 		return f.Value.Kind == ValueString
 	case FilterDtGt, FilterDtGte, FilterDtLt, FilterDtLte:
-		if f.Field == contentField || isRecordPath(f.Field) {
+		if !indexNarrowable(f.Field, f.Op) {
 			return false
 		}
 		// datetimeBound is the SHARED lowering (compileDatetime calls it too), so
