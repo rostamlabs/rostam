@@ -38,6 +38,9 @@ type applier func(rec *wire.Record, a *wire.OperateArgs, stampMs int64) (*wire.R
 
 // skipDynamic makes sub tests whose name starts with "dynamic:" skip. Set by
 // an engine test whose engine implements schema mode only.
+//
+// It is package-level state, as is maxOperateRecordBytes, which one sub-test
+// lowers and restores. No test in this file may call t.Parallel.
 var skipDynamic bool
 
 // sub runs one semantics sub-test, honouring skipDynamic.
@@ -309,6 +312,13 @@ func runSemantics(t *testing.T, apply applier) { //nolint:maintidx // one sub-te
 				t.Fatalf("n=%d: err=%v, want errOperateIfRange", n, err)
 			}
 		}
+		// The bound is eager: an out-of-range n is an error even when the
+		// condition holds and nothing would be skipped.
+		if _, _, err := apply(nil, schemaArgs(s,
+			op(wire.OperateOpIF, opFromSchema, fieldPath(0), 0).withAux(wire.OperateCmpEQ).withB(5),
+			op(wire.OperateOpADD, opFromSchema, fieldPath(0), 1)), 0); !errors.Is(err, errOperateIfRange) {
+			t.Fatalf("condition true, n out of range: %v", err)
+		}
 		// n exactly equal to the remaining op count is legal.
 		rec, _, err := apply(nil, schemaArgs(s,
 			op(wire.OperateOpIF, opFromSchema, fieldPath(0), 100).withAux(wire.OperateCmpGE).withB(1),
@@ -445,7 +455,9 @@ func runSemantics(t *testing.T, apply applier) { //nolint:maintidx // one sub-te
 				t.Errorf("%s: err=%v, want %v", tc.name, err, tc.want)
 			}
 		}
-		// create NONE against an existing record of either mode is fine.
+		// create NONE against an existing schema-mode record is fine. The
+		// dynamic-mode half of that rule is exercised by the freeze sub-test,
+		// which migrates a dynamic record with noneArgs.
 		if _, _, err := apply(base, noneArgs(op(wire.OperateOpADD, opFromSchema, fieldPath(0), 1)), 0); err != nil {
 			t.Fatalf("create NONE on an existing record: %v", err)
 		}
@@ -630,6 +642,20 @@ func runSemantics(t *testing.T, apply applier) { //nolint:maintidx // one sub-te
 		if len(row.Cols) != 1 || row.Cols[0].Name != "d" {
 			t.Fatalf("%+v", row)
 		}
+		// Ruling: a row is a keyed entity, so it survives losing its last
+		// column and still counts as present.
+		bare, res, err := apply(tbl, withCount(dynArgs(
+			op(wire.OperateOpDEL, opFromSchema, nameColPath("t", keyU64(1), "d"), 0)),
+			nameRowPath("t", keyU64(1))), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(bare.Fields[0].Table.Rows) != 1 || len(bare.Fields[0].Table.Rows[0].Cols) != 0 {
+			t.Fatalf("the row should survive its last column: %+v", bare.Fields[0].Table.Rows)
+		}
+		if c, _, _ := wire.DecodeTaggedCell(res.Values[0]); c.U != 1 {
+			t.Fatalf("COUNT of a column-less row %d, want 1", c.U)
+		}
 	})
 
 	sub(t, "dynamic: TRIM and CONFIG", func(t *testing.T) {
@@ -659,6 +685,15 @@ func runSemantics(t *testing.T, apply applier) { //nolint:maintidx // one sub-te
 		}
 		if rec.Fields[0].Table.Policy != wire.OperatePolicyMinKey {
 			t.Fatal("TRIM must not change the stored policy")
+		}
+		// CONFIG is a table op: its type byte is meaningless and ignored.
+		rec, _, err = apply(rec, dynArgs(
+			op(wire.OperateOpCONFIG, wire.OperateTypeF32, namePath("ev"), 5).withAux(wire.OperatePolicyMaxKey)), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rec.Fields[0].Table.Cap != 5 || rec.Fields[0].Table.Policy != wire.OperatePolicyMaxKey {
+			t.Fatalf("%+v", rec.Fields[0].Table)
 		}
 	})
 
@@ -802,6 +837,7 @@ func runSemantics(t *testing.T, apply applier) { //nolint:maintidx // one sub-te
 		}{
 			{"wrong from-version", noneArgs(op(wire.OperateOpMIGRATE, opFromSchema, recPath(), 5).withBytes(s2.Encode())), wire.ErrOperateSchemaVersion},
 			{"not the first op", noneArgs(op(wire.OperateOpADD, opFromSchema, fieldPath(0), 1), migrate), wire.ErrOperateOpcode},
+			{"path is not the record", noneArgs(op(wire.OperateOpMIGRATE, opFromSchema, fieldPath(0), 1).withBytes(s2.Encode())), wire.ErrOperatePath},
 			{"not an append-only extension", noneArgs(op(wire.OperateOpMIGRATE, opFromSchema, recPath(), 1).withBytes(widenedSchema().Encode())), wire.ErrOperateSchema},
 			{"malformed schema blob", noneArgs(op(wire.OperateOpMIGRATE, opFromSchema, recPath(), 1).withBytes([]byte{9, 9})), wire.ErrShortArgs},
 		}
@@ -858,6 +894,16 @@ func runSemantics(t *testing.T, apply applier) { //nolint:maintidx // one sub-te
 		}
 		if _, _, err := apply(wrong, noneArgs(migrate.withAux(wire.OperateMigrateDropExtra)), 0); !errors.Is(err, wire.ErrOperateType) {
 			t.Fatalf("domain mismatch accepted: %v", err)
+		}
+		// A dynamic row key that is not exactly the schema's key width cannot
+		// be packed fixed-width.
+		narrow, _, err := apply(nil, dynArgs(
+			op(wire.OperateOpSET, wire.OperateTypeU16, nameColPath("b", []byte{1, 2, 3, 4}, "c"), 3)), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := apply(narrow, noneArgs(migrate.withAux(wire.OperateMigrateDropExtra)), 0); !errors.Is(err, wire.ErrOperateSchema) {
+			t.Fatalf("row key of the wrong width accepted: %v", err)
 		}
 		// Freezing needs names in the target schema.
 		nameless := frozenSchema()
@@ -1199,6 +1245,220 @@ func runSemantics(t *testing.T, apply applier) { //nolint:maintidx // one sub-te
 		}
 		if _, _, err := apply(nil, a, 0); !errors.Is(err, wire.ErrOperateCap) {
 			t.Fatalf("maxRet: %v", err)
+		}
+	})
+
+	sub(t, "DEL () is terminal and later ops do not resurrect the record", func(t *testing.T) {
+		// Ruling: DEL () ends the op list. An engine that instead cleared the
+		// record and let a later write refill it would return a live record
+		// here.
+		s := sessionSchema()
+		base, _, err := apply(nil, schemaArgs(s, op(wire.OperateOpADD, opFromSchema, fieldPath(0), 5)), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, res, err := apply(base, withCount(withRet(schemaArgs(s,
+			op(wire.OperateOpDEL, opFromSchema, recPath(), 0),
+			op(wire.OperateOpADD, opFromSchema, fieldPath(0), 1)), fieldPath(0)), recPath()), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != nil {
+			t.Fatalf("an op after DEL () resurrected the record: %+v", got.Fields)
+		}
+		if !bytes.Equal(res.Values[0], []byte{wire.OperateTypeUnset}) {
+			t.Fatalf("VALUE after DEL (): %x, want UNSET", res.Values[0])
+		}
+		if c, _, _ := wire.DecodeTaggedCell(res.Values[1]); c.U != 0 {
+			t.Fatalf("COUNT after DEL (): %d, want 0", c.U)
+		}
+	})
+
+	sub(t, "create NONE ignores a schema blob", func(t *testing.T) {
+		// Ruling: §3.5 says a create = NONE call carries no blob, so one that
+		// arrives anyway is ignored — not checked against the stored version.
+		s := sessionSchema()
+		base, _, err := apply(nil, schemaArgs(s, op(wire.OperateOpADD, opFromSchema, fieldPath(0), 1)), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		other := sessionSchema()
+		other.Version = 9
+		other.StoreNames = true
+		a := noneArgs(op(wire.OperateOpADD, opFromSchema, fieldPath(0), 1))
+		a.Schema = other.Encode()
+		got, _, err := apply(base, a, 0)
+		if err != nil {
+			t.Fatalf("create NONE must ignore the blob: %v", err)
+		}
+		if got.Fields[0].Cell.U != 2 || got.Schema.Version != 1 {
+			t.Fatalf("%d v%d", got.Fields[0].Cell.U, got.Schema.Version)
+		}
+	})
+
+	sub(t, "create SCHEMA compares the version, not the blob bytes", func(t *testing.T) {
+		// Ruling: §2.8 matches versions. The stored schema stays
+		// authoritative, so a call may carry a differently encoded blob of the
+		// same version without changing the record.
+		s := sessionSchema()
+		base, _, err := apply(nil, schemaArgs(s, op(wire.OperateOpADD, opFromSchema, fieldPath(0), 1)), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		named := sessionSchema()
+		named.StoreNames = true // same version, different bytes
+		if bytes.Equal(named.Encode(), s.Encode()) {
+			t.Fatal("the two blobs must differ for this test to mean anything")
+		}
+		got, _, err := apply(base, schemaArgs(named, op(wire.OperateOpADD, opFromSchema, fieldPath(0), 1)), 0)
+		if err != nil {
+			t.Fatalf("same version, different blob: %v", err)
+		}
+		if got.Fields[0].Cell.U != 2 {
+			t.Fatalf("rc=%d", got.Fields[0].Cell.U)
+		}
+		// The stored schema won: it still does not store names, so a name
+		// segment is still rejected.
+		if _, _, err := apply(got, schemaArgs(named, op(wire.OperateOpADD, opFromSchema, namePath("rc"), 1)), 0); !errors.Is(err, wire.ErrOperatePath) {
+			t.Fatalf("the call's blob replaced the stored schema: %v", err)
+		}
+	})
+
+	sub(t, "control and table ops ignore their type byte", func(t *testing.T) {
+		// Ruling: IF, CHECK, DEL, TRIM, CONFIG and MIGRATE neither read nor
+		// write a typed value, so a type byte that disagrees with the schema
+		// is not an error for them. (CONFIG's half is in the dynamic
+		// TRIM/CONFIG sub-test; MIGRATE's is in the MIGRATE sub-test, which
+		// passes 0xFF against a table-bearing schema.)
+		s := sessionSchema()
+		base, _, err := apply(nil, schemaArgs(s,
+			op(wire.OperateOpADD, opFromSchema, fieldPath(0), 5),
+			op(wire.OperateOpADD, opFromSchema, colPath(3, keyU64(1), 0), 1)), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, _, err := apply(base, schemaArgs(s,
+			op(wire.OperateOpIF, wire.OperateTypeF64, fieldPath(0), 1).withAux(wire.OperateCmpGE).withB(1),
+			op(wire.OperateOpADD, opFromSchema, fieldPath(0), 1)), 0)
+		if err != nil || got.Fields[0].Cell.U != 6 {
+			t.Fatalf("IF: %v %+v", err, got.Fields[0].Cell)
+		}
+		_, res, err := apply(base, schemaArgs(s,
+			op(wire.OperateOpCHECK, wire.OperateTypeBytes, fieldPath(0), 1).withAux(wire.OperateCmpGE)), 0)
+		if err != nil || res.Status != wire.OperateStatusOK {
+			t.Fatalf("CHECK: %v %+v", err, res)
+		}
+		got, _, err = apply(base, schemaArgs(s, op(wire.OperateOpDEL, wire.OperateTypeF32, fieldPath(0), 0)), 0)
+		if err != nil || got.Fields[0].Cell.U != 0 {
+			t.Fatalf("DEL: %v %+v", err, got.Fields[0].Cell)
+		}
+		got, _, err = apply(base, schemaArgs(s,
+			op(wire.OperateOpTRIM, wire.OperateTypeBytes, fieldPath(3), 0).withAux(wire.OperatePolicyMinKey)), 0)
+		if err != nil || len(got.Fields[3].Table.Rows) != 0 {
+			t.Fatalf("TRIM: %v %+v", err, got.Fields[3].Table)
+		}
+	})
+
+	sub(t, "dynamic: an absent target reads as the zero of the op's type byte", func(t *testing.T) {
+		// Ruling: the op's type byte picks the domain an absent dynamic target
+		// compares in. Here the same comparison is true as bytes (empty equals
+		// empty) and false as an integer (0 != 5).
+		mk := func(typ uint8) *wire.OperateArgs {
+			return dynArgs(
+				op(wire.OperateOpSET, wire.OperateTypeU8, namePath("base"), 1),
+				op(wire.OperateOpIF, typ, namePath("x"), 5).withAux(wire.OperateCmpEQ).withB(1),
+				op(wire.OperateOpSET, wire.OperateTypeU8, namePath("hit"), 1))
+		}
+		asBytes, _, err := apply(nil, mk(wire.OperateTypeBytes), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(asBytes.Fields) != 2 {
+			t.Fatalf("empty BYTES should equal the empty operand: %+v", asBytes.Fields)
+		}
+		asInt, _, err := apply(nil, mk(wire.OperateTypeU8), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(asInt.Fields) != 1 {
+			t.Fatalf("integer zero should not equal 5: %+v", asInt.Fields)
+		}
+	})
+
+	sub(t, "dynamic: MIN_COL orders mixed column types by domain", func(t *testing.T) {
+		// Ruling: in dynamic mode two rows may store different types under one
+		// column name. They order by domain rank (int < float < bytes) so the
+		// victim stays a pure function of the stored bytes.
+		mk := func(a, b oper) []uint64 {
+			rec, _, err := apply(nil, dynArgs(
+				op(wire.OperateOpCONFIG, opFromSchema, namePath("ev"), 2).
+					withAux(wire.OperatePolicyMinCol).withBytes([]byte("s")),
+				a, b), 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec, _, err = apply(rec, dynArgs(
+				op(wire.OperateOpSET, wire.OperateTypeU32, nameColPath("ev", keyU64(3), "s"), 1)), 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return rowKeys(rec.Fields[0].Table)
+		}
+		// Row 1 holds an int, row 2 a float: the int row goes even though 999
+		// is numerically the larger value.
+		keys := mk(
+			op(wire.OperateOpSET, wire.OperateTypeU32, nameColPath("ev", keyU64(1), "s"), 999),
+			op(wire.OperateOpSET, wire.OperateTypeF64, nameColPath("ev", keyU64(2), "s"), f64(1)))
+		if !reflect.DeepEqual(keys, []uint64{2, 3}) {
+			t.Fatalf("int must sort below float: %v", keys)
+		}
+		// Row 1 holds bytes, row 2 an int: the int row goes.
+		keys = mk(
+			op(wire.OperateOpSET, wire.OperateTypeBytes, nameColPath("ev", keyU64(1), "s"), 0).withBytes([]byte("a")),
+			op(wire.OperateOpSET, wire.OperateTypeU32, nameColPath("ev", keyU64(2), "s"), 5))
+		if !reflect.DeepEqual(keys, []uint64{1, 3}) {
+			t.Fatalf("int must sort below bytes: %v", keys)
+		}
+	})
+
+	sub(t, "dynamic: TRIM on an absent table field is a no-op", func(t *testing.T) {
+		// Ruling: TRIM is a shrink, not a write, so it does not vivify.
+		rec, _, err := apply(nil, dynArgs(op(wire.OperateOpSET, wire.OperateTypeU8, namePath("a"), 1)), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, _, err := apply(rec, dynArgs(
+			op(wire.OperateOpTRIM, opFromSchema, namePath("ev"), 1).withAux(wire.OperatePolicyMinKey)), 0)
+		if err != nil {
+			t.Fatalf("TRIM of an absent table field: %v", err)
+		}
+		if len(got.Fields) != 1 || got.Fields[0].Name != "a" {
+			t.Fatalf("TRIM vivified a table: %+v", got.Fields)
+		}
+	})
+
+	sub(t, "an over-large record is a cap error with the record unchanged", func(t *testing.T) {
+		// §2.7's maxRecordBytes backstop. The bound is lowered rather than
+		// building 16 MiB of record; it is package-level state, so no test in
+		// this file may run in parallel.
+		restore := maxOperateRecordBytes
+		maxOperateRecordBytes = 512
+		t.Cleanup(func() { maxOperateRecordBytes = restore })
+
+		s := floatSchema()
+		small, _, err := apply(nil, schemaArgs(s,
+			op(wire.OperateOpSET, opFromSchema, fieldPath(2), 0).withBytes(bytes.Repeat([]byte{7}, 64))), 0)
+		if err != nil || small == nil {
+			t.Fatalf("a record under the bound must still apply: %v", err)
+		}
+		before := small.Encode()
+		got, _, err := apply(small, schemaArgs(s,
+			op(wire.OperateOpSET, opFromSchema, fieldPath(2), 0).withBytes(bytes.Repeat([]byte{7}, 1024))), 0)
+		if !errors.Is(err, wire.ErrOperateCap) {
+			t.Fatalf("err=%v, want ErrOperateCap", err)
+		}
+		if got != nil && !bytes.Equal(got.Encode(), before) {
+			t.Fatal("record changed by a call that hit the record-size cap")
 		}
 	})
 

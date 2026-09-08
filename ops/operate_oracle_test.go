@@ -17,22 +17,10 @@ package ops
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"math"
 	"sort"
 
 	"github.com/rostamlabs/rostam/sdk/wire"
-)
-
-var (
-	// errOperateAbsent is the "create = NONE and the key does not exist"
-	// error of design doc §3.5. The handler maps it to the store's
-	// not-found error.
-	errOperateAbsent = errors.New("ops: operate record absent")
-	// errOperateIfRange marks an IF whose skip count is negative or reaches
-	// past the end of the op list (design doc §3.3, "n bounded by the
-	// remaining list").
-	errOperateIfRange = errors.New("ops: operate IF skip count out of range")
 )
 
 // --- shared test helpers ---------------------------------------------------
@@ -229,6 +217,12 @@ func applyTree(rec *wire.Record, a *wire.OperateArgs, stampMs int64) (*wire.Reco
 	}
 	if out != nil {
 		treeNormalize(out)
+		// §2.7's backstop, checked on the result rather than op by op: a call
+		// that would store an over-large record fails with the record
+		// unchanged.
+		if len(out.Encode()) > maxOperateRecordBytes {
+			return rec, nil, wire.ErrOperateCap
+		}
 	}
 	vals, verr := treeRets(out, true, a.Rets)
 	if verr != nil {
@@ -314,14 +308,18 @@ func (st *treeState) run(ops []wire.OperateOp) (uint8, uint16, error) {
 		}
 		switch o.Opcode {
 		case wire.OperateOpIF:
+			// The skip count is validated whenever the IF runs, not only when
+			// the branch is taken: a malformed op list is malformed whatever
+			// the record happens to hold (design doc §3.3, "n bounded by the
+			// remaining list").
+			if o.B < 0 || o.B > int64(len(ops)-i-1) {
+				return 0, 0, errOperateIfRange
+			}
 			ok, err := st.compare(o)
 			if err != nil {
 				return 0, 0, err
 			}
 			if !ok {
-				if o.B < 0 || o.B > int64(len(ops)-i-1) {
-					return 0, 0, errOperateIfRange
-				}
 				i += int(o.B)
 			}
 		case wire.OperateOpCHECK:
@@ -1569,8 +1567,10 @@ func treeValueOf(rec *wire.Record, nd *treeNode) []byte {
 	}
 }
 
-// treeTableValue is the table's full stored encoding with the record's mode
-// byte in front, so it is decodable knowing only the mode (§3.4). The bytes
+// treeTableValue is the table's stored encoding with the record's mode byte
+// in front (§3.4). Ruling: no schema blob rides along — the caller holds the
+// schema, and the mode byte is all a reader needs to know which of the two
+// table layouts follows. The bytes
 // are exactly what the record encoder emits for that field: they are taken
 // from a one-field record built around it, rather than re-implemented.
 func treeTableValue(rec *wire.Record, fi int) []byte {
