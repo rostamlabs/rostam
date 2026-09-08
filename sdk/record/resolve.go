@@ -324,6 +324,63 @@ func schemaFieldOffset(rec []byte, base int, s *wire.Schema, l *wire.Layout, tar
 	return 0, fmt.Errorf("%w: field %d is in neither layout half", ErrRecord, target)
 }
 
+// walkSchemaFields visits every top-level field of a schema-mode record, in
+// schema position order, exactly once, reporting each field's byte offset
+// (and, for a table field, its row count — visit needs it anyway to know
+// where the table ends, so the walk hands it over rather than making the
+// caller re-read the header). It is schemaFieldOffset's iteration form:
+// IndexEntries needs an offset for every field, and calling
+// schemaFieldOffset once per field would re-walk the variable-length tail
+// from scratch each time, costing O(n²) instead of O(n).
+func walkSchemaFields(rec []byte, base int, s *wire.Schema, l *wire.Layout, visit func(pos, off int, isTable bool, nRows uint64) error) error {
+	off := base + l.FixedLen
+	if off > len(rec) {
+		return fmt.Errorf("%w: record ends inside its fixed fields", ErrRecord)
+	}
+	tailIdx := 0
+	for pos := range s.Fields {
+		if l.FixedOff[pos] >= 0 {
+			foff := base + l.FixedOff[pos]
+			if foff > len(rec) {
+				return fmt.Errorf("%w: record ends before field %d", ErrRecord, pos)
+			}
+			if err := visit(pos, foff, false, 0); err != nil {
+				return err
+			}
+			continue
+		}
+		if tailIdx >= len(l.VarTail) || l.VarTail[tailIdx] != pos {
+			// Unreachable for a Layout built from this schema (VarTail lists
+			// exactly the non-fixed positions, in order).
+			return fmt.Errorf("%w: field %d is in neither layout half", ErrRecord, pos)
+		}
+		tailIdx++
+		foff := off
+		f := &s.Fields[pos]
+		isTable := f.Type == wire.OperateTypeTable
+		var nRows uint64
+		if isTable {
+			var rowsOff int
+			var err error
+			nRows, rowsOff, err = schemaTableHeader(rec, off, l.Tables[pos])
+			if err != nil {
+				return err
+			}
+			off = rowsOff + int(nRows)*l.Tables[pos].RowWidth
+		} else {
+			n, err := cellDataLen(rec, off, f.Type, f.N)
+			if err != nil {
+				return err
+			}
+			off += n
+		}
+		if err := visit(pos, foff, isTable, nRows); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // schemaTableHeader reads a schema-mode table's row count from off and
 // returns it with the offset of the first row, having bounded the rows
 // against the bytes actually left (design doc §2.3).
