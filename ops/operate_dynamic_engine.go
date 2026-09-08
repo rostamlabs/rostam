@@ -768,14 +768,13 @@ func dynTargetType(create bool, opcode, typ, n, storedTyp, storedN uint8) (uint8
 		return 0, 0, wire.ErrOperateType
 	}
 	if opcode == wire.OperateOpSET {
-		if typ == wire.OperateTypeFixed && n < 1 {
-			// A FIXED operand with no usable width cannot retype anything, so
-			// the stored type stands (the oracle's treeRetype returns ok =
-			// false here). applyOps rejects such an op before resolve, so
-			// this only keeps the function total.
-			return storedTyp, storedN, nil
-		}
-		return typ, n, nil
+		// SET replaces the scalar including its type (design doc §2.9), so it
+		// names a type exactly as it would on a missing target — including a
+		// FIXED operand that cannot form a cell, which is wire.ErrOperateType
+		// either way. There is no stored type left for such a SET to fall
+		// back on, and §2.4 leaves no room for reinterpreting the op against
+		// one.
+		return createType(typ, n)
 	}
 	if dynDomain(typ) != dynDomain(storedTyp) {
 		return 0, 0, wire.ErrOperateType
@@ -793,6 +792,13 @@ func (e *dynamicEngine) resolve(p wire.OperatePath, create bool, opcode, typ, n 
 		return e.inner.resolve(p, create, opcode, typ, n)
 	}
 	if p.Kind > wire.OperatePathCol {
+		return ref{}, wire.ErrOperatePath
+	}
+	if opcode == wire.OperateOpCONFIG && p.Kind != wire.OperatePathField {
+		// A table's eviction config lives on the field itself (design doc
+		// §3.2), so a record, row or column path is malformed — checked
+		// before the record path's early return below, since the oracle
+		// rejects a CONFIG at () too.
 		return ref{}, wire.ErrOperatePath
 	}
 	if p.Kind == wire.OperatePathRecord {
@@ -862,11 +868,15 @@ func (e *dynamicEngine) resolveField(p wire.OperatePath, create bool, opcode, ty
 	if f.typ == wire.OperateTypeTable {
 		return ref{kind: refKindTable, field: fi, row: -1, col: -1, off: -1, present: true}, nil
 	}
-	if create && opcode == wire.OperateOpCONFIG {
-		// A scalar field cannot take a table's eviction config: it would have
-		// to become a table, which only DEL then a row write can do (oracle
-		// ruling, design doc §2.9).
-		return ref{}, wire.ErrOperatePath
+	if opcode == wire.OperateOpCONFIG {
+		// A scalar field cannot take a table's eviction config — it would
+		// have to become a table, which only DEL then a row write can do
+		// (design doc §2.9) — but that is config's rejection to make, after
+		// the operand checks, which is the order the oracle rejects it in.
+		// The op's TABLE type byte is not a scalar type and is not checked
+		// against the stored one here for the same reason.
+		return ref{kind: refKindScalar, field: fi, row: -1, col: -1, off: f.typOff,
+			typ: f.typ, n: f.n, present: true}, nil
 	}
 	rtyp, rn, err := dynTargetType(create, opcode, typ, n, f.typ, f.n)
 	if err != nil {
@@ -1200,7 +1210,9 @@ func (e *dynamicEngine) insertRow(fi int, t dynTable, at int, key []byte) error 
 	e.enc = body
 	var hdr [binary.MaxVarintLen64]byte
 	m := binary.PutUvarint(hdr[:], uint64(len(body)))
-	if err := e.charge(m + len(body) + binary.MaxVarintLen64); err != nil {
+	// The row's bytes plus the worst case of the two prefixes that cover it
+	// widening: the table's nRows and its byteLen.
+	if err := e.charge(m + len(body) + 2*binary.MaxVarintLen64); err != nil {
 		return err
 	}
 	e.buf = splice(e.buf, at, 0, hdr[:m])
@@ -1238,7 +1250,9 @@ func (e *dynamicEngine) insertCol(fi, ri, at int, name string, typ, n uint8) err
 	e.enc = appendDynName(e.enc[:0], name)
 	e.enc = wire.AppendTaggedCell(e.enc, wire.ZeroCell(typ, n))
 	entry := e.enc
-	if err := e.charge(len(entry) + 2*binary.MaxVarintLen64); err != nil {
+	// The column's bytes plus the worst case of the three prefixes that cover
+	// it widening: the row's nCols and rowLen, and the table's byteLen.
+	if err := e.charge(len(entry) + 3*binary.MaxVarintLen64); err != nil {
 		return err
 	}
 	t, row, err := e.rowByIndex(fi, ri)
@@ -1544,17 +1558,9 @@ func (e *dynamicEngine) config(r ref, capN uint32, policy uint8, byColName strin
 	if e.inner != nil {
 		return e.inner.config(r, capN, policy, byColName)
 	}
-	// The name-length bound comes first because applyOps cannot check it: it
-	// is a cap on the op's operand, and the oracle reports it before it looks
-	// at the policy byte.
-	if len(byColName) > wire.OperateMaxNameLen {
-		return wire.ErrOperateCap
-	}
-	if policy > wire.OperatePolicyMaxCol {
-		// An unknown policy byte is a schema-shaped error, the same one
-		// Schema.Validate returns for a table declaring it (oracle ruling).
-		return wire.ErrOperateSchema
-	}
+	// applyOps has already bounded byColName's length and rejected an unknown
+	// policy byte, in that order (see its CONFIG branch); what is left is the
+	// pair of rules the loop cannot state, both of them wire.ErrOperatePath.
 	if (policy == wire.OperatePolicyMinCol || policy == wire.OperatePolicyMaxCol) && byColName == "" {
 		return wire.ErrOperatePath
 	}

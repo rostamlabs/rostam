@@ -44,9 +44,9 @@ func TestDynamicEngineMatchesOracle(t *testing.T) {
 			a := randomDynamicArgs(sub)
 			o, ores, oerr := applyTree(oracle, a, int64(iter))
 			e, eres, eerr := bytesApply(byteRec, a, int64(iter))
-			if (oerr == nil) != (eerr == nil) {
-				t.Fatalf("seed %d call %d: oracle err %v, engine err %v\nargs %+v",
-					seed, call, oerr, eerr, a)
+			if operateErrName(oerr) != operateErrName(eerr) {
+				t.Fatalf("seed %d call %d: oracle err %q, engine err %q\nargs %+v",
+					seed, call, operateErrName(oerr), operateErrName(eerr), a)
 			}
 			if oerr != nil {
 				continue

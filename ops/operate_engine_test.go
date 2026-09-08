@@ -409,16 +409,16 @@ func TestApplyOpsMigrate(t *testing.T) {
 	}
 }
 
-// CONFIG/TRIM at a row, col, or record path -> wire.ErrOperatePath, without
-// ever calling resolve (config()/trim() have no path of their own to reject
-// it with, so the loop must).
+// TRIM at a row, col, or record path -> wire.ErrOperatePath, without ever
+// calling resolve (trim() has no path of its own to reject it with, so the
+// loop must). CONFIG's path-kind check is NOT here: it moved into resolve,
+// which is the only thing that knows whether the record's mode has an
+// eviction config at all — see TestApplyOpsConfigChecksRunAfterResolve.
 func TestApplyOpsConfigTrimPathKind(t *testing.T) {
 	cases := []struct {
 		name string
 		op   wire.OperateOp
 	}{
-		{"config-row", wire.OperateOp{Opcode: wire.OperateOpCONFIG, Path: fakeRowPath("b", "k1"), A: 1}},
-		{"config-record", wire.OperateOp{Opcode: wire.OperateOpCONFIG, Path: fakeRecordPath(), A: 1}},
 		{"trim-row", wire.OperateOp{Opcode: wire.OperateOpTRIM, Path: fakeRowPath("b", "k1"), A: 1}},
 		{"trim-record", wire.OperateOp{Opcode: wire.OperateOpTRIM, Path: fakeRecordPath(), A: 1}},
 	}
@@ -534,15 +534,15 @@ func TestApplyOpsScalarPresentForwarded(t *testing.T) {
 }
 
 // (g) CONFIG/TRIM A bounds: negative or over wire.OperateMaxRows ->
-// wire.ErrOperateCap, checked before resolve vivifies anything.
+// wire.ErrOperateCap, checked before resolve vivifies anything. (CONFIG's cap
+// check runs after resolve instead, because the record's mode and the path
+// come first — TestApplyOpsConfigChecksRunAfterResolve covers it.)
 func TestApplyOpsConfigTrimCap(t *testing.T) {
 	cases := []struct {
 		name string
 		op   uint8
 		a    int64
 	}{
-		{"config-negative", wire.OperateOpCONFIG, -1},
-		{"config-over", wire.OperateOpCONFIG, int64(wire.OperateMaxRows) + 1},
 		{"trim-negative", wire.OperateOpTRIM, -1},
 		{"trim-over", wire.OperateOpTRIM, int64(wire.OperateMaxRows) + 1},
 	}
@@ -587,6 +587,54 @@ func TestApplyOpsConfigTrimCap(t *testing.T) {
 	}
 	if len(f2.trimmed) != 1 || f2.trimmed[0].keep != 5 || f2.trimmed[0].policy != wire.OperatePolicyMinKey || f2.trimmed[0].byCol != 2 || f2.trimmed[0].byColName != "bc" {
 		t.Fatalf("trim called with %+v", f2.trimmed)
+	}
+}
+
+// CONFIG's checks run in the order the oracle rejects them in (design doc
+// §3.2): the engine first (its resolve knows the record's mode and the path),
+// then the loop's operand checks — the eviction column name's length, the cap,
+// and the policy byte — and only then config(). Each case below is malformed
+// in an operand that config() itself would accept, so it can only report the
+// right error if the loop got there first; the last one proves resolve still
+// goes first, by failing while the cap is out of range too.
+func TestApplyOpsConfigChecksRunAfterResolve(t *testing.T) {
+	longName := make([]byte, wire.OperateMaxNameLen+1)
+	cases := []struct {
+		name string
+		op   wire.OperateOp
+		want error
+	}{
+		{"byColName too long", wire.OperateOp{Opcode: wire.OperateOpCONFIG,
+			Path: fakeFieldPath("tbl"), A: 1, Bytes: longName}, wire.ErrOperateCap},
+		{"cap out of range", wire.OperateOp{Opcode: wire.OperateOpCONFIG,
+			Path: fakeFieldPath("tbl"), A: -1}, wire.ErrOperateCap},
+		{"unknown policy", wire.OperateOp{Opcode: wire.OperateOpCONFIG,
+			Path: fakeFieldPath("tbl"), A: 1, Aux: wire.OperatePolicyMaxCol + 1}, wire.ErrOperateSchema},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeEngine()
+			_, _, err := applyOps(f, []wire.OperateOp{tc.op}, 0)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("err=%v, want %v", err, tc.want)
+			}
+			if len(f.calls) == 0 || f.calls[0] != "resolve:"+pathKey(fakeFieldPath("tbl")) {
+				t.Fatalf("resolve must run before the operand checks: %v", f.calls)
+			}
+			if len(f.configured) != 0 {
+				t.Fatalf("config must not have been called: %+v", f.configured)
+			}
+		})
+	}
+
+	// resolve's own rejection — for a schema-mode record, the mode gate that
+	// answers wire.ErrOperateOpcode — wins over an out-of-range cap.
+	f := newFakeEngine()
+	f.forceResolveErr[pathKey(fakeFieldPath("tbl"))] = wire.ErrOperateOpcode
+	_, _, err := applyOps(f, []wire.OperateOp{{Opcode: wire.OperateOpCONFIG,
+		Path: fakeFieldPath("tbl"), A: -1}}, 0)
+	if !errors.Is(err, wire.ErrOperateOpcode) {
+		t.Fatalf("err=%v, want the resolve error wire.ErrOperateOpcode", err)
 	}
 }
 
@@ -692,25 +740,25 @@ func TestApplyOpsScalarRejectsNonScalarTarget(t *testing.T) {
 	}
 }
 
-// fixedN: SET creating a FIXED dynamic target passes n=len(o.Bytes); an
-// out-of-range FIXED length is rejected before resolve is called.
+// fixedN: SET creating a FIXED dynamic target passes n=len(o.Bytes). An
+// operand that cannot form a FIXED(1-255) cell yields 0 rather than an error
+// — the width is not the loop's to reject, because the same op aimed at a
+// table field or a row is a PATH error, and only resolve knows which. The
+// engines turn the 0 into wire.ErrOperateType where a width is actually
+// needed (TestDynamicSetFixedWidthIsAType covers the end-to-end rule).
 func TestFixedN(t *testing.T) {
-	n, err := fixedN(&wire.OperateOp{Type: wire.OperateTypeFixed, Bytes: []byte("abc")})
-	if err != nil || n != 3 {
-		t.Fatalf("fixedN(FIXED,3 bytes) = (%d,%v), want (3,nil)", n, err)
+	if n := fixedN(&wire.OperateOp{Type: wire.OperateTypeFixed, Bytes: []byte("abc")}); n != 3 {
+		t.Fatalf("fixedN(FIXED, 3 bytes) = %d, want 3", n)
 	}
-	n, err = fixedN(&wire.OperateOp{Type: wire.OperateTypeU32, Bytes: []byte("abc")})
-	if err != nil || n != 0 {
-		t.Fatalf("fixedN(U32) = (%d,%v), want (0,nil)", n, err)
+	if n := fixedN(&wire.OperateOp{Type: wire.OperateTypeU32, Bytes: []byte("abc")}); n != 0 {
+		t.Fatalf("fixedN(U32) = %d, want 0", n)
 	}
-	_, err = fixedN(&wire.OperateOp{Type: wire.OperateTypeFixed, Bytes: nil})
-	if !errors.Is(err, wire.ErrOperateType) {
-		t.Fatalf("fixedN(FIXED, empty) = %v, want wire.ErrOperateType", err)
+	if n := fixedN(&wire.OperateOp{Type: wire.OperateTypeFixed, Bytes: nil}); n != 0 {
+		t.Fatalf("fixedN(FIXED, empty) = %d, want 0", n)
 	}
 	big := make([]byte, wire.OperateMaxKeyLen+1)
-	_, err = fixedN(&wire.OperateOp{Type: wire.OperateTypeFixed, Bytes: big})
-	if !errors.Is(err, wire.ErrOperateType) {
-		t.Fatalf("fixedN(FIXED, too long) = %v, want wire.ErrOperateType", err)
+	if n := fixedN(&wire.OperateOp{Type: wire.OperateTypeFixed, Bytes: big}); n != 0 {
+		t.Fatalf("fixedN(FIXED, too long) = %d, want 0", n)
 	}
 }
 

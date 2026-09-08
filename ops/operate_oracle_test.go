@@ -17,11 +17,13 @@ package ops
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
 	"sort"
 
+	"github.com/rostamlabs/rostam/cache"
 	"github.com/rostamlabs/rostam/sdk/wire"
 )
 
@@ -899,7 +901,11 @@ func (st *treeState) resolveDynamic(nd *treeNode, p wire.OperatePath, o wire.Ope
 		if err := treeCheckDynType(o, f.Cell.Type); err != nil {
 			return nil, err
 		}
-		if typ, n, ok := treeRetype(o); ok {
+		typ, n, ok, err := treeRetype(o)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
 			nd.typ, nd.n, nd.retype = typ, n, true
 		}
 		return nd, nil
@@ -973,8 +979,12 @@ func (st *treeState) resolveDynamic(nd *treeNode, p wire.OperatePath, o wire.Ope
 	if err := treeCheckDynType(o, c.Type); err != nil {
 		return nil, err
 	}
-	if typ, n, ok := treeRetype(o); ok {
-		nd.typ, nd.n, nd.retype = typ, n, true
+	rtyp, rn, ok, err := treeRetype(o)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		nd.typ, nd.n, nd.retype = rtyp, rn, true
 	}
 	return nd, nil
 }
@@ -1076,15 +1086,25 @@ func treeCreateType(o wire.OperateOp) (uint8, uint8, error) {
 }
 
 // treeRetype reports the new type of a dynamic SET that names one.
-func treeRetype(o wire.OperateOp) (uint8, uint8, bool) {
+//
+// Ruling (adjudicated against the design doc after the first version of this
+// oracle got it wrong): a SET that declares FIXED but carries an operand
+// that cannot form a FIXED(1-255) cell is wire.ErrOperateType on an existing
+// target exactly as on a missing one. §2.9 makes SET replace the scalar
+// INCLUDING its type, so there is no stored type left for such a SET to fall
+// back on, and §2.4's "an op that cannot apply to the field's type is an
+// error" leaves no room for the v1-style silent reinterpretation the earlier
+// code did (it kept the stored type and applied the op against it, which for
+// a stored integer meant writing o.A instead of the bytes the caller sent).
+func treeRetype(o wire.OperateOp) (uint8, uint8, bool, error) {
 	if o.Opcode != wire.OperateOpSET || o.Type == wire.OperateTypeFromSchema {
-		return 0, 0, false
+		return 0, 0, false, nil
 	}
 	typ, n, err := treeCreateType(o)
 	if err != nil {
-		return 0, 0, false
+		return 0, 0, false, err
 	}
-	return typ, n, true
+	return typ, n, true, nil
 }
 
 // treeZeroTypeFor is the type an absent dynamic target reads as. Ruling: the
@@ -2135,6 +2155,19 @@ func randomDynamicOp(rng *rand.Rand) wire.OperateOp {
 			o.Bytes = []byte(dynNames[rng.Intn(len(dynNames))])
 		}
 	}
+	if o.Type == wire.OperateTypeFixed && o.Opcode != wire.OperateOpTRIM && o.Opcode != wire.OperateOpCONFIG {
+		// An operand that cannot form a FIXED(1-255) cell. The type byte
+		// still says FIXED, so there is no width to create or replace with —
+		// wire.ErrOperateType wherever a width is needed, and a PATH error
+		// where the target turns out to be a table or a row, which is the
+		// distinction the loop's fixedN must not pre-empt.
+		switch rng.Intn(12) {
+		case 0:
+			o.Bytes = nil
+		case 1:
+			o.Bytes = make([]byte, wire.OperateMaxKeyLen+1)
+		}
+	}
 	if rng.Intn(8) == 0 {
 		o.Type = wire.OperateTypeFromSchema // "whatever is stored", which a missing target has none of
 	}
@@ -2235,4 +2268,35 @@ func randomFreezeTableDef(rng *rand.Rand) *wire.TableDef {
 		td.ByCol = uint16(rng.Intn(len(td.Cols))) //nolint:gosec // bounded by the column count
 	}
 	return td
+}
+
+// --- error identity --------------------------------------------------------
+
+// operateErrSentinels is every error an operate apply is allowed to return.
+// Which one comes out is part of the contract, not an implementation detail:
+// the client turns it into a status the caller branches on, so an engine that
+// says "bad type" where the oracle says "bad path" is a divergence even
+// though both reject the call. The equivalence property tests compare through
+// operateErrName rather than on nil-ness alone.
+var operateErrSentinels = []error{
+	wire.ErrOperateType, wire.ErrOperatePath, wire.ErrOperateOpcode, wire.ErrOperateCmp,
+	wire.ErrOperateSchema, wire.ErrOperateSchemaVersion, wire.ErrOperateMode,
+	wire.ErrOperateCap, wire.ErrOperateRecord, wire.ErrOperateArgs, wire.ErrShortArgs,
+	errOperateAbsent, errOperateIfRange, cache.ErrNotFound,
+}
+
+// operateErrName names err by the sentinel it wraps, so a property failure
+// reports which two errors disagreed. An error outside the roster is named in
+// full and can never compare equal to a sentinel, which is what makes an
+// engine-private error a test failure rather than a silent pass.
+func operateErrName(err error) string {
+	if err == nil {
+		return "<nil>"
+	}
+	for _, s := range operateErrSentinels {
+		if errors.Is(err, s) {
+			return s.Error()
+		}
+	}
+	return "unrostered error: " + err.Error()
 }

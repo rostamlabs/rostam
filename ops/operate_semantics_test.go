@@ -379,6 +379,55 @@ func runSemantics(t *testing.T, apply applier) { //nolint:maintidx // one sub-te
 		}
 	})
 
+	sub(t, "dynamic: a SET declaring FIXED needs an operand that fits a cell", func(t *testing.T) {
+		// Ruling: SET replaces the scalar INCLUDING its type (§2.9), so a
+		// FIXED type byte whose operand cannot form a FIXED(1-255) cell has
+		// no width to write and no stored type to fall back on — it is
+		// wire.ErrOperateType on an existing target exactly as on a missing
+		// one (§2.4: an op that cannot apply to the field's type is an
+		// error, never a silent reinterpretation).
+		base, _, err := apply(nil, dynArgs(
+			op(wire.OperateOpSET, wire.OperateTypeU8, namePath("x"), 200),
+			op(wire.OperateOpSET, wire.OperateTypeU8, nameColPath("t", keyU64(1), "c"), 4)), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tooWide := bytes.Repeat([]byte{9}, wire.OperateMaxKeyLen+1)
+		for _, tc := range []struct {
+			name  string
+			path  wire.OperatePath
+			bytes []byte
+		}{
+			{"existing field, no operand", namePath("x"), nil},
+			{"existing field, over-wide operand", namePath("x"), tooWide},
+			{"missing field, no operand", namePath("fresh"), nil},
+			{"existing column, no operand", nameColPath("t", keyU64(1), "c"), nil},
+			{"missing column, over-wide operand", nameColPath("t", keyU64(1), "d"), tooWide},
+		} {
+			_, _, err := apply(base, dynArgs(
+				op(wire.OperateOpSET, wire.OperateTypeFixed, tc.path, 0).withBytes(tc.bytes)), 0)
+			if !errors.Is(err, wire.ErrOperateType) {
+				t.Errorf("%s: err=%v, want ErrOperateType", tc.name, err)
+			}
+		}
+		// The same op against a table field or a row is a PATH error, not a
+		// type error: the width is only meaningless once the path has landed
+		// on something that could hold a scalar.
+		for _, tc := range []struct {
+			name string
+			path wire.OperatePath
+		}{
+			{"table field", namePath("t")},
+			{"row", nameRowPath("t", keyU64(1))},
+		} {
+			_, _, err := apply(base, dynArgs(
+				op(wire.OperateOpSET, wire.OperateTypeFixed, tc.path, 0).withBytes(nil)), 0)
+			if !errors.Is(err, wire.ErrOperatePath) {
+				t.Errorf("%s: err=%v, want ErrOperatePath", tc.name, err)
+			}
+		}
+	})
+
 	sub(t, "dynamic: a scalar and a table never swap without DEL", func(t *testing.T) {
 		rec, _, err := apply(nil, dynArgs(op(wire.OperateOpSET, wire.OperateTypeU8, nameColPath("t", keyU64(1), "c"), 4)), 0)
 		if err != nil {
@@ -442,6 +491,13 @@ func runSemantics(t *testing.T, apply applier) { //nolint:maintidx // one sub-te
 				noneArgs(op(wire.OperateOpADD, opFromSchema, fieldPath(0), 1)), errOperateAbsent},
 			{"CONFIG in schema mode", base,
 				schemaArgs(s, op(wire.OperateOpCONFIG, opFromSchema, fieldPath(3), 4).withAux(wire.OperatePolicyMinKey)), wire.ErrOperateOpcode},
+			// A schema-mode record has no eviction config to set at all, so
+			// CONFIG is rejected as an opcode before anything about the op's
+			// path or operands is looked at.
+			{"CONFIG in schema mode, at a row path", base,
+				schemaArgs(s, op(wire.OperateOpCONFIG, opFromSchema, rowPath(3, keyU64(1)), 4).withAux(wire.OperatePolicyMinKey)), wire.ErrOperateOpcode},
+			{"CONFIG in schema mode, with an out-of-range cap", base,
+				schemaArgs(s, op(wire.OperateOpCONFIG, opFromSchema, fieldPath(3), -1).withAux(wire.OperatePolicyMinKey)), wire.ErrOperateOpcode},
 			{"unknown opcode", base,
 				schemaArgs(s, op(99, opFromSchema, fieldPath(0), 1)), wire.ErrOperateOpcode},
 			{"unknown comparator", base,
@@ -694,6 +750,51 @@ func runSemantics(t *testing.T, apply applier) { //nolint:maintidx // one sub-te
 		}
 		if rec.Fields[0].Table.Cap != 5 || rec.Fields[0].Table.Policy != wire.OperatePolicyMaxKey {
 			t.Fatalf("%+v", rec.Fields[0].Table)
+		}
+	})
+
+	sub(t, "dynamic: CONFIG says no in a fixed order", func(t *testing.T) {
+		// Every one of CONFIG's checks fails with a different error, so which
+		// one wins is part of the contract (design doc §3.2). The order is:
+		// the record's mode, the path's kind, its name segment, the name
+		// lengths, the cap operand, the policy byte, a *_COL policy's column
+		// name, and last the field's own kind. Each case below is malformed
+		// in two ways at once, so it can only pass if the earlier check wins.
+		rec, _, err := apply(nil, dynArgs(
+			op(wire.OperateOpSET, wire.OperateTypeU8, namePath("x"), 1),
+			op(wire.OperateOpSET, wire.OperateTypeU8, nameColPath("t", keyU64(1), "c"), 4)), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		long := strings.Repeat("n", 256)
+		cases := []struct {
+			name string
+			args *wire.OperateArgs
+			want error
+		}{
+			{"a record path beats the cap operand",
+				dynArgs(op(wire.OperateOpCONFIG, opFromSchema, recPath(), -1).withAux(wire.OperatePolicyMinKey)),
+				wire.ErrOperatePath},
+			{"a position segment beats the cap operand",
+				dynArgs(op(wire.OperateOpCONFIG, opFromSchema, fieldPath(0), -1).withAux(wire.OperatePolicyMinKey)),
+				wire.ErrOperatePath},
+			{"a name too long beats the cap operand",
+				dynArgs(op(wire.OperateOpCONFIG, opFromSchema, namePath(long), -1).withAux(wire.OperatePolicyMinKey)),
+				wire.ErrOperateCap},
+			{"the cap operand beats the policy byte",
+				dynArgs(op(wire.OperateOpCONFIG, opFromSchema, namePath("t"), -1).withAux(99)),
+				wire.ErrOperateCap},
+			{"the policy byte beats the field's kind",
+				dynArgs(op(wire.OperateOpCONFIG, opFromSchema, namePath("x"), 2).withAux(99)),
+				wire.ErrOperateSchema},
+			{"a scalar field is the last word",
+				dynArgs(op(wire.OperateOpCONFIG, opFromSchema, namePath("x"), 2).withAux(wire.OperatePolicyMinKey)),
+				wire.ErrOperatePath},
+		}
+		for _, tc := range cases {
+			if _, _, err := apply(rec, tc.args, 0); !errors.Is(err, tc.want) {
+				t.Errorf("%s: err=%v, want %v", tc.name, err, tc.want)
+			}
 		}
 	})
 

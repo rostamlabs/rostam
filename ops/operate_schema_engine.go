@@ -442,11 +442,19 @@ func newSchemaRecord(schemaBlob []byte, cache *schemaCache) ([]byte, error) {
 // vivifies a row.
 func (e *schemaEngine) resolve(p wire.OperatePath, create bool, opcode, typ, n uint8) (ref, error) {
 	_ = n // schema mode takes widths from the schema, never from the op
-	// The opcode only matters where a stored type can be replaced, which is
-	// dynamic mode's SET (design doc §2.9). A schema-mode field's type is
-	// the schema's, whatever the op says, so checkType below is the whole
-	// rule here.
-	_ = opcode
+	if opcode == wire.OperateOpCONFIG {
+		// A schema-mode table's eviction triple comes from its schema and
+		// cannot be set per record (design doc §3.2), so CONFIG is not an op
+		// this record has at all — reported here, before the path is even
+		// looked at, because that is where the oracle reports it (its config
+		// checks the record's mode first). config() answers the same thing
+		// for a caller that gets past this.
+		return ref{}, wire.ErrOperateOpcode
+	}
+	// The opcode otherwise only matters where a stored type can be replaced,
+	// which is dynamic mode's SET (design doc §2.9). A schema-mode field's
+	// type is the schema's, whatever the op says, so checkType below is the
+	// whole rule here.
 	if p.Kind > wire.OperatePathCol {
 		return ref{}, wire.ErrOperatePath
 	}

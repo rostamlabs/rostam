@@ -49,9 +49,9 @@ func TestSchemaEngineMatchesOracle(t *testing.T) {
 			a := randomArgs(sub, s)
 			o, ores, oerr := applyTree(oracle, a, int64(iter))
 			e, eres, eerr := bytesApply(engine, a, int64(iter))
-			if (oerr == nil) != (eerr == nil) {
-				t.Fatalf("seed %d call %d: oracle err %v, engine err %v\nschema %+v\nargs %+v",
-					seed, call, oerr, eerr, s, a)
+			if operateErrName(oerr) != operateErrName(eerr) {
+				t.Fatalf("seed %d call %d: oracle err %q, engine err %q\nschema %+v\nargs %+v",
+					seed, call, operateErrName(oerr), operateErrName(eerr), s, a)
 			}
 			if oerr != nil {
 				continue

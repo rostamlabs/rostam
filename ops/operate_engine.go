@@ -189,19 +189,29 @@ func trimByCol(b int64) uint16 {
 // might create a FIXED-typed dynamic-mode target: a FIXED cell's width is
 // the length of its operand bytes (design doc §2.1, "FIXED(n): n raw bytes
 // (1-255)"), never a declared width, since there is no schema to declare
-// one. Every other type creates with n=0. Mirrors the oracle's
-// treeCreateType FIXED branch; an out-of-[1,255] length is
-// wire.ErrOperateType, the same error a real too-wide/empty FIXED value
-// gets from wire.ApplyScalar/AppendTaggedCell elsewhere.
-func fixedN(o *wire.OperateOp) (uint8, error) {
+// one. Every other type creates with n=0.
+//
+// An operand that cannot form a FIXED(1-255) cell yields 0, which every
+// engine rejects as wire.ErrOperateType where the width would actually be
+// used (the oracle's treeCreateType). It is deliberately NOT rejected here:
+// the loop must resolve the path first, so that such an op aimed at a table
+// field or a row reports the path error the oracle reports, rather than a
+// type error about a width nothing was going to use.
+func fixedN(o *wire.OperateOp) uint8 {
 	if o.Type != wire.OperateTypeFixed {
-		return 0, nil
+		return 0
 	}
 	if len(o.Bytes) < 1 || len(o.Bytes) > wire.OperateMaxKeyLen {
-		return 0, wire.ErrOperateType
+		return 0
 	}
-	return uint8(len(o.Bytes)), nil //nolint:gosec // bounded to [1,255] above
+	return uint8(len(o.Bytes)) //nolint:gosec // bounded to [1,255] above
 }
+
+// opcodeInspect is the pseudo-opcode a create=false resolve runs under when
+// no op is driving it (evalRets). It is not a wire opcode — 0 is not one —
+// and no engine consults the opcode for a create=false resolve, where a
+// stored type is never checked or replaced.
+const opcodeInspect uint8 = 0
 
 // zeroTypeFor is the type an ABSENT dynamic-mode target reads as for an op
 // that only inspects it (design doc §2.4, "absent is zero"; the oracle's
@@ -320,19 +330,35 @@ func applyOps(e engine, ops []wire.OperateOp, stampMs int64) (uint8, uint16, err
 			}
 
 		case wire.OperateOpCONFIG:
-			// config() takes no path (only the ref it resolves to), so this
-			// is the only place that can reject CONFIG at a row/col/record
-			// path — a table's eviction config lives on the field itself
-			// (oracle ruling).
-			if o.Path.Kind != wire.OperatePathField {
-				return 0, 0, wire.ErrOperatePath
+			// Order matters here, because every one of these checks can fail
+			// with a different error and the oracle fixes which one wins
+			// (design doc §3.2 says what CONFIG means; the oracle's config
+			// says in what order it says no):
+			//
+			//	mode -> path kind -> path name -> name lengths -> cap ->
+			//	policy -> a *_COL policy's column name -> the field's kind
+			//
+			// The first three belong to resolve, which is the only thing
+			// that knows the record's mode: a schema-mode record answers
+			// wire.ErrOperateOpcode there, before it looks at the path at
+			// all, because a schema-mode table's eviction triple comes from
+			// its schema and cannot be set per record. The last two belong
+			// to config. Only the operand checks in the middle are the
+			// loop's, and they run AFTER resolve has vivified the table
+			// field, which costs nothing: an error discards the whole
+			// working copy anyway.
+			r, err := e.resolve(o.Path, true, o.Opcode, wire.OperateTypeTable, 0)
+			if err != nil {
+				return 0, 0, err
+			}
+			if len(o.Bytes) > wire.OperateMaxNameLen {
+				return 0, 0, wire.ErrOperateCap
 			}
 			if err := checkRowCap(o.A); err != nil {
 				return 0, 0, err
 			}
-			r, err := e.resolve(o.Path, true, o.Opcode, wire.OperateTypeTable, 0)
-			if err != nil {
-				return 0, 0, err
+			if o.Aux > wire.OperatePolicyMaxCol {
+				return 0, 0, wire.ErrOperateSchema
 			}
 			if err := e.config(r, uint32(o.A), o.Aux, string(o.Bytes)); err != nil { //nolint:gosec // o.A bounded above
 				return 0, 0, err
@@ -365,11 +391,7 @@ func applyOps(e engine, ops []wire.OperateOp, stampMs int64) (uint8, uint16, err
 		default: // the scalar ops (SET/ADD/MUL/MIN/MAX/AND/OR/XOR/SHL/SHR/STAMP);
 			// wire.ApplyScalar itself rejects anything else with
 			// wire.ErrOperateOpcode.
-			n, err := fixedN(o)
-			if err != nil {
-				return 0, 0, err
-			}
-			r, err := e.resolve(o.Path, true, o.Opcode, o.Type, n)
+			r, err := e.resolve(o.Path, true, o.Opcode, o.Type, fixedN(o))
 			if err != nil {
 				return 0, 0, err
 			}
@@ -423,7 +445,7 @@ func evalRets(e engine, rets []wire.OperateRet) ([][]byte, error) {
 		// control op: no type check on what it finds, and an absent dynamic
 		// target's zero type is irrelevant (evalRets substitutes UNSET / a
 		// zero count itself rather than reading it).
-		nd, err := e.resolve(r.Path, false, wire.OperateOpIF, 0, 0)
+		nd, err := e.resolve(r.Path, false, opcodeInspect, 0, 0)
 		if err != nil {
 			return nil, err
 		}
