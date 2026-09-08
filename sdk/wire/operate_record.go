@@ -100,33 +100,52 @@ func (r *Record) encodeSchema() []byte {
 			continue
 		}
 		f := &s.Fields[i]
-		cell := Cell{}
+		var tree Cell
 		if i < len(r.Fields) {
-			cell = r.Fields[i].Cell
+			tree = r.Fields[i].Cell
 		}
-		if cell.Type == OperateTypeUnset {
-			cell = ZeroCell(f.Type, f.N)
-		}
-		b = AppendCellData(b, cell)
+		b = AppendCellData(b, schemaCellOrZero(tree, i < len(r.Fields), f.Type, f.N))
 	}
 
 	for _, i := range layout.VarTail {
 		f := &s.Fields[i]
 		var tree Field
-		if i < len(r.Fields) {
+		present := i < len(r.Fields)
+		if present {
 			tree = r.Fields[i]
 		}
 		if f.Type == OperateTypeTable {
 			b = appendSchemaTable(b, f.Table, tree.Table)
 			continue
 		}
-		cell := tree.Cell
-		if cell.Type == OperateTypeUnset {
-			cell = ZeroCell(f.Type, f.N)
-		}
-		b = AppendCellData(b, cell)
+		b = AppendCellData(b, schemaCellOrZero(tree.Cell, present, f.Type, f.N))
 	}
 	return b
+}
+
+// schemaCellOrZero returns tree's payload (U/F/B) re-typed at the schema's
+// declared type and width (typ, n): in schema mode the SCHEMA, never the
+// tree cell's own Type, determines how AppendCellData interprets a field or
+// column (design doc §2.2 — "no tag stored"). tree.Type is otherwise
+// ignored, because OperateTypeU8 is also Go's zero value for uint8 — a
+// freshly zero-valued Cell{} (e.g. from a tree whose Fields slice is shorter
+// than the schema) is bit-for-bit indistinguishable from an explicit
+// Cell{Type: OperateTypeU8}, so branching on tree.Type alone would encode
+// every never-touched non-U8 field as a 1-byte U8 zero instead of its real
+// width, corrupting every fixed-offset field after it. A field that is
+// absent, explicitly OperateTypeUnset, or the Go zero value in every other
+// regard encodes as ZeroCell(typ, n) — for OperateTypeFixed this is n zero
+// bytes, not zero bytes, which matters just as much.
+func schemaCellOrZero(tree Cell, present bool, typ, n uint8) Cell {
+	if !present || tree.Type == OperateTypeUnset || isZeroCell(tree) {
+		return ZeroCell(typ, n)
+	}
+	return Cell{Type: typ, N: n, U: tree.U, F: tree.F, B: tree.B}
+}
+
+// isZeroCell reports whether c is the Go zero value of Cell in every field.
+func isZeroCell(c Cell) bool {
+	return c.Type == 0 && c.N == 0 && c.U == 0 && c.F == 0 && len(c.B) == 0
 }
 
 // appendSchemaTable appends a schema-mode table's value area (design doc
@@ -145,14 +164,12 @@ func appendSchemaTable(b []byte, tdef *TableDef, tbl *Table) []byte {
 		b = append(b, row.Key...)
 		for c := range tdef.Cols {
 			cd := &tdef.Cols[c]
-			var cell Cell
-			if c < len(row.Cols) {
-				cell = row.Cols[c].Cell
+			var tree Cell
+			present := c < len(row.Cols)
+			if present {
+				tree = row.Cols[c].Cell
 			}
-			if cell.Type == OperateTypeUnset {
-				cell = ZeroCell(cd.Type, cd.N)
-			}
-			b = AppendCellData(b, cell)
+			b = AppendCellData(b, schemaCellOrZero(tree, present, cd.Type, cd.N))
 		}
 	}
 	return b
@@ -215,7 +232,10 @@ func appendDynamicTable(dst []byte, t *Table) []byte {
 
 // appendDynamicRow appends one dynamic-mode row's content (everything after
 // its rowLen prefix): [klen u8][key][nCols uvarint]{cols}*, columns sorted
-// by name.
+// by name. Encode assumes a well-formed tree (design doc §2.4: a dynamic
+// row key is 1-255 bytes); a row with an empty Key encodes a klen of 0,
+// which DecodeRecord — the hardened side of this codec — will then reject,
+// so such a tree cannot round-trip. Encode does not itself guard against it.
 func appendDynamicRow(dst []byte, row Row) []byte {
 	dst = append(dst, byte(len(row.Key))) //nolint:gosec // bounded by OperateMaxKeyLen on a well-formed tree
 	dst = append(dst, row.Key...)
@@ -265,23 +285,41 @@ func compareLE(a, b []byte) int {
 	}
 }
 
-// decodeCellDataCanonical wraps DecodeCellData with a re-encode check.
-// DecodeCellData (Task 1) accepts any length-legal varint or BYTES-length
-// encoding, not necessarily the minimal one AppendCellData would produce
-// (e.g. a two-byte over-long encoding of the value 1, [0x81, 0x00]) — fine
-// for the op-args wire format, but a record byte stream carrying such an
-// encoding would decode successfully yet not re-encode identically,
-// breaking the decode-encode identity DecodeRecord's hostile decoder must
-// uphold (FuzzDecodeRecord). Rejecting a non-canonical encoding here, at
-// every cell read, keeps DecodeRecord(b).Encode() == b for every b it
-// accepts, without changing Task 1's cell codec.
+// decodeCellDataCanonical wraps DecodeCellData with a re-encode check for
+// the value shapes that can be spelled non-canonically:
+//
+//   - UVARINT/IVARINT and BYTES's length prefix: DecodeCellData (Task 1)
+//     accepts any length-legal LEB128 encoding, not necessarily the minimal
+//     one AppendCellData would produce (e.g. a two-byte over-long encoding
+//     of the value 1, [0x81, 0x00]) — fine for the op-args wire format, but
+//     a record byte stream carrying such an encoding would decode
+//     successfully yet not re-encode identically.
+//   - F32: Cell always holds a float64 (F), so decoding an F32 widens
+//     through float64 and encoding narrows back. On common hardware that
+//     widen/narrow round trip sets a signaling NaN's quiet bit even though
+//     it is a pure format conversion — so a stored signaling-NaN F32 bit
+//     pattern (which a correctly canonicalizing writer never produces,
+//     design doc §2.5, but a hostile or corrupt stream could contain)
+//     decodes fine yet re-encodes to a different, now-quiet bit pattern.
+//     F64 has no such conversion (DecodeCellData reads its bits directly
+//     into Cell.F) and is not affected.
+//
+// Rejecting a non-canonical encoding here, at every such read, keeps
+// DecodeRecord(b).Encode() == b for every b it accepts (the identity
+// FuzzDecodeRecord checks), without changing Task 1's cell codec. Every
+// other type is fixed-width raw bytes with exactly one possible encoding
+// (or, for F64, a lossless one), so the re-encode-and-compare would always
+// trivially pass — skipped for those.
 func decodeCellDataCanonical(t uint8, n uint8, b []byte) (Cell, int, error) {
 	c, m, err := DecodeCellData(t, n, b)
 	if err != nil {
 		return Cell{}, 0, err
 	}
-	if !bytes.Equal(AppendCellData(nil, c), b[:m]) {
-		return Cell{}, 0, ErrOperateRecord
+	switch t {
+	case OperateTypeUVarint, OperateTypeIVarint, OperateTypeBytes, OperateTypeF32:
+		if !bytes.Equal(AppendCellData(nil, c), b[:m]) {
+			return Cell{}, 0, ErrOperateRecord
+		}
 	}
 	return c, m, nil
 }
@@ -441,10 +479,9 @@ func decodeDynamicRecord(b []byte) (*Record, error) {
 	if !CountFitsIn(int(nFields), len(b)-off, 3) {
 		return nil, ErrOperateRecord
 	}
+	// nFields is already bounded by OperateMaxFields (65535) above, well
+	// under OperateMaxRows (1<<20): no separate cap check is reachable here.
 	budget := int(nFields)
-	if budget > OperateMaxRows {
-		return nil, ErrOperateRecord
-	}
 
 	fields := make([]Field, nFields)
 	var prevName string
@@ -616,7 +653,7 @@ func decodeDynamicRow(b []byte, budget *int) (Row, int, error) {
 	}
 	klen := int(b[0])
 	off := 1
-	if klen > OperateMaxKeyLen {
+	if klen == 0 || klen > OperateMaxKeyLen {
 		return Row{}, 0, ErrOperateRecord
 	}
 	if len(b)-off < klen {
