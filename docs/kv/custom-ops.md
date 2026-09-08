@@ -108,6 +108,20 @@ Inside a handler, `tx` gives you the shard-local store:
 | `tx.Cache()` | escape hatch to the underlying cache (stats, iteration) |
 | `tx.Vectors()` | the vector `CollectionStore` (nil if the dispatcher has none) |
 
+## Don't need custom Go? Use the built-in `operate`
+
+Most atomic multi-field updates don't need a custom op at all: the built-in
+[`operate`](overview.md#atomic-multi-field-updates-operate) op covers
+counters, guarded updates, capped/evicting tables (LRU, LFU, top-N, bounded
+FIFO), and server-side compare-and-swap on any field, driven entirely by a
+data-shaped op list built with the Go client's `OperateBuilder` — no Go code
+to register or ship.
+
+Reach for a custom Go op instead when the update isn't shaped as record +
+table + scalar ops — arbitrary nesting, cross-key logic, a format `operate`
+doesn't model (e.g. JSON in place), or logic you'd rather express directly in
+Go than as an op list.
+
 ## Native Go vs WASM
 
 A native Go op lives in the server process, so it works on `Direct` and
