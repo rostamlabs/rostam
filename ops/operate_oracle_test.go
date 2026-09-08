@@ -17,7 +17,9 @@ package ops
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"math"
+	"math/rand"
 	"sort"
 
 	"github.com/rostamlabs/rostam/sdk/wire"
@@ -1613,4 +1615,395 @@ func treeRowValue(rec *wire.Record, nd *treeNode) []byte {
 		out = wire.AppendTaggedCell(out, c.Cell)
 	}
 	return out
+}
+
+// --- random schemas and calls ----------------------------------------------
+//
+// The generators the equivalence property tests drive both appliers with.
+// They live here, next to the oracle, because every byte-level engine reuses
+// them.
+
+// randomScalarTypes are the types a record field may have; randomColTypes are
+// the subset a table column may have (columns are fixed-width only, §2.3).
+var randomScalarTypes = []uint8{
+	wire.OperateTypeU8, wire.OperateTypeU16, wire.OperateTypeU32, wire.OperateTypeU64,
+	wire.OperateTypeI8, wire.OperateTypeI16, wire.OperateTypeI32, wire.OperateTypeI64,
+	wire.OperateTypeF32, wire.OperateTypeF64, wire.OperateTypeUVarint, wire.OperateTypeIVarint,
+	wire.OperateTypeBytes, wire.OperateTypeFixed,
+}
+
+var randomColTypes = []uint8{
+	wire.OperateTypeU8, wire.OperateTypeU16, wire.OperateTypeU32, wire.OperateTypeU64,
+	wire.OperateTypeI8, wire.OperateTypeI16, wire.OperateTypeI32, wire.OperateTypeI64,
+	wire.OperateTypeF32, wire.OperateTypeF64, wire.OperateTypeFixed,
+}
+
+var randomKeyTypes = []uint8{
+	wire.OperateTypeU8, wire.OperateTypeU16, wire.OperateTypeU32, wire.OperateTypeU64, wire.OperateTypeFixed,
+}
+
+// randomSchema builds a small, always-valid schema: 1-6 fields with up to two
+// tables, small caps so eviction fires often, and every eviction policy. Names
+// are always assigned (so name paths are generatable) but only addressable
+// when StoreNames is set.
+func randomSchema(rng *rand.Rand) *wire.Schema {
+	for {
+		s := &wire.Schema{Version: 1, StoreNames: rng.Intn(2) == 0}
+		nFields := 1 + rng.Intn(6)
+		tables := 0
+		for i := 0; i < nFields; i++ {
+			f := wire.FieldDef{Name: fmt.Sprintf("f%d", i)}
+			if tables < 2 && rng.Intn(3) == 0 {
+				tables++
+				f.Type = wire.OperateTypeTable
+				f.Table = randomTableDef(rng)
+			} else {
+				f.Type = randomScalarTypes[rng.Intn(len(randomScalarTypes))]
+				if f.Type == wire.OperateTypeFixed {
+					f.N = uint8(1 + rng.Intn(4))
+				}
+			}
+			s.Fields = append(s.Fields, f)
+		}
+		if s.Validate() == nil {
+			return s
+		}
+	}
+}
+
+func randomTableDef(rng *rand.Rand) *wire.TableDef {
+	td := &wire.TableDef{KeyType: randomKeyTypes[rng.Intn(len(randomKeyTypes))]}
+	if td.KeyType == wire.OperateTypeFixed {
+		td.KeyN = uint8(1 + rng.Intn(3))
+	}
+	for c := 0; c < 1+rng.Intn(3); c++ {
+		cd := wire.ColumnDef{Name: fmt.Sprintf("c%d", c), Type: randomColTypes[rng.Intn(len(randomColTypes))]}
+		if cd.Type == wire.OperateTypeFixed {
+			cd.N = uint8(1 + rng.Intn(3))
+		}
+		td.Cols = append(td.Cols, cd)
+	}
+	td.Cap = uint32(rng.Intn(5))
+	td.Policy = uint8(rng.Intn(int(wire.OperatePolicyMaxCol) + 1))
+	if td.Policy == wire.OperatePolicyMinCol || td.Policy == wire.OperatePolicyMaxCol {
+		td.ByCol = uint16(rng.Intn(len(td.Cols)))
+	}
+	return td
+}
+
+// randomArgs builds one call against s: 1-8 ops drawn from the whole
+// vocabulary (including the control, table and structural ops and deliberately
+// invalid ones, so the error paths are compared too) plus up to three return
+// specs of both modes.
+func randomArgs(rng *rand.Rand, s *wire.Schema) *wire.OperateArgs {
+	a := &wire.OperateArgs{Create: wire.OperateCreateSchema, Schema: s.Encode()}
+	if rng.Intn(16) == 0 {
+		a.Create = wire.OperateCreateNone
+		a.Schema = nil
+	}
+	// A migration travels alone: it rewrites the schema the rest of the call
+	// would have been written against.
+	if rng.Intn(24) == 0 {
+		a.Create = wire.OperateCreateNone
+		a.Schema = nil
+		a.Ops = []wire.OperateOp{{Opcode: wire.OperateOpMIGRATE, Type: wire.OperateTypeFromSchema,
+			Path: recPath(), A: int64(s.Version), Bytes: randomExtension(rng, s).Encode()}}
+		return a
+	}
+
+	nOps := 1 + rng.Intn(8)
+	for i := 0; i < nOps; i++ {
+		a.Ops = append(a.Ops, randomOp(rng, s))
+	}
+	for i := range a.Ops {
+		if a.Ops[i].Opcode != wire.OperateOpIF {
+			continue
+		}
+		if rng.Intn(16) == 0 {
+			a.Ops[i].B = int64(len(a.Ops)) // out of range on purpose
+			continue
+		}
+		a.Ops[i].B = int64(rng.Intn(len(a.Ops) - i))
+	}
+	for i := 0; i < rng.Intn(4); i++ {
+		mode := uint8(wire.OperateRetValue)
+		if rng.Intn(2) == 0 {
+			mode = wire.OperateRetCount
+		}
+		a.Rets = append(a.Rets, wire.OperateRet{Mode: mode, Path: randomPath(rng, s)})
+	}
+	return a
+}
+
+// randomOpcodes is the whole vocabulary, plus one value that is not an opcode
+// at all so the unknown-opcode path is compared too. randomOp draws from it
+// directly only occasionally: a uniformly random opcode against a uniformly
+// random target is almost always a type error, which would make the property
+// compare error paths and little else.
+var randomOpcodes = []uint8{
+	wire.OperateOpSET, wire.OperateOpDEL, wire.OperateOpADD, wire.OperateOpMUL,
+	wire.OperateOpMIN, wire.OperateOpMAX, wire.OperateOpAND, wire.OperateOpOR,
+	wire.OperateOpXOR, wire.OperateOpSHL, wire.OperateOpSHR, wire.OperateOpSTAMP,
+	wire.OperateOpCONFIG, wire.OperateOpTRIM, wire.OperateOpIF, wire.OperateOpCHECK, 99,
+}
+
+// opcodes that apply to each kind of target (design doc §3.1/§3.2).
+var (
+	intOpcodes = []uint8{wire.OperateOpSET, wire.OperateOpADD, wire.OperateOpMUL, wire.OperateOpMIN,
+		wire.OperateOpMAX, wire.OperateOpAND, wire.OperateOpOR, wire.OperateOpXOR,
+		wire.OperateOpSHL, wire.OperateOpSHR, wire.OperateOpSTAMP, wire.OperateOpDEL,
+		wire.OperateOpIF, wire.OperateOpCHECK}
+	varintOpcodes = []uint8{wire.OperateOpSET, wire.OperateOpADD, wire.OperateOpMUL, wire.OperateOpMIN,
+		wire.OperateOpMAX, wire.OperateOpSTAMP, wire.OperateOpDEL, wire.OperateOpIF, wire.OperateOpCHECK}
+	floatOpcodes = []uint8{wire.OperateOpSET, wire.OperateOpADD, wire.OperateOpMUL, wire.OperateOpMIN,
+		wire.OperateOpMAX, wire.OperateOpDEL, wire.OperateOpIF, wire.OperateOpCHECK}
+	bytesOpcodes = []uint8{wire.OperateOpSET, wire.OperateOpMIN, wire.OperateOpMAX,
+		wire.OperateOpDEL, wire.OperateOpIF, wire.OperateOpCHECK}
+	tableOpcodes = []uint8{wire.OperateOpDEL, wire.OperateOpTRIM, wire.OperateOpIF, wire.OperateOpCHECK}
+	nodeOpcodes  = []uint8{wire.OperateOpDEL, wire.OperateOpIF, wire.OperateOpCHECK}
+)
+
+func randomOp(rng *rand.Rand, s *wire.Schema) wire.OperateOp {
+	p := randomPath(rng, s)
+	typ, n, ok := targetType(s, p)
+	o := wire.OperateOp{Type: wire.OperateTypeFromSchema, Path: p}
+	if !ok || rng.Intn(8) == 0 {
+		o.Opcode = randomOpcodes[rng.Intn(len(randomOpcodes))]
+	} else {
+		pool := opcodePool(typ)
+		o.Opcode = pool[rng.Intn(len(pool))]
+	}
+	switch o.Opcode {
+	case wire.OperateOpIF, wire.OperateOpCHECK:
+		o.Aux = uint8(rng.Intn(int(wire.OperateCmpAbsent) + 2)) // one past the last comparator
+	case wire.OperateOpTRIM, wire.OperateOpCONFIG:
+		o.A = int64(rng.Intn(5))
+		if rng.Intn(16) == 0 {
+			o.A = -1
+		}
+		o.Aux = uint8(rng.Intn(int(wire.OperatePolicyMaxCol) + 2))
+		o.B = int64(rng.Intn(4))
+	case wire.OperateOpSTAMP:
+		o.Aux = uint8(rng.Intn(2))
+	}
+	o.A = randomOperandA(rng, o, typ)
+	o.Bytes = randomOperandBytes(rng, typ, n)
+	if rng.Intn(8) == 0 { // a type byte that may or may not match the schema
+		if ok && rng.Intn(2) == 0 {
+			o.Type = typ
+		} else {
+			o.Type = randomScalarTypes[rng.Intn(len(randomScalarTypes))]
+		}
+	}
+	return o
+}
+
+// opcodePool is the set of opcodes that can apply to a target of type typ.
+// OperateTypeTable stands for a table field and OperateTypeUnset for a row or
+// the record itself — neither has a value of its own.
+func opcodePool(typ uint8) []uint8 {
+	switch {
+	case typ == wire.OperateTypeTable:
+		return tableOpcodes
+	case typ == wire.OperateTypeUnset:
+		return nodeOpcodes
+	case wire.TypeIsFloat(typ):
+		return floatOpcodes
+	case wire.TypeIsFixedInt(typ):
+		return intOpcodes
+	case wire.TypeIsInt(typ):
+		return varintOpcodes
+	default:
+		return bytesOpcodes
+	}
+}
+
+// targetType reports the declared type (and FIXED width) of what p addresses,
+// or ok == false when the path does not resolve at all — in which case the op
+// is an error whatever it says, and randomOp draws its opcode uniformly.
+func targetType(s *wire.Schema, p wire.OperatePath) (uint8, uint8, bool) {
+	if p.Kind == wire.OperatePathRecord {
+		return wire.OperateTypeUnset, 0, true
+	}
+	pos := -1
+	if p.Field.ByName {
+		if s.StoreNames {
+			if i, found := s.FieldPos(p.Field.Name); found {
+				pos = i
+			}
+		}
+	} else if int(p.Field.Pos) < len(s.Fields) {
+		pos = int(p.Field.Pos)
+	}
+	if pos < 0 {
+		return 0, 0, false
+	}
+	fd := &s.Fields[pos]
+	if p.Kind == wire.OperatePathField {
+		return fd.Type, fd.N, true
+	}
+	if fd.Type != wire.OperateTypeTable || len(p.Key) != wire.CellWidth(fd.Table.KeyType, fd.Table.KeyN) {
+		return 0, 0, false
+	}
+	if p.Kind == wire.OperatePathRow {
+		return wire.OperateTypeUnset, 0, true
+	}
+	col := -1
+	if p.Col.ByName {
+		for j := range fd.Table.Cols {
+			if p.Col.Name != "" && fd.Table.Cols[j].Name == p.Col.Name {
+				col = j
+			}
+		}
+	} else if int(p.Col.Pos) < len(fd.Table.Cols) {
+		col = int(p.Col.Pos)
+	}
+	if col < 0 {
+		return 0, 0, false
+	}
+	return fd.Table.Cols[col].Type, fd.Table.Cols[col].N, true
+}
+
+func randomOperandA(rng *rand.Rand, o wire.OperateOp, typ uint8) int64 {
+	switch o.Opcode {
+	case wire.OperateOpTRIM, wire.OperateOpCONFIG, wire.OperateOpSTAMP:
+		return o.A
+	}
+	if wire.TypeIsFloat(typ) && rng.Intn(4) != 0 {
+		// A float operand always travels as the bit pattern of a float64.
+		return f64(float64(rng.Intn(200)-100) / 4)
+	}
+	switch rng.Intn(6) {
+	case 0:
+		return -1
+	case 1:
+		return 0
+	case 2:
+		return rng.Int63n(1 << 20)
+	case 3:
+		return rng.Int63n(1 << 40)
+	case 4:
+		return math.MaxInt64
+	default:
+		return int64(rng.Intn(8))
+	}
+}
+
+// randomOperandBytes sizes a bytes operand for the target: exactly N for a
+// FIXED one (any other width is ErrOperateType), otherwise short and drawn
+// from a tiny alphabet so MIN/MAX comparisons actually change the value.
+func randomOperandBytes(rng *rand.Rand, typ, n uint8) []byte {
+	size := 1 + rng.Intn(4)
+	if typ == wire.OperateTypeFixed && rng.Intn(8) != 0 {
+		size = int(n)
+	}
+	b := make([]byte, size)
+	for i := range b {
+		b[i] = byte(rng.Intn(4))
+	}
+	return b
+}
+
+// randomPath builds a path against s: usually a valid one (a field, or a row
+// or column of a table field), sometimes an out-of-range position, an unknown
+// name, or a key of the wrong width.
+func randomPath(rng *rand.Rand, s *wire.Schema) wire.OperatePath {
+	if rng.Intn(12) == 0 {
+		return recPath()
+	}
+	pos := rng.Intn(len(s.Fields))
+	if rng.Intn(16) == 0 {
+		return fieldPath(uint32(len(s.Fields) + rng.Intn(3)))
+	}
+	fd := &s.Fields[pos]
+	byName := s.StoreNames && rng.Intn(3) == 0
+
+	if fd.Type != wire.OperateTypeTable || rng.Intn(6) == 0 {
+		if byName {
+			return namePath(fd.Name)
+		}
+		return fieldPath(uint32(pos))
+	}
+
+	key := randomRowKey(rng, fd.Table)
+	if rng.Intn(2) == 0 { // a row path
+		if byName {
+			return nameRowPath(fd.Name, key)
+		}
+		return rowPath(uint32(pos), key)
+	}
+	col := rng.Intn(len(fd.Table.Cols))
+	if rng.Intn(16) == 0 {
+		col = len(fd.Table.Cols) + rng.Intn(2)
+	}
+	if byName && col < len(fd.Table.Cols) {
+		return nameColPath(fd.Name, key, fd.Table.Cols[col].Name)
+	}
+	return colPath(uint32(pos), key, uint32(col))
+}
+
+// randomRowKey draws from a small pool so rows collide often, occasionally
+// returning a key of the wrong width.
+func randomRowKey(rng *rand.Rand, td *wire.TableDef) []byte {
+	w := wire.CellWidth(td.KeyType, td.KeyN)
+	if rng.Intn(16) == 0 {
+		w++
+	}
+	key := make([]byte, w)
+	if w > 0 {
+		key[0] = byte(rng.Intn(6))
+	}
+	return key
+}
+
+// randomExtension builds an append-only evolution of s (design doc §2.8):
+// usually a legal one, sometimes not, so MIGRATE's rejection path is compared
+// as well.
+func randomExtension(rng *rand.Rand, s *wire.Schema) *wire.Schema {
+	ns := &wire.Schema{Version: s.Version + 1, StoreNames: s.StoreNames}
+	for i := range s.Fields {
+		f := s.Fields[i]
+		if f.Table != nil {
+			td := *f.Table
+			td.Cols = append([]wire.ColumnDef(nil), f.Table.Cols...)
+			if rng.Intn(2) == 0 {
+				td.Cols = append(td.Cols, wire.ColumnDef{
+					Name: fmt.Sprintf("c%d", len(td.Cols)), Type: wire.OperateTypeU16})
+			}
+			td.Cap = uint32(rng.Intn(4))
+			td.Policy = uint8(rng.Intn(int(wire.OperatePolicyMaxCol) + 1))
+			td.ByCol = 0
+			if td.Policy == wire.OperatePolicyMinCol || td.Policy == wire.OperatePolicyMaxCol {
+				td.ByCol = uint16(rng.Intn(len(td.Cols)))
+			}
+			f.Table = &td
+		}
+		ns.Fields = append(ns.Fields, f)
+	}
+	if rng.Intn(2) == 0 {
+		ns.Fields = append(ns.Fields, wire.FieldDef{
+			Name: fmt.Sprintf("f%d", len(ns.Fields)), Type: randomScalarTypes[rng.Intn(len(randomScalarTypes))], N: 2})
+	}
+	if rng.Intn(8) == 0 && len(ns.Fields) > 0 { // not append-only: widen a field
+		ns.Fields[0].Type = wire.OperateTypeU64
+		ns.Fields[0].Table = nil
+	}
+	if ns.Validate() != nil {
+		return s
+	}
+	return ns
+}
+
+// migratedSchema reports the schema a call migrates the record to, or nil if
+// it is not a migration. The property test uses it to keep speaking the
+// record's current version after a successful MIGRATE.
+func migratedSchema(a *wire.OperateArgs) *wire.Schema {
+	if len(a.Ops) != 1 || a.Ops[0].Opcode != wire.OperateOpMIGRATE {
+		return nil
+	}
+	s, n, err := wire.DecodeSchema(a.Ops[0].Bytes)
+	if err != nil || n != len(a.Ops[0].Bytes) {
+		return nil
+	}
+	return s
 }

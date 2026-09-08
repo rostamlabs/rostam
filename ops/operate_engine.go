@@ -3,6 +3,7 @@
 package ops
 
 import (
+	"encoding/binary"
 	"errors"
 
 	"github.com/rostamlabs/rostam/sdk/wire"
@@ -394,4 +395,50 @@ func evalRets(e engine, rets []wire.OperateRet) ([][]byte, error) {
 // §3.4).
 func appendCountValue(n uint64) []byte {
 	return wire.AppendTaggedCell(nil, wire.Cell{Type: wire.OperateTypeU64, U: n})
+}
+
+// --- shared byte helpers ---------------------------------------------------
+//
+// Both byte-level engines patch a record by replacing one span of it with
+// another, so the two primitives live here rather than in either engine.
+
+// splice replaces buf[off:off+oldLen] with repl and returns the resulting
+// buffer, reusing buf's storage whenever its capacity can absorb the growth
+// (the initial record copy reserves slack precisely so a row insert usually
+// can). The caller is responsible for charging the growth against the
+// record-size cap first: splice itself allocates whatever it is asked to.
+func splice(buf []byte, off, oldLen int, repl []byte) []byte {
+	delta := len(repl) - oldLen
+	switch {
+	case delta == 0:
+		copy(buf[off:], repl)
+		return buf
+	case delta > 0 && cap(buf)-len(buf) < delta:
+		out := make([]byte, len(buf)+delta, len(buf)+delta+64)
+		copy(out, buf[:off])
+		copy(out[off:], repl)
+		copy(out[off+len(repl):], buf[off+oldLen:])
+		return out
+	case delta > 0:
+		old := len(buf)
+		buf = buf[:old+delta]
+		// copy is a memmove: the tail may overlap its destination.
+		copy(buf[off+len(repl):], buf[off+oldLen:old])
+		copy(buf[off:], repl)
+		return buf
+	default:
+		copy(buf[off:], repl)
+		copy(buf[off+len(repl):], buf[off+oldLen:])
+		return buf[:len(buf)+delta]
+	}
+}
+
+// spliceUvarint replaces buf[off:off+oldLen] with the canonical uvarint
+// encoding of v, returning the buffer and the new encoding's length. It is
+// how a row count or a length prefix is rewritten in place when the value's
+// encoded width may change.
+func spliceUvarint(buf []byte, off, oldLen int, v uint64) ([]byte, int) {
+	var tmp [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(tmp[:], v)
+	return splice(buf, off, oldLen, tmp[:n]), n
 }

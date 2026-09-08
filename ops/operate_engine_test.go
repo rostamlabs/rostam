@@ -711,3 +711,27 @@ func TestFixedN(t *testing.T) {
 		t.Fatalf("fixedN(FIXED, too long) = %v, want wire.ErrOperateType", err)
 	}
 }
+
+// bytesApply adapts applyRecordBytes to the semantics suite's applier type:
+// it encodes the tree the suite hands it, applies the call to those bytes,
+// and decodes the result back into a tree. Every byte-level engine is tested
+// through this adapter, so a divergence from the oracle shows up as either a
+// different tree or bytes the record codec refuses.
+func bytesApply(rec *wire.Record, a *wire.OperateArgs, stampMs int64) (*wire.Record, *wire.OperateResult, error) {
+	var cur []byte
+	if rec != nil {
+		cur = rec.Encode()
+	}
+	out, deleted, res, err := applyRecordBytes(cur, a, stampMs)
+	if err != nil {
+		return nil, nil, err
+	}
+	if deleted || len(out) == 0 {
+		return nil, res, nil
+	}
+	got, derr := wire.DecodeRecord(out)
+	if derr != nil {
+		return nil, nil, fmt.Errorf("engine produced undecodable bytes %x: %w", out, derr)
+	}
+	return got, res, nil
+}
