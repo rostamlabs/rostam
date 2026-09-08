@@ -378,8 +378,6 @@ func TestTableBytesIs64Bit(t *testing.T) {
 // rebuilt record has to fit maxRecordBytes, and a migration that would blow it
 // fails with the record unchanged.
 func TestMigrateSizeCap(t *testing.T) {
-	s := sessionSchema()
-	s.Fields[3].Table.Cap = 0
 	base := bigSessionRecord(t, 64)
 	var stored []byte
 	stored = append(stored, base...)

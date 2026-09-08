@@ -206,7 +206,7 @@ valid state.
 |---|---|---|
 | `MIGRATE` | `a` = from version (or `wire.OperateMigrateFromDynamic`), `aux` = flags, `bytes` = new schema blob | must be the first op in the list; append-only evolution or a dynamic freeze |
 | `CONFIG` | `a` = cap, `aux` = policy, `bytes` = byCol name | **dynamic mode only** — sets the table's eviction triple, creating an empty table if absent; schema mode rejects it (`wire.ErrOperateOpcode`) since eviction there is part of the schema, changed via `MIGRATE` |
-| `TRIM` | `a` = keep, `aux` = policy, `bytes`/`b` = byCol | one-off shrink of the table to `keep` rows by the given policy, without changing the table's stored policy; a no-op against an absent table |
+| `TRIM` | `a` = keep, `aux` = policy, `bytes`/`b` = byCol | valid in **both** modes — one-off shrink of the table to `keep` rows by the given policy, without changing the table's stored policy; a no-op against an absent table |
 
 **Control ops:**
 

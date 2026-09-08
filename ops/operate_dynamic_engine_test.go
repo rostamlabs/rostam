@@ -472,6 +472,18 @@ func TestNewDynamicEngineValidates(t *testing.T) {
 		"zero-length field name": {wire.OperateModeDynamic, 1, 0},
 		"zero-length column name": {wire.OperateModeDynamic, 1, 1, 'a', wire.OperateTypeTable, 9,
 			0, 0, 0, 1, 4, 1, 'k', 1, 0},
+		// FIXED(0) is not a width (design doc §2.1: 1-255). The codec
+		// rejects it in a field header and in a column header, so the walk
+		// must too, or the two disagree on which records exist.
+		"zero-width FIXED field": {wire.OperateModeDynamic, 1, 1, 'a', wire.OperateTypeFixed, 0},
+		"zero-width FIXED column": {wire.OperateModeDynamic, 1, 1, 't', wire.OperateTypeTable, 12,
+			0, 0, 0, 1, 7, 1, 'k', 1, 1, 'c', wire.OperateTypeFixed, 0},
+		// Only the canonical quiet NaN re-encodes to itself now that
+		// AppendCellData canonicalizes on the way out, in either float width.
+		"non-canonical F64 NaN": {wire.OperateModeDynamic, 1, 1, 'a', wire.OperateTypeF64,
+			0x01, 0, 0, 0, 0, 0, 0xF8, 0x7F},
+		"non-canonical F32 NaN": {wire.OperateModeDynamic, 1, 1, 'a', wire.OperateTypeF32,
+			0x01, 0, 0xC0, 0x7F},
 	}
 	for name, in := range bad {
 		if _, err := newDynamicEngine(append([]byte(nil), in...)); !errors.Is(err, wire.ErrOperateRecord) {
@@ -574,4 +586,97 @@ func TestDynamicEngineAcceptsExactlyTheCodec(t *testing.T) {
 		t.Fatalf("only %d corpus entries were valid records — the comparison is vacuous", agreed)
 	}
 	t.Logf("%d corpus entries, %d of them valid records", len(corpus), agreed)
+}
+
+// TestDynamicEngineAcceptsCanonicalFloats is the positive half of the two
+// float cases in TestNewDynamicEngineValidates: the canonical quiet NaN, and
+// every ordinary finite value, must still open. Without this the rejections
+// above would pass just as well if the walk refused all NaNs, or all floats.
+func TestDynamicEngineAcceptsCanonicalFloats(t *testing.T) {
+	negZero := math.Copysign(0, -1)
+	for _, f := range []float64{math.NaN(), 0, negZero, 1.5, math.Inf(-1)} {
+		for _, typ := range []uint8{wire.OperateTypeF32, wire.OperateTypeF64} {
+			rec := &wire.Record{Mode: wire.OperateModeDynamic, Fields: []wire.Field{
+				{Name: "a", Cell: wire.Cell{Type: typ, F: f}}}}
+			buf := rec.Encode()
+			if _, err := wire.DecodeRecord(buf); err != nil {
+				t.Fatalf("codec rejected its own encoding of %v (%d): %v", f, typ, err)
+			}
+			if _, err := newDynamicEngine(append([]byte(nil), buf...)); err != nil {
+				t.Fatalf("engine rejected %v (%d) which the codec accepts: %v", f, typ, err)
+			}
+		}
+	}
+}
+
+// TestDynamicChargeIsExactAtTheCap covers the §2.7 charge accounting at the
+// boundary. An edit inside a table row is covered by three length prefixes
+// (nCols, rowLen, byteLen); charging each of them a maximum-width varint
+// over-charges by up to 27 bytes, which would refuse a call whose FINISHED
+// record fits — and the oracle, which checks only the finished size, would
+// accept it. So the two are compared at exactly the cap and one byte under.
+func TestDynamicChargeIsExactAtTheCap(t *testing.T) {
+	base, _, _, err := applyRecordBytes(nil, &wire.OperateArgs{Create: wire.OperateCreateDynamic,
+		Ops: []wire.OperateOp{
+			{Opcode: wire.OperateOpSET, Type: wire.OperateTypeU64,
+				Path: nameColPath("t", []byte("k"), "a"), A: 1},
+			{Opcode: wire.OperateOpSET, Type: wire.OperateTypeBytes,
+				Path: namePath("pad"), Bytes: bytes.Repeat([]byte{9}, 200)},
+		}}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The op under test inserts a second column into that row, growing the
+	// record by the column's bytes and nothing else (no prefix widens).
+	insert := &wire.OperateArgs{Create: wire.OperateCreateDynamic, Ops: []wire.OperateOp{
+		{Opcode: wire.OperateOpSET, Type: wire.OperateTypeU64,
+			Path: nameColPath("t", []byte("k"), "b"), A: 2}}}
+
+	restore := maxOperateRecordBytes
+	t.Cleanup(func() { maxOperateRecordBytes = restore })
+
+	out, _, _, err := applyRecordBytes(append([]byte(nil), base...), insert, 0)
+	if err != nil {
+		t.Fatalf("the insert must apply under the default cap: %v", err)
+	}
+	final := len(out)
+	if final <= len(base) {
+		t.Fatalf("the insert did not grow the record: %d -> %d", len(base), final)
+	}
+
+	rec, err := wire.DecodeRecord(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Exactly at the cap: both the engine and the oracle must accept.
+	maxOperateRecordBytes = final
+	got, _, _, err := applyRecordBytes(append([]byte(nil), base...), insert, 0)
+	if err != nil {
+		t.Fatalf("cap = the finished size (%d): engine refused with %v", final, err)
+	}
+	if len(got) != final {
+		t.Fatalf("record is %d bytes at the cap, want %d", len(got), final)
+	}
+	oracleOut, _, oerr := applyTree(treeClone(rec), insert, 0)
+	if oerr != nil {
+		t.Fatalf("cap = the finished size: oracle refused with %v", oerr)
+	}
+	if !bytes.Equal(oracleOut.Encode(), got) {
+		t.Fatalf("engine and oracle disagree at the cap:\n engine %x\n oracle %x", got, oracleOut.Encode())
+	}
+
+	// One byte under: both must refuse, with the same error.
+	maxOperateRecordBytes = final - 1
+	got, _, _, err = applyRecordBytes(append([]byte(nil), base...), insert, 0)
+	if !errors.Is(err, wire.ErrOperateCap) {
+		t.Fatalf("cap = finished size - 1: engine err = %v, want ErrOperateCap", err)
+	}
+	if got != nil {
+		t.Fatalf("a cap hit stored %x", got)
+	}
+	if _, _, oerr = applyTree(treeClone(rec), insert, 0); !errors.Is(oerr, wire.ErrOperateCap) {
+		t.Fatalf("cap = finished size - 1: oracle err = %v, want ErrOperateCap", oerr)
+	}
 }

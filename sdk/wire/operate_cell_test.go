@@ -4,6 +4,7 @@ package wire
 
 import (
 	"bytes"
+	"encoding/binary"
 	"math"
 	"testing"
 )
@@ -84,5 +85,46 @@ func TestCanonFloat(t *testing.T) {
 	}
 	if math.Float32bits(float32(CanonFloat(OperateTypeF32, nan))) != 0x7FC00000 {
 		t.Fatal("F32 NaN not canonical")
+	}
+}
+
+// TestAppendCellDataCanonicalizesNaN pins design doc §2.5 on the ENCODE
+// side: whatever NaN bit pattern a caller hands in, the bytes that go to
+// storage are the canonical quiet NaN (and an F32 is narrowed through
+// float32 on the way). Without this, a payload NaN reaching AppendCellData
+// from a hand-built Cell would be stored verbatim and then rejected by
+// DecodeRecord's canonical-bytes check as a malformed record.
+func TestAppendCellDataCanonicalizesNaN(t *testing.T) {
+	payload := math.Float64frombits(0x7FF8000000000123) // quiet NaN, payload 0x123
+	signaling := math.Float64frombits(0x7FF0000000000001)
+
+	for _, f := range []float64{payload, signaling, math.NaN()} {
+		got := AppendCellData(nil, Cell{Type: OperateTypeF64, F: f})
+		if len(got) != 8 || binary.LittleEndian.Uint64(got) != 0x7FF8000000000000 {
+			t.Fatalf("F64 NaN encoded as %x, want the canonical quiet NaN", got)
+		}
+		got32 := AppendCellData(nil, Cell{Type: OperateTypeF32, F: f})
+		if len(got32) != 4 || binary.LittleEndian.Uint32(got32) != 0x7FC00000 {
+			t.Fatalf("F32 NaN encoded as %x, want the canonical quiet NaN", got32)
+		}
+	}
+
+	// The canonical pattern round-trips: decode it and it re-encodes to the
+	// same bytes, which is what keeps DecodeRecord's identity intact.
+	canon := AppendCellData(nil, Cell{Type: OperateTypeF64, F: math.NaN()})
+	c, n, err := DecodeCellData(OperateTypeF64, 0, canon)
+	if err != nil || n != 8 || !math.IsNaN(c.F) {
+		t.Fatalf("decode canonical NaN: %+v n=%d err=%v", c, n, err)
+	}
+	if !bytes.Equal(AppendCellData(nil, c), canon) {
+		t.Fatal("canonical NaN did not re-encode to itself")
+	}
+
+	// Finite floats are untouched, negative zero included.
+	for _, f := range []float64{0, math.Copysign(0, -1), 1.5, -3.25, math.Inf(1), math.Inf(-1)} {
+		got := AppendCellData(nil, Cell{Type: OperateTypeF64, F: f})
+		if binary.LittleEndian.Uint64(got) != math.Float64bits(f) {
+			t.Fatalf("finite F64 %v encoded as %x", f, got)
+		}
 	}
 }

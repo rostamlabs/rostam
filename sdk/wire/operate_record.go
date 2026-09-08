@@ -294,29 +294,28 @@ func compareLE(a, b []byte) int {
 //     of the value 1, [0x81, 0x00]) — fine for the op-args wire format, but
 //     a record byte stream carrying such an encoding would decode
 //     successfully yet not re-encode identically.
-//   - F32: Cell always holds a float64 (F), so decoding an F32 widens
-//     through float64 and encoding narrows back. On common hardware that
-//     widen/narrow round trip sets a signaling NaN's quiet bit even though
-//     it is a pure format conversion — so a stored signaling-NaN F32 bit
-//     pattern (which a correctly canonicalizing writer never produces,
-//     design doc §2.5, but a hostile or corrupt stream could contain)
-//     decodes fine yet re-encodes to a different, now-quiet bit pattern.
-//     F64 has no such conversion (DecodeCellData reads its bits directly
-//     into Cell.F) and is not affected.
+//   - F32 and F64: AppendCellData canonicalizes every NaN to the quiet NaN
+//     of design doc §2.5 (and narrows an F32 through float32), so exactly
+//     one NaN bit pattern per float type re-encodes to itself. A stored NaN
+//     spelled any other way — a signaling NaN, or a quiet NaN with a
+//     non-zero payload, neither of which a correctly canonicalizing writer
+//     produces, though a hostile or corrupt stream could contain one —
+//     decodes fine yet re-encodes to different bytes. Non-NaN floats are
+//     unaffected: an F64 keeps its bits verbatim and an F32 survives the
+//     float64 widen/narrow round trip exactly.
 //
 // Rejecting a non-canonical encoding here, at every such read, keeps
 // DecodeRecord(b).Encode() == b for every b it accepts (the identity
 // FuzzDecodeRecord checks), without changing Task 1's cell codec. Every
-// other type is fixed-width raw bytes with exactly one possible encoding
-// (or, for F64, a lossless one), so the re-encode-and-compare would always
-// trivially pass — skipped for those.
+// other type is fixed-width raw bytes with exactly one possible encoding, so
+// the re-encode-and-compare would always trivially pass — skipped for those.
 func decodeCellDataCanonical(t uint8, n uint8, b []byte) (Cell, int, error) {
 	c, m, err := DecodeCellData(t, n, b)
 	if err != nil {
 		return Cell{}, 0, err
 	}
 	switch t {
-	case OperateTypeUVarint, OperateTypeIVarint, OperateTypeBytes, OperateTypeF32:
+	case OperateTypeUVarint, OperateTypeIVarint, OperateTypeBytes, OperateTypeF32, OperateTypeF64:
 		if !bytes.Equal(AppendCellData(nil, c), b[:m]) {
 			return Cell{}, 0, ErrOperateRecord
 		}
@@ -527,6 +526,11 @@ func decodeDynamicRecord(b []byte) (*Record, error) {
 			}
 			n = b[off]
 			off++
+			// FIXED's declared width is 1-255 (design doc §2.1); a stored 0
+			// is a malformed record, not a zero-width value.
+			if n == 0 {
+				return nil, ErrOperateRecord
+			}
 		}
 		cell, m2, cerr := decodeCellDataCanonical(typ, n, b[off:])
 		if cerr != nil {
@@ -711,6 +715,10 @@ func decodeDynamicRow(b []byte, budget *int) (Row, int, error) {
 			}
 			n = b[off]
 			off++
+			// Same rule as a dynamic field header: FIXED(0) is not a width.
+			if n == 0 {
+				return Row{}, 0, ErrOperateRecord
+			}
 		}
 		cell, m2, cerr := decodeCellDataCanonical(typ, n, b[off:])
 		if cerr != nil {

@@ -505,3 +505,58 @@ func TestOperateRegistered(t *testing.T) {
 		t.Fatal("wire.BuiltinOps does not contain \"operate\"")
 	}
 }
+
+// TestOperateOversizedStoredValueNotCopied covers the §2.7 ceiling on the
+// way IN. The value under an operate key is whatever the store holds — a
+// plain `put` can leave anything there — so it can be far larger than a
+// valid operate record. copyRecord must reject it BEFORE it copies: without
+// the check, one call would allocate an arbitrary multiple of the record cap
+// just to discover the bytes are not a record.
+func TestOperateOversizedStoredValueNotCopied(t *testing.T) {
+	old := maxOperateRecordBytes
+	maxOperateRecordBytes = 256
+	t.Cleanup(func() { maxOperateRecordBytes = old })
+
+	// A well-formed dynamic record one byte over the lowered cap: it is only
+	// the SIZE that must reject it, not its contents.
+	rec := &wire.Record{Mode: wire.OperateModeDynamic, Fields: []wire.Field{
+		{Name: "a", Cell: wire.Cell{Type: wire.OperateTypeBytes, B: make([]byte, 300)}}}}
+	stored := rec.Encode()
+	if len(stored) <= maxOperateRecordBytes {
+		t.Fatalf("fixture is %d bytes, not over the %d-byte cap", len(stored), maxOperateRecordBytes)
+	}
+	if _, derr := wire.DecodeRecord(stored); derr != nil {
+		t.Fatalf("fixture is not a well-formed record: %v", derr)
+	}
+
+	a := &wire.OperateArgs{Create: wire.OperateCreateDynamic, Ops: []wire.OperateOp{
+		{Opcode: wire.OperateOpADD, Type: wire.OperateTypeU64, Path: namePath("n"), A: 1}}}
+	out, deleted, res, err := applyRecordBytes(stored, a, 0)
+	if !errors.Is(err, wire.ErrOperateRecord) {
+		t.Fatalf("err = %v, want wire.ErrOperateRecord", err)
+	}
+	if out != nil || deleted || res != nil {
+		t.Fatalf("the rejected call returned out=%x deleted=%v res=%+v", out, deleted, res)
+	}
+
+	// And it costs no copy: the whole point of checking before copyRecord's
+	// make. The pooled engines are already warm after the call above, so the
+	// only allocation this could make is the copy itself.
+	if n := testing.AllocsPerRun(50, func() { _, _, _, _ = applyRecordBytes(stored, a, 0) }); n != 0 {
+		t.Fatalf("the rejected call allocated %v times; the size check must precede the copy", n)
+	}
+
+	// At exactly the cap the same record opens: the rejection above is the
+	// ceiling, not the record. A call that changes nothing is used here, so
+	// the §2.7 check on the FINISHED record cannot be what passes or fails.
+	maxOperateRecordBytes = len(stored)
+	noop := &wire.OperateArgs{Create: wire.OperateCreateDynamic}
+	if _, _, _, err := applyRecordBytes(stored, noop, 0); err != nil {
+		t.Fatalf("a stored record exactly at the cap must open: %v", err)
+	}
+	// With headroom for the new field, the mutating call goes through too.
+	maxOperateRecordBytes = len(stored) + 64
+	if _, _, _, err := applyRecordBytes(stored, a, 0); err != nil {
+		t.Fatalf("a stored record under the cap must apply: %v", err)
+	}
+}

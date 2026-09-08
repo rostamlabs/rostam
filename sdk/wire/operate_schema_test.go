@@ -4,6 +4,8 @@ package wire
 
 import (
 	"bytes"
+	"encoding/binary"
+	"errors"
 	"reflect"
 	"testing"
 )
@@ -136,4 +138,54 @@ func FuzzDecodeSchema(f *testing.F) {
 			t.Fatal("re-encode differs")
 		}
 	})
+}
+
+// TestDecodeSchemaHostileCounts covers the field and column counts against
+// the schema-blob budget. DecodeSchema is handed the whole stored record —
+// up to maxRecordBytes — not just the blob, so CountFitsIn against the bytes
+// remaining is not on its own a bound: a declared 65535 fields inside a
+// megabyte-long record passes it and sizes a multi-megabyte slice. Every
+// field and column costs at least one byte of a blob that can never legally
+// exceed OperateMaxSchemaBytes, so the count is bounded by that too, before
+// the allocation.
+func TestDecodeSchemaHostileCounts(t *testing.T) {
+	// [version u16][flags 0][nFields = 65535][65535+ filler bytes], every
+	// filler byte a valid U8 field type, so nothing but the budget check
+	// stops this from being parsed in full.
+	blob := []byte{1, 0, 0}
+	blob = binary.AppendUvarint(blob, OperateMaxFields)
+	blob = append(blob, make([]byte, OperateMaxFields+16)...)
+	if _, _, err := DecodeSchema(blob); !errors.Is(err, ErrOperateSchema) {
+		t.Fatalf("hostile nFields: err = %v, want ErrOperateSchema", err)
+	}
+	if n := testing.AllocsPerRun(20, func() { _, _, _ = DecodeSchema(blob) }); n > 2 {
+		t.Fatalf("hostile nFields allocated %v times; the count must be bounded before the make", n)
+	}
+
+	// The same shape one level down: one TABLE field declaring 65535
+	// columns, with enough filler to satisfy CountFitsIn.
+	cols := []byte{1, 0, 0, 1, OperateTypeTable, OperateTypeU8}
+	cols = binary.AppendUvarint(cols, OperateMaxCols)
+	cols = append(cols, make([]byte, OperateMaxCols+16)...)
+	if _, _, err := DecodeSchema(cols); !errors.Is(err, ErrOperateSchema) {
+		t.Fatalf("hostile nCols: err = %v, want ErrOperateSchema", err)
+	}
+	if n := testing.AllocsPerRun(20, func() { _, _, _ = DecodeSchema(cols) }); n > 3 {
+		t.Fatalf("hostile nCols allocated %v times; the count must be bounded before the make", n)
+	}
+
+	// A schema at the far side of the budget still decodes: the bound is the
+	// blob budget, not a smaller number picked to make the test pass.
+	s := &Schema{Version: 3, Fields: make([]FieldDef, 1000)}
+	for i := range s.Fields {
+		s.Fields[i].Type = OperateTypeU8
+	}
+	enc := s.Encode()
+	if len(enc) > OperateMaxSchemaBytes {
+		t.Fatalf("fixture schema is %d bytes, over the %d-byte budget", len(enc), OperateMaxSchemaBytes)
+	}
+	got, n, err := DecodeSchema(enc)
+	if err != nil || n != len(enc) || len(got.Fields) != 1000 {
+		t.Fatalf("a legal 1000-field schema must decode: %v (n=%d)", err, n)
+	}
 }

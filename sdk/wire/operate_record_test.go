@@ -5,6 +5,8 @@ package wire
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"math"
 	"testing"
 )
 
@@ -160,21 +162,43 @@ func TestRecordSchemaZeroValueUsesSchemaType(t *testing.T) {
 // LEB128 encoding (via binary.Uvarint), not only the minimal one
 // AppendCellData produces, so a non-canonical encoding would decode
 // successfully yet re-encode to different, shorter bytes.
+//
+// Both build their input with a ONE-BYTE field name. An earlier revision
+// used a zero-length name, which decodeDynamicRecord rejects at its nlen
+// check before it ever reads the value — so the tests passed without the
+// canonical check existing at all. Each one now asserts the canonically
+// spelled twin decodes, which is what proves the decoder reaches the value.
 func TestDecodeRecordRejectsNonCanonicalVarint(t *testing.T) {
-	// mode=dynamic, 1 field, name "", type UVARINT, value = over-long
+	// mode=dynamic, 1 field, name "a", type UVARINT, value = over-long
 	// two-byte encoding of 1 ([0x81, 0x00]; canonical is one byte, 0x01).
-	b := []byte{OperateModeDynamic, 1, 0, OperateTypeUVarint, 0x81, 0x00}
-	if _, err := DecodeRecord(b); err == nil {
-		t.Fatal("non-canonical UVARINT accepted")
+	b := []byte{OperateModeDynamic, 1, 1, 'a', OperateTypeUVarint, 0x81, 0x00}
+	if _, err := DecodeRecord(b); !errors.Is(err, ErrOperateRecord) {
+		t.Fatalf("non-canonical UVARINT: err = %v, want ErrOperateRecord", err)
+	}
+	canonical := []byte{OperateModeDynamic, 1, 1, 'a', OperateTypeUVarint, 0x01}
+	r, err := DecodeRecord(canonical)
+	if err != nil {
+		t.Fatalf("the canonical spelling must decode, or the case above never reaches the value: %v", err)
+	}
+	if len(r.Fields) != 1 || r.Fields[0].Cell.U != 1 {
+		t.Fatalf("canonical UVARINT decoded to %+v", r.Fields)
 	}
 }
 
 func TestDecodeRecordRejectsNonCanonicalBytesLength(t *testing.T) {
-	// mode=dynamic, 1 field, name "", type BYTES, length = over-long
+	// mode=dynamic, 1 field, name "a", type BYTES, length = over-long
 	// two-byte encoding of 0 ([0x80, 0x00]; canonical is one byte, 0x00).
-	b := []byte{OperateModeDynamic, 1, 0, OperateTypeBytes, 0x80, 0x00}
-	if _, err := DecodeRecord(b); err == nil {
-		t.Fatal("non-canonical BYTES length accepted")
+	b := []byte{OperateModeDynamic, 1, 1, 'a', OperateTypeBytes, 0x80, 0x00}
+	if _, err := DecodeRecord(b); !errors.Is(err, ErrOperateRecord) {
+		t.Fatalf("non-canonical BYTES length: err = %v, want ErrOperateRecord", err)
+	}
+	canonical := []byte{OperateModeDynamic, 1, 1, 'a', OperateTypeBytes, 0x00}
+	r, err := DecodeRecord(canonical)
+	if err != nil {
+		t.Fatalf("the canonical spelling must decode, or the case above never reaches the value: %v", err)
+	}
+	if len(r.Fields) != 1 || len(r.Fields[0].Cell.B) != 0 {
+		t.Fatalf("canonical BYTES decoded to %+v", r.Fields)
 	}
 }
 
@@ -190,8 +214,91 @@ func TestDecodeRecordRejectsNonCanonicalF32(t *testing.T) {
 	s := &Schema{Version: 1, Fields: []FieldDef{{Type: OperateTypeF32}}}
 	b := append([]byte{OperateModeSchema}, s.Encode()...)
 	b = append(b, 0x30, 0x30, 0x80, 0xff) // LE bits 0xff803030: signaling NaN
-	if _, err := DecodeRecord(b); err == nil {
-		t.Fatal("non-canonical (signaling NaN) F32 accepted")
+	if _, err := DecodeRecord(b); !errors.Is(err, ErrOperateRecord) {
+		t.Fatalf("non-canonical (signaling NaN) F32: err = %v, want ErrOperateRecord", err)
+	}
+	// The canonical quiet NaN (F32 bits 0x7FC00000) is the one spelling that
+	// must survive, which is also what proves the case above reaches the
+	// value rather than failing earlier in the frame.
+	ok := append([]byte{OperateModeSchema}, s.Encode()...)
+	ok = binary.LittleEndian.AppendUint32(ok, 0x7FC00000)
+	got, err := DecodeRecord(ok)
+	if err != nil {
+		t.Fatalf("canonical quiet-NaN F32 rejected: %v", err)
+	}
+	if !math.IsNaN(got.Fields[0].Cell.F) || !bytes.Equal(got.Encode(), ok) {
+		t.Fatalf("canonical NaN did not round-trip: %+v", got.Fields[0].Cell)
+	}
+}
+
+// TestDecodeRecordRejectsNonCanonicalF64 is the F64 half of the same rule:
+// AppendCellData canonicalizes every NaN (design doc §2.5), so a stored
+// quiet NaN with a non-zero payload decodes fine yet re-encodes to the
+// canonical pattern — DecodeRecord must reject it rather than silently
+// mutate it on the next round trip.
+func TestDecodeRecordRejectsNonCanonicalF64(t *testing.T) {
+	s := &Schema{Version: 1, Fields: []FieldDef{{Type: OperateTypeF64}}}
+	bad := append([]byte{OperateModeSchema}, s.Encode()...)
+	bad = binary.LittleEndian.AppendUint64(bad, 0x7FF8000000000001) // quiet NaN, payload 1
+	if _, err := DecodeRecord(bad); !errors.Is(err, ErrOperateRecord) {
+		t.Fatalf("non-canonical F64 NaN: err = %v, want ErrOperateRecord", err)
+	}
+	ok := append([]byte{OperateModeSchema}, s.Encode()...)
+	ok = binary.LittleEndian.AppendUint64(ok, 0x7FF8000000000000)
+	got, err := DecodeRecord(ok)
+	if err != nil {
+		t.Fatalf("canonical quiet-NaN F64 rejected: %v", err)
+	}
+	if !math.IsNaN(got.Fields[0].Cell.F) || !bytes.Equal(got.Encode(), ok) {
+		t.Fatalf("canonical NaN did not round-trip: %+v", got.Fields[0].Cell)
+	}
+	// A finite F64 keeps its bits verbatim: adding F64 to the canonical check
+	// must not cost the ordinary values anything.
+	fin := append([]byte{OperateModeSchema}, s.Encode()...)
+	fin = binary.LittleEndian.AppendUint64(fin, math.Float64bits(-0.5))
+	if _, err := DecodeRecord(fin); err != nil {
+		t.Fatalf("finite F64 rejected: %v", err)
+	}
+}
+
+// TestDecodeRecordRejectsFixedZeroWidth covers FIXED(0), which is not a
+// legal width (design doc §2.1: FIXED(n) is 1-255 bytes). A zero-width cell
+// would be a second spelling of UNSET — it encodes and decodes as no bytes
+// at all — so the codec rejects it wherever a width is stored: a dynamic
+// field header, a dynamic column header, and a bare tagged cell.
+func TestDecodeRecordRejectsFixedZeroWidth(t *testing.T) {
+	field := []byte{OperateModeDynamic, 1, 1, 'a', OperateTypeFixed, 0}
+	if _, err := DecodeRecord(field); !errors.Is(err, ErrOperateRecord) {
+		t.Fatalf("FIXED(0) field: err = %v, want ErrOperateRecord", err)
+	}
+	// The same record with a width of 1 and one data byte must decode, so the
+	// case above is failing on the width and not on the frame's shape.
+	okField := []byte{OperateModeDynamic, 1, 1, 'a', OperateTypeFixed, 1, 0x7A}
+	if _, err := DecodeRecord(okField); err != nil {
+		t.Fatalf("FIXED(1) field rejected: %v", err)
+	}
+
+	// A dynamic table holding one row with one FIXED(0) column:
+	// [byteLen][cap 0][policy 0][byColLen 0][nRows 1][rowLen][klen 1]['k']
+	// [nCols 1][nlen 1]['c'][type FIXED][n 0].
+	row := []byte{1, 'k', 1, 1, 'c', OperateTypeFixed, 0}
+	inner := append([]byte{0, 0, 0, 1, byte(len(row))}, row...)
+	col := append([]byte{OperateModeDynamic, 1, 1, 't', OperateTypeTable, byte(len(inner))}, inner...)
+	if _, err := DecodeRecord(col); !errors.Is(err, ErrOperateRecord) {
+		t.Fatalf("FIXED(0) column: err = %v, want ErrOperateRecord", err)
+	}
+	okRow := []byte{1, 'k', 1, 1, 'c', OperateTypeFixed, 1, 0x7A}
+	okInner := append([]byte{0, 0, 0, 1, byte(len(okRow))}, okRow...)
+	okCol := append([]byte{OperateModeDynamic, 1, 1, 't', OperateTypeTable, byte(len(okInner))}, okInner...)
+	if _, err := DecodeRecord(okCol); err != nil {
+		t.Fatalf("FIXED(1) column rejected: %v", err)
+	}
+
+	if _, _, err := DecodeTaggedCell([]byte{OperateTypeFixed, 0}); !errors.Is(err, ErrOperateType) {
+		t.Fatalf("DecodeTaggedCell FIXED(0): err = %v, want ErrOperateType", err)
+	}
+	if _, _, err := DecodeCellData(OperateTypeFixed, 0, []byte{1, 2, 3}); !errors.Is(err, ErrOperateType) {
+		t.Fatalf("DecodeCellData FIXED(0): err = %v, want ErrOperateType", err)
 	}
 }
 

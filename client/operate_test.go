@@ -193,10 +193,13 @@ func TestOperateEndToEnd(t *testing.T) {
 		if !reflect.DeepEqual(gotArgs, builderArgs) {
 			t.Fatalf("args on the wire:\n got %+v\nwant %+v", gotArgs, builderArgs)
 		}
-		payload := wire.EncodeOperateResult(&wire.OperateResult{
+		payload, eerr := wire.EncodeOperateResult(&wire.OperateResult{
 			Status: wire.OperateStatusOK,
 			Values: [][]byte{wire.AppendTaggedCell(nil, wire.Cell{Type: wire.OperateTypeU8, U: 9})},
 		})
+		if eerr != nil {
+			t.Fatalf("EncodeOperateResult: %v", eerr)
+		}
 		return StatusOK, payload
 	})
 	defer stop()
@@ -265,5 +268,64 @@ func TestOperateEncodeErrorNoNetworkCall(t *testing.T) {
 	}
 	if !errors.Is(err, wire.ErrOperateCap) {
 		t.Fatalf("err = %v, want wire.ErrOperateCap", err)
+	}
+}
+
+// TestOperateBuilderMigrateValidatesSchema covers Migrate's schema check.
+// WithSchema validates the schema it attaches, so Migrate — which ships a
+// second schema blob the server will store — must do the same, or an invalid
+// target schema only surfaces after a round trip.
+func TestOperateBuilderMigrateValidatesSchema(t *testing.T) {
+	bad := &wire.Schema{Version: 2, Fields: []wire.FieldDef{
+		{Name: "f", Type: wire.OperateTypeFixed, N: 0}, // FIXED(0) is not a width
+	}}
+	if err := bad.Validate(); err == nil {
+		t.Fatal("the fixture schema must be invalid for this test to mean anything")
+	}
+	_, err := NewOperate([]byte("k")).Dynamic().
+		Migrate(wire.OperateMigrateFromDynamic, bad, false).
+		Args()
+	if err == nil {
+		t.Fatal("Migrate accepted a schema that fails Validate")
+	}
+
+	good := &wire.Schema{Version: 2, Fields: []wire.FieldDef{{Name: "f", Type: wire.OperateTypeU64}}}
+	if _, err := NewOperate([]byte("k")).Dynamic().
+		Migrate(wire.OperateMigrateFromDynamic, good, false).Args(); err != nil {
+		t.Fatalf("a valid migration schema must build: %v", err)
+	}
+}
+
+// TestOperateBuilderConfigIsDynamicOnly covers the two mode rules the
+// builder can check for itself: CONFIG against a schema-mode record is
+// wire.ErrOperateOpcode on the server (design doc §3.2 — a schema-mode
+// table's eviction triple comes from its schema), so the call can only ever
+// fail; TRIM is valid in both modes and must keep building.
+func TestOperateBuilderConfigIsDynamicOnly(t *testing.T) {
+	s := &wire.Schema{Version: 1, Fields: []wire.FieldDef{
+		{Name: "ev", Type: wire.OperateTypeTable, Table: &wire.TableDef{
+			KeyType: wire.OperateTypeU64,
+			Cols:    []wire.ColumnDef{{Name: "hits", Type: wire.OperateTypeU32}},
+		}},
+	}}
+
+	if _, err := NewOperate([]byte("k")).WithSchema(s).
+		Config(F("ev"), 10, wire.OperatePolicyMinKey, "").Args(); err == nil {
+		t.Fatal("Config built a call against a schema-mode record")
+	}
+	// The same op is fine without a schema.
+	if _, err := NewOperate([]byte("k")).Dynamic().
+		Config(F("ev"), 10, wire.OperatePolicyMinKey, "").Args(); err != nil {
+		t.Fatalf("Config in dynamic mode: %v", err)
+	}
+
+	// TRIM builds in both modes.
+	if _, err := NewOperate([]byte("k")).WithSchema(s).
+		Trim(F("ev"), 5, wire.OperatePolicyMinCol, "hits").Args(); err != nil {
+		t.Fatalf("Trim in schema mode: %v", err)
+	}
+	if _, err := NewOperate([]byte("k")).Dynamic().
+		Trim(F("ev"), 5, wire.OperatePolicyMinCol, "hits").Args(); err != nil {
+		t.Fatalf("Trim in dynamic mode: %v", err)
 	}
 }

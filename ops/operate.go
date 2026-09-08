@@ -103,5 +103,5 @@ func handleOperate(tx *TxContext, args []byte) ([]byte, error) {
 		}
 	}
 
-	return wire.EncodeOperateResult(res), nil
+	return wire.EncodeOperateResult(res)
 }

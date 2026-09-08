@@ -419,13 +419,20 @@ func (ob *OperateBuilder) MaxFloatT(path Path, typ uint8, v float64) *OperateBui
 // table if absent (design doc §3.2: dynamic mode only — in schema mode
 // eviction is part of the schema and changes via Migrate). byCol may be ""
 // when policy does not need one.
+//
+// Because it is dynamic-mode only, Args returns an error rather than a call
+// when a schema is attached (WithSchema): the server would answer
+// wire.ErrOperateOpcode for it.
 func (ob *OperateBuilder) Config(path Path, capacity uint32, policy uint8, byCol string) *OperateBuilder {
 	return ob.addOp(builderOp{opcode: wire.OperateOpCONFIG, aux: policy, path: path, a: int64(capacity), byColName: byCol})
 }
 
 // Trim shrinks the table field at path to at most keep rows by policy (and,
 // for a *_COL policy, byCol), without changing the table's stored eviction
-// config (design doc §3.2). byCol may be "" when policy does not need one.
+// config (design doc §3.2). Unlike Config it is valid in BOTH modes: it is a
+// one-off shrink, not a change to the table's configuration, so it does not
+// collide with a schema-mode table's schema-declared eviction triple. byCol
+// may be "" when policy does not need one.
 func (ob *OperateBuilder) Trim(path Path, keep uint32, policy uint8, byCol string) *OperateBuilder {
 	return ob.addOp(builderOp{opcode: wire.OperateOpTRIM, aux: policy, path: path, a: int64(keep), byColName: byCol})
 }
@@ -435,12 +442,19 @@ func (ob *OperateBuilder) Trim(path Path, keep uint32, policy uint8, byCol strin
 // version in this atomic call, an append-only evolution or a dynamic-mode
 // freeze (design doc §2.8/§2.9). It must be the first op in the list.
 // dropExtra sets wire.OperateMigrateDropExtra, discarding dynamic fields s
-// does not declare rather than rejecting the call. A nil s is recorded and
-// returned by Args rather than panicking.
+// does not declare rather than rejecting the call. s is validated here, as
+// WithSchema validates its own; a nil s or a validation failure is recorded
+// and returned by Args rather than panicking.
 func (ob *OperateBuilder) Migrate(from int64, s *wire.Schema, dropExtra bool) *OperateBuilder {
 	if s == nil {
 		if ob.err == nil {
 			ob.err = fmt.Errorf("client: operate: Migrate requires a non-nil schema")
+		}
+		return ob
+	}
+	if err := s.Validate(); err != nil {
+		if ob.err == nil {
+			ob.err = err
 		}
 		return ob
 	}
@@ -513,6 +527,14 @@ func (ob *OperateBuilder) Args() (*wire.OperateArgs, error) {
 		args.Schema = ob.schema.Encode()
 	}
 	for _, op := range ob.ops {
+		if op.opcode == wire.OperateOpCONFIG && ob.schema != nil {
+			// The server answers wire.ErrOperateOpcode for a CONFIG against a
+			// schema-mode record (design doc §3.2: a schema-mode table's
+			// eviction triple comes from its schema and changes only via
+			// MIGRATE), so this call can only ever fail — say so here rather
+			// than after a round trip.
+			return nil, fmt.Errorf("client: operate: Config is dynamic-mode only; a schema-mode table's eviction triple changes via Migrate")
+		}
 		wop, err := ob.resolveOp(op)
 		if err != nil {
 			return nil, err

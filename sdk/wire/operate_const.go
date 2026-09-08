@@ -167,17 +167,47 @@ const OperateMigrateDropExtra uint8 = 1
 // allocation, all-or-nothing. Hitting one is an error with the record left
 // unchanged — never an implicit eviction.
 const (
-	OperateMaxFields      = 65535   // a schema declaring more fields is rejected
-	OperateMaxCols        = 65535   // a table declaring more columns is rejected
-	OperateMaxSchemaBytes = 4096    // bounds schema parsing and the offset-cache entry
-	OperateMaxRows        = 1 << 20 // per table; a hostile cap above it is clamped
-	OperateMaxRowWidth    = 4096    // bounds FIXED(n) columns × count, in bytes
-	OperateMaxKeyLen      = 255     // u8; FIXED(n) keys (schema mode) or any key (dynamic mode)
-	OperateMaxNameLen     = 255     // u8; dynamic-mode field/column names
-	OperateMaxBytesLen    = 65535   // u16 on the wire, per BYTES field
-	OperateMaxNameBytes   = 4096    // per record; names are stored once
-	OperateMaxOps         = 4096    // per call; bounds CPU per apply
-	OperateMaxRet         = 4096    // per call; bounds CPU per apply
+	// OperateMaxFields bounds a schema's field count and a dynamic record's;
+	// a declaration above it is rejected.
+	OperateMaxFields = 65535
+	// OperateMaxCols bounds one table's column count; a declaration above it
+	// is rejected.
+	OperateMaxCols = 65535
+	// OperateMaxSchemaBytes bounds the encoded schema blob, the offset-cache
+	// entry built from it, and — because every field and column costs at
+	// least one byte of that blob — the field and column counts DecodeSchema
+	// will allocate for, checked BEFORE the allocation rather than after it.
+	OperateMaxSchemaBytes = 4096
+	// OperateMaxRows bounds one table's rows. A declared cap above it is
+	// rejected outright: Schema.Validate refuses a TableDef.Cap over it and
+	// checkRowCap refuses a CONFIG/TRIM operand over it, so an over-cap cap
+	// is an error, never a silently clamped one. On the decode side the row
+	// and column counts of every table in a record are charged against one
+	// shared budget of this size, so a record cannot dodge it by spreading
+	// rows across many tables.
+	OperateMaxRows = 1 << 20
+	// OperateMaxRowWidth bounds one table row's stored bytes: key plus every
+	// column, FIXED(n) widths included.
+	OperateMaxRowWidth = 4096
+	// OperateMaxKeyLen bounds a row key: a u8 length, so FIXED(n) keys in
+	// schema mode and any key in dynamic mode.
+	OperateMaxKeyLen = 255
+	// OperateMaxNameLen bounds one dynamic-mode field or column name (a u8
+	// length prefix), and one name in a schema blob's names section.
+	OperateMaxNameLen = 255
+	// OperateMaxBytesLen bounds one BYTES value; it is a u16 on the wire.
+	OperateMaxBytesLen = 65535
+	// OperateMaxNameBytes bounds the SCHEMA BLOB's names section only — the
+	// one place names are stored per record, since a schema is stored inline
+	// in front of its values. It says nothing about dynamic mode, whose
+	// names are bounded individually by OperateMaxNameLen and collectively
+	// only by the record-size cap (there is no names section to bound).
+	OperateMaxNameBytes = 4096
+	// OperateMaxOps bounds a call's op list; it bounds CPU per apply.
+	OperateMaxOps = 4096
+	// OperateMaxRet bounds a call's return-spec list, and with it the value
+	// count a result frame may carry; it bounds CPU per apply.
+	OperateMaxRet = 4096
 )
 
 // Errors returned by the operate wire codec and, downstream, its apply engine.

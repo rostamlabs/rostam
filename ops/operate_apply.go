@@ -160,7 +160,11 @@ func openRecord(es engines, cur []byte, a *wire.OperateArgs) (modeEngine, error)
 		return nil, wire.ErrOperateArgs
 	}
 
-	e, err := openMode(es, copyRecord(cur), true)
+	buf, err := copyRecord(cur)
+	if err != nil {
+		return nil, err
+	}
+	e, err := openMode(es, buf, true)
 	if err != nil {
 		return nil, err
 	}
@@ -228,10 +232,21 @@ func openMode(es engines, buf []byte, existed bool) (modeEngine, error) {
 // copyRecord copies cur into a buffer the engine owns, with slack so a single
 // row insert usually does not reallocate. The stored value aliases the
 // store's cache page (design doc §2.6): it must never be written through.
-func copyRecord(cur []byte) []byte {
+//
+// The §2.7 record-size cap is checked BEFORE the copy, not after: the value
+// under the key is whatever a plain `put` left there, so it can be far larger
+// than any operate record may be, and copying it first would let one call
+// allocate an arbitrary multiple of the cap before the engine ever looked at
+// the bytes. A stored value that big cannot be a valid operate record, so it
+// is wire.ErrOperateRecord — a malformed stored record — rather than
+// wire.ErrOperateCap, which means "this call would grow the record too far".
+func copyRecord(cur []byte) ([]byte, error) {
+	if len(cur) > maxOperateRecordBytes {
+		return nil, wire.ErrOperateRecord
+	}
 	buf := make([]byte, len(cur), len(cur)+64)
 	copy(buf, cur)
-	return buf
+	return buf, nil
 }
 
 // retsBefore evaluates the return specs against the pre-call record after a
@@ -247,7 +262,11 @@ func retsBefore(es engines, cur []byte, rets []wire.OperateRet) ([][]byte, error
 	// Re-opening the pre-call bytes reuses the same pooled engines: the
 	// working copy they were pointing at is discarded whole by a failed
 	// CHECK, so nothing in it is still needed.
-	e, err := openMode(es, copyRecord(cur), true)
+	buf, err := copyRecord(cur)
+	if err != nil {
+		return nil, err
+	}
+	e, err := openMode(es, buf, true)
 	if err != nil {
 		return nil, err
 	}

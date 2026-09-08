@@ -368,10 +368,10 @@ func lenFits(n uint64, remaining int) bool {
 // cellDataLen returns the stored length of one cell's data of type typ (and,
 // for FIXED, width n) at the front of b, rejecting anything the record codec
 // would reject: a truncated value, a non-canonical varint or BYTES length, an
-// over-long BYTES payload, an F32 bit pattern that does not survive the
-// codec's float64 round trip, and any type byte that is not cell data at all
-// (TABLE, or a tag past the last known type). It never allocates, which is
-// what lets the structural walk stay off the heap.
+// over-long BYTES payload, a FIXED width of 0, a float bit pattern that does
+// not survive the codec's canonicalizing round trip, and any type byte that
+// is not cell data at all (TABLE, or a tag past the last known type). It
+// never allocates, which is what lets the structural walk stay off the heap.
 func cellDataLen(typ, n uint8, b []byte) (int, error) {
 	switch typ {
 	case wire.OperateTypeUnset:
@@ -379,7 +379,7 @@ func cellDataLen(typ, n uint8, b []byte) (int, error) {
 	case wire.OperateTypeU8, wire.OperateTypeI8,
 		wire.OperateTypeU16, wire.OperateTypeI16,
 		wire.OperateTypeU32, wire.OperateTypeI32,
-		wire.OperateTypeU64, wire.OperateTypeI64, wire.OperateTypeF64:
+		wire.OperateTypeU64, wire.OperateTypeI64:
 		w := wire.CellWidth(typ, n)
 		if len(b) < w {
 			return 0, wire.ErrOperateRecord
@@ -389,16 +389,29 @@ func cellDataLen(typ, n uint8, b []byte) (int, error) {
 		if len(b) < 4 {
 			return 0, wire.ErrOperateRecord
 		}
-		// The codec stores an F32 through a float64 (Cell.F), so a bit
-		// pattern that does not come back identically — a signaling NaN on
-		// hardware that quiets it — decodes fine yet re-encodes differently.
+		// The codec canonicalizes every NaN on the way out (wire.CanonFloat,
+		// design doc §2.5) and stores an F32 through a float64 (Cell.F), so a
+		// bit pattern that does not come back identically — any NaN but the
+		// canonical quiet one — decodes fine yet re-encodes differently.
 		// wire.DecodeRecord rejects those; so must this walk, or the two
 		// would disagree on which records exist.
 		v := binary.LittleEndian.Uint32(b[:4])
-		if math.Float32bits(float32(float64(math.Float32frombits(v)))) != v {
+		f := wire.CanonFloat(wire.OperateTypeF32, float64(math.Float32frombits(v)))
+		if math.Float32bits(float32(f)) != v {
 			return 0, wire.ErrOperateRecord
 		}
 		return 4, nil
+	case wire.OperateTypeF64:
+		if len(b) < 8 {
+			return 0, wire.ErrOperateRecord
+		}
+		// Same rule one width up: only the canonical quiet NaN re-encodes to
+		// itself, every other NaN spelling is a malformed record.
+		v := binary.LittleEndian.Uint64(b[:8])
+		if math.Float64bits(wire.CanonFloat(wire.OperateTypeF64, math.Float64frombits(v))) != v {
+			return 0, wire.ErrOperateRecord
+		}
+		return 8, nil
 	case wire.OperateTypeUVarint, wire.OperateTypeIVarint:
 		_, m, err := readUvarint(b)
 		if err != nil {
@@ -418,6 +431,11 @@ func cellDataLen(typ, n uint8, b []byte) (int, error) {
 		}
 		return m + int(ln), nil //nolint:gosec // bounded above
 	case wire.OperateTypeFixed:
+		// FIXED's declared width is 1-255 (design doc §2.1): a stored 0 is a
+		// malformed record, which is what wire.DecodeRecord calls it too.
+		if n == 0 {
+			return 0, wire.ErrOperateRecord
+		}
 		if !wire.CountFitsIn(int(n), len(b), 1) {
 			return 0, wire.ErrOperateRecord
 		}
@@ -1112,13 +1130,17 @@ func (e *dynamicEngine) spliceValue(r ref, off, oldLen int, repl []byte) error {
 		e.buf = splice(e.buf, off, oldLen, repl)
 		return e.reindex()
 	}
-	// The row's and the table's length prefixes can widen along with the value
-	// they cover, so their worst case is charged before the first splice too.
-	if err := e.charge(delta + 2*binary.MaxVarintLen64); err != nil {
-		return err
-	}
 	t, row, err := e.rowByIndex(r.field, r.row)
 	if err != nil {
+		return err
+	}
+	// The row's and the table's length prefixes can widen along with the
+	// value they cover, so they are charged before the first splice too — at
+	// their ACTUAL width change, computed from the inside out, not at the
+	// worst case of two maximum-width varints (see prefixDelta).
+	rowDelta := prefixDelta(int64(row.bodyLen)+int64(delta), row.lenLen)
+	tblDelta := prefixDelta(int64(t.byteLen)+int64(delta)+int64(rowDelta), t.lenLen)
+	if err := e.charge(delta + rowDelta + tblDelta); err != nil {
 		return err
 	}
 	e.buf = splice(e.buf, off, oldLen, repl)
@@ -1153,12 +1175,37 @@ func (e *dynamicEngine) patchTableLen(t dynTable, delta int) error {
 }
 
 // charge rejects a growth that would take the record past the §2.7
-// record-size cap before the splice allocates for it.
+// record-size cap before the splice allocates for it. The sum is taken in
+// 64-bit so a hostile delta can never wrap a 32-bit int into a small
+// positive size.
 func (e *dynamicEngine) charge(delta int) error {
-	if delta > 0 && len(e.buf)+delta > maxOperateRecordBytes {
+	if delta > 0 && int64(len(e.buf))+int64(delta) > int64(maxOperateRecordBytes) {
 		return wire.ErrOperateCap
 	}
 	return nil
+}
+
+// prefixDelta is how many bytes a uvarint length prefix currently oldLen
+// bytes wide grows (or shrinks) by when it comes to hold newVal.
+//
+// Every charge uses this rather than binary.MaxVarintLen64 per prefix: an
+// edit inside a table is covered by up to three prefixes (nCols, rowLen,
+// byteLen), and charging each of them a maximum-width varint over-charges by
+// as much as 27 bytes. The oracle checks only the size of the FINISHED
+// record, so a call whose result lands a few bytes under maxRecordBytes must
+// be accepted — over-charging would reject it and diverge. Real prefixes
+// grow by at most one byte per edit, and the exact figure is cheap to
+// compute, so there is no reason to guess.
+//
+// newVal is taken as an int64 so the caller's arithmetic cannot wrap on a
+// 32-bit int; a negative one cannot arise from a well-formed edit and is
+// reported as no change, leaving the splice's own structural checks to
+// reject the record.
+func prefixDelta(newVal int64, oldLen int) int {
+	if newVal < 0 {
+		return 0
+	}
+	return uvarintLen(uint64(newVal)) - oldLen
 }
 
 // reindex re-walks the field level after a splice.
@@ -1195,7 +1242,9 @@ func (e *dynamicEngine) insertField(idx int, entry []byte) error {
 	if idx < len(e.fields) {
 		at = e.fields[idx].off
 	}
-	if err := e.charge(len(entry) + binary.MaxVarintLen64); err != nil {
+	// The entry's bytes plus the actual width change of the one prefix that
+	// covers it: the record's own nFields.
+	if err := e.charge(len(entry) + prefixDelta(int64(len(e.fields))+1, e.nLen)); err != nil {
 		return err
 	}
 	e.buf = splice(e.buf, at, 0, entry)
@@ -1225,15 +1274,17 @@ func (e *dynamicEngine) insertRow(fi int, t dynTable, at int, key []byte) error 
 	e.enc = body
 	var hdr [binary.MaxVarintLen64]byte
 	m := binary.PutUvarint(hdr[:], uint64(len(body)))
-	// The row's bytes plus the worst case of the two prefixes that cover it
-	// widening: the table's nRows and its byteLen.
-	if err := e.charge(m + len(body) + 2*binary.MaxVarintLen64); err != nil {
+	rowBytes := m + len(body)
+	// The row's bytes plus the actual width change of the two prefixes that
+	// cover it: the table's nRows and, around that, its byteLen.
+	nRowsDelta := prefixDelta(int64(t.nRows)+1, t.nRowsLen)
+	tblDelta := prefixDelta(int64(t.byteLen)+int64(rowBytes)+int64(nRowsDelta), t.lenLen)
+	if err := e.charge(rowBytes + nRowsDelta + tblDelta); err != nil {
 		return err
 	}
 	e.buf = splice(e.buf, at, 0, hdr[:m])
 	e.buf = splice(e.buf, at+m, 0, body)
 
-	rowBytes := m + len(body)
 	buf, m2 := spliceUvarint(e.buf, t.nRowsOff, t.nRowsLen, uint64(t.nRows+1)) //nolint:gosec // nRows >= 0
 	e.buf = buf
 	if err := e.patchTableLen(t, rowBytes+m2-t.nRowsLen); err != nil {
@@ -1265,13 +1316,17 @@ func (e *dynamicEngine) insertCol(fi, ri, at int, name string, typ, n uint8) err
 	e.enc = appendDynName(e.enc[:0], name)
 	e.enc = wire.AppendTaggedCell(e.enc, wire.ZeroCell(typ, n))
 	entry := e.enc
-	// The column's bytes plus the worst case of the three prefixes that cover
-	// it widening: the row's nCols and rowLen, and the table's byteLen.
-	if err := e.charge(len(entry) + 3*binary.MaxVarintLen64); err != nil {
-		return err
-	}
 	t, row, err := e.rowByIndex(fi, ri)
 	if err != nil {
+		return err
+	}
+	// The column's bytes plus the actual width change of the three prefixes
+	// that cover it, from the inside out: the row's nCols, then its rowLen,
+	// then the table's byteLen.
+	nColsDelta := prefixDelta(int64(row.nCols)+1, row.nColsLen)
+	rowDelta := prefixDelta(int64(row.bodyLen)+int64(len(entry))+int64(nColsDelta), row.lenLen)
+	tblDelta := prefixDelta(int64(t.byteLen)+int64(len(entry))+int64(nColsDelta)+int64(rowDelta), t.lenLen)
+	if err := e.charge(len(entry) + nColsDelta + rowDelta + tblDelta); err != nil {
 		return err
 	}
 	e.buf = splice(e.buf, at, 0, entry)
@@ -1591,7 +1646,10 @@ func (e *dynamicEngine) config(r ref, capN uint32, policy uint8, byColName strin
 	hdr = appendDynName(hdr, byColName)
 	e.enc = hdr
 	oldLen := t.nRowsOff - t.capOff
-	if err := e.charge(len(hdr) - oldLen); err != nil {
+	hdrDelta := len(hdr) - oldLen
+	// The table's byteLen covers the header being rewritten, so it moves with
+	// it; charge its actual width change alongside the header's own.
+	if err := e.charge(hdrDelta + prefixDelta(int64(t.byteLen)+int64(hdrDelta), t.lenLen)); err != nil {
 		return err
 	}
 	e.buf = splice(e.buf, t.capOff, oldLen, hdr)

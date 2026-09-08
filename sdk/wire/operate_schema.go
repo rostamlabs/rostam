@@ -180,8 +180,9 @@ func appendName(dst []byte, name string) []byte {
 
 // DecodeSchema reads one Encode-formatted schema blob from the front of b,
 // returning the decoded schema and the number of bytes consumed. Every
-// count is bounded with CountFitsIn against the remaining input and the
-// relevant cap before it is trusted to size an allocation, and every read is
+// count is bounded with CountFitsIn against the remaining input, against the
+// relevant cap, and against OperateMaxSchemaBytes (the blob a schema must
+// fit in) before it is trusted to size an allocation, and every read is
 // truncation-checked, so DecodeSchema never panics or over-reads on hostile
 // input. A successfully decoded schema always passes Validate — DecodeSchema
 // runs it before returning.
@@ -206,7 +207,14 @@ func DecodeSchema(b []byte) (*Schema, int, error) {
 		return nil, 0, err
 	}
 	off += m
-	if nFields > OperateMaxFields {
+	// Two independent bounds, both before the allocation below. CountFitsIn
+	// bounds the count against the bytes actually left, but b is the whole
+	// stored record — up to 16 MiB — not just the schema blob, so on its own
+	// it would let a declared 65535 fields size a multi-megabyte slice out of
+	// a blob that can never legally exceed OperateMaxSchemaBytes. Every field
+	// costs at least one byte of that blob, so the count is bounded by the
+	// blob budget too.
+	if nFields > OperateMaxFields || nFields > OperateMaxSchemaBytes {
 		return nil, 0, ErrOperateSchema
 	}
 	if !CountFitsIn(int(nFields), len(b)-off, 1) {
@@ -251,7 +259,9 @@ func DecodeSchema(b []byte) (*Schema, int, error) {
 			return nil, 0, err
 		}
 		off += m2
-		if nCols > OperateMaxCols {
+		// Bounded by the blob budget as well as by the column cap, for the
+		// same reason nFields is: one byte of blob per column, minimum.
+		if nCols > OperateMaxCols || nCols > OperateMaxSchemaBytes {
 			return nil, 0, ErrOperateSchema
 		}
 		if !CountFitsIn(int(nCols), len(b)-off, 1) {

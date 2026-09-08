@@ -309,6 +309,12 @@ func EncodeOperateArgs(a *OperateArgs) ([]byte, error) {
 	if a.Create > OperateCreateDynamic {
 		return nil, ErrOperateArgs
 	}
+	// ttlMs rides the wire as an unsigned 64-bit count of milliseconds, so a
+	// negative duration has no encoding: converting it would wrap to a
+	// ~584-million-year TTL rather than the expiry the caller asked for.
+	if a.TTL < 0 {
+		return nil, ErrOperateArgs
+	}
 
 	buf := make([]byte, 0, 2+len(a.Key)+8+1+1+2+len(a.Schema)+2+2)
 	buf = binary.BigEndian.AppendUint16(buf, uint16(len(a.Key))) //nolint:gosec // bounded by the check above
@@ -446,18 +452,30 @@ func DecodeOperateArgs(b []byte) (*OperateArgs, error) {
 // [status u8][failedOp u16 iff status==OperateStatusCheckFailed][nRet
 // u16]{[vlen u32][value]}*. failedOp is written only when the status is
 // OperateStatusCheckFailed; every other status omits it entirely.
-func EncodeOperateResult(r *OperateResult) []byte {
+//
+// It returns an error rather than truncating: nRet is a uint16 on the wire,
+// so more than OperateMaxRet values could not be counted honestly, and a
+// silent narrowing would ship a frame whose declared count does not match
+// the values behind it. A status outside OperateStatus* is rejected for the
+// same reason — DecodeOperateResult would not accept it back.
+func EncodeOperateResult(r *OperateResult) ([]byte, error) {
+	if len(r.Values) > OperateMaxRet {
+		return nil, ErrOperateCap
+	}
+	if r.Status != OperateStatusOK && r.Status != OperateStatusCheckFailed {
+		return nil, ErrOperateArgs
+	}
 	buf := make([]byte, 0, 1+2+2+len(r.Values)*4)
 	buf = append(buf, r.Status)
 	if r.Status == OperateStatusCheckFailed {
 		buf = binary.BigEndian.AppendUint16(buf, r.FailedOp)
 	}
-	buf = binary.BigEndian.AppendUint16(buf, uint16(len(r.Values))) //nolint:gosec // bounded by OperateMaxRet upstream
+	buf = binary.BigEndian.AppendUint16(buf, uint16(len(r.Values))) //nolint:gosec // bounded by OperateMaxRet above
 	for _, v := range r.Values {
 		buf = binary.BigEndian.AppendUint32(buf, uint32(len(v))) //nolint:gosec // bounded by the apply engine upstream
 		buf = append(buf, v...)
 	}
-	return buf
+	return buf, nil
 }
 
 // DecodeOperateResult reads a frame produced by EncodeOperateResult, with
@@ -468,6 +486,12 @@ func DecodeOperateResult(b []byte) (*OperateResult, error) {
 		return nil, ErrShortArgs
 	}
 	status := b[0]
+	if status != OperateStatusOK && status != OperateStatusCheckFailed {
+		// An unknown status byte changes the frame's own shape (only
+		// CHECK_FAILED carries failedOp), so accepting one would mean
+		// guessing at the layout of the bytes behind it.
+		return nil, ErrOperateArgs
+	}
 	off := 1
 	var failedOp uint16
 	if status == OperateStatusCheckFailed {

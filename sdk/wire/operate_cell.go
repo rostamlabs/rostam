@@ -122,6 +122,14 @@ func TypeIsBytes(t uint8) bool {
 // IVARINT, [len uvarint][data] for BYTES, and the raw N bytes for FIXED.
 // UNSET appends nothing. It is the caller's responsibility not to call this
 // with OperateTypeTable, which is never cell data.
+//
+// Float values are canonicalized on the way out (CanonFloat, design doc
+// §2.5): a payload NaN is written as the canonical quiet NaN and an F32 is
+// rounded through float32, so the stored bytes are a pure function of the
+// value no matter what bit pattern the caller handed in. DecodeCellData's
+// canonical-bytes check (decodeCellDataCanonical) mirrors this, so a stored
+// canonical NaN round-trips and every other NaN spelling is rejected as a
+// malformed record rather than silently rewritten.
 func AppendCellData(dst []byte, c Cell) []byte {
 	switch c.Type {
 	case OperateTypeU8, OperateTypeI8:
@@ -133,9 +141,9 @@ func AppendCellData(dst []byte, c Cell) []byte {
 	case OperateTypeU64, OperateTypeI64:
 		return binary.LittleEndian.AppendUint64(dst, c.U)
 	case OperateTypeF32:
-		return binary.LittleEndian.AppendUint32(dst, math.Float32bits(float32(c.F)))
+		return binary.LittleEndian.AppendUint32(dst, math.Float32bits(float32(CanonFloat(OperateTypeF32, c.F))))
 	case OperateTypeF64:
-		return binary.LittleEndian.AppendUint64(dst, math.Float64bits(c.F))
+		return binary.LittleEndian.AppendUint64(dst, math.Float64bits(CanonFloat(OperateTypeF64, c.F)))
 	case OperateTypeUVarint:
 		return binary.AppendUvarint(dst, c.U)
 	case OperateTypeIVarint:
@@ -155,7 +163,8 @@ func AppendCellData(dst []byte, c Cell) []byte {
 // number of bytes consumed. Every branch is truncation-checked; BYTES length
 // is additionally bounded by OperateMaxBytesLen before it is trusted to size
 // an allocation. t == OperateTypeTable is rejected: a table is never cell
-// data.
+// data, and so is OperateTypeFixed with n == 0, which is not a legal width
+// (design doc §2.1: FIXED(n) is 1-255 bytes).
 func DecodeCellData(t uint8, n uint8, b []byte) (Cell, int, error) {
 	c := Cell{Type: t, N: n}
 	switch t {
@@ -245,6 +254,12 @@ func DecodeCellData(t uint8, n uint8, b []byte) (Cell, int, error) {
 		c.B = data
 		return c, m + int(ln), nil
 	case OperateTypeFixed:
+		// FIXED(0) is not a type: the design doc §2.1 declares FIXED's width
+		// as 1-255, and a zero-width cell would be an alias for UNSET that
+		// encodes and decodes as a distinct, second spelling of "no bytes".
+		if n == 0 {
+			return Cell{}, 0, ErrOperateType
+		}
 		if !CountFitsIn(int(n), len(b), 1) {
 			return Cell{}, 0, ErrShortArgs
 		}

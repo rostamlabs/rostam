@@ -4,6 +4,7 @@ package wire
 
 import (
 	"encoding/binary"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -81,12 +82,20 @@ func TestDecodeOperateArgsHostileCounts(t *testing.T) {
 
 func TestOperateResultRoundtrip(t *testing.T) {
 	r := &OperateResult{Status: OperateStatusCheckFailed, FailedOp: 3, Values: [][]byte{AppendTaggedCell(nil, Cell{Type: OperateTypeU8, U: 9}), {OperateTypeUnset}}}
-	got, err := DecodeOperateResult(EncodeOperateResult(r))
+	enc, err := EncodeOperateResult(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeOperateResult(enc)
 	if err != nil || !reflect.DeepEqual(got, r) {
 		t.Fatalf("%+v %v", got, err)
 	}
 	ok := &OperateResult{Status: OperateStatusOK, Values: [][]byte{}}
-	got, _ = DecodeOperateResult(EncodeOperateResult(ok))
+	enc, err = EncodeOperateResult(ok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ = DecodeOperateResult(enc)
 	if got.Status != OperateStatusOK || got.FailedOp != 0 {
 		t.Fatal(got)
 	}
@@ -114,4 +123,71 @@ func FuzzDecodeOperateArgs(f *testing.F) {
 			t.Fatal("not stable")
 		}
 	})
+}
+
+// TestEncodeOperateArgsNegativeTTL covers a negative duration, which has no
+// wire encoding: ttlMs is an unsigned 64-bit millisecond count, so
+// converting one would wrap into a ~584-million-year TTL rather than the
+// expiry the caller asked for.
+func TestEncodeOperateArgsNegativeTTL(t *testing.T) {
+	a := sampleArgs()
+	a.TTL = -time.Second
+	if _, err := EncodeOperateArgs(a); !errors.Is(err, ErrOperateArgs) {
+		t.Fatalf("err = %v, want ErrOperateArgs", err)
+	}
+	a.TTL = 0
+	if _, err := EncodeOperateArgs(a); err != nil {
+		t.Fatalf("a zero TTL must still encode: %v", err)
+	}
+	// A sub-millisecond positive duration truncates to zero rather than
+	// erroring — it is representable, just rounded.
+	a.TTL = time.Microsecond
+	if _, err := EncodeOperateArgs(a); err != nil {
+		t.Fatalf("a sub-millisecond TTL must still encode: %v", err)
+	}
+}
+
+// TestEncodeOperateResultLimits covers the two frames the result encoder
+// cannot honestly represent: more values than nRet's uint16 (and
+// OperateMaxRet) can count, and a status byte DecodeOperateResult would not
+// accept back.
+func TestEncodeOperateResultLimits(t *testing.T) {
+	over := &OperateResult{Status: OperateStatusOK, Values: make([][]byte, OperateMaxRet+1)}
+	if _, err := EncodeOperateResult(over); !errors.Is(err, ErrOperateCap) {
+		t.Fatalf("err = %v, want ErrOperateCap", err)
+	}
+	at := &OperateResult{Status: OperateStatusOK, Values: make([][]byte, OperateMaxRet)}
+	b, err := EncodeOperateResult(at)
+	if err != nil {
+		t.Fatalf("exactly OperateMaxRet values must encode: %v", err)
+	}
+	got, err := DecodeOperateResult(b)
+	if err != nil || len(got.Values) != OperateMaxRet {
+		t.Fatalf("round trip at the cap: %+v %v", got, err)
+	}
+	if _, err := EncodeOperateResult(&OperateResult{Status: 7}); !errors.Is(err, ErrOperateArgs) {
+		t.Fatalf("unknown status encoded: err = %v, want ErrOperateArgs", err)
+	}
+}
+
+// TestDecodeOperateResultUnknownStatus covers the decode side of the same
+// rule. The status byte selects the frame's shape — only
+// OperateStatusCheckFailed carries failedOp — so an unknown one cannot be
+// parsed past, and accepting it would hand the caller a status it has no
+// branch for.
+func TestDecodeOperateResultUnknownStatus(t *testing.T) {
+	for _, status := range []byte{2, 3, 0xFF} {
+		if _, err := DecodeOperateResult([]byte{status, 0, 0}); !errors.Is(err, ErrOperateArgs) {
+			t.Fatalf("status %d: err = %v, want ErrOperateArgs", status, err)
+		}
+	}
+	for _, status := range []uint8{OperateStatusOK, OperateStatusCheckFailed} {
+		b, err := EncodeOperateResult(&OperateResult{Status: status})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := DecodeOperateResult(b); err != nil {
+			t.Fatalf("status %d rejected: %v", status, err)
+		}
+	}
 }
