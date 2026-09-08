@@ -105,7 +105,8 @@ func segKey(s wire.OperateSeg) string {
 	return fmt.Sprintf("pos=%d", s.Pos)
 }
 
-func (f *fakeEngine) resolve(p wire.OperatePath, create bool, typ, n uint8) (ref, error) {
+func (f *fakeEngine) resolve(p wire.OperatePath, create bool, opcode, typ, n uint8) (ref, error) {
+	_ = opcode // the fake never retypes a stored cell, so the opcode is noise here
 	key := pathKey(p)
 	f.calls = append(f.calls, "resolve:"+key)
 	if err, ok := f.forceResolveErr[key]; ok {

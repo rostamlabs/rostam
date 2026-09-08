@@ -94,8 +94,19 @@ type engine interface {
 	// with (schema mode ignores them, since the schema is authoritative);
 	// applyOps computes n as len(o.Bytes) for a FIXED target it is about to
 	// create (see fixedN) and 0 otherwise, matching the wire encoding of a
-	// freshly created FIXED cell.
-	resolve(p wire.OperatePath, create bool, typ, n uint8) (ref, error)
+	// freshly created FIXED cell. For a create=false resolve, typ/n are
+	// instead the type an ABSENT dynamic target reads as (see zeroTypeFor),
+	// and no type check is performed on a target that does exist — every
+	// create=false caller is a control op, whose type byte the design doc
+	// §2.4 rules never check against a stored type.
+	//
+	// opcode is the op resolve is running for. Only dynamic mode consults
+	// it, and only for a create=true resolve, where design doc §2.9's
+	// "SET replaces the scalar including its type" makes SET the one op
+	// whose declared type may differ from the stored one without being a
+	// domain error (the oracle's treeCheckDynType/treeRetype pair). Schema
+	// mode ignores it: a schema-mode field's type is never replaced.
+	resolve(p wire.OperatePath, create bool, opcode, typ, n uint8) (ref, error)
 	// get returns r's current scalar value. If !r.present this is the
 	// type's zero cell (design doc §2.4, "absent reads as zero") — callers
 	// pass r.present alongside it to whatever needs to distinguish the two.
@@ -192,12 +203,39 @@ func fixedN(o *wire.OperateOp) (uint8, error) {
 	return uint8(len(o.Bytes)), nil //nolint:gosec // bounded to [1,255] above
 }
 
+// zeroTypeFor is the type an ABSENT dynamic-mode target reads as for an op
+// that only inspects it (design doc §2.4, "absent is zero"; the oracle's
+// treeZeroTypeFor). The op's own type byte picks the zero's domain — so a
+// comparison against an absent BYTES-typed target compares bytewise (empty
+// against the operand) rather than as an integer — and an integer zero is
+// the fallback for 0xFF and for any byte that is not a value type at all.
+// A FIXED zero is as wide as the operand it is compared against, since
+// there is no schema to declare a width.
+//
+// Schema mode never needs it (the schema is authoritative for every field's
+// type), and it is only meaningful where the target is absent: a stored
+// value's own type always wins over the op's byte.
+func zeroTypeFor(o *wire.OperateOp) (uint8, uint8) {
+	if o.Type < wire.OperateTypeCount && o.Type != wire.OperateTypeTable && o.Type != wire.OperateTypeUnset {
+		if o.Type != wire.OperateTypeFixed {
+			return o.Type, 0
+		}
+		if len(o.Bytes) >= 1 && len(o.Bytes) <= wire.OperateMaxKeyLen {
+			return o.Type, uint8(len(o.Bytes)) //nolint:gosec // bounded to [1,255] above
+		}
+	}
+	return wire.OperateTypeU8, 0
+}
+
 // evalCond evaluates one IF/CHECK op's comparator against the node its path
 // addresses (design doc §3.3). It never vivifies (resolve's create=false).
-// The comparator travels in o.Aux (control ops otherwise ignore the type
-// byte — o.Type is never consulted here, matching resolve's typ=0/n=0).
+// The comparator travels in o.Aux; the type byte is not checked against a
+// stored type (a control op never declares one, §2.4) but does pick the
+// domain an absent dynamic target compares in, which is what zeroTypeFor
+// hands to resolve.
 func evalCond(e engine, o *wire.OperateOp) (bool, error) {
-	r, err := e.resolve(o.Path, false, 0, 0)
+	zeroTyp, zeroN := zeroTypeFor(o)
+	r, err := e.resolve(o.Path, false, o.Opcode, zeroTyp, zeroN)
 	if err != nil {
 		return false, err
 	}
@@ -267,7 +305,7 @@ func applyOps(e engine, ops []wire.OperateOp, stampMs int64) (uint8, uint16, err
 			}
 
 		case wire.OperateOpDEL:
-			r, err := e.resolve(o.Path, false, 0, 0)
+			r, err := e.resolve(o.Path, false, o.Opcode, 0, 0)
 			if err != nil {
 				return 0, 0, err
 			}
@@ -292,7 +330,7 @@ func applyOps(e engine, ops []wire.OperateOp, stampMs int64) (uint8, uint16, err
 			if err := checkRowCap(o.A); err != nil {
 				return 0, 0, err
 			}
-			r, err := e.resolve(o.Path, true, wire.OperateTypeTable, 0)
+			r, err := e.resolve(o.Path, true, o.Opcode, wire.OperateTypeTable, 0)
 			if err != nil {
 				return 0, 0, err
 			}
@@ -316,7 +354,7 @@ func applyOps(e engine, ops []wire.OperateOp, stampMs int64) (uint8, uint16, err
 			if o.Aux > wire.OperatePolicyMaxCol {
 				return 0, 0, wire.ErrOperateSchema
 			}
-			r, err := e.resolve(o.Path, false, 0, 0)
+			r, err := e.resolve(o.Path, false, o.Opcode, 0, 0)
 			if err != nil {
 				return 0, 0, err
 			}
@@ -331,7 +369,7 @@ func applyOps(e engine, ops []wire.OperateOp, stampMs int64) (uint8, uint16, err
 			if err != nil {
 				return 0, 0, err
 			}
-			r, err := e.resolve(o.Path, true, o.Type, n)
+			r, err := e.resolve(o.Path, true, o.Opcode, o.Type, n)
 			if err != nil {
 				return 0, 0, err
 			}
@@ -381,7 +419,11 @@ func evalRets(e engine, rets []wire.OperateRet) ([][]byte, error) {
 		if r.Mode != wire.OperateRetValue && r.Mode != wire.OperateRetCount {
 			return nil, wire.ErrOperateArgs
 		}
-		nd, err := e.resolve(r.Path, false, 0, 0)
+		// A return spec inspects but never writes, so it resolves like a
+		// control op: no type check on what it finds, and an absent dynamic
+		// target's zero type is irrelevant (evalRets substitutes UNSET / a
+		// zero count itself rather than reading it).
+		nd, err := e.resolve(r.Path, false, wire.OperateOpIF, 0, 0)
 		if err != nil {
 			return nil, err
 		}

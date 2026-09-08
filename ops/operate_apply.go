@@ -21,6 +21,32 @@ import (
 // for a fresh engine per call on a hot key.
 var schemaEnginePool = sync.Pool{New: func() any { return new(schemaEngine) }}
 
+// dynamicEnginePool does the same for dynamic-mode records (design doc §2.9),
+// whose engine carries a field index and an encode scratch buffer worth
+// keeping between calls for the same reason.
+var dynamicEnginePool = sync.Pool{New: func() any { return new(dynamicEngine) }}
+
+// modeEngine is the engine of one stored record plus the one thing
+// applyWithEngine needs that the engine interface does not carry: the
+// "did this record exist before the call" flag a record-path EXISTS/ABSENT
+// compares (design doc §2.4), which the returns see as true once the call
+// has stored something.
+type modeEngine interface {
+	engine
+	setExisted(v bool)
+}
+
+// setExisted implements modeEngine for the schema engine.
+func (e *schemaEngine) setExisted(v bool) { e.existed = v }
+
+// engines is the pair of pooled engines one call borrows: which of the two
+// runs is decided by the stored record's mode byte, and the other costs
+// nothing but a pool round trip.
+type engines struct {
+	se *schemaEngine
+	de *dynamicEngine
+}
+
 // applyRecordBytes applies one operate call to a stored record.
 //
 // cur is the record's stored bytes, or nil when the key is absent; it is never
@@ -37,15 +63,20 @@ func applyRecordBytes(cur []byte, a *wire.OperateArgs, stampMs int64) ([]byte, b
 	if len(a.Ops) > wire.OperateMaxOps || len(a.Rets) > wire.OperateMaxRet {
 		return nil, false, nil, wire.ErrOperateCap
 	}
-	se := schemaEnginePool.Get().(*schemaEngine) //nolint:errcheck,forcetypeassert // the pool's New returns exactly this
-	out, deleted, res, err := applyWithEngine(se, cur, a, stampMs)
-	se.clear()
-	schemaEnginePool.Put(se)
+	es := engines{
+		se: schemaEnginePool.Get().(*schemaEngine),   //nolint:errcheck,forcetypeassert // the pool's New returns exactly this
+		de: dynamicEnginePool.Get().(*dynamicEngine), //nolint:errcheck,forcetypeassert // the pool's New returns exactly this
+	}
+	out, deleted, res, err := applyWithEngine(es, cur, a, stampMs)
+	es.se.clear()
+	es.de.clear()
+	schemaEnginePool.Put(es.se)
+	dynamicEnginePool.Put(es.de)
 	return out, deleted, res, err
 }
 
-func applyWithEngine(se *schemaEngine, cur []byte, a *wire.OperateArgs, stampMs int64) ([]byte, bool, *wire.OperateResult, error) {
-	e, err := openRecord(se, cur, a)
+func applyWithEngine(es engines, cur []byte, a *wire.OperateArgs, stampMs int64) ([]byte, bool, *wire.OperateResult, error) {
+	e, err := openRecord(es, cur, a)
 	if err != nil {
 		return nil, false, nil, err
 	}
@@ -57,7 +88,7 @@ func applyWithEngine(se *schemaEngine, cur []byte, a *wire.OperateArgs, stampMs 
 	if status == wire.OperateStatusCheckFailed {
 		// The op list aborts with the record unchanged, and the returns are
 		// evaluated against that unchanged record.
-		vals, verr := retsBefore(se, cur, a.Rets)
+		vals, verr := retsBefore(es, cur, a.Rets)
 		if verr != nil {
 			return nil, false, nil, verr
 		}
@@ -84,7 +115,7 @@ func applyWithEngine(se *schemaEngine, cur []byte, a *wire.OperateArgs, stampMs 
 	// even when this call created it — ref.present is "existed before the
 	// call" only for the op list's own EXISTS/ABSENT (the oracle evaluates
 	// its success-path returns with existed = true for the same reason).
-	se.existed = true
+	e.setExisted(true)
 	vals, verr := evalRets(e, a.Rets)
 	if verr != nil {
 		return nil, false, nil, verr
@@ -95,9 +126,9 @@ func applyWithEngine(se *schemaEngine, cur []byte, a *wire.OperateArgs, stampMs 
 // openRecord resolves the call's `create` parameter against the stored record
 // (design doc §3.5) and returns an engine over a private, patchable copy of
 // the bytes to apply the ops to.
-func openRecord(se *schemaEngine, cur []byte, a *wire.OperateArgs) (engine, error) {
+func openRecord(es engines, cur []byte, a *wire.OperateArgs) (modeEngine, error) {
 	if cur == nil {
-		return createRecord(se, a)
+		return createRecord(es, a)
 	}
 	if len(cur) < 1 {
 		return nil, wire.ErrOperateRecord
@@ -129,7 +160,7 @@ func openRecord(se *schemaEngine, cur []byte, a *wire.OperateArgs) (engine, erro
 		return nil, wire.ErrOperateArgs
 	}
 
-	e, err := openMode(se, copyRecord(cur), true)
+	e, err := openMode(es, copyRecord(cur), true)
 	if err != nil {
 		return nil, err
 	}
@@ -138,7 +169,7 @@ func openRecord(se *schemaEngine, cur []byte, a *wire.OperateArgs) (engine, erro
 		// schema stays authoritative for the record; the call's blob only has
 		// to agree on the version, so a differently encoded blob of the same
 		// version is accepted and changes nothing.
-		if se.schema.Version != callSchema.Version {
+		if es.se.schema.Version != callSchema.Version {
 			return nil, wire.ErrOperateSchemaVersion
 		}
 	}
@@ -147,7 +178,7 @@ func openRecord(se *schemaEngine, cur []byte, a *wire.OperateArgs) (engine, erro
 
 // createRecord builds the record a call creates when the key is absent
 // (design doc §3.5).
-func createRecord(se *schemaEngine, a *wire.OperateArgs) (engine, error) {
+func createRecord(es engines, a *wire.OperateArgs) (modeEngine, error) {
 	switch a.Create {
 	case wire.OperateCreateNone:
 		return nil, errOperateAbsent
@@ -156,30 +187,39 @@ func createRecord(se *schemaEngine, a *wire.OperateArgs) (engine, error) {
 		if err != nil {
 			return nil, err
 		}
-		return openMode(se, buf, false)
+		return openMode(es, buf, false)
 	case wire.OperateCreateDynamic:
-		return openMode(se, []byte{wire.OperateModeDynamic, 0}, false)
+		// An empty dynamic record: the mode byte and a field count of zero
+		// (design doc §2.9). The slack is what a first field's splice grows
+		// into without reallocating.
+		buf := append(make([]byte, 0, 64), wire.OperateModeDynamic, 0)
+		return openMode(es, buf, false)
 	default:
 		return nil, wire.ErrOperateArgs
 	}
 }
 
-// openMode builds the engine for a record's stored mode byte. The dynamic
-// engine lands in a later task; until then a dynamic record is a mode this
-// build cannot apply to.
-func openMode(se *schemaEngine, buf []byte, existed bool) (engine, error) {
+// openMode builds the engine for a record's stored mode byte: the stored
+// bytes, not the call, decide which of the two engines runs (design doc
+// §2.9, "the mode byte on the record and the create byte on the call are the
+// whole contract").
+func openMode(es engines, buf []byte, existed bool) (modeEngine, error) {
 	if len(buf) < 1 {
 		return nil, wire.ErrOperateRecord
 	}
 	switch buf[0] {
 	case wire.OperateModeSchema:
-		if err := se.reset(buf, operateSchemas); err != nil {
+		if err := es.se.reset(buf, operateSchemas); err != nil {
 			return nil, err
 		}
-		se.existed = existed
-		return se, nil
+		es.se.existed = existed
+		return es.se, nil
 	case wire.OperateModeDynamic:
-		return nil, wire.ErrOperateMode
+		if err := es.de.reset(buf, operateSchemas); err != nil {
+			return nil, err
+		}
+		es.de.existed = existed
+		return es.de, nil
 	default:
 		return nil, wire.ErrOperateRecord
 	}
@@ -197,14 +237,17 @@ func copyRecord(cur []byte) []byte {
 // retsBefore evaluates the return specs against the pre-call record after a
 // failed CHECK. Against a record that did not exist before the call every
 // return is absent, without resolving anything (oracle ruling).
-func retsBefore(se *schemaEngine, cur []byte, rets []wire.OperateRet) ([][]byte, error) {
+func retsBefore(es engines, cur []byte, rets []wire.OperateRet) ([][]byte, error) {
 	if len(rets) == 0 {
 		return nil, nil
 	}
 	if cur == nil {
 		return absentRets(rets)
 	}
-	e, err := openMode(se, copyRecord(cur), true)
+	// Re-opening the pre-call bytes reuses the same pooled engines: the
+	// working copy they were pointing at is discarded whole by a failed
+	// CHECK, so nothing in it is still needed.
+	e, err := openMode(es, copyRecord(cur), true)
 	if err != nil {
 		return nil, err
 	}

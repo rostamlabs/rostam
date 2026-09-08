@@ -22,8 +22,10 @@ import (
 )
 
 // TestSchemaEngineSemantics runs the whole semantics suite against the byte
-// engine. Dynamic-mode sub-tests are skipped until the dynamic engine lands
-// (Task 10); every other rule in the suite must hold here.
+// engine with dynamic mode switched off: this is the schema-only lane, which
+// keeps the skipDynamic mechanism exercised and pins that every schema-mode
+// and mode-independent rule holds without the dynamic engine ever running.
+// TestDynamicEngineSemantics runs the same suite with both modes enabled.
 func TestSchemaEngineSemantics(t *testing.T) {
 	skipDynamic = true
 	t.Cleanup(func() { skipDynamic = false })
@@ -282,7 +284,7 @@ func TestNewSchemaEngineValidates(t *testing.T) {
 	if e.empty() {
 		t.Fatal("a fresh engine reports the record deleted")
 	}
-	r, err := e.resolve(colPath(3, keyU64(1), 0), false, opFromSchema, 0)
+	r, err := e.resolve(colPath(3, keyU64(1), 0), false, wire.OperateOpIF, opFromSchema, 0)
 	if err != nil || !r.present {
 		t.Fatalf("resolve: %v %+v", err, r)
 	}

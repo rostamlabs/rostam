@@ -2018,3 +2018,221 @@ func migratedSchema(a *wire.OperateArgs) *wire.Schema {
 	}
 	return s
 }
+
+// --- random dynamic-mode calls ---------------------------------------------
+//
+// The dynamic generators mirror the schema ones above: a small pool of names
+// so ops collide on the same fields, columns and rows often enough to
+// exercise the stored-type, eviction and freeze rules, plus a steady trickle
+// of deliberately invalid ops so the error paths are compared too.
+
+// dynNames is the name pool every dynamic path draws from.
+var dynNames = []string{"a", "bb", "c", "dd", "e", "ff"}
+
+// randomDynamicArgs builds one call against a dynamic record: 1-8 ops from
+// the whole vocabulary plus up to three return specs, or — occasionally — a
+// lone MIGRATE freeze into a names-carrying schema built from the same pool.
+func randomDynamicArgs(rng *rand.Rand) *wire.OperateArgs {
+	a := &wire.OperateArgs{Create: wire.OperateCreateDynamic}
+	if rng.Intn(16) == 0 {
+		a.Create = wire.OperateCreateNone
+	}
+	if rng.Intn(12) == 0 {
+		// A freeze travels alone: it rewrites the record into the schema mode
+		// the rest of the call would no longer be written against.
+		a.Create = wire.OperateCreateNone
+		o := wire.OperateOp{Opcode: wire.OperateOpMIGRATE, Type: wire.OperateTypeFromSchema,
+			Path: recPath(), A: wire.OperateMigrateFromDynamic, Bytes: randomFreezeSchema(rng).Encode()}
+		if rng.Intn(2) == 0 {
+			o.Aux = wire.OperateMigrateDropExtra
+		}
+		if rng.Intn(16) == 0 {
+			o.A = int64(rng.Intn(3)) // not a freeze at all: a dynamic record has no version to extend
+		}
+		a.Ops = []wire.OperateOp{o}
+		return a
+	}
+
+	nOps := 1 + rng.Intn(8)
+	for i := 0; i < nOps; i++ {
+		a.Ops = append(a.Ops, randomDynamicOp(rng))
+	}
+	for i := range a.Ops {
+		if a.Ops[i].Opcode != wire.OperateOpIF {
+			continue
+		}
+		if rng.Intn(16) == 0 {
+			a.Ops[i].B = int64(len(a.Ops)) // out of range on purpose
+			continue
+		}
+		a.Ops[i].B = int64(rng.Intn(len(a.Ops) - i))
+	}
+	for i := 0; i < rng.Intn(4); i++ {
+		mode := uint8(wire.OperateRetValue)
+		if rng.Intn(2) == 0 {
+			mode = wire.OperateRetCount
+		}
+		a.Rets = append(a.Rets, wire.OperateRet{Mode: mode, Path: randomDynamicPath(rng)})
+	}
+	return a
+}
+
+// randomDynamicOp draws one op. Unlike schema mode there is no declared type
+// to aim at — whatever the record already stores wins — so the op picks a
+// type first and an opcode that suits it, which is what makes the stored-type
+// and SET-retype rules (§2.9) fire rather than only the error paths.
+func randomDynamicOp(rng *rand.Rand) wire.OperateOp {
+	p := randomDynamicPath(rng)
+	typ := randomScalarTypes[rng.Intn(len(randomScalarTypes))]
+	o := wire.OperateOp{Type: typ, Path: p}
+	switch {
+	case p.Kind == wire.OperatePathRecord:
+		// DEL () is terminal and takes the whole record with it, so it is
+		// drawn rarely: an op list that deletes the record every other call
+		// never builds one deep enough to be interesting.
+		o.Opcode = wire.OperateOpIF
+		switch {
+		case rng.Intn(10) == 0:
+			o.Opcode = wire.OperateOpDEL
+		case rng.Intn(2) == 0:
+			o.Opcode = wire.OperateOpCHECK
+		}
+	case p.Kind == wire.OperatePathRow:
+		o.Opcode = nodeOpcodes[rng.Intn(len(nodeOpcodes))]
+	case p.Kind == wire.OperatePathField && rng.Intn(5) == 0:
+		// A table-shaped op against a field path: CONFIG and TRIM only ever
+		// address the field itself.
+		o.Opcode = tableOpcodes[rng.Intn(len(tableOpcodes))]
+		if rng.Intn(2) == 0 {
+			o.Opcode = wire.OperateOpCONFIG
+		}
+	case rng.Intn(8) == 0:
+		o.Opcode = randomOpcodes[rng.Intn(len(randomOpcodes))]
+	default:
+		pool := opcodePool(typ)
+		o.Opcode = pool[rng.Intn(len(pool))]
+	}
+
+	switch o.Opcode {
+	case wire.OperateOpIF, wire.OperateOpCHECK:
+		o.Aux = uint8(rng.Intn(int(wire.OperateCmpAbsent) + 2)) // one past the last comparator
+	case wire.OperateOpTRIM, wire.OperateOpCONFIG:
+		o.A = int64(rng.Intn(5))
+		if rng.Intn(16) == 0 {
+			o.A = -1
+		}
+		o.Aux = uint8(rng.Intn(int(wire.OperatePolicyMaxCol) + 2))
+		o.B = int64(rng.Intn(4))
+	case wire.OperateOpSTAMP:
+		o.Aux = uint8(rng.Intn(2))
+	}
+	o.A = randomOperandA(rng, o, typ)
+	o.Bytes = randomOperandBytes(rng, wire.OperateTypeBytes, 0)
+	if o.Opcode == wire.OperateOpTRIM || o.Opcode == wire.OperateOpCONFIG {
+		// For a table op the bytes operand is the eviction column's NAME.
+		o.Bytes = nil
+		if rng.Intn(3) != 0 {
+			o.Bytes = []byte(dynNames[rng.Intn(len(dynNames))])
+		}
+	}
+	if rng.Intn(8) == 0 {
+		o.Type = wire.OperateTypeFromSchema // "whatever is stored", which a missing target has none of
+	}
+	return o
+}
+
+// randomDynamicPath builds a dynamic path: usually a name-addressed field,
+// row or column, sometimes a position segment (which dynamic mode rejects
+// outright) or an empty key.
+func randomDynamicPath(rng *rand.Rand) wire.OperatePath {
+	if rng.Intn(12) == 0 {
+		return recPath()
+	}
+	if rng.Intn(20) == 0 {
+		return fieldPath(uint32(rng.Intn(3))) // a position segment
+	}
+	name := dynNames[rng.Intn(len(dynNames))]
+	switch rng.Intn(3) {
+	case 0:
+		return namePath(name)
+	case 1:
+		return nameRowPath(name, randomDynamicKey(rng))
+	default:
+		if rng.Intn(20) == 0 {
+			return colPath(0, randomDynamicKey(rng), 0) // a position column segment
+		}
+		return nameColPath(name, randomDynamicKey(rng), dynNames[rng.Intn(len(dynNames))])
+	}
+}
+
+// randomDynamicKey draws a row key of 1-8 bytes from a tiny alphabet so rows
+// collide often, biased towards the 8-byte width a freeze into a U64-keyed
+// table needs. An empty key (which no row may have) turns up occasionally.
+func randomDynamicKey(rng *rand.Rand) []byte {
+	if rng.Intn(24) == 0 {
+		return nil
+	}
+	n := 8
+	if rng.Intn(2) == 0 {
+		n = 1 + rng.Intn(8)
+	}
+	key := make([]byte, n)
+	key[0] = byte(rng.Intn(6))
+	for i := 1; i < n; i++ {
+		key[i] = byte(rng.Intn(3))
+	}
+	return key
+}
+
+// randomFreezeSchema builds the target of a dynamic-mode freeze: names from
+// the same pool the record's fields are drawn from (a freeze matches by
+// name), always valid, and always carrying its names.
+func randomFreezeSchema(rng *rand.Rand) *wire.Schema {
+	for {
+		s := &wire.Schema{Version: uint16(1 + rng.Intn(3)), StoreNames: true} //nolint:gosec // deterministic test input
+		perm := rng.Perm(len(dynNames))
+		nFields := 1 + rng.Intn(4)
+		tables := 0
+		for i := 0; i < nFields; i++ {
+			f := wire.FieldDef{Name: dynNames[perm[i]]}
+			if tables < 2 && rng.Intn(3) == 0 {
+				tables++
+				f.Type = wire.OperateTypeTable
+				f.Table = randomFreezeTableDef(rng)
+			} else {
+				f.Type = randomScalarTypes[rng.Intn(len(randomScalarTypes))]
+				if f.Type == wire.OperateTypeFixed {
+					f.N = uint8(1 + rng.Intn(4)) //nolint:gosec // bounded
+				}
+			}
+			s.Fields = append(s.Fields, f)
+		}
+		if s.Validate() == nil {
+			return s
+		}
+	}
+}
+
+func randomFreezeTableDef(rng *rand.Rand) *wire.TableDef {
+	td := &wire.TableDef{KeyType: wire.OperateTypeU64}
+	if rng.Intn(3) == 0 {
+		td.KeyType = randomKeyTypes[rng.Intn(len(randomKeyTypes))]
+		if td.KeyType == wire.OperateTypeFixed {
+			td.KeyN = uint8(1 + rng.Intn(3)) //nolint:gosec // bounded
+		}
+	}
+	perm := rng.Perm(len(dynNames))
+	for c := 0; c < 1+rng.Intn(3); c++ {
+		cd := wire.ColumnDef{Name: dynNames[perm[c]], Type: randomColTypes[rng.Intn(len(randomColTypes))]}
+		if cd.Type == wire.OperateTypeFixed {
+			cd.N = uint8(1 + rng.Intn(3)) //nolint:gosec // bounded
+		}
+		td.Cols = append(td.Cols, cd)
+	}
+	td.Cap = uint32(rng.Intn(4)) //nolint:gosec // bounded
+	td.Policy = uint8(rng.Intn(int(wire.OperatePolicyMaxCol) + 1))
+	if td.Policy == wire.OperatePolicyMinCol || td.Policy == wire.OperatePolicyMaxCol {
+		td.ByCol = uint16(rng.Intn(len(td.Cols))) //nolint:gosec // bounded by the column count
+	}
+	return td
+}

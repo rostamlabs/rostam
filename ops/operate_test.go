@@ -166,13 +166,9 @@ func handlerApply(rec *wire.Record, a *wire.OperateArgs, stampMs int64) (*wire.R
 // TestOperateHandlerSemantics runs the whole operate semantics suite twice:
 // once against applyRecordBytes directly (bytesApply, Task 8's adapter) and
 // once through the real handler (handlerApply, above) on a live TxContext.
-// Dynamic mode is not implemented until Task 10, so both runs skip its
-// sub-tests; every schema-mode and mode-independent rule must hold through
-// both adapters.
+// Both modes run in both lanes: every rule in the suite must hold through the
+// handler exactly as it does against the apply core.
 func TestOperateHandlerSemantics(t *testing.T) {
-	skipDynamic = true
-	t.Cleanup(func() { skipDynamic = false })
-
 	t.Run("bytes", func(t *testing.T) {
 		runSemantics(t, bytesApply)
 	})
@@ -263,12 +259,9 @@ func TestOperateTTLModes(t *testing.T) {
 }
 
 // TestOperateDeleteOnEmptyDynamic pins DEL of a dynamic record's last field
-// (design doc §2.5): the record itself disappears. Dynamic mode is not
-// implemented until Task 10 (openMode returns wire.ErrOperateMode for it), so
-// this is written against the intended behavior and skipped for now.
+// (design doc §2.5) through the real handler: the record itself disappears,
+// and the key is gone from the store rather than holding an empty record.
 func TestOperateDeleteOnEmptyDynamic(t *testing.T) {
-	t.Skip("dynamic engine: Task 10")
-
 	_, tx := newTestSetup(t)
 	key := []byte("dyn-key")
 	set := &wire.OperateArgs{Key: key, Create: wire.OperateCreateDynamic,
