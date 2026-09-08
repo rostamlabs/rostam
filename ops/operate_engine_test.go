@@ -659,6 +659,37 @@ func TestApplyOpsTableComparesByCount(t *testing.T) {
 	}
 }
 
+// A scalar op whose path resolves to the record, a table, or a row (not a
+// scalar) is rejected, even though resolve() itself succeeded.
+func TestApplyOpsScalarRejectsNonScalarTarget(t *testing.T) {
+	cases := []struct {
+		name string
+		path wire.OperatePath
+	}{
+		{"record", fakeRecordPath()},
+		{"table", fakeFieldPath("b")},
+		{"row", fakeRowPath("b", "k1")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeEngine()
+			f.tables[pathKey(fakeFieldPath("b"))] = 0
+			ops := []wire.OperateOp{
+				{Opcode: wire.OperateOpSET, Type: wire.OperateTypeU32, Path: tc.path, A: 1},
+			}
+			_, _, err := applyOps(f, ops, 0)
+			if !errors.Is(err, wire.ErrOperatePath) {
+				t.Fatalf("%s: err=%v, want wire.ErrOperatePath", tc.name, err)
+			}
+			for _, call := range f.calls {
+				if call == "get" || call == "set" {
+					t.Fatalf("%s: get/set must not run against a non-scalar ref: %v", tc.name, f.calls)
+				}
+			}
+		})
+	}
+}
+
 // fixedN: SET creating a FIXED dynamic target passes n=len(o.Bytes); an
 // out-of-range FIXED length is rejected before resolve is called.
 func TestFixedN(t *testing.T) {

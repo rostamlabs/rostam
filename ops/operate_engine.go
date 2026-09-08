@@ -315,6 +315,13 @@ func applyOps(e engine, ops []wire.OperateOp, stampMs int64) (uint8, uint16, err
 			if err != nil {
 				return 0, 0, err
 			}
+			// resolve reports what it found, not whether it fits a scalar
+			// op: a path can resolve straight to the record, a table, or a
+			// row (e.g. a stray Col-shaped op against a plain field). Only
+			// refKindScalar is a valid scalar-op target (oracle ruling).
+			if r.kind != refKindScalar {
+				return 0, 0, wire.ErrOperatePath
+			}
 			cur, err := e.get(r)
 			if err != nil {
 				return 0, 0, err
