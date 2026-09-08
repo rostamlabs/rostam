@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -420,4 +421,87 @@ func TestStatsSparseVectors(t *testing.T) {
 	if got := h.Stats().SparseVectors; got != 3 {
 		t.Errorf("Stats.SparseVectors = %d, want 3", got)
 	}
+}
+
+// TestValueCodecRecordRoundtrip covers the [len:u32][bytes] ValueRecord case
+// added to writeValue/readValue — the single codec shared by snapshot, WAL,
+// and persist, so this one round-trip test exercises all three durability
+// paths.
+func TestValueCodecRecordRoundtrip(t *testing.T) {
+	t.Run("roundtrip", func(t *testing.T) {
+		want := Value{Kind: ValueRecord, Rec: []byte{0xDE, 0xAD, 0xBE, 0xEF}}
+		var buf bytes.Buffer
+		if err := writeValue(&buf, want); err != nil {
+			t.Fatalf("writeValue: %v", err)
+		}
+		got, err := readValue(bytes.NewReader(buf.Bytes()))
+		if err != nil {
+			t.Fatalf("readValue: %v", err)
+		}
+		if got.Kind != ValueRecord {
+			t.Fatalf("Kind = %v, want ValueRecord", got.Kind)
+		}
+		if !bytes.Equal(got.Rec, want.Rec) {
+			t.Fatalf("Rec = %v, want %v", got.Rec, want.Rec)
+		}
+	})
+
+	t.Run("empty record roundtrip", func(t *testing.T) {
+		want := Value{Kind: ValueRecord, Rec: []byte{}}
+		var buf bytes.Buffer
+		if err := writeValue(&buf, want); err != nil {
+			t.Fatalf("writeValue: %v", err)
+		}
+		got, err := readValue(bytes.NewReader(buf.Bytes()))
+		if err != nil {
+			t.Fatalf("readValue: %v", err)
+		}
+		if len(got.Rec) != 0 {
+			t.Fatalf("Rec = %v, want empty", got.Rec)
+		}
+	})
+
+	t.Run("truncated frame errors", func(t *testing.T) {
+		want := Value{Kind: ValueRecord, Rec: []byte{1, 2, 3, 4, 5}}
+		var buf bytes.Buffer
+		if err := writeValue(&buf, want); err != nil {
+			t.Fatalf("writeValue: %v", err)
+		}
+		// Chop off the last two payload bytes: the length prefix still claims 5
+		// bytes, but only 3 are actually present.
+		truncated := buf.Bytes()[:buf.Len()-2]
+		if _, err := readValue(bytes.NewReader(truncated)); err == nil {
+			t.Fatal("readValue on truncated frame: got nil error, want one")
+		}
+	})
+
+	t.Run("oversized length errors without allocating", func(t *testing.T) {
+		// kind byte + a length prefix claiming ~4 GiB, with NO payload bytes
+		// behind it. bytes.Reader implements Len(), so boundedRecordBytes must
+		// reject this from the length prefix alone rather than attempting
+		// make([]byte, 0xFFFFFFF0) — which would otherwise blow the test's
+		// memory budget or the process's.
+		var frame bytes.Buffer
+		frame.WriteByte(byte(ValueRecord))
+		if err := writeU32(&frame, 0xFFFFFFF0); err != nil {
+			t.Fatalf("writeU32: %v", err)
+		}
+		frameBytes := frame.Bytes()
+
+		// testing.AllocsPerRun counts allocation EVENTS, not bytes — a single
+		// make([]byte, 4<<30) would show up as "1 alloc", not as a red flag. Measure
+		// heap bytes via runtime.MemStats instead, so a multi-GiB buffer can't hide.
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		if _, err := readValue(bytes.NewReader(frameBytes)); err == nil {
+			t.Fatal("readValue on oversized length: got nil error, want one")
+		}
+		runtime.ReadMemStats(&after)
+
+		const budget = 1 << 20 // 1 MiB — generous headroom over the few bytes this path should touch, nowhere near the ~4 GiB it would need to actually allocate the claimed length
+		if got := after.TotalAlloc - before.TotalAlloc; got > budget {
+			t.Fatalf("readValue allocated %d bytes for an oversized length, want < %d (no ~4 GiB buffer)", got, budget)
+		}
+	})
 }

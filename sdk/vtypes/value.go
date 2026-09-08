@@ -3,6 +3,7 @@
 package vtypes
 
 import (
+	"bytes"
 	"fmt"
 )
 
@@ -24,6 +25,11 @@ const (
 	// APPEND-ONLY: it must stay 8 so existing snapshots/WAL records (which encode
 	// the kind as a raw u8) keep decoding correctly. Never renumber the kinds.
 	ValueGeo
+	// ValueRecord carries an opaque record-encoded byte blob (see sdk/record) in
+	// the Rec field. APPEND-ONLY: it must stay 9 (ValueGeo+1) for the same reason
+	// ValueGeo must stay 8 — the kind is a raw u8 on disk and on the wire. Never
+	// renumber the kinds.
+	ValueRecord
 )
 
 // Value is a tagged union holding one metadata attribute. Only the field
@@ -47,6 +53,11 @@ type Value struct {
 	// — i.e. omitempty here means "field absent", never "coordinate absent".
 	Lat float64 `json:"lat,omitempty"`
 	Lon float64 `json:"lon,omitempty"`
+	// Rec holds an opaque record-encoded byte blob when Kind == ValueRecord.
+	// Raw bytes marshal to base64 automatically via encoding/json's []byte
+	// handling. omitempty is safe here (unlike Lat/Lon): an empty/nil record is
+	// not a distinct meaningful value the way (0,0) is a real geo point.
+	Rec []byte `json:"rec,omitempty"`
 }
 
 // IsZero reports whether the Value is the zero value (Kind == ValueNone).
@@ -78,6 +89,10 @@ func (v Value) Equal(o Value) bool {
 		// below, so any two geo points would compare equal — silently making
 		// FilterEq always match and FilterNe never match on a geo field.
 		return v.Lat == o.Lat && v.Lon == o.Lon
+	case ValueRecord:
+		// CRITICAL: same bug class as ValueGeo above — without this case every
+		// pair of records would compare equal via the default `return true`.
+		return bytes.Equal(v.Rec, o.Rec)
 	}
 	return true
 }
@@ -110,6 +125,10 @@ func NewFloats(f []float64) Value { return Value{Kind: ValueFloats, Flts: f} }
 
 // NewGeo returns a Value carrying a WGS84 geographic point (lat/lon in degrees).
 func NewGeo(lat, lon float64) Value { return Value{Kind: ValueGeo, Lat: lat, Lon: lon} }
+
+// NewRecord returns a Value carrying an opaque record-encoded byte blob. rec
+// is stored by reference; callers must not mutate it after handing it off.
+func NewRecord(rec []byte) Value { return Value{Kind: ValueRecord, Rec: rec} }
 
 func stringSliceEqual(a, b []string) bool {
 	if len(a) != len(b) {
@@ -157,6 +176,7 @@ var valueKindNames = map[ValueKind]string{
 	ValueInts:    "ints",
 	ValueFloats:  "floats",
 	ValueGeo:     "geo",
+	ValueRecord:  "record",
 }
 
 var valueKindByName = func() map[string]ValueKind {

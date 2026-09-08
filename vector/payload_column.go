@@ -132,6 +132,9 @@ func numericKeyValue(k scalarKey) (float64, bool) {
 	case ValueFloat:
 		return k.f, true
 	default:
+		// ValueRecord considered: k.kind can never be ValueRecord — scalarKeyOf
+		// declines records before a scalarKey is ever minted, so this correctly
+		// declines by construction, not just by accident.
 		return 0, false
 	}
 }

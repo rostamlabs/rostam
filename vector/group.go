@@ -276,6 +276,8 @@ func groupKeyString(v Value) (string, bool) {
 	}
 	// ValueGeo (and list/none kinds) cannot serve as a group-by key: a lat/lon
 	// point is a 2-D value with no meaningful single-string bucket identity, so
-	// it declines here (ok=false) and the row is simply not grouped.
+	// it declines here (ok=false) and the row is simply not grouped. ValueRecord
+	// declines for the same reason: a record is a byte blob, not a single scalar
+	// bucket identity.
 	return "", false
 }

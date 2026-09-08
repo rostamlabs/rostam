@@ -146,6 +146,8 @@ func stringValue(v Value) (string, bool) {
 	if v.Kind == ValueString {
 		return v.Str, true
 	}
+	// ValueRecord considered: falls to the ("", false) below, correctly
+	// declining — a record is not a scalar string ordering key.
 	return "", false
 }
 

@@ -605,6 +605,12 @@ func compileIsEmpty(field string) (Predicate, error) {
 			// absence). Made explicit instead of relying on the default below so a
 			// future kind can't silently inherit the wrong answer here.
 			return false
+		case ValueRecord:
+			// A record's own emptiness is its byte length, mirroring the
+			// ValueString case above — an explicit case rather than falling to
+			// the default (which would wrongly answer "never empty" the way a
+			// geo point never is).
+			return len(got.Rec) == 0
 		default:
 			return false
 		}
@@ -615,6 +621,10 @@ func compileIsEmpty(field string) (Predicate, error) {
 // its kind is ValueNone (an explicit null). An absent field is NOT null —
 // that's the is_empty/is_null distinction. It returns an error for signature
 // uniformity with the other leaf compilers; it never fails.
+//
+// ValueRecord considered: this checks presence + ValueNone only (no per-kind
+// switch), so a present record already answers correctly — not null — with no
+// change needed here.
 func compileIsNull(field string) (Predicate, error) {
 	return func(m Metadata) bool {
 		got, ok := lookupPath(m, field)

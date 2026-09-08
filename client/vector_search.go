@@ -246,6 +246,11 @@ func rawGroupKeyToString(raw json.RawMessage) (string, error) {
 	case vtypes.ValueBool:
 		return strconv.FormatBool(v.Bool), nil
 	default:
+		// ValueRecord considered: falls here too — vector/group.go's groupKeyString
+		// already declines records upstream (a byte blob has no single-string
+		// bucket identity), so a record can never actually arrive as a group key
+		// wire value. The raw-JSON fallback is kept generic rather than special-
+		// cased so it degrades safely for any future kind, record included.
 		return string(raw), nil
 	}
 }

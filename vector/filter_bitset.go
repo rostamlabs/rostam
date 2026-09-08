@@ -478,6 +478,8 @@ func filterIndexExact(f Filter) bool {
 		case ValueStrings, ValueInts, ValueFloats:
 			return true
 		default:
+			// ValueRecord considered: falls here, correctly declining — a record
+			// is not an array, so FilterIn's index-exactness claim doesn't apply.
 			return false
 		}
 	case FilterGt, FilterGte, FilterLt, FilterLte:

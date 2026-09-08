@@ -300,6 +300,12 @@ func metadataToJSON(m rostam.VectorMetadata) map[string]any {
 			out[key] = v.Flts
 		case vector.ValueGeo:
 			out[key] = map[string]float64{"lat": v.Lat, "lon": v.Lon}
+		case vector.ValueRecord:
+			// Pass-through, not a new MCP feature: v.Rec is raw bytes, which
+			// encoding/json already renders as base64 for any []byte value — the
+			// same representation vtypes.Value's own JSON tag produces. Without
+			// this case the key would silently vanish from tool output instead.
+			out[key] = v.Rec
 		}
 	}
 	return out

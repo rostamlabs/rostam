@@ -66,6 +66,7 @@ const (
 	ValueInts    = vtypes.ValueInts
 	ValueFloats  = vtypes.ValueFloats
 	ValueGeo     = vtypes.ValueGeo
+	ValueRecord  = vtypes.ValueRecord
 
 	Cosine     = vtypes.Cosine
 	L2         = vtypes.L2
@@ -162,6 +163,7 @@ var (
 	NewInts    = vtypes.NewInts
 	NewFloats  = vtypes.NewFloats
 	NewGeo     = vtypes.NewGeo
+	NewRecord  = vtypes.NewRecord
 
 	// DefaultConfig is re-exported as a function value so every DefaultConfig()
 	// call site is unchanged.

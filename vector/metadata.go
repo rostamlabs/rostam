@@ -39,6 +39,8 @@ func numericValue(v Value) (float64, bool) {
 	case ValueFloat:
 		return v.Flt, true
 	default:
+		// ValueRecord considered: falls here, correctly declining — a record is
+		// not a scalar number.
 		return 0, false
 	}
 }

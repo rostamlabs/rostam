@@ -997,6 +997,7 @@ func readString(r io.Reader) (string, error) {
 //	ints:    [count:u32] then each [i64]
 //	floats:  [count:u32] then each [f64]
 //	geo:     [lat:f64][lon:f64]
+//	record:  [len:u32][bytes]
 func writeValue(w io.Writer, v Value) error {
 	if _, err := w.Write([]byte{byte(v.Kind)}); err != nil {
 		return err
@@ -1053,11 +1054,41 @@ func writeValue(w io.Writer, v Value) error {
 			return err
 		}
 		return writeF64(w, v.Lon)
+	case ValueRecord:
+		// [len:u32][bytes], mirroring ValueString above. This one function pair
+		// serves WAL, snapshot, and persist, so this case makes a record-bearing
+		// collection durable on every path.
+		if err := writeU32(w, uint32(len(v.Rec))); err != nil {
+			return err
+		}
+		_, err := w.Write(v.Rec)
+		return err
 	case ValueNone:
 		return nil
 	default:
 		return fmt.Errorf("%w: unknown value kind %d", ErrSnapshotFormat, v.Kind)
 	}
+}
+
+// sizedReader is implemented by readers that can report how many bytes remain
+// unread (e.g. *bytes.Reader). readValue's ValueRecord case uses it to reject
+// an oversized length prefix BEFORE allocating — a hostile or corrupt frame
+// otherwise drives an attacker/corruption-controlled make([]byte, n) up to
+// 4 GiB before io.ReadFull ever gets a chance to fail on the short read. Only
+// readers that expose this — untrusted callers should pass one — get the
+// protection; a plain io.Reader (e.g. bufio.Reader) falls back to the same
+// allocate-then-fail behavior every other case here already has.
+type sizedReader interface{ Len() int }
+
+func boundedRecordBytes(r io.Reader, n uint32) ([]byte, error) {
+	if sr, ok := r.(sizedReader); ok && uint64(n) > uint64(sr.Len()) {
+		return nil, fmt.Errorf("%w: record length %d exceeds %d remaining bytes", ErrSnapshotFormat, n, sr.Len())
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
 }
 
 func readValue(r io.Reader) (Value, error) {
@@ -1142,6 +1173,16 @@ func readValue(r io.Reader) (Value, error) {
 		}
 		v.Lat = lat
 		v.Lon = lon
+	case ValueRecord:
+		n, err := readU32(r)
+		if err != nil {
+			return Value{}, err
+		}
+		buf, err := boundedRecordBytes(r, n)
+		if err != nil {
+			return Value{}, err
+		}
+		v.Rec = buf
 	case ValueNone:
 		// no payload
 	default:

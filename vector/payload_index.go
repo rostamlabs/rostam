@@ -52,6 +52,12 @@ func scalarKeyOf(v Value) (scalarKey, bool) {
 		return scalarKey{kind: ValueFloat, f: v.Flt}, true
 	case ValueBool:
 		return scalarKey{kind: ValueBool, b: v.Bool}, true
+	case ValueRecord:
+		// A record is a byte blob, not a scalar: it has no equality/ordering key
+		// here (its top-level fields get their own synthetic scalar entries via
+		// the record resolver, not this index). Made explicit rather than left to
+		// the default below, matching this file's own NaN-decline discipline.
+		return scalarKey{}, false
 	default:
 		return scalarKey{}, false
 	}
@@ -190,7 +196,7 @@ func (p *payloadIndex) addPost(field string, kind ValueKind, delta int) {
 		c.num += delta
 	case ValueString:
 		c.str += delta
-	default:
+	default: // ValueRecord (and bool) considered: never reaches here — scalarKeyOf declines records, so no scalarKey carries kind == ValueRecord.
 		return // bool: counted by neither, see fieldPosts
 	}
 	if c.num == 0 && c.str == 0 {
@@ -290,6 +296,8 @@ func (p *payloadIndex) ensureSorted(field string) *sortedKeys {
 	sc.num = sc.num[:0]
 	sc.str = sc.str[:0]
 	for key := range p.fields[field] {
+		// ValueRecord considered: key.kind can never be ValueRecord — scalarKeyOf
+		// declines records before a scalarKey is ever minted, so no case is needed.
 		switch key.kind {
 		case ValueInt:
 			sc.num = append(sc.num, numEntry{float64(key.i), key})
@@ -381,7 +389,8 @@ func (p *payloadIndex) reindex(slot uint32, meta Metadata) {
 		// the FilterMatch predicate) and each DISTINCT token posts the slot once
 		// (per-document). The eq index below still indexes a ValueString as one
 		// whole-string key; the two are independent. ValueStrings only lives here
-		// (scalarKeyOf declines slices).
+		// (scalarKeyOf declines slices). ValueRecord considered: no case, so it
+		// correctly declines tokenization like every other non-string kind.
 		switch v.Kind {
 		case ValueString:
 			slotTokens = p.addTokens(field, tokenize(v.Str), slot, slotTokens)
@@ -1746,6 +1755,8 @@ func (p *payloadIndex) inSet(field string, want Value, limit int) (map[uint32]st
 		}
 		return out, true
 	default:
+		// ValueRecord considered: falls here, correctly declining — a record is
+		// not an array, so it can never be a FilterIn value.
 		return nil, false
 	}
 }
