@@ -2,31 +2,71 @@
 
 package vector
 
+import "github.com/rostamlabs/rostam/sdk/record"
+
 // The Value tagged union, its ValueKind enumeration, the Metadata map, the
 // Value constructors, and the ValueKind text (un)marshaling now live in the
 // engine-free vtypes leaf package and are re-exported via vtypes_aliases.go.
 // The two helpers below stay here because they are used only by the filter
 // compiler in this package, not by the wire codec or client.
 
-// lookupPath resolves a (possibly dotted) field name against metadata. It
-// always tries the EXACT key first, so a flattened dotted key (e.g. the flat
-// entry {"address.city": ...}) matches and non-dotted keys behave exactly as a
-// raw map lookup — fully backward-compatible. The dotted-path traversal of
-// nested ValueObject maps is a documented follow-up: today Metadata is flat
-// (no ValueObject kind), so the practical effect is exact-key lookup. Keeping
-// the indirection here lets the future nested traversal slot in without
-// touching every leaf op.
+// recordResolver is the package-level record.Resolver shared by every filter
+// evaluation and (from Task 6) indexing pass. 1024 rather than a smaller
+// number: on clear-when-full the cache falls back to a full schema decode,
+// and a single collection can carry many schema versions over its lifetime
+// (every operate schema change adds one), so a small bound would thrash.
+// Resolver is safe for concurrent use (its own doc comment), so one instance
+// is shared across every query goroutine.
+var recordResolver = record.NewResolver(1024)
+
+// lookupPath resolves a (possibly dotted, possibly record-path) field name
+// against metadata. It always tries the EXACT key first, so a flattened
+// dotted key (e.g. the flat entry {"address.city": ...}) matches and
+// non-dotted keys behave exactly as a raw map lookup — fully
+// backward-compatible. A payload key literally named "a/b" therefore always
+// wins over treating "a/b" as "payload key a, record path b".
+//
+// Only when there is no exact match does it try record.SplitField: if field
+// splits into payloadKey/path and m[payloadKey] holds a ValueRecord, the path
+// is parsed and resolved against that record's bytes via the shared
+// recordResolver, and a Scalar/Count result is converted to a Value.
+//
+// Every other outcome — no '/' in field, no exact match and payloadKey holds
+// something other than a ValueRecord, a path that fails to parse, or a
+// Resolve that returns ErrPath/ErrRecord or a Table/RowPresent/Absent result
+// (none of which is a scalar a filter can compare) — reports (Value{},
+// false). This is deliberate even for a malformed path: the filter is
+// compiled ONCE for the whole predicate tree, but the record named by
+// payloadKey varies per point, so a path that is well-formed syntax but
+// cannot apply to THIS point's record must degrade to "field absent" rather
+// than fail the whole search. compileRowPresence is the one place a record
+// path is inspected for something other than a scalar value (row presence).
 func lookupPath(m Metadata, field string) (Value, bool) {
 	if m == nil {
 		return Value{}, false
 	}
-	// Exact key wins (covers flattened dotted keys and all plain keys).
+	// Exact key wins (covers flattened dotted keys, record-path-shaped keys,
+	// and all plain keys).
 	if v, ok := m[field]; ok {
 		return v, true
 	}
-	// Future: when ValueObject exists, split on '.' and traverse nested maps
-	// here. No such kind today, so a non-exact dotted key simply misses.
-	return Value{}, false
+	payloadKey, path, ok := record.SplitField(field)
+	if !ok {
+		return Value{}, false
+	}
+	rv, ok := m[payloadKey]
+	if !ok || rv.Kind != ValueRecord {
+		return Value{}, false
+	}
+	p, err := record.ParsePath(path)
+	if err != nil {
+		return Value{}, false
+	}
+	res, err := recordResolver.Resolve(rv.Rec, p)
+	if err != nil {
+		return Value{}, false
+	}
+	return record.ResultValue(res)
 }
 
 // numericValue extracts a float64 from a scalar numeric Value (int or float).

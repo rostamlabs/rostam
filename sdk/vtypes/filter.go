@@ -42,6 +42,15 @@ const (
 	FilterGeoRadius  // geo field within RadiusM meters (haversine) of center
 	FilterGeoBox     // geo field inside an SW->NE bounding box (inclusive)
 	FilterGeoPolygon // geo field inside a polygon exterior ring (ray-casting)
+
+	// Record row-presence operators. Appended after FilterGeoPolygon so
+	// existing wire-encoded op numbers are never renumbered. Both address a
+	// path ending in a table row segment (see sdk/record); they take no
+	// Value. FilterRowExists is true iff the row is present; FilterRowAbsent
+	// is its asymmetric negation (see vector/filter.go's compileRowPresence
+	// doc comment for the asymmetry: it is NOT simply "not exists").
+	FilterRowExists
+	FilterRowAbsent
 )
 
 var filterOpNames = map[FilterOp]string{
@@ -67,6 +76,8 @@ var filterOpNames = map[FilterOp]string{
 	FilterGeoRadius:  "geo_radius",
 	FilterGeoBox:     "geo_bounding_box",
 	FilterGeoPolygon: "geo_polygon",
+	FilterRowExists:  "row_exists",
+	FilterRowAbsent:  "row_absent",
 }
 
 var filterOpByName = func() map[string]FilterOp {

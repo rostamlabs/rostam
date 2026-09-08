@@ -109,6 +109,8 @@ const (
 	FilterGeoRadius  = vtypes.FilterGeoRadius
 	FilterGeoBox     = vtypes.FilterGeoBox
 	FilterGeoPolygon = vtypes.FilterGeoPolygon
+	FilterRowExists  = vtypes.FilterRowExists
+	FilterRowAbsent  = vtypes.FilterRowAbsent
 
 	// Query leaf kinds.
 	LeafDense     = vtypes.LeafDense

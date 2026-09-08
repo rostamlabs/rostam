@@ -10,6 +10,8 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/rostamlabs/rostam/sdk/record"
 )
 
 // Predicate is a compiled filter: given a vector's metadata (nil if the
@@ -68,7 +70,8 @@ func compileNode(f Filter) (Predicate, error) {
 	case FilterEq, FilterNe, FilterGt, FilterGte, FilterLt, FilterLte, FilterIn, FilterContains,
 		FilterMatch, FilterRegex, FilterIsEmpty, FilterIsNull,
 		FilterDtGt, FilterDtGte, FilterDtLt, FilterDtLte,
-		FilterGeoRadius, FilterGeoBox, FilterGeoPolygon:
+		FilterGeoRadius, FilterGeoBox, FilterGeoPolygon,
+		FilterRowExists, FilterRowAbsent:
 		return compileLeaf(f)
 	default:
 		return nil, fmt.Errorf("vector: unknown filter op %d", f.Op)
@@ -124,6 +127,8 @@ func compileLeaf(f Filter) (Predicate, error) {
 		return compileDatetime(field, f.Op, want)
 	case FilterGeoRadius, FilterGeoBox, FilterGeoPolygon:
 		return compileGeo(field, f.Op, f.Geo)
+	case FilterRowExists, FilterRowAbsent:
+		return compileRowPresence(f)
 	default:
 		return nil, fmt.Errorf("vector: compileLeaf called with non-leaf op %d", f.Op)
 	}
@@ -786,6 +791,65 @@ func validateLatLon(lat, lon float64) error {
 		return fmt.Errorf("longitude %v out of range [-180,180]", lon)
 	}
 	return nil
+}
+
+// compileRowPresence builds the FilterRowExists / FilterRowAbsent predicate.
+// f.Field must have the "payloadKey/path" shape (record.SplitField) with a
+// path naming exactly a table row (a field segment then a row segment, e.g.
+// "b/42") — that shape is validated ONCE here, at compile time, because it
+// depends only on the filter's field STRING, never on any point's data; the
+// parsed record.Path is cached in the closure so per-point work is Resolve
+// only, per the Task 5 parsing-cost ruling (contrast with lookupPath, which
+// re-parses per call because it is shared by every scalar leaf op and has no
+// dedicated per-op compile step).
+//
+// At each point, row_exists is true iff Resolve reports Kind == RowPresent.
+// Every "cannot apply" outcome — a missing payload key, a payload key that
+// is not a ValueRecord, or a Resolve error (e.g. the record's schema puts a
+// scalar where this filter expects a table) — already falls out of the
+// Kind != RowPresent check, so row_exists needs no separate branch for it.
+//
+// row_absent is DELIBERATELY NOT simply "not row_exists": it reports true
+// only when Resolve AFFIRMATIVELY finds the row missing from a REAL table on
+// this point (Kind == Absent) — never for a point that cannot even be asked
+// the question. Concretely, row_absent answers false (not true) when the
+// payload key is missing, holds something other than a ValueRecord, or
+// Resolve errors (e.g. this point's schema has a scalar, not a table, at
+// that field). The rationale: "the row is absent" presupposes there was a
+// table to search; a point with no such record, or no such table, is not in
+// a position to assert anything about a row inside one. This is the one
+// asymmetry in an otherwise-mirrored pair of ops, and it is why row_absent
+// cannot be compiled as `!rowExists(m)`.
+func compileRowPresence(f Filter) (Predicate, error) {
+	payloadKey, pathStr, ok := record.SplitField(f.Field)
+	if !ok {
+		return nil, fmt.Errorf("vector: filter op %q requires a payloadKey/path field, got %q", mustOpName(f.Op), f.Field)
+	}
+	p, err := record.ParsePath(pathStr)
+	if err != nil {
+		return nil, fmt.Errorf("vector: filter op %q has an invalid record path %q: %w", mustOpName(f.Op), pathStr, err)
+	}
+	if len(p.Segs) != 2 || p.Segs[1].Kind != record.SegRow {
+		return nil, fmt.Errorf("vector: filter op %q requires a path naming exactly a table row (field/row), got %q", mustOpName(f.Op), pathStr)
+	}
+	exists := f.Op == FilterRowExists
+	return func(m Metadata) bool {
+		if m == nil {
+			return false
+		}
+		rv, ok := m[payloadKey]
+		if !ok || rv.Kind != ValueRecord {
+			return false
+		}
+		res, rerr := recordResolver.Resolve(rv.Rec, p)
+		if rerr != nil {
+			return false
+		}
+		if exists {
+			return res.Kind == record.RowPresent
+		}
+		return res.Kind == record.Absent
+	}, nil
 }
 
 func mustOpName(op FilterOp) string {
