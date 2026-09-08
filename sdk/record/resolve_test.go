@@ -139,6 +139,15 @@ func resultsEqual(a, b Result) bool {
 	return a.Cell.F == b.Cell.F
 }
 
+// isZeroResult reports whether res is the zero Result — the only thing an
+// error return may carry. Checking Kind alone would not catch it: Absent is
+// itself the zero Kind, so a stray Count or Cell would slip through.
+func isZeroResult(res Result) bool {
+	return res.Kind == Absent && res.Count == 0 &&
+		res.Cell.Type == 0 && res.Cell.N == 0 && res.Cell.U == 0 &&
+		res.Cell.F == 0 && res.Cell.B == nil
+}
+
 // errClass reduces an error to the class the oracle comparison cares about.
 func errClass(err error) string {
 	switch {
@@ -347,7 +356,7 @@ func TestResolveMatchesOracle(t *testing.T) {
 	}
 	rng := rand.New(rand.NewSource(20260908))
 	r := NewResolver(64)
-	checked := 0
+	checked, specials := 0, 0
 	seen := map[string]int{}
 	for i := 0; i < records; i++ {
 		var enc []byte
@@ -380,12 +389,22 @@ func TestResolveMatchesOracle(t *testing.T) {
 				t.Fatalf("record %d path %q: got %+v, oracle %+v", i, s, got, want)
 			}
 			seen[outcomeName(got, gerr, dec.Mode)]++
+			if gerr == nil && got.Kind == Scalar &&
+				(math.IsNaN(got.Cell.F) || math.IsInf(got.Cell.F, 0)) {
+				specials++
+			}
 		}
 	}
 	if checked < records {
 		t.Fatalf("only %d path resolutions checked over %d records", checked, records)
 	}
-	t.Logf("%d resolutions checked: %v", checked, seen)
+	t.Logf("%d resolutions checked (%d NaN/Inf scalars): %v", checked, specials, seen)
+	// NaN and the infinities are the float values the resolver treats
+	// specially (readCellAt rejects every NaN spelling but the canonical
+	// one), so at least some must actually reach the oracle comparison.
+	if specials == 0 {
+		t.Fatalf("no NaN or Inf float cell was ever resolved; the generator stopped drawing them")
+	}
 	// A property test that only ever produced "absent" would pass while
 	// proving nothing, so require every outcome, in both modes, to show up.
 	floor := checked / 200
@@ -455,7 +474,7 @@ func TestResolveHostileNeverPanics(t *testing.T) {
 			if err != nil && errClass(err) == "other" {
 				t.Fatalf("%s: error outside ErrPath/ErrRecord: %v", name, err)
 			}
-			if err != nil && res.Kind != Absent {
+			if err != nil && !isZeroResult(res) {
 				t.Fatalf("%s: error %v returned a non-zero result %+v", name, err, res)
 			}
 		}
@@ -653,6 +672,78 @@ func TestResolveWithoutCache(t *testing.T) {
 		}
 		if !resultsEqual(a, b) {
 			t.Fatalf("%q: uncached %+v, cached %+v", s, a, b)
+		}
+	}
+}
+
+// TestResolveWideFixedKey pins the case a uint64 cannot hold: a FIXED row
+// key wider than 8 bytes, where a decimal segment denotes the number's
+// little-endian bytes zero-filled out to the key width. The randomised
+// oracle test draws these too; this one names the arithmetic so a
+// regression in it reads as itself.
+func TestResolveWideFixedKey(t *testing.T) {
+	const kw = 12
+	wide := func(v uint64) []byte {
+		b := make([]byte, kw)
+		binary.LittleEndian.PutUint64(b[:8], v)
+		return b
+	}
+	s := &wire.Schema{Version: 1, StoreNames: true, Fields: []wire.FieldDef{
+		{Name: "b", Type: wire.OperateTypeTable, Table: &wire.TableDef{
+			KeyType: wire.OperateTypeFixed,
+			KeyN:    kw,
+			Cols:    []wire.ColumnDef{{Name: "hi", Type: wire.OperateTypeU32}},
+		}},
+	}}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("schema invalid: %v", err)
+	}
+	// "zzzz…" sorts after every little-endian small number, so the rows are
+	// already in the bytewise order a FIXED key is stored in.
+	textKey := bytes.Repeat([]byte("z"), kw)
+	rec := &wire.Record{Mode: wire.OperateModeSchema, Schema: s, Fields: []wire.Field{
+		{Cell: wire.Cell{Type: wire.OperateTypeTable}, Table: &wire.Table{Rows: []wire.Row{
+			{Key: wide(42), Cols: []wire.Col{{Cell: wire.Cell{Type: wire.OperateTypeU32, U: 500}}}},
+			{Key: wide(300), Cols: []wire.Col{{Cell: wire.Cell{Type: wire.OperateTypeU32, U: 7}}}},
+			{Key: textKey, Cols: []wire.Col{{Cell: wire.Cell{Type: wire.OperateTypeU32, U: 9}}}},
+		}}},
+	}}
+	enc := rec.Encode()
+	if enc == nil {
+		t.Fatal("record failed to encode")
+	}
+	dec, err := wire.DecodeRecord(enc)
+	if err != nil {
+		t.Fatalf("record failed to decode: %v", err)
+	}
+
+	cases := []struct {
+		path string
+		want Result
+	}{
+		{"b/42", Result{Kind: RowPresent}},
+		{"b/42/hi", Result{Kind: Scalar, Cell: wire.Cell{Type: wire.OperateTypeU32, U: 500}}},
+		{"b/300/hi", Result{Kind: Scalar, Cell: wire.Cell{Type: wire.OperateTypeU32, U: 7}}},
+		{`b/"zzzzzzzzzzzz"/hi`, Result{Kind: Scalar, Cell: wire.Cell{Type: wire.OperateTypeU32, U: 9}}},
+		{"b/7", Result{Kind: Absent}},
+		{"b/18446744073709551615", Result{Kind: Absent}},
+		{`b/"zzz"`, Result{Kind: Absent}}, // wrong width for this key
+		{"b#count", Result{Kind: Count, Count: 3}},
+	}
+	r := NewResolver(4)
+	for _, tc := range cases {
+		p := mustPath(t, tc.path)
+		got, err := r.Resolve(enc, p)
+		if err != nil {
+			t.Errorf("Resolve(%q): %v", tc.path, err)
+			continue
+		}
+		if !resultsEqual(got, tc.want) {
+			t.Errorf("Resolve(%q) = %+v, want %+v", tc.path, got, tc.want)
+		}
+		oracle, oerr := resolveTree(dec, p)
+		if oerr != nil || !resultsEqual(got, oracle) {
+			t.Errorf("Resolve(%q) = %+v, oracle = %+v (err %v)", tc.path, got, oracle, oerr)
 		}
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand"
 	"strconv"
 	"strings"
@@ -242,6 +243,23 @@ func leKeyBytes(v uint64, width int) ([]byte, bool) {
 	return b, true
 }
 
+// decimalKeyFor renders key as a decimal row-key segment, reporting false
+// when no decimal segment can name it: a decimal denotes the key width's
+// little-endian encoding of a uint64, so every byte past the eighth must be
+// zero.
+func decimalKeyFor(key []byte) (string, bool) {
+	for i := 8; i < len(key); i++ {
+		if key[i] != 0 {
+			return "", false
+		}
+	}
+	n := len(key)
+	if n > 8 {
+		n = 8
+	}
+	return strconv.FormatUint(leValue(key[:n]), 10), true
+}
+
 // leValue decodes at most 8 little-endian bytes as an unsigned integer.
 func leValue(b []byte) uint64 {
 	var v uint64
@@ -356,7 +374,11 @@ func randomSchemaRecord(rng *rand.Rand) ([]byte, *wire.Record, error) {
 func randomTableDef(rng *rand.Rand) *wire.TableDef {
 	td := &wire.TableDef{KeyType: keyTypes[rng.Intn(len(keyTypes))]}
 	if td.KeyType == wire.OperateTypeFixed {
-		td.KeyN = uint8(1 + rng.Intn(4))
+		// 1..12, deliberately spanning 8: a FIXED key wider than a uint64
+		// is the only thing that exercises the zero-fill in the decimal
+		// key comparison (resolve.go's leByte past byte 7), and it must be
+		// drawn on both the matching and the near-miss side.
+		td.KeyN = uint8(1 + rng.Intn(12))
 	}
 	nCols := 1 + rng.Intn(3)
 	for c := 0; c < nCols; c++ {
@@ -378,6 +400,13 @@ func randomSchemaTable(rng *rand.Rand, td *wire.TableDef) *wire.Table {
 		var key []byte
 		if td.KeyType == wire.OperateTypeFixed {
 			key = randomKeyBytes(rng, kw)
+			// A third of FIXED keys are the little-endian encoding of a
+			// small number, so a decimal segment can actually MATCH a FIXED
+			// key (including one wider than 8 bytes, where the target is
+			// zero-filled past the eighth byte) and not only miss it.
+			if rng.Intn(3) == 0 {
+				key, _ = leKeyBytes(uint64(rng.Intn(60)), kw)
+			}
 		} else {
 			v := uint64(rng.Intn(60))
 			key, _ = leKeyBytes(v, kw)
@@ -393,6 +422,24 @@ func randomSchemaTable(rng *rand.Rand, td *wire.TableDef) *wire.Table {
 		t.Rows = append(t.Rows, row)
 	}
 	return t
+}
+
+// randomFloat draws a float value, one in eight of them a special: NaN and
+// the two infinities are what put the resolver's canonical-NaN check
+// (readCellAt's F32/F64 branches) under the oracle rather than only under
+// the hostile test. The encoder canonicalises the NaN it stores, so the
+// record still round-trips through DecodeRecord unchanged.
+func randomFloat(rng *rand.Rand) float64 {
+	switch rng.Intn(8) {
+	case 0:
+		return math.NaN()
+	case 1:
+		return math.Inf(1)
+	case 2:
+		return math.Inf(-1)
+	default:
+		return rng.NormFloat64()
+	}
 }
 
 // randomKeyBytes draws n bytes from keyAlphabet.
@@ -424,9 +471,9 @@ func randomCell(rng *rand.Rand, typ, n uint8) wire.Cell {
 	case wire.OperateTypeI64, wire.OperateTypeIVarint:
 		c.U = su64(int64(rng.Uint64()) >> uint(rng.Intn(64)))
 	case wire.OperateTypeF32:
-		c.F = float64(float32(rng.NormFloat64()))
+		c.F = float64(float32(randomFloat(rng)))
 	case wire.OperateTypeF64:
-		c.F = rng.NormFloat64()
+		c.F = randomFloat(rng)
 	case wire.OperateTypeBytes:
 		c.B = randomKeyBytes(rng, rng.Intn(6))
 	case wire.OperateTypeFixed:
@@ -574,6 +621,11 @@ func randomKeyText(rng *rand.Rand, td *wire.TableDef, tbl *wire.Table) string {
 	if td != nil && tbl != nil && len(tbl.Rows) > 0 && rng.Intn(2) == 0 {
 		key := tbl.Rows[rng.Intn(len(tbl.Rows))].Key
 		if td.KeyType == wire.OperateTypeFixed {
+			// A FIXED key that happens to be a little-endian number is
+			// addressable either way; draw both spellings.
+			if dec, ok := decimalKeyFor(key); ok && rng.Intn(2) == 0 {
+				return dec
+			}
 			return quoteKeyText(key)
 		}
 		return strconv.FormatUint(leValue(key), 10)
@@ -581,7 +633,7 @@ func randomKeyText(rng *rand.Rand, td *wire.TableDef, tbl *wire.Table) string {
 	if rng.Intn(2) == 0 {
 		return strconv.FormatUint(uint64(rng.Intn(70)), 10)
 	}
-	return quoteKeyText(randomKeyBytes(rng, 1+rng.Intn(4)))
+	return quoteKeyText(randomKeyBytes(rng, 1+rng.Intn(12)))
 }
 
 func randomColText(rng *rand.Rand, td *wire.TableDef) string {
