@@ -220,6 +220,69 @@ func TestRebuildRejectsCorruptPageTail(t *testing.T) {
 	}
 }
 
+// TestRebuildRejectsCorruptEqualHeadTail covers the case the equality shortcut
+// missed: a page whose on-disk head AND tail are BOTH corrupted to the same
+// out-of-range value (not just an out-of-range tail alone) still satisfies
+// head==tail. Checking bounds only after that shortcut let such a page slip
+// through untouched at recovery: no corruption counted, no reset, and
+// FreeTail() = len(entries) - tail went negative, wedging every future Put
+// against this page behind errPageFull forever. rebuildIndexFromPages must
+// validate 0 <= head <= tail <= len(entries) BEFORE the head==tail shortcut,
+// not after.
+func TestRebuildRejectsCorruptEqualHeadTail(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.NumShards = 1
+	cfg.PageSize = 1 << 20
+	cfg.MaxMemoryPerShard = 1 << 20 // 1 page
+	cfg.TTLSweepIntervalMs = 0      // no sweeper interference
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pages.dat")
+	writeCurrentFileWithEntries(t, path, cfg.PageSize, 1, [][2][]byte{
+		{[]byte("k0"), []byte("AAAA")},
+	})
+
+	// Corrupt page 0's on-disk head AND tail to the SAME huge garbage value, as
+	// a bit-flip or a crash mid-setTail could produce. head lives at
+	// region[0:4], tail at region[4:8] (see newMmapPage); page 0's region
+	// starts right after the file header.
+	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	headAt := int64(headerSize)
+	tailAt := int64(headerSize + 4)
+	garbage := []byte{0xF0, 0xFF, 0xFF, 0xFF}
+	if _, err := f.WriteAt(garbage, headAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(garbage, tailAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := newShard(cfg, dir)
+	if err != nil {
+		t.Fatalf("newShard: %v, want a clean error/reset instead of a panic", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	if got := s.snapshot().CorruptionErrors; got == 0 {
+		t.Error("CorruptionErrors = 0 after recovering a page with corrupt equal head/tail; corruption was swallowed silently")
+	}
+	if free := s.pages[0].FreeTail(); free < 0 {
+		t.Errorf("pages[0].FreeTail() = %d, want >= 0 (page must be reset, not left with an out-of-range tail)", free)
+	}
+	if err := s.Put([]byte("k1"), []byte("BBBB"), 0); err != nil {
+		t.Errorf("Put after corrupt-equal-head/tail recovery: %v, want success (page must not be permanently wedged behind errPageFull)", err)
+	}
+	if _, err := s.Get([]byte("k0")); err != ErrNotFound {
+		t.Errorf("Get(k0) = %v, want ErrNotFound (page reset after corrupt head/tail)", err)
+	}
+}
+
 // TestTornEntrySurvivesEviction reproduces the wedged-shard scenario: a page
 // recovered with a torn entry inside [head, tail) must not fail every
 // eviction-triggering Put forever. rebuildIndexFromPages truncates the page to

@@ -1051,10 +1051,16 @@ func (s *shard) rebuildIndexFromPages() {
 	for pageIdx, p := range s.pages {
 		head := p.head()
 		tail := p.tail()
-		if head == tail {
-			continue
-		}
 		entries := p.entries()
+		// Validate BEFORE the head==tail shortcut below: head/tail are read
+		// straight off disk, and a corrupt page can have them bit-rotted (or
+		// crash-torn mid-setTail) to the SAME out-of-range value — e.g. both
+		// 0xFFFFFFF0. That still satisfies head==tail, so checking bounds only
+		// in the else branch let such a page slip through untouched: no
+		// corruption counted, no reset, and FreeTail() = len(entries) - tail
+		// goes negative, wedging the page's writes behind errPageFull forever.
+		// head is `int(uint32(...))`, so it is never negative in practice; the
+		// `head < 0` check is kept only as defense in depth.
 		if head < 0 || tail < head || tail > len(entries) {
 			// Corrupt head/tail (e.g. bit-rot or a crash mid-setTail): trusting
 			// these raw values into entries[cursor:tail] below would either panic
@@ -1066,6 +1072,9 @@ func (s *shard) rebuildIndexFromPages() {
 			slog.Warn("corrupt page head/tail during recovery; resetting page",
 				"component", "cache", "page", pageIdx, "head", head, "tail", tail, "cap", len(entries))
 			p.Reset()
+			continue
+		}
+		if head == tail {
 			continue
 		}
 		cursor := head
