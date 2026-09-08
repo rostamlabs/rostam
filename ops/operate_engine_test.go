@@ -390,6 +390,53 @@ func TestApplyOpsMigrate(t *testing.T) {
 	if len(f2.migrated) != 0 {
 		t.Fatalf("migrate must not have been called: %v", f2.migrated)
 	}
+
+	// MIGRATE at index 0 but not addressing the record -> wire.ErrOperatePath,
+	// and e.migrate must never be called (migrate() has no path of its own
+	// to reject it with).
+	f3 := newFakeEngine()
+	ops3 := []wire.OperateOp{
+		{Opcode: wire.OperateOpMIGRATE, A: 3, Path: fakeFieldPath("x")},
+	}
+	_, _, err = applyOps(f3, ops3, 0)
+	if !errors.Is(err, wire.ErrOperatePath) {
+		t.Fatalf("applyOps (MIGRATE not at record path): err=%v, want wire.ErrOperatePath", err)
+	}
+	if len(f3.migrated) != 0 {
+		t.Fatalf("migrate must not have been called: %v", f3.migrated)
+	}
+}
+
+// CONFIG/TRIM at a row, col, or record path -> wire.ErrOperatePath, without
+// ever calling resolve (config()/trim() have no path of their own to reject
+// it with, so the loop must).
+func TestApplyOpsConfigTrimPathKind(t *testing.T) {
+	cases := []struct {
+		name string
+		op   wire.OperateOp
+	}{
+		{"config-row", wire.OperateOp{Opcode: wire.OperateOpCONFIG, Path: fakeRowPath("b", "k1"), A: 1}},
+		{"config-record", wire.OperateOp{Opcode: wire.OperateOpCONFIG, Path: fakeRecordPath(), A: 1}},
+		{"trim-row", wire.OperateOp{Opcode: wire.OperateOpTRIM, Path: fakeRowPath("b", "k1"), A: 1}},
+		{"trim-record", wire.OperateOp{Opcode: wire.OperateOpTRIM, Path: fakeRecordPath(), A: 1}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeEngine()
+			_, _, err := applyOps(f, []wire.OperateOp{tc.op}, 0)
+			if !errors.Is(err, wire.ErrOperatePath) {
+				t.Fatalf("%s: err=%v, want wire.ErrOperatePath", tc.name, err)
+			}
+			for _, call := range f.calls {
+				if len(call) >= len("resolve:") && call[:len("resolve:")] == "resolve:" {
+					t.Fatalf("%s: resolve was called before the path-kind check rejected the op: %v", tc.name, f.calls)
+				}
+			}
+			if len(f.configured) != 0 || len(f.trimmed) != 0 {
+				t.Fatalf("%s: config/trim must not have been called", tc.name)
+			}
+		})
+	}
 }
 
 // (e)/(f) evalRets maps RetCount to a tagged U64 and RetValue to e.value();

@@ -223,6 +223,12 @@ func applyOps(e engine, ops []wire.OperateOp, stampMs int64) (uint8, uint16, err
 			if i != 0 {
 				return 0, 0, wire.ErrOperateOpcode
 			}
+			// migrate() takes no path (it always addresses the whole
+			// record), so this is the only place that can reject a
+			// MIGRATE aimed at a field/row/col (oracle ruling).
+			if o.Path.Kind != wire.OperatePathRecord {
+				return 0, 0, wire.ErrOperatePath
+			}
 			if err := e.migrate(o.A, o.Aux, o.Bytes); err != nil {
 				return 0, 0, err
 			}
@@ -262,6 +268,13 @@ func applyOps(e engine, ops []wire.OperateOp, stampMs int64) (uint8, uint16, err
 			}
 
 		case wire.OperateOpCONFIG:
+			// config() takes no path (only the ref it resolves to), so this
+			// is the only place that can reject CONFIG at a row/col/record
+			// path — a table's eviction config lives on the field itself
+			// (oracle ruling).
+			if o.Path.Kind != wire.OperatePathField {
+				return 0, 0, wire.ErrOperatePath
+			}
 			if err := checkRowCap(o.A); err != nil {
 				return 0, 0, err
 			}
@@ -274,6 +287,12 @@ func applyOps(e engine, ops []wire.OperateOp, stampMs int64) (uint8, uint16, err
 			}
 
 		case wire.OperateOpTRIM:
+			// trim() takes no path either, and unlike CONFIG it does not
+			// even create — a row/col/record path is rejected here before
+			// resolve gets a chance to no-op it as merely absent.
+			if o.Path.Kind != wire.OperatePathField {
+				return 0, 0, wire.ErrOperatePath
+			}
 			if err := checkRowCap(o.A); err != nil {
 				return 0, 0, err
 			}
