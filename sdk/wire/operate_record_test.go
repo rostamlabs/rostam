@@ -87,7 +87,10 @@ func TestDecodeRecordHostile(t *testing.T) {
 	cases := [][]byte{{}, {0}, {3}, {1}, {2}, {1, 1, 0, 0, 1, OperateTypeU8}, {2, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F},
 		append([]byte{1}, append(sessionSchema().Encode(), 1, 2, 3, 4, 5, 6, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F)...), // nRows huge
 		{2, 1, 1, 'x', OperateTypeBytes, 0xFF, 0xFF, 0x03},
-		{2, 1, 1, 't', OperateTypeTable, 7, 0, 0, 0, 1, 2, 0, 0}} // dynamic row with a zero-length key
+		{2, 1, 1, 't', OperateTypeTable, 7, 0, 0, 0, 1, 2, 0, 0}, // dynamic row with a zero-length key
+		{2, 1, 0}, // dynamic field with a zero-length name
+		(&Record{Mode: OperateModeDynamic, Fields: []Field{{Name: "t", Cell: Cell{Type: OperateTypeTable}, Table: &Table{
+			Rows: []Row{{Key: []byte("k"), Cols: []Col{{Name: "", Cell: Cell{Type: OperateTypeU8}}}}}}}}}).Encode()} // dynamic column with a zero-length name
 	for _, b := range cases {
 		if _, err := DecodeRecord(b); err == nil {
 			t.Errorf("%x accepted", b)

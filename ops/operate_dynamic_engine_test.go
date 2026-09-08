@@ -469,6 +469,9 @@ func TestNewDynamicEngineValidates(t *testing.T) {
 			0, 0, 0},
 		"zero-length row key": {wire.OperateModeDynamic, 1, 1, 'a', wire.OperateTypeTable, 6,
 			0, 0, 0, 1, 2, 0, 0},
+		"zero-length field name": {wire.OperateModeDynamic, 1, 0},
+		"zero-length column name": {wire.OperateModeDynamic, 1, 1, 'a', wire.OperateTypeTable, 9,
+			0, 0, 0, 1, 4, 1, 'k', 1, 0},
 	}
 	for name, in := range bad {
 		if _, err := newDynamicEngine(append([]byte(nil), in...)); !errors.Is(err, wire.ErrOperateRecord) {

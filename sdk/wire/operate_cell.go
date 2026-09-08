@@ -313,7 +313,7 @@ func CanonFloat(t uint8, f float64) float64 {
 }
 
 // zigzag and unzigzag map a signed int64 to/from an unsigned "zigzag" value
-// so small magnitudes (positive or negative) encode as small LEB128 varints.
-// Copied verbatim from v1 (ops/operate.go).
+// so small magnitudes (positive or negative) encode as small LEB128 varints:
+// standard zigzag encoding.
 func zigzag(i int64) uint64   { return uint64((i << 1) ^ (i >> 63)) } //nolint:gosec // standard zigzag
 func unzigzag(u uint64) int64 { return int64(u>>1) ^ -int64(u&1) }    //nolint:gosec // standard zigzag

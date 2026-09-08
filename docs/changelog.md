@@ -5,6 +5,22 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **`operate`: server-side atomic multi-field updates on a record.** A new
+  built-in op updates several fields of one record atomically, in one round
+  trip, against a hot key — the way you'd reach for a Redis hash command or
+  an Aerospike `Operate` call, without writing a custom Go op or a
+  client-side get-modify-put CAS loop. The record/table model is record →
+  table of keyed rows → columns, addressed by path and applied under the same
+  shard lock as every other read-write op. Two storage modes share one apply
+  engine: **schema** mode packs a client-defined, versioned layout with
+  nothing per value (fastest, smallest, for a known shape); **dynamic** mode
+  is schema-free, Redis-hash-ergonomic, and lets any op add a new name/type
+  at any time. A dynamic record can later be frozen into schema mode with
+  `MIGRATE`. Available on the Go client via `client.NewOperate`'s typed
+  op-list builder. See
+  [the KV overview](kv/overview.md#atomic-multi-field-updates-operate) for
+  the full path/type/op vocabulary, caps, and worked examples.
+
 - **New `-online-compaction` flag.** Opts every replicated mmap reject-writes
   shard into online relocating compaction, so a write/overwrite-heavy replicated
   shard reclaims dead ("ghost") bytes while the process runs instead of only at

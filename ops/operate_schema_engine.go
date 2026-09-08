@@ -566,11 +566,12 @@ func (e *schemaEngine) colPos(td *wire.TableDef, seg wire.OperateSeg) (int, erro
 // Ruling: applyOps passes typ=0 for every op whose type byte is meaningless
 // (IF, CHECK, DEL, TRIM, and every return spec) and the op's own type byte
 // only for the scalar ops, which are exactly the ops that pass create=true —
-// so create is the signal that typ is a real type byte to check. The one
-// op this mis-reads is CONFIG, which also resolves with create=true (typ =
-// TABLE): aimed at a scalar field it fails here with ErrOperateType where the
-// oracle reports ErrOperateOpcode. Both reject the call with the record
-// unchanged, and CONFIG is never valid in schema mode at all.
+// so create is the signal that typ is a real type byte to check. CONFIG is
+// never reached here: resolve rejects it with ErrOperateOpcode before the
+// path is even looked at, because CONFIG is not a valid op on a schema-mode
+// record at all (its eviction triple comes from the schema, design doc
+// §3.2). checkType's only callers are the field- and column-path scalar
+// cases above, both already past that CONFIG check.
 func (e *schemaEngine) checkType(create bool, typ, want uint8) error {
 	if !create || typ == wire.OperateTypeFromSchema || typ == want {
 		return nil

@@ -563,6 +563,9 @@ func (ob *OperateBuilder) resolveOp(op builderOp) (wire.OperateOp, error) {
 	}
 	wop := wire.OperateOp{Opcode: op.opcode, Type: op.typ, Aux: op.aux, Path: path, A: op.a, B: op.b, Bytes: op.bytes}
 	if op.opcode == wire.OperateOpCONFIG || op.opcode == wire.OperateOpTRIM {
+		if (op.aux == wire.OperatePolicyMinCol || op.aux == wire.OperatePolicyMaxCol) && op.byColName == "" {
+			return wire.OperateOp{}, fmt.Errorf("client: operate: *_COL policy needs a column name")
+		}
 		wop.Bytes = []byte(op.byColName)
 		if op.byColName != "" && ob.schema != nil {
 			pos, cerr := ob.tableColPos(path, op.byColName)

@@ -292,8 +292,12 @@ func cloneBytes(b []byte) []byte {
 // present alone; every other comparator compares in c's domain — numeric
 // (an absent cell reads as zero, per §2.4) or bytewise for BYTES/FIXED. For
 // an unsigned cell, a negative operand is below every unsigned value (it
-// cannot be represented in that domain). An unknown comparator (or one
-// applied to a domain it does not support) returns ErrOperateCmp.
+// cannot be represented in that domain). A float comparison against NaN
+// (either c or the operand) is neither < nor >, so it falls to floatCompare's
+// equal case: EQ reports true and LT/GT report false for a NaN cell against
+// any operand, including another NaN — a deliberate, deterministic choice,
+// not IEEE 754 unordered semantics. An unknown comparator (or one applied to
+// a domain it does not support) returns ErrOperateCmp.
 func CompareCell(cmp uint8, c Cell, present bool, op Operand) (bool, error) {
 	switch cmp {
 	case OperateCmpExists:

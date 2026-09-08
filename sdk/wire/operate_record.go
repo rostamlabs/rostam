@@ -156,7 +156,7 @@ func appendSchemaTable(b []byte, tdef *TableDef, tbl *Table) []byte {
 	if tbl != nil {
 		rows = append([]Row(nil), tbl.Rows...)
 	}
-	sort.Slice(rows, func(i, j int) bool {
+	sort.SliceStable(rows, func(i, j int) bool {
 		return compareKey(rows[i].Key, rows[j].Key, tdef.KeyType) < 0
 	})
 	b = binary.AppendUvarint(b, uint64(len(rows))) //nolint:gosec // bounded by OperateMaxRows on a well-formed tree
@@ -177,7 +177,7 @@ func appendSchemaTable(b []byte, tdef *TableDef, tbl *Table) []byte {
 
 func (r *Record) encodeDynamic() []byte {
 	fields := append([]Field(nil), r.Fields...)
-	sort.Slice(fields, func(i, j int) bool { return fields[i].Name < fields[j].Name })
+	sort.SliceStable(fields, func(i, j int) bool { return fields[i].Name < fields[j].Name })
 
 	b := []byte{OperateModeDynamic}
 	b = binary.AppendUvarint(b, uint64(len(fields))) //nolint:gosec // bounded by OperateMaxFields on a well-formed tree
@@ -212,7 +212,7 @@ func appendDynamicTable(dst []byte, t *Table) []byte {
 		capV, policy, byColName = t.Cap, t.Policy, t.ByColName
 		rows = append([]Row(nil), t.Rows...)
 	}
-	sort.Slice(rows, func(i, j int) bool { return bytes.Compare(rows[i].Key, rows[j].Key) < 0 })
+	sort.SliceStable(rows, func(i, j int) bool { return bytes.Compare(rows[i].Key, rows[j].Key) < 0 })
 
 	inner := make([]byte, 0, 32)
 	inner = binary.AppendUvarint(inner, uint64(capV))
@@ -241,7 +241,7 @@ func appendDynamicRow(dst []byte, row Row) []byte {
 	dst = append(dst, row.Key...)
 
 	cols := append([]Col(nil), row.Cols...)
-	sort.Slice(cols, func(i, j int) bool { return cols[i].Name < cols[j].Name })
+	sort.SliceStable(cols, func(i, j int) bool { return cols[i].Name < cols[j].Name })
 	dst = binary.AppendUvarint(dst, uint64(len(cols))) //nolint:gosec // bounded by OperateMaxCols on a well-formed tree
 	for _, c := range cols {
 		dst = append(dst, byte(len(c.Name))) //nolint:gosec // bounded by OperateMaxNameLen on a well-formed tree
@@ -491,7 +491,7 @@ func decodeDynamicRecord(b []byte) (*Record, error) {
 		}
 		nlen := int(b[off])
 		off++
-		if nlen > OperateMaxNameLen {
+		if nlen == 0 || nlen > OperateMaxNameLen {
 			return nil, ErrOperateRecord
 		}
 		if len(b)-off < nlen {
@@ -686,7 +686,7 @@ func decodeDynamicRow(b []byte, budget *int) (Row, int, error) {
 		}
 		nlen := int(b[off])
 		off++
-		if nlen > OperateMaxNameLen {
+		if nlen == 0 || nlen > OperateMaxNameLen {
 			return Row{}, 0, ErrOperateRecord
 		}
 		if len(b)-off < nlen {

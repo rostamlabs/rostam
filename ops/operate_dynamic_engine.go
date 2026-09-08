@@ -215,6 +215,9 @@ func (e *dynamicEngine) walk(deep bool) error {
 		}
 		f.nameLen = int(buf[off])
 		off++
+		if f.nameLen == 0 {
+			return wire.ErrOperateRecord
+		}
 		if len(buf)-off < f.nameLen {
 			return wire.ErrOperateRecord
 		}
@@ -549,6 +552,9 @@ func (e *dynamicEngine) colAt(off, end int) (dynCol, error) {
 	}
 	c.nameLen = int(buf[off])
 	c.nameOff = off + 1
+	if c.nameLen == 0 {
+		return dynCol{}, wire.ErrOperateRecord
+	}
 	if end-c.nameOff < c.nameLen {
 		return dynCol{}, wire.ErrOperateRecord
 	}
@@ -812,6 +818,12 @@ func (e *dynamicEngine) resolve(p wire.OperatePath, create bool, opcode, typ, n 
 	if len(p.Field.Name) > wire.OperateMaxNameLen {
 		return ref{}, wire.ErrOperateCap
 	}
+	if create && p.Field.Name == "" {
+		// Names are 1-255 bytes, like row keys (design doc §2.4): a create
+		// that would vivify a field with an empty name is rejected here,
+		// before insertTableField ever runs, matching the oracle.
+		return ref{}, wire.ErrOperatePath
+	}
 	if p.Kind != wire.OperatePathField {
 		if len(p.Key) == 0 {
 			return ref{}, wire.ErrOperatePath
@@ -826,6 +838,9 @@ func (e *dynamicEngine) resolve(p wire.OperatePath, create bool, opcode, typ, n 
 		}
 		if len(p.Col.Name) > wire.OperateMaxNameLen {
 			return ref{}, wire.ErrOperateCap
+		}
+		if create && p.Col.Name == "" {
+			return ref{}, wire.ErrOperatePath
 		}
 	}
 

@@ -890,6 +890,16 @@ func runSemantics(t *testing.T, apply applier) { //nolint:maintidx // one sub-te
 		}
 	})
 
+	sub(t, "dynamic: names are 1-255 bytes", func(t *testing.T) {
+		if _, _, err := apply(nil, dynArgs(op(wire.OperateOpSET, wire.OperateTypeU8, namePath(""), 1)), 0); !errors.Is(err, wire.ErrOperatePath) {
+			t.Fatalf("field creation with an empty name: %v", err)
+		}
+		if _, _, err := apply(nil, dynArgs(
+			op(wire.OperateOpSET, wire.OperateTypeU8, nameColPath("t", []byte("k"), ""), 1)), 0); !errors.Is(err, wire.ErrOperatePath) {
+			t.Fatalf("column creation with an empty name: %v", err)
+		}
+	})
+
 	sub(t, "MIGRATE is append-only and must be the first op", func(t *testing.T) {
 		s1 := sessionSchema()
 		var rec *wire.Record

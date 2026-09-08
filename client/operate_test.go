@@ -109,6 +109,34 @@ func TestOperateBuilderSchemaErrors(t *testing.T) {
 	}
 }
 
+// TestOperateBuilderConfigTrimColPolicyGuard checks that Args rejects a
+// Config/Trim call whose policy is a *_COL policy (MIN_COL/MAX_COL) but
+// whose byCol is empty, both in dynamic mode (where the wire itself would
+// otherwise accept byColLen 0 and silently mean column 0) and in schema
+// mode (where an empty byCol would otherwise resolve nothing at all).
+func TestOperateBuilderConfigTrimColPolicyGuard(t *testing.T) {
+	if _, err := NewOperate([]byte("k")).Dynamic().
+		Config(F("t"), 1024, wire.OperatePolicyMinCol, "").Args(); err == nil {
+		t.Fatal("expected error for Config with MinCol policy and empty byCol (dynamic mode)")
+	}
+	if _, err := NewOperate([]byte("k")).Dynamic().
+		Trim(F("t"), 10, wire.OperatePolicyMaxCol, "").Args(); err == nil {
+		t.Fatal("expected error for Trim with MaxCol policy and empty byCol (dynamic mode)")
+	}
+
+	s := sessionSchema()
+	if _, err := NewOperate([]byte("k")).WithSchema(s).
+		Config(F("b"), 1024, wire.OperatePolicyMinCol, "").Args(); err == nil {
+		t.Fatal("expected error for Config with MinCol policy and empty byCol (schema mode)")
+	}
+
+	// A non-*_COL policy still needs no byCol.
+	if _, err := NewOperate([]byte("k")).Dynamic().
+		Config(F("t"), 1024, wire.OperatePolicyNone, "").Args(); err != nil {
+		t.Fatalf("Config with OperatePolicyNone and empty byCol: unexpected error: %v", err)
+	}
+}
+
 // TestOperateBuilderDynamicMode checks that without a schema, Field/Col
 // resolve to name segments, typed variants (AddT/SetBytesT) carry the given
 // type, and an untyped variant (Add) still emits OperateTypeFromSchema —

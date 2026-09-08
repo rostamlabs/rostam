@@ -293,7 +293,10 @@ unstamped `STAMP` writes `0`: a `MIN_COL`/`MAX_COL` "LRU" table built on that
 column then degrades to evicting by ascending key, since every row ties on
 the stamp and `*_COL` ties resolve to the smallest key. A follower re-applying
 the same call against the same prior record, with the same stamp, always
-produces byte-identical stored bytes.
+produces byte-identical stored bytes. On read, the schema-mode engine
+bounds-checks stored bytes but does not re-verify stored row ordering (valid
+in, valid out); the dynamic engine, which trusts nothing about its input
+until it has walked it, verifies ordering on read.
 
 ### Caps and all-or-nothing
 

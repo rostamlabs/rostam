@@ -135,3 +135,23 @@ func TestCompareCell(t *testing.T) {
 		t.Fatal("bad cmp accepted")
 	}
 }
+
+// TestCompareCellNaN pins the documented, deterministic (not IEEE 754
+// unordered) NaN behavior of CompareCell/floatCompare: a NaN cell is
+// neither < nor > any operand, including another NaN, so it falls to the
+// equal case — EQ reports true, LT and GT report false.
+func TestCompareCellNaN(t *testing.T) {
+	nan := Cell{Type: OperateTypeF64, F: math.NaN()}
+	if got, _ := CompareCell(OperateCmpEQ, nan, true, Operand{A: f64(math.NaN())}); !got {
+		t.Fatal("NaN EQ NaN should be true (deterministic, not IEEE unordered)")
+	}
+	if got, _ := CompareCell(OperateCmpEQ, nan, true, Operand{A: f64(1)}); !got {
+		t.Fatal("NaN EQ 1 should be true (deterministic, not IEEE unordered)")
+	}
+	if got, _ := CompareCell(OperateCmpLT, nan, true, Operand{A: f64(1)}); got {
+		t.Fatal("NaN LT 1 should be false")
+	}
+	if got, _ := CompareCell(OperateCmpGT, nan, true, Operand{A: f64(1)}); got {
+		t.Fatal("NaN GT 1 should be false")
+	}
+}

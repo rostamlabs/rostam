@@ -852,6 +852,12 @@ func (st *treeState) resolveDynamic(nd *treeNode, p wire.OperatePath, o wire.Ope
 	if len(p.Field.Name) > wire.OperateMaxNameLen {
 		return nil, wire.ErrOperateCap
 	}
+	if create && p.Field.Name == "" {
+		// Names are 1-255 bytes, like row keys (design doc §2.4): a create
+		// that would vivify a field with an empty name is rejected here,
+		// mirroring the engine.
+		return nil, wire.ErrOperatePath
+	}
 	if p.Kind != wire.OperatePathField {
 		if len(p.Key) == 0 {
 			return nil, wire.ErrOperatePath
@@ -866,6 +872,9 @@ func (st *treeState) resolveDynamic(nd *treeNode, p wire.OperatePath, o wire.Ope
 		}
 		if len(p.Col.Name) > wire.OperateMaxNameLen {
 			return nil, wire.ErrOperateCap
+		}
+		if create && p.Col.Name == "" {
+			return nil, wire.ErrOperatePath
 		}
 	}
 	fi := treeFindField(st.rec.Fields, p.Field.Name)
