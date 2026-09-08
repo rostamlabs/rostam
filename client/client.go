@@ -534,9 +534,14 @@ func (e *ambiguousError) Unwrap() error { return e.err }
 // made in the interval. The wrapper must carry the same guard as "flush" or the
 // double-apply hole reopens one layer down — cluster.proposeFlush relies on this to
 // surface an ambiguous per-group flush instead of the peer Client re-sending it.
+//
+// "operate" mutates counters non-idempotently (ADD/MUL/SHL/…, and CHECK's
+// server-side CAS), so a blind replay after an ambiguous post-commit failure
+// would apply every increment twice; it surfaces the ambiguous error instead,
+// exactly like "incr_ex".
 func nonReplayableOp(op string) bool {
 	switch op {
-	case "set_nx", "cas", "cad", "getdel", "getset", "incr_ex", "caex", "persist", "flush", "__flush_shard__":
+	case "set_nx", "cas", "cad", "getdel", "getset", "incr_ex", "caex", "persist", "flush", "__flush_shard__", "operate":
 		return true
 	}
 	return false
