@@ -185,10 +185,15 @@ blob.
 | `STAMP` | `aux` = unit (`wire.OperateStampMs`/`OperateStampS`) | `x = tx.applyStamp()` in that unit, saturating | int only |
 | `DEL` | — | see below | all |
 
-`DEL`'s effect depends on the path it's given: a record field becomes
-`UNSET` (schema mode) or is removed outright (dynamic mode); a row is
-removed from its table; a table field is emptied (all rows dropped); the
-record path (`()`) deletes the whole record. **`DEL ()` is terminal**: the
+`DEL`'s effect depends on the path it's given: a record field is **always
+present in schema mode** — the schema declares it, so `DEL` cannot remove it
+or leave it `UNSET`; instead it **zeroes the field to its declared type's
+zero value**. A table column behaves the same way when its row exists;
+against a column of a row that doesn't exist, `DEL` never vivifies — it's a
+no-op, not a zero-write. In dynamic mode a field or column is **removed
+outright**. A row is removed from its table; a table field is emptied (all
+rows dropped); the record path (`()`) deletes the whole record. **`DEL ()`
+is terminal**: the
 op list stops there and every return sees an absent record, rather than
 running further ops against nothing. In dynamic mode, **deleting a record's
 last field deletes the record** (the `HDEL`-of-the-last-field precedent); a
