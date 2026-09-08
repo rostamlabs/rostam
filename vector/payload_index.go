@@ -630,26 +630,41 @@ var emptySlotSet = map[uint32]struct{}{}
 // indexNarrowable reports whether `field` can be narrowed by the payload index
 // at all.
 //
-// THE EMPTY-SET INFERENCE, AND THE ONE FIELD THAT BREAKS IT. Every narrowing
+// THE EMPTY-SET INFERENCE, AND THE FIELDS THAT BREAK IT. Every narrowing
 // path answers a missing field with the empty sentinel, and that is normally
 // sound: a field no document carries as an indexable value is a field no
 // document can MATCH on, so "no postings" and "no matches" are the same
 // statement. The inference depends on the index having TRIED to index the
-// field.
+// field. Two field shapes never get that try:
 //
-// contentField is the one key it never tries. reindex skips $content by design
-// (a document body is not a filter key, and equality-indexing megabytes of text
-// would be absurd), so its posting maps are permanently empty — while the
-// compiled predicate reads $content perfectly well, because content is stored as
-// an ordinary entry in the slot's metadata map and lookupPath finds it like any
-// other key. Only the RETURN path strips it (fetchDocs / docForLocked). So for
-// $content alone, "no postings" means "never indexed", not "no matches", and
-// treating the empty set as a superset silently drops every matching row.
+// contentField. reindex skips $content by design (a document body is not a
+// filter key, and equality-indexing megabytes of text would be absurd), so its
+// posting maps are permanently empty — while the compiled predicate reads
+// $content perfectly well, because content is stored as an ordinary entry in
+// the slot's metadata map and lookupPath finds it like any other key. Only the
+// RETURN path strips it (fetchDocs / docForLocked). So for $content alone, "no
+// postings" means "never indexed", not "no matches", and treating the empty
+// set as a superset silently drops every matching row.
+//
+// A record path (isRecordPath — a "payloadKey/path" field naming a location
+// inside a ValueRecord payload key, per sdk/record) breaks the SAME inference
+// the SAME way, for the same underlying reason: reindex only posts LITERAL
+// scalar keys (scalarKeyOf declines ValueRecord outright, per the
+// ValueRecord-considered comments throughout this file), so
+// p.fields["session/rc"] is always nil — even though lookupPath resolves
+// "session/rc" through the record perfectly well at predicate-evaluation
+// time. "No postings" therefore means "never indexed" here too, not "no
+// matches". This is a Phase-1 scoping choice, not a permanent one: Task 6
+// adds indexing for the shapes IndexEntries extracts (top-level scalar fields
+// and #count), and can re-enable indexNarrowable for exactly those shapes
+// once postings exist for them to prove anything from.
 //
 // Declining instead is always safe: an un-narrowed conjunct is simply re-checked
 // by the predicate, and a filter that narrows on nothing else falls back to
-// graph traversal, which evaluates $content correctly.
-func indexNarrowable(field string) bool { return field != contentField }
+// graph traversal, which evaluates $content and record paths correctly.
+func indexNarrowable(field string) bool {
+	return field != contentField && !isRecordPath(field)
+}
 
 // candidates returns (slots, true) when filter can be narrowed by the payload
 // index — the slots are a SUPERSET of the filter's matching live slots, so the

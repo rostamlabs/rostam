@@ -443,10 +443,14 @@ func (h *hnsw) gateProfitable(minSize, nsets, k int) bool {
 //     cannot appear in an exact plan; an And containing one is a superset plan
 //     (the un-narrowed conjunct is re-checked by the predicate).
 //
-// contentField is declined here too, but it is no longer THIS function's
-// problem and the checks below are now defence in depth: indexNarrowable
-// declines $content at every posting-set lookup, so no $content set reaches a
-// plan at all.
+// contentField and every record path (isRecordPath) are declined here too,
+// but neither is really THIS function's problem any more: indexNarrowable
+// declines both at every posting-set lookup upstream (collectEqTerms and
+// friends), so neither ever reaches a plan for these checks to grade. They
+// stay as defence in depth — this function derives its own answer per op
+// straight from f.Field, not from what collectNarrowSets happened to plan,
+// so it must independently agree with indexNarrowable rather than trust that
+// whatever reached it was already filtered.
 //
 // The original note here read "only the EXACT classification could turn that
 // into wrong results — a superset plan re-checks, and an empty gate just rejects
@@ -465,13 +469,13 @@ func (h *hnsw) gateProfitable(minSize, nsets, k int) bool {
 func filterIndexExact(f Filter) bool {
 	switch f.Op {
 	case FilterEq, FilterContains:
-		if f.Field == contentField {
+		if f.Field == contentField || isRecordPath(f.Field) {
 			return false
 		}
 		_, ok := scalarKeyOf(f.Value)
 		return ok
 	case FilterIn:
-		if f.Field == contentField {
+		if f.Field == contentField || isRecordPath(f.Field) {
 			return false
 		}
 		switch f.Value.Kind {
@@ -483,7 +487,7 @@ func filterIndexExact(f Filter) bool {
 			return false
 		}
 	case FilterGt, FilterGte, FilterLt, FilterLte:
-		if f.Field == contentField {
+		if f.Field == contentField || isRecordPath(f.Field) {
 			return false
 		}
 		// Mirror orderingSet's own kind test: a want that can drive neither the
@@ -497,7 +501,7 @@ func filterIndexExact(f Filter) bool {
 		}
 		return f.Value.Kind == ValueString
 	case FilterDtGt, FilterDtGte, FilterDtLt, FilterDtLte:
-		if f.Field == contentField {
+		if f.Field == contentField || isRecordPath(f.Field) {
 			return false
 		}
 		// datetimeBound is the SHARED lowering (compileDatetime calls it too), so

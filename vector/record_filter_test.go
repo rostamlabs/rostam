@@ -4,6 +4,7 @@ package vector
 
 import (
 	"encoding/binary"
+	"math/rand"
 	"testing"
 
 	"github.com/rostamlabs/rostam/sdk/wire"
@@ -27,6 +28,15 @@ func su64(i int64) uint64 { return uint64(i) }
 //	#4 tag  BYTES   = "de"
 //	#5 b    TABLE(key U64; c0 "hi" U32, c1 "lo" U32) = {42: (500, 1), 99: (7, 2)}
 func sessionRecordBytes(t *testing.T) []byte {
+	t.Helper()
+	return sessionRecordBytesRC(t, 7)
+}
+
+// sessionRecordBytesRC is sessionRecordBytes with a caller-chosen rc value
+// (bc/hist/bal/tag/table b stay fixed) — used by tests that need many
+// distinct records differing only in rc, e.g. to populate a corpus for a
+// filter-first-vs-brute-force equivalence check.
+func sessionRecordBytesRC(t *testing.T, rc uint8) []byte {
 	t.Helper()
 	leKey := func(v uint64) []byte {
 		b := make([]byte, 8)
@@ -55,7 +65,7 @@ func sessionRecordBytes(t *testing.T) []byte {
 		t.Fatalf("session schema invalid: %v", err)
 	}
 	rec := &wire.Record{Mode: wire.OperateModeSchema, Schema: s, Fields: []wire.Field{
-		{Cell: wire.Cell{Type: wire.OperateTypeU8, U: 7}},
+		{Cell: wire.Cell{Type: wire.OperateTypeU8, U: uint64(rc)}},
 		{Cell: wire.Cell{Type: wire.OperateTypeU8, U: 3}},
 		{Cell: wire.Cell{Type: wire.OperateTypeU32, U: 1234}},
 		{Cell: wire.Cell{Type: wire.OperateTypeI32, U: su64(-5)}},
@@ -205,5 +215,129 @@ func TestCompileFilterRowPresenceCompileErrors(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestRecordPathFilterFirstMatchesBruteForce is the fix-round-1 regression
+// test: the payload-index planner must NEVER claim a record path is
+// index-narrowable (it has no postings — reindex only posts literal scalar
+// keys, and scalarKeyOf declines ValueRecord outright), because "field has
+// no postings" is the planner's proof that "field never matches" — and for a
+// record path that inference is false, not just unproven. Before the
+// indexNarrowable/filterIndexExact fix, `p.fields["session/rc"]` was always
+// nil, so the planner graded an Eq/Gt/In/row-presence leaf over a record path
+// as an EXACT, proven-empty set — searchIntoWith intersected the empty set
+// and returned zero results (bypassing graph fallback), and matchingIDsAt
+// took the same fast path and silently under-deleted. This test drives BOTH
+// consumers (SearchFiltered and matchingIDs, the selection matchingIDsAt
+// performs for delete-by-filter/scroll) over a real corpus and checks they
+// agree with a brute-force evaluation of the SAME compiled predicate — so a
+// regression here is a wrong ANSWER, not just a slow one.
+func TestRecordPathFilterFirstMatchesBruteForce(t *testing.T) {
+	const (
+		n   = 60
+		dim = 8
+		k   = 12
+	)
+	rng := rand.New(rand.NewSource(20260908))
+	h, err := newHNSW(Config{Dim: dim, Metric: L2, M: 16, EfConstruction: 200, EfSearch: 128, Seed: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	corpus := make(map[uint64][]float32, n)
+	metas := make(map[uint64]Metadata, n)
+	for i := 1; i <= n; i++ {
+		v := make([]float32, dim)
+		for j := range v {
+			v[j] = float32(rng.NormFloat64())
+		}
+		id := uint64(i)
+		m := Metadata{}
+		if i%2 == 0 {
+			m["country"] = NewString("DE")
+		} else {
+			m["country"] = NewString("US")
+		}
+		// Most points carry a "session" record (rc varies 0..12 so Eq/Gt/In
+		// each have some true and some false points); the rest carry none, so
+		// every record-path filter also has to correctly reject points with
+		// no such payload key at all.
+		if i <= 45 {
+			m["session"] = NewRecord(sessionRecordBytesRC(t, uint8(i%13))) //nolint:gosec // i%13 fits uint8
+		}
+		corpus[id] = v
+		metas[id] = m
+		if _, _, err := h.Insert(id, v, 0, m, nil, nil, CASCond{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	q := make([]float32, dim)
+	for j := range q {
+		q[j] = float32(rng.NormFloat64())
+	}
+
+	filters := []Filter{
+		{Op: FilterEq, Field: "session/rc", Value: NewInt(5)},
+		{Op: FilterGt, Field: "session/rc", Value: NewInt(10)},
+		{Op: FilterIn, Field: "session/rc", Value: NewInts([]int64{3, 7})},
+		{Op: FilterRowExists, Field: "session/b/42"},
+		{Op: FilterAnd, And: []Filter{
+			{Op: FilterEq, Field: "country", Value: NewString("DE")},
+			{Op: FilterEq, Field: "session/rc", Value: NewInt(5)},
+		}},
+	}
+
+	for _, f := range filters {
+		pred := compileOrFail(t, f)
+
+		// Consumer 1: SearchFiltered (filter-first KNN through
+		// hnsw.searchIntoWith), compared against a brute-force top-k over the
+		// SAME compiled predicate.
+		got, err := h.SearchFiltered(q, k, f)
+		if err != nil {
+			t.Fatalf("filter %+v: SearchFiltered: %v", f, err)
+		}
+		want := bruteForceFiltered(corpus, metas, q, k, pred)
+		if !eqUint64(resultIDs(got), want) {
+			t.Errorf("filter %+v: SearchFiltered ids %v != brute-force %v", f, resultIDs(got), want)
+		}
+
+		// Consumer 2: matchingIDs, the id-selection matchingIDsAt performs for
+		// delete-by-filter and non-vector scroll, compared against a
+		// brute-force full-corpus evaluation of the same predicate (not
+		// capped to k, unlike the search path above).
+		gotIDs, err := h.matchingIDs(f, pred)
+		if err != nil {
+			t.Fatalf("filter %+v: matchingIDs: %v", f, err)
+		}
+		wantSet := bruteMatchIDs(metas, pred)
+		gotSet := make(map[uint64]struct{}, len(gotIDs))
+		for _, id := range gotIDs {
+			gotSet[id] = struct{}{}
+		}
+		if len(gotSet) != len(wantSet) {
+			t.Errorf("filter %+v: matchingIDs set size %d != brute-force %d (got=%v want=%v)", f, len(gotSet), len(wantSet), gotSet, wantSet)
+			continue
+		}
+		for id := range wantSet {
+			if _, ok := gotSet[id]; !ok {
+				t.Errorf("filter %+v: matchingIDs missing true match id %d (under-selects, so delete-by-filter would under-delete)", f, id)
+			}
+		}
+	}
+
+	// A control assertion pinning the bug's shape directly: at least one of
+	// the filters above must have a NON-EMPTY brute-force match set, or this
+	// whole test would pass vacuously (both sides empty) without ever
+	// exercising the planner's wrong "proven empty" claim.
+	nonEmpty := false
+	for _, f := range filters {
+		if len(bruteMatchIDs(metas, compileOrFail(t, f))) > 0 {
+			nonEmpty = true
+			break
+		}
+	}
+	if !nonEmpty {
+		t.Fatal("every filter's brute-force match set was empty; test proves nothing — fixture is broken")
 	}
 }

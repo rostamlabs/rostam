@@ -69,6 +69,31 @@ func lookupPath(m Metadata, field string) (Value, bool) {
 	return record.ResultValue(res)
 }
 
+// isRecordPath reports whether field has the "payloadKey/path" shape a
+// record path filter uses: record.SplitField finds a '/' AND the tail
+// parses as a record.Path. A field that does not have that shape (no '/',
+// or a malformed tail) is a literal key and isRecordPath reports false for
+// it — unchanged from today's behaviour.
+//
+// This is intentionally syntactic only: it does not (and cannot) know
+// whether some point's metadata happens to carry field as an EXACT literal
+// key (lookupPath's exact-key precedence would still honor that at
+// evaluation time). Callers of isRecordPath — indexNarrowable and
+// filterIndexExact — use it to decide whether the payload INDEX can prove
+// anything about the field across every point, not to decide what one
+// point's predicate evaluates to; declining a field the index cannot prove
+// is always sound (the predicate re-checks it), so treating a
+// path-shaped-but-possibly-literal field as "not narrowable" costs nothing
+// but a slower fallback, never a wrong answer.
+func isRecordPath(field string) bool {
+	_, path, ok := record.SplitField(field)
+	if !ok {
+		return false
+	}
+	_, err := record.ParsePath(path)
+	return err == nil
+}
+
 // numericValue extracts a float64 from a scalar numeric Value (int or float).
 // Returns (0, false) for non-numeric kinds. Used by the filter compiler's
 // ordering predicates to compare across int/float.
