@@ -64,7 +64,9 @@ func (w *wal) appendNamedInsertStaged(id uint64, vectors map[string][]float32, s
 			_ = writeF32(&buf, f)
 		}
 	}
-	writeOptMeta(&buf, payload)
+	if err := writeOptMeta(&buf, payload); err != nil {
+		return 0, err
+	}
 	writeOptKeyExpires(&buf, keyExpires)
 	// Trailing per-point CAS version block (byte-identical when 0; an old record
 	// without it replays as version 0 -> a fresh insert defaults to 1). Reuses the
@@ -162,7 +164,9 @@ func (w *wal) appendNamedSetPayloadStaged(id uint64, meta Metadata, keyExpires m
 	var buf bytes.Buffer
 	buf.WriteByte(byte(namedSetPayloadRec))
 	_ = writeU64(&buf, id)
-	writeOptMeta(&buf, meta)
+	if err := writeOptMeta(&buf, meta); err != nil {
+		return 0, err
+	}
 	writeOptKeyExpires(&buf, keyExpires)
 	// Trailing per-point CAS version (the resulting version), restored VERBATIM by
 	// replay. Byte-identical when 0 (an old record replays as version 0 -> leaves

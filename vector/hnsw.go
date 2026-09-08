@@ -1902,6 +1902,9 @@ func (h *hnsw) InsertAt(id uint64, vec []float32, ttl time.Duration, meta Metada
 // one-snapshot rule and byte-identical to the historical multi-read path under a
 // stable clock.
 func (h *hnsw) insertBody(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond, stamped bool, nowMs uint64) (uint64, map[string]uint64, error) {
+	if err := checkRecordValues(meta); err != nil {
+		return 0, nil, err
+	}
 	// A failed mmap slab growth freed the backing region; reject rather than
 	// write into it (see arena.poisoned / ErrIndexPoisoned).
 	if h.arena.poisoned.Load() {
@@ -2869,6 +2872,9 @@ func (h *hnsw) SetPayloadAt(id uint64, patch Metadata, keyTTLMs map[string]int64
 }
 
 func (h *hnsw) setPayloadBody(id uint64, patch Metadata, keyTTLMs map[string]int64, cas CASCond, stamped bool, nowMs uint64) (Metadata, map[string]uint64, uint64, error) {
+	if err := checkRecordValues(patch); err != nil {
+		return nil, nil, 0, err
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	now := nowMs
@@ -2936,6 +2942,9 @@ func (h *hnsw) OverwritePayloadAt(id uint64, meta Metadata, keyTTLMs map[string]
 }
 
 func (h *hnsw) overwritePayloadBody(id uint64, meta Metadata, keyTTLMs map[string]int64, cas CASCond, stamped bool, nowMs uint64) (Metadata, map[string]uint64, uint64, error) {
+	if err := checkRecordValues(meta); err != nil {
+		return nil, nil, 0, err
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	now := nowMs
@@ -3159,6 +3168,9 @@ func (h *hnsw) InsertIfAbsentVersionAt(id uint64, vec []float32, ttl time.Durati
 }
 
 func (h *hnsw) insertIfAbsentBody(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64, stamped bool, nowMs uint64) (inserted bool, err error) {
+	if err := checkRecordValues(meta); err != nil {
+		return false, err
+	}
 	start := time.Now()
 	defer func() { h.insertLat.observe(time.Since(start)) }()
 

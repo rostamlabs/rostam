@@ -557,6 +557,9 @@ func (m *MultiVectorIndex) AddCASKeyTTLSparseAt(docID uint64, tokens [][]float32
 }
 
 func (m *MultiVectorIndex) addCASKeyTTLSparseBody(docID uint64, tokens [][]float32, meta Metadata, keyTTLMs map[string]int64, sparse *SparseVector, cas CASCond, stamped bool, nowMs int64) (uint64, error) {
+	if err := checkRecordValues(meta); err != nil {
+		return 0, err
+	}
 	if len(tokens) == 0 {
 		return 0, ErrEmptyDocument
 	}
@@ -739,6 +742,9 @@ func (m *MultiVectorIndex) restoreAdd(docID uint64, tokens [][]float32, meta Met
 // always wins (mirror of hnsw.InsertIfAbsent). Returns ErrDimMismatch / ErrEmptyDocument
 // on a malformed document, exactly as Add.
 func (m *MultiVectorIndex) AddIfAbsent(docID uint64, tokens [][]float32, meta Metadata) (inserted bool, err error) {
+	if err := checkRecordValues(meta); err != nil {
+		return false, err
+	}
 	if len(tokens) == 0 {
 		return false, ErrEmptyDocument
 	}
@@ -831,6 +837,9 @@ func (m *MultiVectorIndex) MultiAddIfAbsentVersion(docID uint64, tokens [][]floa
 func (m *MultiVectorIndex) MultiAddIfAbsentVersionSparse(docID uint64, tokens [][]float32, meta Metadata, keyExpires map[string]uint64, version uint64, sparse *SparseVector) (inserted bool, err error) {
 	if version == 0 && len(keyExpires) == 0 && (sparse == nil || sparse.IsZero()) {
 		return m.AddIfAbsent(docID, tokens, meta) // byte-for-byte the existing path (logs version 1)
+	}
+	if err := checkRecordValues(meta); err != nil {
+		return false, err
 	}
 	if len(tokens) == 0 {
 		return false, ErrEmptyDocument
@@ -1408,6 +1417,9 @@ func (m *MultiVectorIndex) setPayloadLocked(docID uint64, patch Metadata, keyTTL
 }
 
 func (m *MultiVectorIndex) setPayloadLockedAt(docID uint64, patch Metadata, keyTTLMs map[string]int64, cas CASCond, now int64) (Metadata, map[string]int64, uint64, error) {
+	if err := checkRecordValues(patch); err != nil {
+		return nil, nil, 0, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, exists := m.docTokens[docID]; !exists {
@@ -1566,6 +1578,9 @@ func (m *MultiVectorIndex) overwritePayloadLocked(docID uint64, meta Metadata, k
 }
 
 func (m *MultiVectorIndex) overwritePayloadLockedAt(docID uint64, meta Metadata, keyTTLMs map[string]int64, cas CASCond, now int64) (Metadata, map[string]int64, uint64, error) {
+	if err := checkRecordValues(meta); err != nil {
+		return nil, nil, 0, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, exists := m.docTokens[docID]; !exists {

@@ -453,7 +453,7 @@ func mvAddRecordBytes(t *testing.T, docID uint64, tokens [][]float32, meta Metad
 			_ = writeF32(&buf, f)
 		}
 	}
-	writeOptMeta(&buf, meta)
+	_ = writeOptMeta(&buf, meta)
 	writeOptKeyExpires(&buf, keyExpires)
 	writeOptVersion(&buf, version)
 	writeOptMVSparse(&buf, sparse)

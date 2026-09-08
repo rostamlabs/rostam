@@ -496,6 +496,9 @@ func (ix *ivf) InsertAt(id uint64, vec []float32, ttl time.Duration, meta Metada
 }
 
 func (ix *ivf) insertBody(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond, stamped bool, nowMs uint64) (uint64, map[string]uint64, error) {
+	if err := checkRecordValues(meta); err != nil {
+		return 0, nil, err
+	}
 	start := time.Now()
 	defer func() { ix.insertLat.observe(time.Since(start)) }()
 
@@ -1192,6 +1195,9 @@ func (ix *ivf) InsertIfAbsentVersionAt(id uint64, vec []float32, ttl time.Durati
 }
 
 func (ix *ivf) insertIfAbsentBody(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64, stamped bool, nowMs uint64) (bool, error) {
+	if err := checkRecordValues(meta); err != nil {
+		return false, err
+	}
 	start := time.Now()
 	defer func() { ix.insertLat.observe(time.Since(start)) }()
 
@@ -1287,6 +1293,9 @@ func (ix *ivf) BuildConcurrent(ids []uint64, vecs [][]float32, workers int) erro
 // so a payload's postings are the arena's stored metadata and the payload index,
 // and nothing else.
 func (ix *ivf) BuildConcurrentMeta(ids []uint64, vecs [][]float32, metas []Metadata, workers int) error {
+	if err := checkRecordValuesAll(metas); err != nil {
+		return err
+	}
 	if len(metas) != 0 && len(metas) != len(ids) {
 		return ErrBuildMetaLenMismatch
 	}
@@ -3549,6 +3558,9 @@ func (ix *ivf) SetPayloadAt(id uint64, patch Metadata, keyTTLMs map[string]int64
 }
 
 func (ix *ivf) setPayloadBody(id uint64, patch Metadata, keyTTLMs map[string]int64, cas CASCond, stamped bool, nowMs uint64) (Metadata, map[string]uint64, uint64, error) {
+	if err := checkRecordValues(patch); err != nil {
+		return nil, nil, 0, err
+	}
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	now := nowMs
@@ -3607,6 +3619,9 @@ func (ix *ivf) OverwritePayloadAt(id uint64, meta Metadata, keyTTLMs map[string]
 }
 
 func (ix *ivf) overwritePayloadBody(id uint64, meta Metadata, keyTTLMs map[string]int64, cas CASCond, stamped bool, nowMs uint64) (Metadata, map[string]uint64, uint64, error) {
+	if err := checkRecordValues(meta); err != nil {
+		return nil, nil, 0, err
+	}
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	now := nowMs

@@ -417,7 +417,7 @@ func TestNamedDenseOnlyWALByteIdentical(t *testing.T) {
 			_ = writeF32(&oldBuf, f)
 		}
 	}
-	writeOptMeta(&oldBuf, payload)
+	_ = writeOptMeta(&oldBuf, payload)
 	writeOptKeyExpires(&oldBuf, nil)
 	writeOptVersion(&oldBuf, 1)
 
@@ -434,7 +434,7 @@ func TestNamedDenseOnlyWALByteIdentical(t *testing.T) {
 			_ = writeF32(&newBuf, f)
 		}
 	}
-	writeOptMeta(&newBuf, payload)
+	_ = writeOptMeta(&newBuf, payload)
 	writeOptKeyExpires(&newBuf, nil)
 	writeOptVersion(&newBuf, 1)
 	writeNamedSparseVectors(&newBuf, nil) // dense-only: must write nothing

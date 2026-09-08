@@ -199,7 +199,9 @@ func (w *wal) appendInsertStaged(id uint64, vec []float32, ttl time.Duration, me
 	for _, f := range vec {
 		_ = writeF32(&buf, f)
 	}
-	writeOptMeta(&buf, meta)
+	if err := writeOptMeta(&buf, meta); err != nil {
+		return 0, err
+	}
 	if sparse == nil {
 		buf.WriteByte(0)
 	} else {
@@ -250,17 +252,33 @@ func readOptVersion(r io.Reader) (uint64, bool) {
 // writeOptMeta writes the optional-metadata encoding shared by appendInsertStaged
 // and appendSetPayloadStaged: a 1-byte present flag, then (when present) a u32 key count
 // followed by each [string key][Value]. readOptMeta is its exact inverse.
-func writeOptMeta(buf *bytes.Buffer, meta Metadata) {
+//
+// IT RETURNS THE ENCODE ERROR, AND EVERY CALLER MUST FAIL THE APPEND ON IT.
+// writeValue can fail — today only for a ValueRecord above maxRecordValueBytes —
+// and it fails AFTER it has already emitted the value's kind byte, so a record
+// built past that point is self-inconsistent: readOptMeta answers false for it,
+// which replay reads as a torn record and answers with errStopReplay, DISCARDING
+// every acknowledged write logged after it. Discarding the error here (as this
+// function used to) turned one rejected value into unbounded acked-write loss on
+// the next restart. Callers build into a local bytes.Buffer and only hand it to
+// appendFramedStaged at the end, so returning early here means no byte of the
+// half-built record ever reaches the log. checkRecordValues rejects the same
+// payload at ingest, before any state change; this is the durability backstop for
+// any path that reaches the codec anyway (WAL replay, restore, reshard copy).
+func writeOptMeta(buf *bytes.Buffer, meta Metadata) error {
 	if meta == nil {
 		buf.WriteByte(0)
-		return
+		return nil
 	}
 	buf.WriteByte(1)
 	_ = writeU32(buf, uint32(len(meta))) //nolint:gosec
 	for k, v := range meta {
 		_ = writeString(buf, k)
-		_ = writeValue(buf, v)
+		if err := writeValue(buf, v); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // appendSetPayloadStaged logs an in-place payload mutation as the resulting full
@@ -294,7 +312,9 @@ func (w *wal) appendSetPayloadStaged(id uint64, meta Metadata, keyExpires map[st
 	var buf bytes.Buffer
 	buf.WriteByte(byte(walSetPayload))
 	_ = writeU64(&buf, id)
-	writeOptMeta(&buf, meta)
+	if err := writeOptMeta(&buf, meta); err != nil {
+		return 0, err
+	}
 	writeOptKeyExpires(&buf, keyExpires)
 	writeOptVersion(&buf, version) // trailing version block (byte-identical when 0)
 	return w.appendFramedStaged(buf.Bytes())

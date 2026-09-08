@@ -735,6 +735,9 @@ func (c *Collection) StageBulk(ids []uint64, vecs [][]float32) error {
 // point. Everything StageBulk documents about dimension checking applies here
 // unchanged.
 func (c *Collection) StageBulkPayloads(ids []uint64, vecs [][]float32, metas []Metadata) error {
+	if err := checkRecordValuesAll(metas); err != nil {
+		return err
+	}
 	// NILNESS here, LENGTH in BuildConcurrentMeta, and the difference is deliberate.
 	// This function has to decide whether to MATERIALIZE the payload column, and
 	// only nil can mean "this caller has no payload column at all" — an empty
@@ -824,6 +827,9 @@ func (c *Collection) UpsertCAS(id uint64, vec []float32, content string, ttl tim
 // deadlines; the WAL logs them so replay restores them verbatim. Empty/nil
 // keyTTLMs is the zero-overhead path.
 func (c *Collection) UpsertCASKeyTTL(id uint64, vec []float32, content string, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond) (uint64, error) {
+	if err := checkRecordValues(meta); err != nil {
+		return 0, err
+	}
 	c.startSweeper()
 	// opMu is held across {apply + WAL WRITE} only, scoped to a closure (see
 	// InsertCASKeyTTL) so a panic inside idx.Get/Delete/Insert or a WAL append
@@ -1295,6 +1301,9 @@ func (c *Collection) DeleteByFilterAt(filter Filter, nowMs int64) (int, error) {
 // precheck + unconditional delete), then re-inserts via InsertAt so the point/per-key
 // deadlines are stamped identically on every replica (#4 vector TTL determinism).
 func (c *Collection) UpsertCASKeyTTLAt(id uint64, vec []float32, content string, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond, nowMs int64) (uint64, error) {
+	if err := checkRecordValues(meta); err != nil {
+		return 0, err
+	}
 	c.startSweeper()
 	// opMu is held across {apply + WAL WRITE} only, scoped to a closure (see
 	// UpsertCASKeyTTL) so a panic inside idx.DeleteAt/InsertAt or a WAL append

@@ -491,6 +491,12 @@ func writeInternalError(w http.ResponseWriter, ctx string, err error) {
 func statusForError(err error) int {
 	switch {
 	case errors.Is(err, vector.ErrDimMismatch),
+		// A payload carrying a record value above the storage cap: 400, not 500.
+		// The cap is the snapshot/WAL codec's, so accepting the write would mean
+		// acking something that can never be made durable; refusing it is a
+		// client-fixable mistake and the message is the caller's own data.
+		// Keeps this classifier in sync with server.clientFacingErr.
+		errors.Is(err, vector.ErrRecordTooLarge),
 		errors.Is(err, vector.ErrEmptyFilter),
 		errors.Is(err, vector.ErrEmptyGroupBy),
 		errors.Is(err, vector.ErrSparseMismatch),

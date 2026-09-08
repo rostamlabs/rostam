@@ -58,7 +58,9 @@ func (w *wal) appendMVAddStaged(docID uint64, tokens [][]float32, meta Metadata,
 			_ = writeF32(&buf, f)
 		}
 	}
-	writeOptMeta(&buf, meta)
+	if err := writeOptMeta(&buf, meta); err != nil {
+		return 0, err
+	}
 	writeOptKeyExpires(&buf, keyExpires)
 	// Trailing per-doc CAS version block (byte-identical when 0; an old record
 	// without it replays as version 0 -> a fresh add defaults to 1). Reuses the
@@ -128,7 +130,9 @@ func (w *wal) appendMVSetPayloadStaged(docID uint64, meta Metadata, keyExpires m
 	var buf bytes.Buffer
 	buf.WriteByte(byte(mvSetPayloadRec))
 	_ = writeU64(&buf, docID)
-	writeOptMeta(&buf, meta)
+	if err := writeOptMeta(&buf, meta); err != nil {
+		return 0, err
+	}
 	writeOptKeyExpires(&buf, keyExpires)
 	// Trailing per-doc CAS version (the resulting version), restored VERBATIM by
 	// replay. Byte-identical when 0.

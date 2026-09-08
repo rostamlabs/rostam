@@ -499,6 +499,9 @@ func (nc *NamedCollection) InsertCASKeyTTLAt(id uint64, vectors map[string][]flo
 }
 
 func (nc *NamedCollection) insertCASKeyTTLBody(id uint64, vectors map[string][]float32, sparseVectors map[string]*SparseVector, payload Metadata, ttl time.Duration, keyTTLMs map[string]int64, cas CASCond, stamped bool, nowMs int64) (uint64, error) {
+	if err := checkRecordValues(payload); err != nil {
+		return 0, err
+	}
 	// Validate every name/dim/modality up front so a malformed request mutates
 	// nothing.
 	if err := nc.validateInsertSpaces(vectors, sparseVectors); err != nil {
@@ -1246,6 +1249,9 @@ func (nc *NamedCollection) setPayloadLocked(id uint64, patch Metadata, keyTTLMs 
 }
 
 func (nc *NamedCollection) setPayloadLockedAt(id uint64, patch Metadata, keyTTLMs map[string]int64, cas CASCond, now int64) (Metadata, map[string]int64, uint64, error) {
+	if err := checkRecordValues(patch); err != nil {
+		return nil, nil, 0, err
+	}
 	nc.mu.Lock()
 	defer nc.mu.Unlock()
 	if !nc.liveLockedAt(id, now) {
@@ -1394,6 +1400,9 @@ func (nc *NamedCollection) overwritePayloadLocked(id uint64, meta Metadata, keyT
 }
 
 func (nc *NamedCollection) overwritePayloadLockedAt(id uint64, meta Metadata, keyTTLMs map[string]int64, cas CASCond, now int64) (Metadata, map[string]int64, uint64, error) {
+	if err := checkRecordValues(meta); err != nil {
+		return nil, nil, 0, err
+	}
 	nc.mu.Lock()
 	defer nc.mu.Unlock()
 	if !nc.liveLockedAt(id, now) {

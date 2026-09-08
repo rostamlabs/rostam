@@ -49,6 +49,9 @@ func (h *hnsw) BuildConcurrent(ids []uint64, vecs [][]float32, workers int) erro
 // search landing between build and apply returns a WRONG (empty-ish) answer
 // rather than an error.
 func (h *hnsw) BuildConcurrentMeta(ids []uint64, vecs [][]float32, metas []Metadata, workers int) error {
+	if err := checkRecordValuesAll(metas); err != nil {
+		return err
+	}
 	if len(metas) != 0 && len(metas) != len(ids) {
 		return ErrBuildMetaLenMismatch
 	}

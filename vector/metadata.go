@@ -2,7 +2,12 @@
 
 package vector
 
-import "github.com/rostamlabs/rostam/sdk/record"
+import (
+	"errors"
+	"fmt"
+
+	"github.com/rostamlabs/rostam/sdk/record"
+)
 
 // The Value tagged union, its ValueKind enumeration, the Metadata map, the
 // Value constructors, and the ValueKind text (un)marshaling now live in the
@@ -67,6 +72,48 @@ func lookupPath(m Metadata, field string) (Value, bool) {
 		return Value{}, false
 	}
 	return record.ResultValue(res)
+}
+
+// ErrRecordTooLarge is returned by every metadata-accepting mutation entry —
+// insert, insert-if-absent, upsert, set-payload, overwrite, bulk stage/build,
+// dense/IVF/named/multi-vector alike — when the payload carries a ValueRecord
+// longer than maxRecordValueBytes.
+//
+// WHY THE CAP IS ENFORCED AT INGEST AND NOT WHERE IT IS DISCOVERED.
+// maxRecordValueBytes is the SNAPSHOT/WAL codec's cap (writeValue), so a point
+// whose record exceeds it can be held in memory but can never be written down:
+// the WAL append would have to fail mid-record and every snapshot of the
+// collection would fail for as long as the point stayed live. Accepting the
+// write and failing the durability is the one outcome that leaves the in-memory
+// state and the durable state permanently unable to agree, so the cap is
+// checked HERE, before any state change, where refusing costs the caller one
+// error and nothing else. It is a caller mistake, classified 400 on both
+// transports like ErrDimMismatch.
+var ErrRecordTooLarge = errors.New("vector: record payload value exceeds the storage cap")
+
+// checkRecordValues rejects a payload carrying an oversize ValueRecord. Every
+// mutation entry calls it BEFORE it touches any state or stages a WAL write;
+// the inner helpers those entries share deliberately do NOT repeat it, so each
+// op pays exactly one pass over its own payload.
+func checkRecordValues(m Metadata) error {
+	for k, v := range m {
+		if v.Kind == ValueRecord && len(v.Rec) > maxRecordValueBytes {
+			return fmt.Errorf("%w: payload key %q holds a %d-byte record, the cap is %d bytes",
+				ErrRecordTooLarge, k, len(v.Rec), maxRecordValueBytes)
+		}
+	}
+	return nil
+}
+
+// checkRecordValuesAll is checkRecordValues over a bulk batch, naming the
+// offending row so a rejected bulk stage/build says which point to fix.
+func checkRecordValuesAll(metas []Metadata) error {
+	for i, m := range metas {
+		if err := checkRecordValues(m); err != nil {
+			return fmt.Errorf("payload %d: %w", i, err)
+		}
+	}
+	return nil
 }
 
 // recordPoison is the READ side of the payload index's per-payload-key

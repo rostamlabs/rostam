@@ -186,6 +186,11 @@ func mapResult(disp Dispatcher, result []byte, err error, reqID string) (uint8, 
 func clientFacingErr(err error) bool {
 	switch {
 	case errors.Is(err, vector.ErrDimMismatch),
+		// vector.ErrRecordTooLarge: a payload carrying a record value above the
+		// storage cap. A caller mistake with a clear remedy (send a smaller
+		// record), and the message names the key and both sizes — all of which
+		// the caller sent — so it is safe to return verbatim, like a bad dim.
+		errors.Is(err, vector.ErrRecordTooLarge),
 		errors.Is(err, vector.ErrEmptyFilter),
 		errors.Is(err, vector.ErrEmptyGroupBy),
 		errors.Is(err, vector.ErrSparseMismatch),
