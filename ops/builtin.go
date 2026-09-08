@@ -69,12 +69,12 @@ var builtinHandlers = map[string]Handler{
 	"persist": handlePersist,
 	"ttl":     handleTTL,
 	"incr_ex": handleIncrEx,
-	"caex":    handleCAEX,
-	"mget":    handleMGet,
 	// operate is a generic atomic multi-field read/check/write op against one
 	// stored record, addressed and typed by the call's schema (design doc
 	// operate-v2-design.md).
 	"operate": handleOperate,
+	"caex":    handleCAEX,
+	"mget":    handleMGet,
 	// flush wipes the ENTIRE KV keyspace (keyless, no args). The cluster path
 	// broadcasts it to every shard group; each group applies it here against its own
 	// cache. See handleFlush.

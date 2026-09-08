@@ -229,6 +229,17 @@ func TestOperateTTLModes(t *testing.T) {
 		if _, expiryMs := readAt(t, tx, 1_005_000, key); expiryMs != 1_015_000 {
 			t.Fatalf("SET on an existing key did not refresh: expiry = %d, want 1015000", expiryMs)
 		}
+
+		// SET with TTL == 0 means "refresh to no expiry" (design doc §3.5):
+		// it must clear the deadline on an existing key, not leave the old
+		// one in place or misinterpret zero as "unspecified".
+		clear := addField0(key)
+		clear.TTLMode = wire.OperateTTLSet
+		clear.TTL = 0
+		callOperate(t, tx, 1_010_000, clear)
+		if _, expiryMs := readAt(t, tx, 1_010_000, key); expiryMs != 0 {
+			t.Fatalf("SET with TTL=0 did not clear the expiry: got %d, want 0 (none)", expiryMs)
+		}
 	})
 
 	t.Run("create_only", func(t *testing.T) {
