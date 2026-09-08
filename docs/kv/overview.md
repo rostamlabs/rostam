@@ -412,6 +412,16 @@ wire args. The stored **record and cell data themselves are little-endian**
 (fixed-width ints, table row keys) — the wire args format and the on-disk
 record format are independent conventions.
 
+### Searching operate records from vector payloads
+
+A record `operate` writes can also be stored verbatim as a vector point's
+payload value (kind `record`) and filtered on directly — `session/rc`,
+`session/b/42/hi`, `session/b#count`, and the `row_exists`/`row_absent`
+presence ops all address the same paths this section describes, against the
+same stored bytes. See
+[record paths in filters](../vector/filtering.md#record-paths) for the path
+grammar, value mapping, and what a collection auto-indexes.
+
 ## TTL semantics
 
 TTLs are absolute deadlines computed at write time. Expiry is enforced lazily on

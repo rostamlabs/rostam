@@ -5,6 +5,19 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **Filter and index `operate` records stored in vector payloads.** A payload
+  value of kind `record` (the bytes `operate` writes) can now be addressed
+  directly by filters: a path like `session/rc`, `session/b/42/hi`, or
+  `session/b#count` resolves into the record, and two new leaf ops,
+  `row_exists` and `row_absent`, test table-row presence. A collection
+  auto-indexes every top-level scalar field and table row count for `eq`/
+  `in`/range acceleration; row/column/positional paths and
+  `contains`/`match`/`regex`/`row_exists`/`row_absent` are always evaluated
+  against the live record. A point whose stored record is malformed fails
+  the whole payload key closed (evaluated live, still correct) until it is
+  repaired or reclaimed. See
+  [record paths in filters](vector/filtering.md#record-paths).
+
 - **`operate`: server-side atomic multi-field updates on a record.** A new
   built-in op updates several fields of one record atomically, in one round
   trip, against a hot key — the way you'd reach for a Redis hash command or

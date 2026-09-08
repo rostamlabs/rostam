@@ -34,6 +34,7 @@ Over HTTP the same filter is JSON, with operators as lowercase names:
 | Presence | `is_empty`, `is_null` |
 | Datetime | `dt_gt`, `dt_gte`, `dt_lt`, `dt_lte` (RFC 3339 bounds) |
 | Geo | `geo_radius`, `geo_bounding_box`, `geo_polygon` |
+| Record | `row_exists`, `row_absent` (table-row presence inside a [record payload value](#record-paths)) |
 
 Geo filters take a `geo` condition object instead of `value`:
 `geo_radius` → `{center_lat, center_lon, radius_m}`; `geo_bounding_box` →
@@ -99,6 +100,158 @@ an ordering, and inventing one leaves `x >= 3 AND x <= 2` matching a NaN row.
     different rows depending on which query path ran; the new rule is what makes
     both paths answer the same question. To keep such points matchable, write a
     real sentinel value instead of NaN.
+
+## Record paths
+
+`operate` (the KV store's server-side atomic multi-field update op, see
+[the KV overview](../kv/overview.md#atomic-multi-field-updates-operate))
+writes a **record**: a struct of scalar fields where a field may be a table
+of keyed rows of columns. A vector payload can carry one of these records
+verbatim as a payload value of kind `record`:
+
+```json
+{"kind": "record", "rec": "<base64 of the operate record bytes>"}
+```
+
+`rec` is exactly the bytes `operate` stores for the key — copy them in as-is
+(e.g. from a KV `get`'s raw value, or the Go client's typed operate result),
+never hand-built. A record value is never `is_empty`/`is_null` unless it is
+literally absent or zero-length; a present, non-empty record is neither.
+
+### Path grammar
+
+A filter's `field` string is tried as an exact payload key first. Only when
+there is no exact match, and the field contains a `/`, is it split at the
+**first** `/` into a payload key and a path into that key's record (a literal
+payload key that itself contains `/` — including one that happens to look
+like a path, e.g. `"a/b"` — always wins over this splitting). The path is
+1-3 `/`-separated segments:
+
+| Segment | Form | Names |
+|---|---|---|
+| field | `name` or `#N` | a top-level record field, by name or position (`N` ≤ 65535) |
+| row key | decimal digits, or `"…"` | a table row: decimal for an integer key type, quoted (`\"`/`\\` escapes) for a `FIXED` key type |
+| column | `name` or `#N` | one column of the row named by the previous segment |
+
+A field segment may instead end in `#count` (e.g. `session/b#count`), which
+must be the only segment — it reports a table field's row count and does not
+compose with a row or column segment.
+
+For a **dynamic**-mode record, table row keys have no declared width: a
+decimal segment denotes the 8-byte little-endian encoding of the number (what
+the Go client's `client.KeyU64` produces), and a quoted segment denotes its
+unescaped bytes verbatim. For a **schema**-mode record, the row key's type and
+width come from the schema, and a decimal segment denotes that width's
+little-endian encoding.
+
+A path that cannot apply — an unknown field, an absent row or column, a
+row/column segment against a scalar field, a position against a schema that
+stores no names, or a payload key that holds something other than a record —
+evaluates as "no such field": no match, never a filter error. `row_exists`
+and `row_absent` are the one exception: their `field` string's path **shape**
+is validated once, at filter-compile time (see below), because that shape
+depends only on the string, never on any point's data.
+
+### Example
+
+```
+payload {"session": <record>}
+  #0 rc   U8    = 7
+  #1 bc   U8    = 3
+  #2 hist U32   = 1234
+  #3 bal  I32   = -5
+  #4 tag  BYTES = "de"
+  #5 b    TABLE(key U64; hi U32, lo U32) = {42: (hi=500, lo=1), 99: (hi=7, lo=2)}
+```
+
+```json
+{"op": "gt", "field": "session/rc", "value": {"kind": "int", "int": 5}}
+{"op": "eq", "field": "session/b/42/hi", "value": {"kind": "int", "int": 500}}
+{"op": "gte", "field": "session/b#count", "value": {"kind": "int", "int": 1}}
+{"op": "row_exists", "field": "session/b/42"}
+{"op": "row_absent", "field": "session/b/7"}
+```
+
+### `row_exists` / `row_absent`
+
+Both take a `field` whose path names exactly a table row — a field segment
+then a row segment (`table/rowKey`), nothing shorter or longer; `CompileFilter`
+rejects any other shape (a bare field, a `#count`, or a row **and** column) as
+a compile error, since that shape never depends on the data. `row_exists` is
+true iff the row is present. `row_absent` is **not** simply "not
+`row_exists`": it is true only when the row is affirmatively missing from a
+real table on that point (the payload key holds a record and the named field
+really is a table). A missing payload key, a payload key holding something
+other than a record, or a path that cannot apply to that point's record
+shape (e.g. the field is a scalar, not a table) makes **both** ops false —
+"the row is absent" presupposes a table to search, and a point that cannot
+even be asked the question is not in a position to assert that.
+
+### Value mapping
+
+A resolved cell (or a `#count`) maps to a payload value the same comparators
+`eq`/`ne`/`gt`/`gte`/`lt`/`lte`/`in` use everywhere else:
+
+| Stored type | Payload kind |
+|---|---|
+| `U8`/`U16`/`U32`/`I8`/`I16`/`I32`/`I64`/`IVARINT`, and `U64`/`UVARINT` up to `MaxInt64` | `int` |
+| `U64`/`UVARINT` above `MaxInt64` | `float` (lossy — the only wider payload kind) |
+| `F32`/`F64` | `float` |
+| `BYTES`/`FIXED` | `string` (the raw bytes) |
+| `#count` (a table's row count) | `int` |
+
+`contains`, `match`, and `regex` read a record path's resolved **string**
+cell (`BYTES`/`FIXED`) the same way they read any string payload field, via
+the live record — they have no index of their own over record content (see
+below).
+
+### What's indexed
+
+A collection auto-indexes, for every point whose payload carries a record —
+no configuration needed — each top-level **scalar** field by name and each
+table field's row count, as synthetic payload fields `<payloadKey>/<field>`
+and `<payloadKey>/<table>#count`, with the same `eq`/`in`/range acceleration
+a literal payload field gets.
+
+**Not indexed** — always evaluated against the live record instead, still
+correct, just not accelerated:
+
+- a positional field (`session/#0`) — even when the record's schema would
+  resolve it, since one collection can mix a names-carrying schema (indexed
+  by name) and a names-less one (indexed positionally), and a field string
+  alone can't say which a given point uses;
+- a table row, a table column, or the table field itself (`session/b`,
+  `session/b/42`, `session/b/42/hi`);
+- `contains`, `match`, `regex`, `row_exists`, and `row_absent` on any record
+  path — a record's scalars post whole-value **equality** keys only, never
+  tokens, contains-elements, or geo cells.
+
+### Fail-closed indexing
+
+If any live point stores a **malformed** record under a payload key —
+bytes that fail to enumerate in full, even though some of its fields would
+still resolve individually — every path under that payload key stops using
+the index for **every point**, for as long as the malformed record survives:
+filtered search and delete/scroll selection fall back to evaluating the live
+record, which stays correct. The key regains acceleration automatically once
+the malformed point's payload is repaired, cleared, or the point itself is
+reclaimed; it is a tracked state, not a one-way trip. Since a hand-crafted
+byte string can trigger this, produce records only through `operate` or its
+SDK encoder, never by hand.
+
+### Known limits
+
+- A literal payload key whose name merely **looks like** a path (e.g. a
+  string field literally named `"a/b"`) still resolves and indexes exactly —
+  but the planner decides whether to accelerate a filter purely from the
+  field *name*'s shape, which cannot tell a literal key from a record path
+  apart. Such a key gets full `eq`/`in`/range acceleration but not
+  `match`/`contains`/geo acceleration, even though the underlying value is
+  an ordinary string. This is a deliberate, accepted phase-1 cost: the
+  filter still answers correctly, just via the graph-traversal fallback
+  instead of the payload index for those operators.
+- A positional field (`#N`) is always evaluated live, regardless of
+  selectivity, per the indexing rule above.
 
 ## Building filters from Python
 
