@@ -3,6 +3,7 @@
 package vector
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
@@ -475,33 +476,79 @@ func TestValueCodecRecordRoundtrip(t *testing.T) {
 		}
 	})
 
-	t.Run("oversized length errors without allocating", func(t *testing.T) {
+	t.Run("oversized length errors without allocating (sized reader)", func(t *testing.T) {
 		// kind byte + a length prefix claiming ~4 GiB, with NO payload bytes
 		// behind it. bytes.Reader implements Len(), so boundedRecordBytes must
 		// reject this from the length prefix alone rather than attempting
 		// make([]byte, 0xFFFFFFF0) — which would otherwise blow the test's
 		// memory budget or the process's.
-		var frame bytes.Buffer
-		frame.WriteByte(byte(ValueRecord))
-		if err := writeU32(&frame, 0xFFFFFFF0); err != nil {
-			t.Fatalf("writeU32: %v", err)
-		}
-		frameBytes := frame.Bytes()
+		frameBytes := oversizedRecordFrame(t)
+		assertNoLargeAlloc(t, func() {
+			if _, err := readValue(bytes.NewReader(frameBytes)); err == nil {
+				t.Fatal("readValue on oversized length: got nil error, want one")
+			}
+		})
+	})
 
-		// testing.AllocsPerRun counts allocation EVENTS, not bytes — a single
-		// make([]byte, 4<<30) would show up as "1 alloc", not as a red flag. Measure
-		// heap bytes via runtime.MemStats instead, so a multi-GiB buffer can't hide.
-		var before, after runtime.MemStats
-		runtime.GC()
-		runtime.ReadMemStats(&before)
-		if _, err := readValue(bytes.NewReader(frameBytes)); err == nil {
-			t.Fatal("readValue on oversized length: got nil error, want one")
-		}
-		runtime.ReadMemStats(&after)
+	t.Run("oversized length errors without allocating (bufio reader, no Len())", func(t *testing.T) {
+		// Every production reader of a snapshot/WAL/persist stream is
+		// bufio-wrapped and does NOT implement Len() — this is the path the
+		// sizedReader early-out CANNOT protect, and the one a hostile or
+		// corrupt on-disk frame actually reaches. Only the hard
+		// maxRecordValueBytes cap in boundedRecordBytes (checked before any
+		// reader-type test) protects this path.
+		frameBytes := oversizedRecordFrame(t)
+		assertNoLargeAlloc(t, func() {
+			br := bufio.NewReader(bytes.NewReader(frameBytes))
+			if _, ok := interface{}(br).(sizedReader); ok {
+				t.Fatal("bufio.Reader unexpectedly implements sizedReader — this test no longer covers the unprotected path")
+			}
+			if _, err := readValue(br); err == nil {
+				t.Fatal("readValue on oversized length (bufio): got nil error, want one")
+			}
+		})
+	})
 
-		const budget = 1 << 20 // 1 MiB — generous headroom over the few bytes this path should touch, nowhere near the ~4 GiB it would need to actually allocate the claimed length
-		if got := after.TotalAlloc - before.TotalAlloc; got > budget {
-			t.Fatalf("readValue allocated %d bytes for an oversized length, want < %d (no ~4 GiB buffer)", got, budget)
+	t.Run("writeValue rejects a record above the cap", func(t *testing.T) {
+		// The write side must refuse what the read side would reject, so the
+		// bound is symmetric: nothing this process ever writes can trip its own
+		// read-side cap.
+		oversized := Value{Kind: ValueRecord, Rec: make([]byte, maxRecordValueBytes+1)}
+		var buf bytes.Buffer
+		if err := writeValue(&buf, oversized); err == nil {
+			t.Fatal("writeValue on a record above maxRecordValueBytes: got nil error, want one")
 		}
 	})
+}
+
+// oversizedRecordFrame builds a raw [kind:u8][len:u32] frame (kind ==
+// ValueRecord) whose length prefix claims ~4 GiB, with no payload bytes
+// behind it — used by both oversized-length subtests above.
+func oversizedRecordFrame(t *testing.T) []byte {
+	t.Helper()
+	var frame bytes.Buffer
+	frame.WriteByte(byte(ValueRecord))
+	if err := writeU32(&frame, 0xFFFFFFF0); err != nil {
+		t.Fatalf("writeU32: %v", err)
+	}
+	return frame.Bytes()
+}
+
+// assertNoLargeAlloc runs fn and fails if it allocated more than a small
+// constant budget of heap bytes. testing.AllocsPerRun counts allocation
+// EVENTS, not bytes — a single make([]byte, 4<<30) would show up as "1
+// alloc", not as a red flag — so this measures via runtime.MemStats instead,
+// which a multi-GiB buffer can't hide from.
+func assertNoLargeAlloc(t *testing.T, fn func()) {
+	t.Helper()
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	fn()
+	runtime.ReadMemStats(&after)
+
+	const budget = 1 << 20 // 1 MiB — generous headroom over the few bytes this path should touch, nowhere near the ~4 GiB it would need to actually allocate the claimed length
+	if got := after.TotalAlloc - before.TotalAlloc; got > budget {
+		t.Fatalf("allocated %d bytes, want < %d (no multi-GiB buffer)", got, budget)
+	}
 }
