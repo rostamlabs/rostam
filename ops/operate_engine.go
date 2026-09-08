@@ -47,12 +47,9 @@ var (
 // resolve is the only place a ref is produced; every other engine method
 // takes one back exactly as resolve returned it.
 type ref struct {
-	kind uint8
-	//nolint:unused // reserved for the byte-level engines (Tasks 8/10); applyOps never reads it
-	field int
-	//nolint:unused // reserved for the byte-level engines (Tasks 8/10); applyOps never reads it
-	row int
-	//nolint:unused // reserved for the byte-level engines (Tasks 8/10); applyOps never reads it
+	kind    uint8
+	field   int
+	row     int
 	col     int
 	off     int
 	typ, n  uint8
@@ -159,6 +156,22 @@ func checkRowCap(a int64) error {
 		return wire.ErrOperateCap
 	}
 	return nil
+}
+
+// trimByCol narrows a TRIM's eviction-column operand to the uint16 the engines
+// address columns with, without letting a hostile value alias a real column: an
+// int64 outside [0, OperateMaxCols) becomes OperateMaxCols, which is one past
+// the highest addressable position (a schema's ByCol must be < len(Cols), and
+// len(Cols) <= OperateMaxCols), so a schema-mode engine rejects it with
+// wire.ErrOperatePath exactly as the oracle rejects the original out-of-range
+// value. Dynamic mode addresses the eviction column by name and ignores this
+// entirely. Without the clamp, o.B = 65536 (or -65536) would silently trim by
+// column 0.
+func trimByCol(b int64) uint16 {
+	if b < 0 || b >= int64(wire.OperateMaxCols) {
+		return wire.OperateMaxCols
+	}
+	return uint16(b) //nolint:gosec // bounded to [0, OperateMaxCols) above
 }
 
 // fixedN computes the n (width) applyOps passes to resolve when a scalar op
@@ -297,11 +310,17 @@ func applyOps(e engine, ops []wire.OperateOp, stampMs int64) (uint8, uint16, err
 			if err := checkRowCap(o.A); err != nil {
 				return 0, 0, err
 			}
+			// The policy byte is validated before resolve, not inside the
+			// engine: an unknown policy is a malformed op whatever the
+			// record holds (the oracle checks it in the same place).
+			if o.Aux > wire.OperatePolicyMaxCol {
+				return 0, 0, wire.ErrOperateSchema
+			}
 			r, err := e.resolve(o.Path, false, 0, 0)
 			if err != nil {
 				return 0, 0, err
 			}
-			if err := e.trim(r, uint32(o.A), o.Aux, uint16(o.B), string(o.Bytes)); err != nil { //nolint:gosec // o.A bounded above; o.B is a column position, not attacker-scaled
+			if err := e.trim(r, uint32(o.A), o.Aux, trimByCol(o.B), string(o.Bytes)); err != nil { //nolint:gosec // o.A bounded by checkRowCap above
 				return 0, 0, err
 			}
 

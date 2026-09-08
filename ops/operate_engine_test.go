@@ -5,6 +5,7 @@ package ops
 import (
 	"errors"
 	"fmt"
+	"math"
 	"testing"
 
 	"github.com/rostamlabs/rostam/sdk/wire"
@@ -726,6 +727,11 @@ func bytesApply(rec *wire.Record, a *wire.OperateArgs, stampMs int64) (*wire.Rec
 	if err != nil {
 		return nil, nil, err
 	}
+	if res != nil && res.Status == wire.OperateStatusCheckFailed {
+		// A no-op: nothing is stored, and the record the suite sees is the
+		// one it passed in.
+		return rec, res, nil
+	}
 	if deleted || len(out) == 0 {
 		return nil, res, nil
 	}
@@ -734,4 +740,65 @@ func bytesApply(rec *wire.Record, a *wire.OperateArgs, stampMs int64) (*wire.Rec
 		return nil, nil, fmt.Errorf("engine produced undecodable bytes %x: %w", out, derr)
 	}
 	return got, res, nil
+}
+
+// TestApplyOpsTrimByCol pins the narrowing of TRIM's eviction-column operand.
+// It travels as an int64 and the engines address columns as a uint16, so a
+// plain conversion would let 1<<16 alias column 0 and -65536 alias it too —
+// silently trimming by a real column where the tree oracle rejects the op.
+// Anything outside [0, OperateMaxCols) must arrive as OperateMaxCols, which no
+// schema can have a column at.
+func TestApplyOpsTrimByCol(t *testing.T) {
+	cases := []struct {
+		name string
+		b    int64
+		want uint16
+	}{
+		{"zero", 0, 0},
+		{"in range", 7, 7},
+		{"highest addressable", int64(wire.OperateMaxCols) - 1, wire.OperateMaxCols - 1},
+		{"negative", -1, wire.OperateMaxCols},
+		{"negative aliasing zero", -65536, wire.OperateMaxCols},
+		{"one past the top", int64(wire.OperateMaxCols), wire.OperateMaxCols},
+		{"aliasing zero", 1 << 16, wire.OperateMaxCols},
+		{"aliasing column two", 1<<16 + 2, wire.OperateMaxCols},
+		{"max", math.MaxInt64, wire.OperateMaxCols},
+		{"min", math.MinInt64, wire.OperateMaxCols},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := trimByCol(tc.b); got != tc.want {
+				t.Fatalf("trimByCol(%d)=%d, want %d", tc.b, got, tc.want)
+			}
+			f := newFakeEngine()
+			ops := []wire.OperateOp{{Opcode: wire.OperateOpTRIM, Path: fakeFieldPath("tbl"),
+				A: 1, Aux: wire.OperatePolicyMinCol, B: tc.b}}
+			if _, _, err := applyOps(f, ops, 0); err != nil {
+				t.Fatalf("applyOps: %v", err)
+			}
+			if len(f.trimmed) != 1 || f.trimmed[0].byCol != tc.want {
+				t.Fatalf("trim called with %+v, want byCol %d", f.trimmed, tc.want)
+			}
+		})
+	}
+}
+
+// TestApplyOpsTrimPolicy: an unknown eviction policy is rejected before
+// resolve, the way the oracle rejects it — a malformed op is malformed
+// whatever the record holds.
+func TestApplyOpsTrimPolicy(t *testing.T) {
+	f := newFakeEngine()
+	ops := []wire.OperateOp{{Opcode: wire.OperateOpTRIM, Path: fakeFieldPath("tbl"), A: 1,
+		Aux: wire.OperatePolicyMaxCol + 1}}
+	if _, _, err := applyOps(f, ops, 0); !errors.Is(err, wire.ErrOperateSchema) {
+		t.Fatalf("err=%v, want wire.ErrOperateSchema", err)
+	}
+	for _, call := range f.calls {
+		if call == "resolve:"+pathKey(fakeFieldPath("tbl")) {
+			t.Fatal("resolve ran before the policy check rejected the op")
+		}
+	}
+	if len(f.trimmed) != 0 {
+		t.Fatalf("trim ran: %+v", f.trimmed)
+	}
 }

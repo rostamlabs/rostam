@@ -1697,6 +1697,11 @@ func randomTableDef(rng *rand.Rand) *wire.TableDef {
 // specs of both modes.
 func randomArgs(rng *rand.Rand, s *wire.Schema) *wire.OperateArgs {
 	a := &wire.OperateArgs{Create: wire.OperateCreateSchema, Schema: s.Encode()}
+	if rng.Intn(24) == 0 {
+		// A blob with something after it is not a schema blob, on a fresh
+		// record or an existing one.
+		a.Schema = append(a.Schema, byte(rng.Intn(256))) //nolint:gosec // deterministic test input
+	}
 	if rng.Intn(16) == 0 {
 		a.Create = wire.OperateCreateNone
 		a.Schema = nil
@@ -1783,6 +1788,12 @@ func randomOp(rng *rand.Rand, s *wire.Schema) wire.OperateOp {
 		}
 		o.Aux = uint8(rng.Intn(int(wire.OperatePolicyMaxCol) + 2))
 		o.B = int64(rng.Intn(4))
+		if rng.Intn(8) == 0 {
+			// Out of range, including the two values that would alias column
+			// 0 and column 2 if the operand were merely truncated to uint16.
+			o.B = []int64{-1, -65536, 1 << 16, 1<<16 + 2, int64(wire.OperateMaxCols),
+				math.MaxInt64}[rng.Intn(6)]
+		}
 	case wire.OperateOpSTAMP:
 		o.Aux = uint8(rng.Intn(2))
 	}

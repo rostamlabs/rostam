@@ -66,16 +66,30 @@ func newSchemaCache(max int) *schemaCache {
 	return &schemaCache{max: max, ents: make(map[string]*schemaEntry, max)}
 }
 
-// get decodes the schema blob at the front of b, returning the schema and its
-// layout. It is the contract's entry point; lookup below is the internal form
-// that also reports how many bytes the blob occupied (a stored record's blob
-// is a prefix of the record, a call's blob is the whole argument).
+// get decodes a call's schema blob, returning the schema and its layout. It is
+// the contract's entry point and, like every call-argument path, requires the
+// blob to be exactly one schema.
 func (c *schemaCache) get(b []byte) (*wire.Schema, *wire.Layout, error) {
-	ent, _, err := c.lookup(b)
+	ent, err := c.lookupCall(b)
 	if err != nil {
 		return nil, nil, err
 	}
 	return ent.schema, ent.layout, nil
+}
+
+// lookupCall is the call-argument form of lookup: the blob a call carries must
+// be exactly one schema, with nothing after it (the oracle's treeOpen rejects a
+// trailing byte the same way). A stored record's blob, by contrast, is a prefix
+// of the record and uses lookup directly.
+func (c *schemaCache) lookupCall(b []byte) (*schemaEntry, error) {
+	ent, n, err := c.lookup(b)
+	if err != nil {
+		return nil, err
+	}
+	if n != len(b) {
+		return nil, wire.ErrOperateSchema
+	}
+	return ent, nil
 }
 
 // lookup returns the cached entry for the schema blob at the front of b and
@@ -404,14 +418,9 @@ func newSchemaRecord(schemaBlob []byte, cache *schemaCache) ([]byte, error) {
 	if len(schemaBlob) == 0 {
 		return nil, wire.ErrOperateSchema
 	}
-	ent, n, err := cache.lookup(schemaBlob)
+	ent, err := cache.lookupCall(schemaBlob)
 	if err != nil {
 		return nil, err
-	}
-	if n != len(schemaBlob) {
-		// Trailing bytes after the schema: the call's blob must be exactly
-		// one schema (mirrors the oracle's treeOpen).
-		return nil, wire.ErrOperateSchema
 	}
 	size := 1 + len(ent.blob) + ent.layout.FixedLen + len(ent.layout.VarTail)
 	if size > maxOperateRecordBytes {
@@ -571,7 +580,13 @@ func (e *schemaEngine) rows(pos int) int { return e.tail[e.ent.tailSlot[pos]].ro
 // rowsOff is the offset of the table field's row count uvarint.
 func (e *schemaEngine) rowsOff(pos int) int { return e.tail[e.ent.tailSlot[pos]].off }
 
-// rowStart is the offset of row idx of the table field at pos.
+// rowStart is the offset of row idx of the table field at pos. idx*RowWidth
+// cannot overflow: reindexTail admitted the table only after CountFitsIn
+// proved rows*RowWidth fits the buffer, and idx <= rows. Every other
+// count-times-width product in this file (reindexTail, removeRows, colVictim,
+// value) is bounded the same way, by the buffer that already holds the rows;
+// rebuiltSize is the one that projects a *new* width and so does its
+// arithmetic in uint64.
 func (e *schemaEngine) rowStart(pos, idx int) int {
 	ent := &e.tail[e.ent.tailSlot[pos]]
 	return ent.off + uvarintLen(uint64(ent.rows)) + idx*e.layout.Tables[pos].RowWidth //nolint:gosec // rows >= 0
@@ -998,12 +1013,9 @@ func (e *schemaEngine) config(_ ref, _ uint32, _ uint8, _ string) error {
 // whose cap the new schema lowered is evicted down to it by the new policy.
 func (e *schemaEngine) migrate(from int64, flags uint8, schemaBlob []byte) error {
 	_ = flags // DROP_EXTRA only means anything to a dynamic-mode freeze
-	ent, n, err := e.cache.lookup(schemaBlob)
+	ent, err := e.cache.lookupCall(schemaBlob)
 	if err != nil {
 		return err
-	}
-	if n != len(schemaBlob) {
-		return wire.ErrOperateSchema
 	}
 	if from == wire.OperateMigrateFromDynamic {
 		// A freeze targets a dynamic record; this one is already frozen.
@@ -1090,26 +1102,36 @@ func (e *schemaEngine) rebuild(ent *schemaEntry) error {
 // rebuiltSize is the exact byte length the rebuilt record will have, charged
 // against the record-size cap before anything is allocated for it.
 func (e *schemaEngine) rebuiltSize(ent *schemaEntry) (int, error) {
-	size := 1 + len(ent.blob) + ent.layout.FixedLen
+	// Accumulated in uint64, never int: the migration can widen every row, so
+	// rows x newRowWidth reaches 2^20 x 4096 = 2^32 — which wraps to a small
+	// positive on a 32-bit int and would slip past the cap check, leaving
+	// rebuild to append unbounded.
+	size := uint64(1) + uint64(len(ent.blob)) + uint64(ent.layout.FixedLen)
 	for _, i := range ent.layout.VarTail {
-		if i >= len(e.schema.Fields) {
+		switch {
+		case i >= len(e.schema.Fields):
 			size++
-			continue
+		case ent.schema.Fields[i].Type != wire.OperateTypeTable:
+			size += uint64(e.varFieldLen(i)) //nolint:gosec // a stored length, bounded by the buffer
+		default:
+			size += tableBytes(e.rows(i), ent.layout.Tables[i].RowWidth)
 		}
-		if ent.schema.Fields[i].Type != wire.OperateTypeTable {
-			size += e.varFieldLen(i)
-			continue
-		}
-		rows := e.rows(i)
-		size += uvarintLen(uint64(rows)) + rows*ent.layout.Tables[i].RowWidth //nolint:gosec // rows >= 0
-		if size < 0 || size > maxOperateRecordBytes {
+		if size > uint64(maxOperateRecordBytes) { //nolint:gosec // maxOperateRecordBytes > 0
 			return 0, wire.ErrOperateCap
 		}
 	}
-	if size > maxOperateRecordBytes {
-		return 0, wire.ErrOperateCap
+	return int(size), nil //nolint:gosec // bounded by maxOperateRecordBytes, itself an int
+}
+
+// tableBytes is the stored size of a table of rows rows at rowWidth bytes each,
+// computed in uint64 so the product cannot wrap: rows is bounded by
+// OperateMaxRows (2^20) and rowWidth by OperateMaxRowWidth (4096), whose
+// product does not fit a 32-bit int.
+func tableBytes(rows, rowWidth int) uint64 {
+	if rows < 0 || rowWidth < 0 {
+		return 0
 	}
-	return size, nil
+	return uint64(uvarintLen(uint64(rows))) + uint64(rows)*uint64(rowWidth)
 }
 
 // varFieldLen is the stored length of variable-length field i under the

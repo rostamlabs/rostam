@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand"
 	"reflect"
 	"sync"
@@ -223,8 +224,9 @@ func TestSchemaEngineNeverPanics(t *testing.T) {
 	}
 }
 
-// safeApply turns a panic into a test failure signal rather than tearing the
-// run down, so the frame that caused it is reported.
+// safeApply re-panics with the frame that caused it: a bare panic from deep
+// inside the engine says nothing about which of the thousand corpus entries
+// reached it, and that input is the whole finding.
 func safeApply(cur []byte, a *wire.OperateArgs) (out []byte, deleted bool, res *wire.OperateResult, err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -339,4 +341,130 @@ func TestSchemaEngineConcurrent(t *testing.T) {
 		}(g)
 	}
 	wg.Wait()
+}
+
+// TestTableBytesIs64Bit pins the arithmetic MIGRATE's size check depends on. A
+// migration may widen every row, so the projected size is rows x the NEW row
+// width — at the caps, 2^20 x 4096 = 2^32, which wraps to a small positive on
+// a 32-bit int and would slip past the record cap, leaving the rebuild to
+// append unbounded inside FSM apply. The product cannot be built as a real
+// record (it is 4 GiB), so the arithmetic is tested directly.
+func TestTableBytesIs64Bit(t *testing.T) {
+	const rows, width = 1 << 20, 4096 // wire.OperateMaxRows x wire.OperateMaxRowWidth
+	got := tableBytes(rows, width)
+	want := uint64(uvarintLen(rows)) + uint64(rows)*uint64(width)
+	if got != want {
+		t.Fatalf("tableBytes=%d, want %d", got, want)
+	}
+	if got <= math.MaxInt32 {
+		t.Fatalf("tableBytes=%d does not exceed MaxInt32, so this test proves nothing", got)
+	}
+	// The naive 32-bit product this replaces wrapped to a value that passes
+	// every cap check.
+	if wrapped := int32(uint32(got)); wrapped >= 0 && wrapped < 16<<20 { //nolint:gosec // demonstrating the wrap
+		t.Logf("a 32-bit int would have seen %d bytes instead of %d", wrapped, got)
+	}
+	if got <= uint64(maxOperateRecordBytes) {
+		t.Fatalf("tableBytes=%d is under the record cap %d", got, maxOperateRecordBytes)
+	}
+	if tableBytes(-1, width) != 0 || tableBytes(rows, -1) != 0 {
+		t.Fatal("negative inputs must not produce a size")
+	}
+}
+
+// TestMigrateSizeCap drives the same check through a real migration: the
+// rebuilt record has to fit maxRecordBytes, and a migration that would blow it
+// fails with the record unchanged.
+func TestMigrateSizeCap(t *testing.T) {
+	s := sessionSchema()
+	s.Fields[3].Table.Cap = 0
+	base := bigSessionRecord(t, 64)
+	var stored []byte
+	stored = append(stored, base...)
+
+	// Widen every row by appending eight FIXED(255) columns: 64 rows x 2040
+	// new bytes is far past the lowered cap.
+	ns := sessionSchema()
+	ns.Version = 2
+	for i := 0; i < 8; i++ {
+		ns.Fields[3].Table.Cols = append(ns.Fields[3].Table.Cols,
+			wire.ColumnDef{Name: fmt.Sprintf("w%d", i), Type: wire.OperateTypeFixed, N: 255})
+	}
+	if err := ns.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	migrate := &wire.OperateArgs{Create: wire.OperateCreateNone, Ops: []wire.OperateOp{
+		{Opcode: wire.OperateOpMIGRATE, Type: opFromSchema, Path: recPath(), A: 1, Bytes: ns.Encode()}}}
+
+	// It fits by default...
+	out, _, _, err := applyRecordBytes(stored, migrate, 0)
+	if err != nil {
+		t.Fatalf("migration under the cap: %v", err)
+	}
+	if _, derr := wire.DecodeRecord(out); derr != nil {
+		t.Fatalf("migrated record does not decode: %v", derr)
+	}
+	// ...and is refused when it does not.
+	restore := maxOperateRecordBytes
+	maxOperateRecordBytes = len(stored) + 1024
+	t.Cleanup(func() { maxOperateRecordBytes = restore })
+	out, _, _, err = applyRecordBytes(stored, migrate, 0)
+	if !errors.Is(err, wire.ErrOperateCap) {
+		t.Fatalf("err=%v, want ErrOperateCap", err)
+	}
+	if out != nil {
+		t.Fatal("a refused migration returned a record to store")
+	}
+	if !bytes.Equal(stored, base) {
+		t.Fatal("the stored record was mutated by a refused migration")
+	}
+}
+
+// TestSchemaBlobMustBeExact: a call's schema blob is exactly one schema. A
+// trailing byte is rejected whether the record exists or not — the oracle
+// rejects it in treeOpen either way, and accepting it on one path only would
+// make "the same call" mean two things.
+func TestSchemaBlobMustBeExact(t *testing.T) {
+	s := sessionSchema()
+	exact := s.Encode()
+	trailing := append(append([]byte(nil), exact...), 0)
+
+	mk := func(blob []byte) *wire.OperateArgs {
+		return &wire.OperateArgs{Create: wire.OperateCreateSchema, Schema: blob,
+			Ops: []wire.OperateOp{{Opcode: wire.OperateOpADD, Type: opFromSchema, Path: fieldPath(0), A: 1}}}
+	}
+	base, _, _, err := applyRecordBytes(nil, mk(exact), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		cur  []byte
+	}{{"absent record", nil}, {"existing record", base}} {
+		out, _, _, err := applyRecordBytes(tc.cur, mk(trailing), 0)
+		if !errors.Is(err, wire.ErrOperateSchema) {
+			t.Errorf("%s: err=%v, want ErrOperateSchema", tc.name, err)
+		}
+		if out != nil {
+			t.Errorf("%s: returned a record to store", tc.name)
+		}
+	}
+	// The oracle agrees, on both paths.
+	for _, tc := range []struct {
+		name string
+		rec  *wire.Record
+	}{{"absent record", nil}, {"existing record", mustDecode(t, base)}} {
+		if _, _, err := applyTree(tc.rec, mk(trailing), 0); !errors.Is(err, wire.ErrOperateSchema) {
+			t.Errorf("oracle, %s: err=%v, want ErrOperateSchema", tc.name, err)
+		}
+	}
+}
+
+func mustDecode(t *testing.T, b []byte) *wire.Record {
+	t.Helper()
+	rec, err := wire.DecodeRecord(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rec
 }

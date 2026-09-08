@@ -23,13 +23,16 @@ var schemaEnginePool = sync.Pool{New: func() any { return new(schemaEngine) }}
 
 // applyRecordBytes applies one operate call to a stored record.
 //
-// cur is the record's stored bytes, or nil when the key is absent; it is
-// never mutated — the engine works on a private copy. On success out is the
-// record to store (deleted == true means "delete the key instead", design doc
-// §2.5). On a failed CHECK the call is a no-op: out is cur unchanged and the
-// result carries OperateStatusCheckFailed plus the return specs evaluated
-// against the pre-call record (design doc §3.3). On error nothing is
-// returned but the error, and the stored record is unchanged by definition.
+// cur is the record's stored bytes, or nil when the key is absent; it is never
+// mutated — the engine works on a private copy.
+//
+// out is what the caller should store, and it is nil whenever the call stores
+// nothing: on a failed CHECK (a no-op, whose result still carries
+// OperateStatusCheckFailed and the return specs evaluated against the pre-call
+// record, design doc §3.3), on any error, and when deleted is true — which
+// means "delete the key" rather than "store nothing" (design doc §2.5). out is
+// never an alias of cur: the caller can write it back without thinking about
+// the store's own page.
 func applyRecordBytes(cur []byte, a *wire.OperateArgs, stampMs int64) ([]byte, bool, *wire.OperateResult, error) {
 	if len(a.Ops) > wire.OperateMaxOps || len(a.Rets) > wire.OperateMaxRet {
 		return nil, false, nil, wire.ErrOperateCap
@@ -58,7 +61,7 @@ func applyWithEngine(se *schemaEngine, cur []byte, a *wire.OperateArgs, stampMs 
 		if verr != nil {
 			return nil, false, nil, verr
 		}
-		return cur, false, &wire.OperateResult{Status: status, FailedOp: failedOp, Values: vals}, nil
+		return nil, false, &wire.OperateResult{Status: status, FailedOp: failedOp, Values: vals}, nil
 	}
 
 	if e.empty() {
