@@ -3,10 +3,10 @@
 // Package record implements record paths and byte-level resolution for
 // `operate` records (design doc §2.2/§2.9), shared by the vector store's
 // record-typed payload cells and the KV store's operate records. It has no
-// dependency on either engine: it operates purely on decoded record trees
-// (sdk/wire) and produces payload-shaped values (sdk/vtypes) so filter and
-// index code on both sides can treat a resolved record cell like any other
-// payload value.
+// dependency on either engine: it reads stored record bytes with the wire
+// format's own vocabulary (sdk/wire) and produces payload-shaped values
+// (sdk/vtypes) so filter and index code on both sides can treat a resolved
+// record cell like any other payload value.
 //
 // # Path grammar
 //
@@ -34,11 +34,10 @@
 // ParsePath and SplitField are pure functions of their input string: same
 // bytes in, same result out, on every platform and Go version this module
 // supports. Nothing in this package consults the clock, environment,
-// filesystem, or any other ambient state. A later resolver built on top of
-// this grammar (Task 3) must hold to the same rule: it is a pure function of
-// the record bytes and the parsed Path, and any schema cache it keeps must
-// be keyed by the schema blob's bytes so a cache hit can never change the
-// answer.
+// filesystem, or any other ambient state. Resolver.Resolve holds to the
+// same rule: it is a pure function of the record bytes and the parsed Path,
+// and its schema cache is keyed by the schema blob's bytes so a cache hit
+// can never change the answer.
 //
 // # Hardening
 //
@@ -50,8 +49,8 @@
 // before slicing, every numeric parse is bounds-checked before the value is
 // trusted (position <= 65535, row-key digit count <= 20 and must fit
 // uint64), and no segment is treated as well-formed until it has been fully
-// validated. A resolver built on this grammar (Task 3, mirroring
-// sdk/wire/operate_record.go) must extend the same discipline to the record
-// bytes themselves: every offset bounds-checked before use, every count
-// bounded before allocation, and only canonical uvarints accepted.
+// validated. Resolver.Resolve extends the same discipline to the record
+// bytes themselves, mirroring sdk/wire/operate_record.go: every offset
+// bounds-checked before use, every count bounded before allocation, and
+// only canonical uvarints accepted.
 package record
