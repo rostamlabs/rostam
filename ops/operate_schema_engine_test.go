@@ -468,3 +468,83 @@ func mustDecode(t *testing.T, b []byte) *wire.Record {
 	}
 	return rec
 }
+
+// TestMigrateSizeCapAllFixedTarget covers the record-size check for a target
+// schema with no variable-length fields at all: the per-tail-field check
+// inside rebuiltSize's loop never runs there, so the cap has to be tested
+// unconditionally as well. A maximal all-fixed schema (OperateMaxFields
+// FIXED(255) fields) is ~16.7 MB of fixed area on its own, past the 16 MiB
+// record cap, with no table anywhere to trip the in-loop check.
+func TestMigrateSizeCapAllFixedTarget(t *testing.T) {
+	s := &wire.Schema{Version: 1, Fields: []wire.FieldDef{{Name: "f0", Type: wire.OperateTypeU64}}}
+	base, _, _, err := applyRecordBytes(nil, &wire.OperateArgs{Create: wire.OperateCreateSchema,
+		Schema: s.Encode(), Ops: []wire.OperateOp{
+			{Opcode: wire.OperateOpADD, Type: opFromSchema, Path: fieldPath(0), A: 7}}}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := append([]byte(nil), base...)
+
+	ns := &wire.Schema{Version: 2, Fields: append([]wire.FieldDef(nil), s.Fields...)}
+	for i := 0; i < 40; i++ { // 40 x 255 = 10200 bytes of fixed area, no tail at all
+		ns.Fields = append(ns.Fields, wire.FieldDef{
+			Name: fmt.Sprintf("w%d", i), Type: wire.OperateTypeFixed, N: 255})
+	}
+	if err := ns.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	layout, err := ns.Layout()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(layout.VarTail) != 0 {
+		t.Fatalf("the target schema must have an empty tail for this test to mean anything: %v", layout.VarTail)
+	}
+	migrate := &wire.OperateArgs{Create: wire.OperateCreateNone, Ops: []wire.OperateOp{
+		{Opcode: wire.OperateOpMIGRATE, Type: opFromSchema, Path: recPath(), A: 1, Bytes: ns.Encode()}}}
+
+	// It fits under the default cap.
+	out, _, _, err := applyRecordBytes(stored, migrate, 0)
+	if err != nil {
+		t.Fatalf("migration under the cap: %v", err)
+	}
+	if _, derr := wire.DecodeRecord(out); derr != nil {
+		t.Fatalf("migrated record does not decode: %v", derr)
+	}
+
+	// It does not fit under a lowered one. The assertion that matters is on
+	// rebuiltSize itself: applyRecordBytes also checks the finished record, so
+	// an end-to-end ErrOperateCap alone would pass even with the cap check
+	// missing — while rebuild would already have allocated and filled the
+	// oversized buffer to get there.
+	restore := maxOperateRecordBytes
+	maxOperateRecordBytes = 1024
+	t.Cleanup(func() { maxOperateRecordBytes = restore })
+
+	e, err := newSchemaEngine(append([]byte(nil), stored...), operateSchemas)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ent, err := operateSchemas.lookupCall(ns.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ent.layout.VarTail) != 0 {
+		t.Fatal("the cached target entry must have an empty tail")
+	}
+	if _, err := e.rebuiltSize(ent); !errors.Is(err, wire.ErrOperateCap) {
+		t.Fatalf("rebuiltSize err=%v, want ErrOperateCap — an all-fixed target schema reaches "+
+			"no per-tail-field check, so the size must be tested unconditionally", err)
+	}
+
+	out, deleted, res, err := applyRecordBytes(stored, migrate, 0)
+	if !errors.Is(err, wire.ErrOperateCap) {
+		t.Fatalf("err=%v, want ErrOperateCap", err)
+	}
+	if out != nil || deleted || res != nil {
+		t.Fatalf("a refused migration returned out=%x deleted=%v res=%+v", out, deleted, res)
+	}
+	if !bytes.Equal(stored, base) {
+		t.Fatal("the stored record was mutated by a refused migration")
+	}
+}

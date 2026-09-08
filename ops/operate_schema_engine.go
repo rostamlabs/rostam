@@ -1120,6 +1120,14 @@ func (e *schemaEngine) rebuiltSize(ent *schemaEntry) (int, error) {
 			return 0, wire.ErrOperateCap
 		}
 	}
+	// Unconditionally, not only per tail field: a target schema may have no
+	// variable-length fields at all (every field fixed-width is legal), and
+	// then the loop above never runs — while the header and the fixed area it
+	// already counted can exceed the cap on their own, since OperateMaxFields
+	// FIXED(255) fields are ~16.7 MB.
+	if size > uint64(maxOperateRecordBytes) { //nolint:gosec // maxOperateRecordBytes > 0
+		return 0, wire.ErrOperateCap
+	}
 	return int(size), nil //nolint:gosec // bounded by maxOperateRecordBytes, itself an int
 }
 
