@@ -88,8 +88,10 @@ func appendSeg(buf []byte, seg OperateSeg) ([]byte, error) {
 }
 
 // decodeSeg reads one fseg/cseg from the front of b, returning the segment
-// and the number of bytes consumed. An unknown seg-kind byte is
-// ErrOperateArgs; a truncated frame is ErrShortArgs.
+// and the number of bytes consumed. An unknown seg-kind byte, or a position
+// past the uint32 an OperateSeg addresses with, is ErrOperateArgs — the
+// frame is complete and well-formed, its content is out of range, which is
+// what ErrOperateArgs means. A truncated frame is ErrShortArgs.
 func decodeSeg(b []byte) (OperateSeg, int, error) {
 	if len(b) < 1 {
 		return OperateSeg{}, 0, ErrShortArgs
@@ -101,7 +103,7 @@ func decodeSeg(b []byte) (OperateSeg, int, error) {
 			return OperateSeg{}, 0, ErrShortArgs
 		}
 		if v > math.MaxUint32 {
-			return OperateSeg{}, 0, ErrShortArgs
+			return OperateSeg{}, 0, ErrOperateArgs
 		}
 		return OperateSeg{Pos: uint32(v)}, 1 + n, nil
 	case 1:
@@ -345,9 +347,12 @@ func EncodeOperateArgs(a *OperateArgs) ([]byte, error) {
 
 // DecodeOperateArgs reads args produced by EncodeOperateArgs, applying v1
 // decode discipline throughout: every read is truncation-checked before it
-// happens, and every declared count (nOps, nRet) is bounded with
-// CountFitsIn against the smallest honest encoding of that kind of element,
-// and against its cap, BEFORE any slice sized by it is allocated. Decoded
+// happens, and every declared count (nOps, nRet) is bounded against its cap
+// (ErrOperateCap) and with CountFitsIn against the smallest honest encoding
+// of that kind of element (ErrShortArgs), BEFORE any slice sized by it is
+// allocated. The two bounds report different errors because they mean
+// different things: over the cap is a call asking for more than the protocol
+// allows, over the byte budget is a truncated or lying frame. Decoded
 // Key/Schema/Bytes/Name/path-Key fields may alias b: the apply path only
 // reads them during one call and never retains them past it.
 func DecodeOperateArgs(b []byte) (*OperateArgs, error) {
@@ -400,7 +405,14 @@ func DecodeOperateArgs(b []byte) (*OperateArgs, error) {
 	}
 	nOps := int(binary.BigEndian.Uint16(b[off : off+2]))
 	off += 2
-	if nOps > OperateMaxOps || !CountFitsIn(nOps, len(b)-off, minOpBytes) {
+	// Two distinct failures, reported as two distinct errors: a count over
+	// the design doc §2.7 cap is ErrOperateCap (the frame asked for more ops
+	// than a call may carry), while a count the remaining bytes cannot
+	// possibly hold is a truncated frame.
+	if nOps > OperateMaxOps {
+		return nil, ErrOperateCap
+	}
+	if !CountFitsIn(nOps, len(b)-off, minOpBytes) {
 		return nil, ErrShortArgs
 	}
 	var ops []OperateOp
@@ -421,7 +433,10 @@ func DecodeOperateArgs(b []byte) (*OperateArgs, error) {
 	}
 	nRet := int(binary.BigEndian.Uint16(b[off : off+2]))
 	off += 2
-	if nRet > OperateMaxRet || !CountFitsIn(nRet, len(b)-off, minRetBytes) {
+	if nRet > OperateMaxRet {
+		return nil, ErrOperateCap
+	}
+	if !CountFitsIn(nRet, len(b)-off, minRetBytes) {
 		return nil, ErrShortArgs
 	}
 	var rets []OperateRet

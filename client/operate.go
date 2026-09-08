@@ -166,7 +166,20 @@ func NewOperate(key []byte) *OperateBuilder {
 // subsequent Field/Col name is resolved against s. s is validated once,
 // here; a nil s or a validation failure is recorded and returned by Args
 // rather than panicking.
+//
+// It is exclusive with Dynamic: the two set the same `create` byte to
+// opposite values, and a builder that has been through both would ship a
+// dynamic call carrying a schema blob and schema-POSITION paths. The wire
+// decoder accepts that frame, so nothing catches it until the dynamic
+// engine rejects every path with wire.ErrOperatePath — calling the second
+// one is recorded as an error here instead.
 func (ob *OperateBuilder) WithSchema(s *wire.Schema) *OperateBuilder {
+	if ob.create == wire.OperateCreateDynamic {
+		if ob.err == nil {
+			ob.err = fmt.Errorf("client: operate: builder is already in dynamic mode; WithSchema and Dynamic are exclusive")
+		}
+		return ob
+	}
 	if ob.err == nil {
 		if s == nil {
 			ob.err = fmt.Errorf("client: operate: WithSchema requires a non-nil schema")
@@ -184,8 +197,15 @@ func (ob *OperateBuilder) WithSchema(s *wire.Schema) *OperateBuilder {
 
 // Dynamic marks the call as creating an absent record in dynamic mode
 // (design doc §2.9): no schema, every field and column named and typed by
-// the ops that first touch it.
+// the ops that first touch it. It is exclusive with WithSchema, for the
+// reason given there.
 func (ob *OperateBuilder) Dynamic() *OperateBuilder {
+	if ob.create == wire.OperateCreateSchema || ob.schema != nil {
+		if ob.err == nil {
+			ob.err = fmt.Errorf("client: operate: builder is already in schema mode; Dynamic and WithSchema are exclusive")
+		}
+		return ob
+	}
 	ob.create = wire.OperateCreateDynamic
 	return ob
 }
@@ -606,7 +626,17 @@ func (ob *OperateBuilder) resolveOp(op builderOp) (wire.OperateOp, error) {
 // and, if Key is set, checked against the field's table (schema mode: the
 // field must be a table, and the key must be exactly the table's key
 // width) before Col (if set) is resolved against that table's columns.
+//
+// A column belongs to a row, so a Path carrying Col without Key addresses
+// nothing (design doc §2.4). It is rejected rather than narrowed: the wire
+// form for such a path is OperatePathField, which silently DROPS the column
+// and aims the op at the field itself — in dynamic mode that means a SET
+// meant for one column of one row would overwrite a scalar field of the
+// same name.
 func (ob *OperateBuilder) resolvePath(p Path) (wire.OperatePath, error) {
+	if p.HasCol && !p.HasKey {
+		return wire.OperatePath{}, fmt.Errorf("client: operate: column %q of field %q needs a row key; use Col(field, key, col)", p.Col, p.Field)
+	}
 	if p.Field == "" && !p.HasKey && !p.HasCol {
 		return wire.OperatePath{Kind: wire.OperatePathRecord}, nil
 	}

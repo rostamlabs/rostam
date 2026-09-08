@@ -5,6 +5,7 @@ package wire
 import (
 	"encoding/binary"
 	"errors"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -189,5 +190,78 @@ func TestDecodeOperateResultUnknownStatus(t *testing.T) {
 		if _, err := DecodeOperateResult(b); err != nil {
 			t.Fatalf("status %d rejected: %v", status, err)
 		}
+	}
+}
+
+// TestDecodeOperateArgsErrorIdentity pins which error each rejection
+// reports. The client turns these into a status the caller branches on, so
+// "over a cap" and "the frame is short" must not collapse into one another:
+//
+//   - a path position past the uint32 an OperateSeg addresses with is
+//     ErrOperateArgs (the frame is complete, its content is out of range),
+//   - nOps/nRet over OperateMaxOps/OperateMaxRet is ErrOperateCap,
+//   - nOps/nRet the remaining bytes cannot hold is still ErrShortArgs.
+func TestDecodeOperateArgsErrorIdentity(t *testing.T) {
+	// One op whose field seg is a by-position segment holding 2^32, which is
+	// one past the largest addressable position.
+	frame := func(pos uint64) []byte {
+		b := binary.BigEndian.AppendUint16(nil, 1) // keyLen
+		b = append(b, 'k')
+		b = binary.BigEndian.AppendUint64(b, 0)          // ttlMs
+		b = append(b, OperateTTLKeep, OperateCreateNone) // ttlMode, create
+		b = binary.BigEndian.AppendUint16(b, 0)          // schemaLen
+		b = binary.BigEndian.AppendUint16(b, 1)          // nOps
+		b = append(b, OperateOpADD, OperateTypeU64, 0)   // opcode, type, aux
+		b = append(b, OperatePathField, 0)               // path kind, seg kind = by position
+		b = binary.AppendUvarint(b, pos)
+		b = binary.BigEndian.AppendUint64(b, 1)    // a
+		b = binary.BigEndian.AppendUint64(b, 0)    // b
+		b = binary.BigEndian.AppendUint16(b, 0)    // blen
+		return binary.BigEndian.AppendUint16(b, 0) // nRet
+	}
+	if _, err := DecodeOperateArgs(frame(math.MaxUint32 + 1)); !errors.Is(err, ErrOperateArgs) {
+		t.Fatalf("out-of-range seg position: err = %v, want ErrOperateArgs", err)
+	}
+	// The largest position that IS addressable decodes, so the case above is
+	// failing on the range and not on the frame.
+	got, err := DecodeOperateArgs(frame(math.MaxUint32))
+	if err != nil {
+		t.Fatalf("seg position at MaxUint32: %v", err)
+	}
+	if got.Ops[0].Path.Field.Pos != math.MaxUint32 {
+		t.Fatalf("pos = %d", got.Ops[0].Path.Field.Pos)
+	}
+
+	// nOps and nRet over their caps, each in a frame long enough that
+	// CountFitsIn would otherwise be satisfied. An over-cap count is
+	// unencodable — EncodeOperateArgs refuses it — so it only ever arrives in
+	// hostile input, which is exactly why the error has to say "cap".
+	base, err := EncodeOperateArgs(&OperateArgs{Key: []byte("k"), Create: OperateCreateDynamic})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nOpsOff := 2 + 1 + 8 + 1 + 1 + 2
+	over := append(append([]byte(nil), base...), make([]byte, (OperateMaxOps+1)*minOpBytes)...)
+	binary.BigEndian.PutUint16(over[nOpsOff:], OperateMaxOps+1)
+	if _, err := DecodeOperateArgs(over); !errors.Is(err, ErrOperateCap) {
+		t.Fatalf("nOps over the cap: err = %v, want ErrOperateCap", err)
+	}
+	overRet := append(append([]byte(nil), base...), make([]byte, (OperateMaxRet+1)*minRetBytes)...)
+	binary.BigEndian.PutUint16(overRet[nOpsOff+2:], OperateMaxRet+1) // nRet, with nOps = 0 before it
+	if _, err := DecodeOperateArgs(overRet); !errors.Is(err, ErrOperateCap) {
+		t.Fatalf("nRet over the cap: err = %v, want ErrOperateCap", err)
+	}
+
+	// A count under the cap that the remaining bytes cannot hold is still a
+	// short frame, not a cap hit.
+	short := append([]byte(nil), base...)
+	binary.BigEndian.PutUint16(short[nOpsOff:], OperateMaxOps)
+	if _, err := DecodeOperateArgs(short); !errors.Is(err, ErrShortArgs) {
+		t.Fatalf("nOps within the cap but past the byte budget: err = %v, want ErrShortArgs", err)
+	}
+	shortRet := append([]byte(nil), base...)
+	binary.BigEndian.PutUint16(shortRet[nOpsOff+2:], OperateMaxRet)
+	if _, err := DecodeOperateArgs(shortRet); !errors.Is(err, ErrShortArgs) {
+		t.Fatalf("nRet within the cap but past the byte budget: err = %v, want ErrShortArgs", err)
 	}
 }

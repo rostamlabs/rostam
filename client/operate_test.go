@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -327,5 +328,75 @@ func TestOperateBuilderConfigIsDynamicOnly(t *testing.T) {
 	if _, err := NewOperate([]byte("k")).Dynamic().
 		Trim(F("ev"), 5, wire.OperatePolicyMinCol, "hits").Args(); err != nil {
 		t.Fatalf("Trim in dynamic mode: %v", err)
+	}
+}
+
+// TestOperateBuilderModesAreExclusive covers the create-mode setters in both
+// orders. Before this guard, a builder that had been through both shipped a
+// DYNAMIC create byte alongside a schema blob and schema-position paths: the
+// wire decoder accepts that frame, so nothing rejected it until the dynamic
+// engine failed every path with wire.ErrOperatePath, a round trip later.
+func TestOperateBuilderModesAreExclusive(t *testing.T) {
+	s := &wire.Schema{Version: 1, Fields: []wire.FieldDef{{Name: "hits", Type: wire.OperateTypeU64}}}
+
+	got, err := NewOperate([]byte("k")).WithSchema(s).Dynamic().
+		Add(F("hits"), 1).Args()
+	if err == nil {
+		t.Fatalf("WithSchema().Dynamic() built a call: %+v", got)
+	}
+	if !strings.Contains(err.Error(), "schema mode") {
+		t.Fatalf("err = %v, want it to name the mode already set", err)
+	}
+
+	got, err = NewOperate([]byte("k")).Dynamic().WithSchema(s).
+		AddT(F("hits"), wire.OperateTypeU64, 1).Args()
+	if err == nil {
+		t.Fatalf("Dynamic().WithSchema() built a call: %+v", got)
+	}
+	if !strings.Contains(err.Error(), "dynamic mode") {
+		t.Fatalf("err = %v, want it to name the mode already set", err)
+	}
+
+	// Neither guard fires when only one of the two is used, nor when the same
+	// one is used twice.
+	if _, err := NewOperate([]byte("k")).WithSchema(s).WithSchema(s).
+		Add(F("hits"), 1).Args(); err != nil {
+		t.Fatalf("WithSchema twice: %v", err)
+	}
+	if _, err := NewOperate([]byte("k")).Dynamic().Dynamic().
+		AddT(F("hits"), wire.OperateTypeU64, 1).Args(); err != nil {
+		t.Fatalf("Dynamic twice: %v", err)
+	}
+}
+
+// TestOperateBuilderColumnNeedsRowKey covers a Path carrying a column but no
+// row key. A column belongs to a row (design doc §2.4), and the wire form
+// for such a path is OperatePathField, which DROPS the column and aims the
+// op at the field itself — in dynamic mode a SET meant for one column would
+// overwrite a scalar field of the same name.
+func TestOperateBuilderColumnNeedsRowKey(t *testing.T) {
+	orphan := Path{Field: "b", Col: "c", HasCol: true}
+
+	got, err := NewOperate([]byte("k")).Dynamic().SetT(orphan, wire.OperateTypeU64, 1).Args()
+	if err == nil {
+		t.Fatalf("a column path without a key built a call: %+v", got)
+	}
+	if !strings.Contains(err.Error(), `"c"`) || !strings.Contains(err.Error(), `"b"`) {
+		t.Fatalf("err = %v, want it to name the column and the field", err)
+	}
+
+	// A return spec goes through the same resolver, so it is caught too.
+	if _, err := NewOperate([]byte("k")).Dynamic().Return(orphan).Args(); err == nil {
+		t.Fatal("a column ret spec without a key built a call")
+	}
+
+	// The well-formed version of the same path still builds, as a Col path.
+	args, err := NewOperate([]byte("k")).Dynamic().
+		SetT(Col("b", []byte("r"), "c"), wire.OperateTypeU64, 1).Args()
+	if err != nil {
+		t.Fatalf("Col(field, key, col): %v", err)
+	}
+	if args.Ops[0].Path.Kind != wire.OperatePathCol || args.Ops[0].Path.Col.Name != "c" {
+		t.Fatalf("path = %+v", args.Ops[0].Path)
 	}
 }
