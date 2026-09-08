@@ -52,8 +52,15 @@ const (
 // or abort a run of the other ops. Groups are numbered with gaps so a later
 // revision can add an op to a group without renumbering the others.
 const (
-	OperateOpSET   uint8 = 1  // write a (int/float) or bytes (bytes/fixed)
-	OperateOpDEL   uint8 = 2  // field -> UNSET; row -> removed; table -> emptied; record -> deleted
+	OperateOpSET uint8 = 1 // write a (int/float) or bytes (bytes/fixed)
+	// DEL's effect on a FIELD differs by mode, because only one of the two
+	// has a declaration to fall back on: schema mode ZEROES the field to its
+	// schema-declared type (the slot is still declared, so it still occupies
+	// its bytes and still reads as that type's zero), while dynamic mode
+	// REMOVES it outright (nothing declares it, and losing the last field
+	// deletes the record). Row -> removed; table -> emptied; record ->
+	// deleted, in both modes.
+	OperateOpDEL   uint8 = 2
 	OperateOpADD   uint8 = 3  // x += a, saturating (int) / IEEE (float)
 	OperateOpMUL   uint8 = 4  // x *= a, saturating (int) / IEEE (float)
 	OperateOpMIN   uint8 = 5  // x = min(x, v); int, float, bytes/fixed (bytewise)
@@ -186,8 +193,15 @@ const (
 	// shared budget of this size, so a record cannot dodge it by spreading
 	// rows across many tables.
 	OperateMaxRows = 1 << 20
-	// OperateMaxRowWidth bounds one table row's stored bytes: key plus every
-	// column, FIXED(n) widths included.
+	// OperateMaxRowWidth bounds one SCHEMA-mode table row's stored bytes: key
+	// plus every column, FIXED(n) widths included. Schema.Validate computes
+	// that width from the TableDef and refuses a schema over it, which it can
+	// do because a schema-mode row is fixed-width by construction. A
+	// dynamic-mode row has no declared width to check, so it is bounded
+	// instead by what its parts are individually capped at
+	// (OperateMaxNameLen per column name, OperateMaxKeyLen per key,
+	// OperateMaxBytesLen per BYTES value, OperateMaxCols columns) and, in
+	// aggregate, by the record-size cap.
 	OperateMaxRowWidth = 4096
 	// OperateMaxKeyLen bounds a row key: a u8 length, so FIXED(n) keys in
 	// schema mode and any key in dynamic mode.

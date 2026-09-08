@@ -3,6 +3,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"reflect"
@@ -112,9 +113,15 @@ func TestOperateBuilderSchemaErrors(t *testing.T) {
 
 // TestOperateBuilderConfigTrimColPolicyGuard checks that Args rejects a
 // Config/Trim call whose policy is a *_COL policy (MIN_COL/MAX_COL) but
-// whose byCol is empty, both in dynamic mode (where the wire itself would
-// otherwise accept byColLen 0 and silently mean column 0) and in schema
-// mode (where an empty byCol would otherwise resolve nothing at all).
+// whose byCol is empty, in dynamic mode (where the wire itself would
+// otherwise accept byColLen 0 and silently mean column 0) and in schema mode
+// (where an empty byCol would otherwise resolve nothing at all).
+//
+// The schema-mode case uses Trim, not Config. Config in schema mode is
+// refused by the mode guard before the byCol rule is ever consulted, so a
+// Config sub-case here would pass for the wrong reason and keep passing if
+// the byCol rule were deleted; Trim is valid in both modes, so it reaches the
+// rule under test.
 func TestOperateBuilderConfigTrimColPolicyGuard(t *testing.T) {
 	if _, err := NewOperate([]byte("k")).Dynamic().
 		Config(F("t"), 1024, wire.OperatePolicyMinCol, "").Args(); err == nil {
@@ -126,9 +133,20 @@ func TestOperateBuilderConfigTrimColPolicyGuard(t *testing.T) {
 	}
 
 	s := sessionSchema()
+	_, err := NewOperate([]byte("k")).WithSchema(s).
+		Trim(F("b"), 10, wire.OperatePolicyMinCol, "").Args()
+	if err == nil {
+		t.Fatal("expected error for Trim with MinCol policy and empty byCol (schema mode)")
+	}
+	if !strings.Contains(err.Error(), "column name") {
+		t.Fatalf("err = %v, want the *_COL byCol rule, not some earlier guard", err)
+	}
+
+	// The same Trim with a real column name builds, so the case above is
+	// failing on the empty byCol and not on the path or the mode.
 	if _, err := NewOperate([]byte("k")).WithSchema(s).
-		Config(F("b"), 1024, wire.OperatePolicyMinCol, "").Args(); err == nil {
-		t.Fatal("expected error for Config with MinCol policy and empty byCol (schema mode)")
+		Trim(F("b"), 10, wire.OperatePolicyMinCol, "c").Args(); err != nil {
+		t.Fatalf("Trim with MinCol and a real byCol (schema mode): %v", err)
 	}
 
 	// A non-*_COL policy still needs no byCol.
@@ -398,5 +416,140 @@ func TestOperateBuilderColumnNeedsRowKey(t *testing.T) {
 	}
 	if args.Ops[0].Path.Kind != wire.OperatePathCol || args.Ops[0].Path.Col.Name != "c" {
 		t.Fatalf("path = %+v", args.Ops[0].Path)
+	}
+}
+
+// TestOperateNilArgs covers Client.Operate against a nil args pointer, which
+// is the shape a caller lands on by ignoring OperateBuilder.Args's error.
+// EncodeOperateArgs dereferences it, so this used to panic inside the client.
+func TestOperateNilArgs(t *testing.T) {
+	c, err := New(Config{Servers: []string{"127.0.0.1:1"}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	res, err := c.Operate(context.Background(), nil)
+	if !errors.Is(err, wire.ErrOperateArgs) {
+		t.Fatalf("err = %v, want wire.ErrOperateArgs", err)
+	}
+	if res != nil {
+		t.Fatalf("res = %+v, want nil", res)
+	}
+}
+
+// TestDecodeOperateValueTrailingBytes covers the "one tagged cell, exactly"
+// rule. A value that decodes and leaves bytes over is not the value it claims
+// to be — a table's or a row's encoding read as a scalar, or a corrupt
+// frame — and returning its first cell would hand the caller a prefix of
+// something else.
+func TestDecodeOperateValueTrailingBytes(t *testing.T) {
+	one := wire.AppendTaggedCell(nil, wire.Cell{Type: wire.OperateTypeU16, U: 7})
+	if c, err := DecodeOperateValue(one); err != nil || c.U != 7 {
+		t.Fatalf("a single tagged cell must decode: %+v %v", c, err)
+	}
+	two := wire.AppendTaggedCell(append([]byte(nil), one...), wire.Cell{Type: wire.OperateTypeU8, U: 1})
+	if _, err := DecodeOperateValue(two); !errors.Is(err, wire.ErrOperateArgs) {
+		t.Fatalf("two cells: err = %v, want wire.ErrOperateArgs", err)
+	}
+	if _, err := DecodeOperateValue(append(append([]byte(nil), one...), 0)); err == nil {
+		t.Fatal("a single trailing byte was accepted")
+	}
+	// The absent-value convention is one byte and still decodes.
+	if c, err := DecodeOperateValue([]byte{wire.OperateTypeUnset}); err != nil || c.Type != wire.OperateTypeUnset {
+		t.Fatalf("UNSET: %+v %v", c, err)
+	}
+}
+
+// TestOperateBuilderMigrateMustBeFirst covers MIGRATE's position. applyOps
+// rejects a MIGRATE at any index but 0 with wire.ErrOperateOpcode (design doc
+// §2.8), so building one after another op can only ever produce a request the
+// server refuses.
+func TestOperateBuilderMigrateMustBeFirst(t *testing.T) {
+	s := &wire.Schema{Version: 2, Fields: []wire.FieldDef{{Name: "rc", Type: wire.OperateTypeU64}}}
+
+	_, err := NewOperate([]byte("k")).Dynamic().
+		AddT(F("rc"), wire.OperateTypeU64, 1).
+		Migrate(wire.OperateMigrateFromDynamic, s, false).
+		Args()
+	if err == nil {
+		t.Fatal("Migrate after another op built a call")
+	}
+	if !strings.Contains(err.Error(), "first op") {
+		t.Fatalf("err = %v, want it to name the position rule", err)
+	}
+
+	// Two MIGRATEs is the same rule: the second is not the first op.
+	if _, err := NewOperate([]byte("k")).Dynamic().
+		Migrate(wire.OperateMigrateFromDynamic, s, false).
+		Migrate(wire.OperateMigrateFromDynamic, s, false).Args(); err == nil {
+		t.Fatal("a second Migrate built a call")
+	}
+
+	// Migrate first is fine, and stays op 0.
+	args, err := NewOperate([]byte("k")).Dynamic().
+		Migrate(wire.OperateMigrateFromDynamic, s, false).
+		Add(F("rc"), 1).Args()
+	if err != nil {
+		t.Fatalf("Migrate first: %v", err)
+	}
+	if args.Ops[0].Opcode != wire.OperateOpMIGRATE {
+		t.Fatalf("op 0 = %d, want MIGRATE", args.Ops[0].Opcode)
+	}
+}
+
+// TestOperateBuilderMigrateInstallsResolutionSchema covers what a MIGRATE
+// does to name resolution. It is the first op, so every other op and every
+// return spec runs against the record as the migration leaves it, and their
+// Field/Col names must resolve against the TARGET schema — by position, with
+// Type OperateTypeFromSchema — not as dynamic name segments.
+func TestOperateBuilderMigrateInstallsResolutionSchema(t *testing.T) {
+	s := sessionSchema()
+	args, err := NewOperate([]byte("k")).Dynamic().
+		Migrate(wire.OperateMigrateFromDynamic, s, false).
+		Add(F("rc"), 1).
+		Count(F("b")).
+		Args()
+	if err != nil {
+		t.Fatalf("Args: %v", err)
+	}
+	if args.Create != wire.OperateCreateDynamic {
+		t.Fatalf("create = %d, want CreateDynamic; a freeze does not change the create mode", args.Create)
+	}
+	// The call's own schema blob stays empty: the server checks the blob
+	// against the version the record is stored at when it OPENS it, and this
+	// record is dynamic. The target schema rides on the MIGRATE op instead.
+	if len(args.Schema) != 0 {
+		t.Fatalf("args.Schema = %x, want empty for a dynamic-create call", args.Schema)
+	}
+	add := args.Ops[1]
+	if add.Path.Field.ByName || add.Path.Field.Pos != 0 {
+		t.Fatalf("Add path = %+v, want position 0 (rc) resolved against the target schema", add.Path.Field)
+	}
+	if add.Type != wire.OperateTypeFromSchema {
+		t.Fatalf("Add type = %d, want OperateTypeFromSchema", add.Type)
+	}
+	if ret := args.Rets[0]; ret.Path.Field.ByName || ret.Path.Field.Pos != 3 {
+		t.Fatalf("ret path = %+v, want position 3 (b)", ret.Path.Field)
+	}
+
+	// A schema-mode evolution keeps shipping the version the record is stored
+	// at while resolving later names against the target.
+	v1 := sessionSchema()
+	v2 := sessionSchema()
+	v2.Version = 2
+	v2.Fields = append(v2.Fields, wire.FieldDef{Name: "extra", Type: wire.OperateTypeU64})
+	args, err = NewOperate([]byte("k")).WithSchema(v1).
+		Migrate(1, v2, false).
+		Add(F("extra"), 1).
+		Args()
+	if err != nil {
+		t.Fatalf("schema-mode evolution: %v", err)
+	}
+	if !bytes.Equal(args.Schema, v1.Encode()) {
+		t.Fatal("the call's schema blob must stay the version the record is stored at")
+	}
+	if got := args.Ops[1].Path.Field.Pos; got != 4 {
+		t.Fatalf("Add path pos = %d, want 4 (the field only v2 declares)", got)
 	}
 }

@@ -207,16 +207,29 @@ func DecodeSchema(b []byte) (*Schema, int, error) {
 		return nil, 0, err
 	}
 	off += m
-	// Two independent bounds, both before the allocation below. CountFitsIn
-	// bounds the count against the bytes actually left, but b is the whole
-	// stored record — up to 16 MiB — not just the schema blob, so on its own
-	// it would let a declared 65535 fields size a multi-megabyte slice out of
-	// a blob that can never legally exceed OperateMaxSchemaBytes. Every field
-	// costs at least one byte of that blob, so the count is bounded by the
-	// blob budget too.
-	if nFields > OperateMaxFields || nFields > OperateMaxSchemaBytes {
+	// budget is what is left of OperateMaxSchemaBytes, and it is spent by
+	// every declaration in the blob rather than reset per declaration.
+	//
+	// CountFitsIn bounds a count against the bytes actually left, but b is
+	// the whole STORED record — up to maxRecordBytes, 16 MiB — not just the
+	// schema blob, and the 4 KiB blob cap is only checked by Validate, after
+	// the whole thing has been decoded. A per-declaration bound is therefore
+	// not a bound at all in aggregate: every one of thousands of table fields
+	// can declare thousands of columns, each passing its own check, while the
+	// sum sizes hundreds of megabytes of ColumnDef before anything says no.
+	//
+	// One running budget closes that. Every field costs at least its type
+	// byte, every column at least its own, and the names section costs its
+	// declared length, so a schema whose declarations sum past the blob cap
+	// cannot possibly encode within it — and the budget is spent BEFORE each
+	// make, so an over-declaration is rejected rather than allocated for. It
+	// never rejects a legal schema: len(Encode()) >= nFields + Σ nCols +
+	// nameBytes, and Validate already requires len(Encode()) <= the cap.
+	budget := uint64(OperateMaxSchemaBytes)
+	if nFields > OperateMaxFields || nFields > budget {
 		return nil, 0, ErrOperateSchema
 	}
+	budget -= nFields
 	if !CountFitsIn(int(nFields), len(b)-off, 1) {
 		return nil, 0, ErrShortArgs
 	}
@@ -259,11 +272,13 @@ func DecodeSchema(b []byte) (*Schema, int, error) {
 			return nil, 0, err
 		}
 		off += m2
-		// Bounded by the blob budget as well as by the column cap, for the
-		// same reason nFields is: one byte of blob per column, minimum.
-		if nCols > OperateMaxCols || nCols > OperateMaxSchemaBytes {
+		// Charged against the same running budget the fields were, so the
+		// columns of every table in the blob are bounded in aggregate and
+		// not merely one table at a time.
+		if nCols > OperateMaxCols || nCols > budget {
 			return nil, 0, ErrOperateSchema
 		}
+		budget -= nCols
 		if !CountFitsIn(int(nCols), len(b)-off, 1) {
 			return nil, 0, ErrShortArgs
 		}
@@ -321,7 +336,9 @@ func DecodeSchema(b []byte) (*Schema, int, error) {
 		return nil, 0, err
 	}
 	off += m5
-	if nameBytes > OperateMaxNameBytes {
+	// The last charge against the budget: the names section is the rest of
+	// what a blob spends its 4 KiB on.
+	if nameBytes > OperateMaxNameBytes || nameBytes > budget {
 		return nil, 0, ErrOperateSchema
 	}
 	if !CountFitsIn(int(nameBytes), len(b)-off, 1) {
@@ -556,8 +573,11 @@ func (s *Schema) Layout() (*Layout, error) {
 
 // Extends reports whether newer is a valid append-only evolution of s
 // (design doc §2.8): a strictly greater version; every existing field kept
-// at its position with an unchanged type and width (a table's key type/width
-// unchanged and its existing columns kept as an unchanged-type prefix, while
+// at its position with an unchanged type and, for OperateTypeFixed, an
+// unchanged width — N is compared only where it means something, since it is
+// ignored (and not even encoded) for every other type (a table's key
+// type/width unchanged and its existing columns kept as an unchanged-type
+// prefix, while
 // Cap/Policy/ByCol are free to change); new fields and columns may be
 // appended; a name already stored may not change (though a field/column that
 // had no name may gain one). Anything else is ErrOperateSchema.
@@ -571,7 +591,11 @@ func (s *Schema) Extends(newer *Schema) error {
 	for i := range s.Fields {
 		of := &s.Fields[i]
 		nf := &newer.Fields[i]
-		if nf.Type != of.Type || nf.N != of.N {
+		// N is the FIXED(n) width and is ignored for every other type
+		// (FieldDef.N's own doc says so), so comparing it unconditionally
+		// would refuse an otherwise identical schema over a byte nothing
+		// reads — Encode does not even write it.
+		if nf.Type != of.Type || (of.Type == OperateTypeFixed && nf.N != of.N) {
 			return ErrOperateSchema
 		}
 		if of.Name != "" && nf.Name != of.Name {
@@ -584,7 +608,8 @@ func (s *Schema) Extends(newer *Schema) error {
 			return ErrOperateSchema
 		}
 		ot, nt := of.Table, nf.Table
-		if ot.KeyType != nt.KeyType || ot.KeyN != nt.KeyN {
+		// KeyN, like N, is the FIXED key's width and ignored otherwise.
+		if ot.KeyType != nt.KeyType || (ot.KeyType == OperateTypeFixed && ot.KeyN != nt.KeyN) {
 			return ErrOperateSchema
 		}
 		if len(nt.Cols) < len(ot.Cols) {
@@ -592,7 +617,7 @@ func (s *Schema) Extends(newer *Schema) error {
 		}
 		for c := range ot.Cols {
 			oc, nc := &ot.Cols[c], &nt.Cols[c]
-			if nc.Type != oc.Type || nc.N != oc.N {
+			if nc.Type != oc.Type || (oc.Type == OperateTypeFixed && nc.N != oc.N) {
 				return ErrOperateSchema
 			}
 			if oc.Name != "" && nc.Name != oc.Name {

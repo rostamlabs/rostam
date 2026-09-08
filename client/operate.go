@@ -20,8 +20,14 @@ import (
 // An error from wire.EncodeOperateArgs (a's op/ret list, key, or schema
 // blob exceeds a wire cap, or carries a structurally invalid field) is
 // returned unchanged, without a network round trip — build a's OperateArgs
-// with OperateBuilder to avoid ever hitting one by hand.
+// with OperateBuilder to avoid ever hitting one by hand. A nil a is
+// wire.ErrOperateArgs rather than a panic: it is the shape a caller lands on
+// by ignoring OperateBuilder.Args's error, which is exactly when a panic is
+// least welcome.
 func (c *Client) Operate(ctx context.Context, a *wire.OperateArgs) (*wire.OperateResult, error) {
+	if a == nil {
+		return nil, wire.ErrOperateArgs
+	}
 	args, err := wire.EncodeOperateArgs(a)
 	if err != nil {
 		return nil, err
@@ -39,9 +45,20 @@ func (c *Client) Operate(ctx context.Context, a *wire.OperateArgs) (*wire.Operat
 // wire.Cell{Type: wire.OperateTypeUnset} rather than an error, so a caller
 // can read res.Values[i] uniformly without special-casing "not present"
 // against a decode failure.
+//
+// The tagged cell must consume b exactly. A value that decodes and leaves
+// bytes over is not the value it claims to be — a table's or a row's
+// encoding read as a scalar, or a corrupt frame — and returning its first
+// cell would silently hand the caller a prefix of something else.
 func DecodeOperateValue(b []byte) (wire.Cell, error) {
-	c, _, err := wire.DecodeTaggedCell(b)
-	return c, err
+	c, n, err := wire.DecodeTaggedCell(b)
+	if err != nil {
+		return wire.Cell{}, err
+	}
+	if n != len(b) {
+		return wire.Cell{}, fmt.Errorf("client: operate: %d bytes left after the tagged cell: %w", len(b)-n, wire.ErrOperateArgs)
+	}
+	return c, nil
 }
 
 // Path addresses one node inside an operate record (design doc §2.4): the
@@ -143,15 +160,23 @@ type builderRet struct {
 // into a non-table field, a typed op whose type disagrees with the schema —
 // is recorded and returned by Args, so no intermediate call needs its own
 // error check.
+// schema and createSchema are deliberately two fields. createSchema is the
+// blob the CALL carries, which the server checks against the version the
+// record is stored at when it opens it — so it must stay the schema the
+// record has NOW, and only WithSchema sets it. schema is what Field/Col
+// names resolve against, which a MIGRATE moves forward: MIGRATE is the first
+// op, so every other op and every return spec runs against the record as the
+// migration leaves it, and must be resolved against the target schema.
 type OperateBuilder struct {
-	key     []byte
-	schema  *wire.Schema
-	create  uint8
-	ttl     time.Duration
-	ttlMode uint8
-	ops     []builderOp
-	rets    []builderRet
-	err     error
+	key          []byte
+	schema       *wire.Schema
+	createSchema *wire.Schema
+	create       uint8
+	ttl          time.Duration
+	ttlMode      uint8
+	ops          []builderOp
+	rets         []builderRet
+	err          error
 }
 
 // NewOperate starts building an operate call against key. The call defaults
@@ -190,7 +215,7 @@ func (ob *OperateBuilder) WithSchema(s *wire.Schema) *OperateBuilder {
 			return ob
 		}
 	}
-	ob.schema = s
+	ob.schema, ob.createSchema = s, s
 	ob.create = wire.OperateCreateSchema
 	return ob
 }
@@ -200,7 +225,7 @@ func (ob *OperateBuilder) WithSchema(s *wire.Schema) *OperateBuilder {
 // the ops that first touch it. It is exclusive with WithSchema, for the
 // reason given there.
 func (ob *OperateBuilder) Dynamic() *OperateBuilder {
-	if ob.create == wire.OperateCreateSchema || ob.schema != nil {
+	if ob.create == wire.OperateCreateSchema {
 		if ob.err == nil {
 			ob.err = fmt.Errorf("client: operate: builder is already in schema mode; Dynamic and WithSchema are exclusive")
 		}
@@ -460,11 +485,23 @@ func (ob *OperateBuilder) Trim(path Path, keep uint32, policy uint8, byCol strin
 // Migrate moves the record from its stored version (from, or
 // wire.OperateMigrateFromDynamic when the record is dynamic-mode) to s's
 // version in this atomic call, an append-only evolution or a dynamic-mode
-// freeze (design doc §2.8/§2.9). It must be the first op in the list.
-// dropExtra sets wire.OperateMigrateDropExtra, discarding dynamic fields s
-// does not declare rather than rejecting the call. s is validated here, as
-// WithSchema validates its own; a nil s or a validation failure is recorded
-// and returned by Args rather than panicking.
+// freeze (design doc §2.8/§2.9). dropExtra sets
+// wire.OperateMigrateDropExtra, discarding dynamic fields s does not declare
+// rather than rejecting the call. s is validated here, as WithSchema
+// validates its own; a nil s or a validation failure is recorded and
+// returned by Args rather than panicking.
+//
+// It must be the FIRST op: applyOps rejects a MIGRATE at any other index
+// with wire.ErrOperateOpcode (design doc §2.8), so calling it after another
+// op can only ever build a request the server refuses. That is recorded as a
+// builder error here instead.
+//
+// It also moves the builder's resolution schema to s, without touching the
+// call's `create` byte or the schema blob the call carries. Every op after
+// the MIGRATE — which is all of them — and every return spec runs against
+// the record as the migration leaves it, so their Field/Col names resolve
+// against the TARGET schema. The call still declares the version the record
+// is stored at, which is what the server checks when it opens it.
 func (ob *OperateBuilder) Migrate(from int64, s *wire.Schema, dropExtra bool) *OperateBuilder {
 	if s == nil {
 		if ob.err == nil {
@@ -478,10 +515,17 @@ func (ob *OperateBuilder) Migrate(from int64, s *wire.Schema, dropExtra bool) *O
 		}
 		return ob
 	}
+	if len(ob.ops) > 0 {
+		if ob.err == nil {
+			ob.err = fmt.Errorf("client: operate: Migrate must be the first op, but %d op(s) were added before it", len(ob.ops))
+		}
+		return ob
+	}
 	var aux uint8
 	if dropExtra {
 		aux = wire.OperateMigrateDropExtra
 	}
+	ob.schema = s
 	return ob.addOp(builderOp{opcode: wire.OperateOpMIGRATE, aux: aux, path: RecordPath(), a: from, bytes: s.Encode()})
 }
 
@@ -543,8 +587,8 @@ func (ob *OperateBuilder) Args() (*wire.OperateArgs, error) {
 		TTLMode: ob.ttlMode,
 		Create:  ob.create,
 	}
-	if ob.schema != nil {
-		args.Schema = ob.schema.Encode()
+	if ob.createSchema != nil {
+		args.Schema = ob.createSchema.Encode()
 	}
 	for _, op := range ob.ops {
 		if op.opcode == wire.OperateOpCONFIG && ob.schema != nil {
@@ -552,7 +596,9 @@ func (ob *OperateBuilder) Args() (*wire.OperateArgs, error) {
 			// schema-mode record (design doc §3.2: a schema-mode table's
 			// eviction triple comes from its schema and changes only via
 			// MIGRATE), so this call can only ever fail — say so here rather
-			// than after a round trip.
+			// than after a round trip. A schema installed by a MIGRATE counts:
+			// the record is in schema mode from the freeze onwards, and the
+			// MIGRATE is the first op, so every CONFIG in the list is after it.
 			return nil, fmt.Errorf("client: operate: Config is dynamic-mode only; a schema-mode table's eviction triple changes via Migrate")
 		}
 		wop, err := ob.resolveOp(op)

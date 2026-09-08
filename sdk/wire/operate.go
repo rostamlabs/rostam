@@ -258,17 +258,29 @@ func decodeOp(b []byte) (OperateOp, int, error) {
 	return OperateOp{Opcode: opcode, Type: typ, Aux: aux, Path: path, A: a, B: bv, Bytes: opBytes}, off, nil
 }
 
-// appendRet appends one ret: [mode u8][path] (design doc §3.4/§3.5).
+// appendRet appends one ret: [mode u8][path] (design doc §3.4/§3.5). A mode
+// outside OperateRet* is ErrOperateArgs: the apply engine has no branch for
+// one, so encoding it would ship a frame that can only be rejected server
+// side.
 func appendRet(buf []byte, ret OperateRet) ([]byte, error) {
+	if ret.Mode > OperateRetCount {
+		return nil, ErrOperateArgs
+	}
 	buf = append(buf, ret.Mode)
 	return appendPath(buf, ret.Path)
 }
 
 // decodeRet reads one ret from the front of b, returning the ret and the
-// number of bytes consumed.
+// number of bytes consumed. A mode byte outside OperateRet* is
+// ErrOperateArgs, checked here rather than left to the apply engine, so a
+// decoded OperateArgs always re-encodes (the FuzzDecodeOperateArgs identity)
+// and every OperateRet a caller sees is one it has a branch for.
 func decodeRet(b []byte) (OperateRet, int, error) {
 	if len(b) < 1 {
 		return OperateRet{}, 0, ErrShortArgs
+	}
+	if b[0] > OperateRetCount {
+		return OperateRet{}, 0, ErrOperateArgs
 	}
 	path, n, err := decodePath(b[1:])
 	if err != nil {
@@ -522,7 +534,13 @@ func DecodeOperateResult(b []byte) (*OperateResult, error) {
 	}
 	nRet := int(binary.BigEndian.Uint16(b[off : off+2]))
 	off += 2
-	if nRet > OperateMaxRet || !CountFitsIn(nRet, len(b)-off, 4) {
+	// Split for the same reason DecodeOperateArgs splits its two: over the
+	// cap is a frame declaring more values than a call may return,
+	// over the byte budget is a truncated or lying frame.
+	if nRet > OperateMaxRet {
+		return nil, ErrOperateCap
+	}
+	if !CountFitsIn(nRet, len(b)-off, 4) {
 		return nil, ErrShortArgs
 	}
 	var values [][]byte

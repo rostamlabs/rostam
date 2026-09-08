@@ -58,7 +58,7 @@ type dynField struct {
 type dynTable struct {
 	lenOff, lenLen     int
 	byteLen            int
-	capOff, capLen     int
+	capOff             int
 	policyOff          int
 	byColOff, byColLen int // byColOff is the byColLen byte; byColLen the name's length
 	nRowsOff, nRowsLen int
@@ -480,7 +480,7 @@ func (e *dynamicEngine) parseTableAt(lenOff, innerOff, innerLen int) (dynTable, 
 	if capV > wire.OperateMaxRows {
 		return dynTable{}, wire.ErrOperateRecord
 	}
-	t.capOff, t.capLen, t.capV = innerOff, m, uint32(capV) //nolint:gosec // bounded by OperateMaxRows above
+	t.capOff, t.capV = innerOff, uint32(capV) //nolint:gosec // bounded by OperateMaxRows above
 	off := innerOff + m
 
 	if t.end-off < 1 {
@@ -502,6 +502,14 @@ func (e *dynamicEngine) parseTableAt(lenOff, innerOff, innerLen int) (dynTable, 
 		return dynTable{}, wire.ErrOperateRecord
 	}
 	off += t.byColLen
+	// A MIN_COL/MAX_COL policy evicts by a named column, so it is meaningless
+	// without the name (design doc §3.2). wire.DecodeRecord rejects the
+	// pairing; so must this parse, or the two would disagree on which records
+	// exist. config() refuses to write it in the first place, so no edit this
+	// engine makes can produce a table the check then rejects.
+	if (t.policy == wire.OperatePolicyMinCol || t.policy == wire.OperatePolicyMaxCol) && t.byColLen == 0 {
+		return dynTable{}, wire.ErrOperateRecord
+	}
 
 	nRows, m2, err := readUvarint(buf[off:t.end])
 	if err != nil {

@@ -271,9 +271,12 @@ func dynamicArgsFor(key []byte) *wire.OperateArgs {
 }
 
 // TestDynamicEngineAllocs pins the §2.6 budget for dynamic mode's in-place
-// path: the record copy and the result frame, and nothing per op. A
-// regression here means a lookup or a patch started building something —
-// exactly the cost the byte engine exists to avoid.
+// path: the record copy and the result frame, and nothing per op — two
+// allocations, which is what the budget is quoted as and what this measures.
+// A regression here means a lookup or a patch started building something —
+// exactly the cost the byte engine exists to avoid. The bound is the measured
+// figure, not a round number above it: slack here is coverage given away,
+// since a new per-call allocation would slip in under it unnoticed.
 func TestDynamicEngineAllocs(t *testing.T) {
 	rec := bigDynamicRecord(t, 1024)
 	a := dynamicArgsFor(keyU64(512))
@@ -283,8 +286,8 @@ func TestDynamicEngineAllocs(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	if allocs > 3 {
-		t.Fatalf("%v allocations per apply, want at most 3", allocs)
+	if allocs > 2 {
+		t.Fatalf("%v allocations per apply, want at most 2 (the record copy and the result frame)", allocs)
 	}
 	t.Logf("allocations per apply: %v", allocs)
 }
@@ -484,6 +487,12 @@ func TestNewDynamicEngineValidates(t *testing.T) {
 			0x01, 0, 0, 0, 0, 0, 0xF8, 0x7F},
 		"non-canonical F32 NaN": {wire.OperateModeDynamic, 1, 1, 'a', wire.OperateTypeF32,
 			0x01, 0, 0xC0, 0x7F},
+		// A MIN_COL/MAX_COL policy with no eviction column name: the codec
+		// rejects the pairing, so the walk must too.
+		"MIN_COL policy with no byCol": {wire.OperateModeDynamic, 1, 1, 't', wire.OperateTypeTable, 4,
+			0, wire.OperatePolicyMinCol, 0, 0},
+		"MAX_COL policy with no byCol": {wire.OperateModeDynamic, 1, 1, 't', wire.OperateTypeTable, 4,
+			0, wire.OperatePolicyMaxCol, 0, 0},
 	}
 	for name, in := range bad {
 		if _, err := newDynamicEngine(append([]byte(nil), in...)); !errors.Is(err, wire.ErrOperateRecord) {
@@ -678,5 +687,34 @@ func TestDynamicChargeIsExactAtTheCap(t *testing.T) {
 	}
 	if _, _, oerr = applyTree(treeClone(rec), insert, 0); !errors.Is(oerr, wire.ErrOperateCap) {
 		t.Fatalf("cap = finished size - 1: oracle err = %v, want ErrOperateCap", oerr)
+	}
+}
+
+// TestDynamicEngineAcceptsColPolicyWithColumn is the positive half of the two
+// *_COL cases in TestNewDynamicEngineValidates: a table that DOES name its
+// eviction column must still open, and so must every policy that does not
+// evict by one. Without this the rejections above would pass just as well if
+// the walk refused every *_COL table.
+func TestDynamicEngineAcceptsColPolicyWithColumn(t *testing.T) {
+	build := func(policy uint8, byCol string) []byte {
+		inner := []byte{0, policy, byte(len(byCol))}
+		inner = append(inner, byCol...)
+		inner = append(inner, 0) // nRows
+		b := []byte{wire.OperateModeDynamic, 1, 1, 't', wire.OperateTypeTable, byte(len(inner))}
+		return append(b, inner...)
+	}
+	cases := map[string][]byte{
+		"MIN_COL with a column": build(wire.OperatePolicyMinCol, "c"),
+		"MAX_COL with a column": build(wire.OperatePolicyMaxCol, "c"),
+		"MIN_KEY, no column":    build(wire.OperatePolicyMinKey, ""),
+		"NONE, no column":       build(wire.OperatePolicyNone, ""),
+	}
+	for name, buf := range cases {
+		if _, err := wire.DecodeRecord(buf); err != nil {
+			t.Fatalf("%s: the codec rejected the fixture: %v", name, err)
+		}
+		if _, err := newDynamicEngine(append([]byte(nil), buf...)); err != nil {
+			t.Fatalf("%s: engine rejected a record the codec accepts: %v", name, err)
+		}
 	}
 }

@@ -549,7 +549,8 @@ func decodeDynamicRecord(b []byte) (*Record, error) {
 // decodeDynamicTable reads a dynamic-mode table value ([byteLen uvarint]
 // [cap uvarint][policy u8][byColLen u8][byColName][nRows uvarint]{rows}*,
 // design doc §2.9) from the front of b. byteLen must fit the remaining
-// bytes and the parse of the fields it covers must consume it exactly.
+// bytes and the parse of the fields it covers must consume it exactly, and
+// a MIN_COL/MAX_COL policy must name the column it evicts by.
 // budget accumulates every field, row, and column decoded anywhere in the
 // record against OperateMaxRows.
 func decodeDynamicTable(b []byte, budget *int) (*Table, int, error) {
@@ -596,6 +597,15 @@ func decodeDynamicTable(b []byte, budget *int) (*Table, int, error) {
 	}
 	byColName := string(inner[ioff : ioff+byColLen])
 	ioff += byColLen
+	// A MIN_COL/MAX_COL policy evicts by the value in a named column, so it
+	// is meaningless without the name (design doc §3.2). Nothing that writes
+	// a table produces this pairing — CONFIG rejects it with
+	// wire.ErrOperatePath before it stores anything — so a record carrying
+	// it is malformed, and accepting it would leave the eviction victim
+	// undefined.
+	if (policy == OperatePolicyMinCol || policy == OperatePolicyMaxCol) && byColLen == 0 {
+		return nil, 0, ErrOperateRecord
+	}
 
 	nRows, m3, err := decodeCanonicalUvarint(inner[ioff:])
 	if err != nil {

@@ -315,3 +315,42 @@ func FuzzDecodeRecord(f *testing.F) {
 		}
 	})
 }
+
+// dynTableRecord frames a one-field dynamic record whose single field "t" is
+// a table with the given cap/policy/byColName and no rows, so a header rule
+// can be exercised on bytes no encoder would produce.
+func dynTableRecord(policy uint8, byColName string) []byte {
+	inner := []byte{0, policy, byte(len(byColName))} // cap 0, policy, byColLen
+	inner = append(inner, byColName...)
+	inner = append(inner, 0) // nRows
+	b := []byte{OperateModeDynamic, 1, 1, 't', OperateTypeTable, byte(len(inner))}
+	return append(b, inner...)
+}
+
+// TestDecodeRecordRejectsColPolicyWithoutColumn covers a dynamic table header
+// whose policy evicts by a column but whose byColName is empty. MIN_COL and
+// MAX_COL pick their victim by the value in a named column (design doc §3.2),
+// so without the name the eviction victim is undefined. CONFIG refuses to
+// write the pairing, so a stored record carrying it is malformed.
+func TestDecodeRecordRejectsColPolicyWithoutColumn(t *testing.T) {
+	for _, policy := range []uint8{OperatePolicyMinCol, OperatePolicyMaxCol} {
+		if _, err := DecodeRecord(dynTableRecord(policy, "")); !errors.Is(err, ErrOperateRecord) {
+			t.Fatalf("policy %d with no byColName: err = %v, want ErrOperateRecord", policy, err)
+		}
+		// The same header naming a column decodes, so the case above is
+		// failing on the missing name and not on the frame.
+		got, err := DecodeRecord(dynTableRecord(policy, "c"))
+		if err != nil {
+			t.Fatalf("policy %d with a byColName: %v", policy, err)
+		}
+		if got.Fields[0].Table.ByColName != "c" {
+			t.Fatalf("byColName = %q", got.Fields[0].Table.ByColName)
+		}
+	}
+	// A policy that does not evict by a column needs no name.
+	for _, policy := range []uint8{OperatePolicyNone, OperatePolicyMinKey, OperatePolicyMaxKey} {
+		if _, err := DecodeRecord(dynTableRecord(policy, "")); err != nil {
+			t.Fatalf("policy %d with no byColName: %v", policy, err)
+		}
+	}
+}

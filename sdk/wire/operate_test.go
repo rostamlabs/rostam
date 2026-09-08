@@ -265,3 +265,58 @@ func TestDecodeOperateArgsErrorIdentity(t *testing.T) {
 		t.Fatalf("nRet within the cap but past the byte budget: err = %v, want ErrShortArgs", err)
 	}
 }
+
+// TestOperateRetModeValidated covers the return-spec mode byte at both ends
+// of the codec. The apply engine has no branch for a mode outside
+// OperateRet*, so encoding one would ship a frame that can only be rejected
+// server side, and accepting one on decode would hand the caller a spec it
+// cannot act on — and break the decode/re-encode identity, since the encoder
+// now refuses what the decoder produced.
+func TestOperateRetModeValidated(t *testing.T) {
+	a := sampleArgs()
+	a.Rets = []OperateRet{{Mode: OperateRetCount + 1, Path: OperatePath{Kind: OperatePathRecord}}}
+	if _, err := EncodeOperateArgs(a); !errors.Is(err, ErrOperateArgs) {
+		t.Fatalf("encode: err = %v, want ErrOperateArgs", err)
+	}
+	for _, mode := range []uint8{OperateRetValue, OperateRetCount} {
+		a.Rets[0].Mode = mode
+		if _, err := EncodeOperateArgs(a); err != nil {
+			t.Fatalf("encode mode %d: %v", mode, err)
+		}
+	}
+
+	// Decode: patch the ret mode byte of a well-formed frame in place. The
+	// rets are last, and a record-path ret is two bytes, so the mode byte is
+	// the second-to-last.
+	a.Rets[0].Mode = OperateRetCount
+	b, err := EncodeOperateArgs(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeOperateArgs(b); err != nil {
+		t.Fatalf("the unpatched frame must decode: %v", err)
+	}
+	b[len(b)-2] = OperateRetCount + 1
+	if _, err := DecodeOperateArgs(b); !errors.Is(err, ErrOperateArgs) {
+		t.Fatalf("decode: err = %v, want ErrOperateArgs", err)
+	}
+}
+
+// TestDecodeOperateResultCountErrors covers the result frame's declared
+// count, split the same way DecodeOperateArgs splits its own: over the cap is
+// a frame declaring more values than a call may return, over the byte budget
+// is a truncated or lying frame.
+func TestDecodeOperateResultCountErrors(t *testing.T) {
+	over := []byte{OperateStatusOK, 0, 0}
+	binary.BigEndian.PutUint16(over[1:], OperateMaxRet+1)
+	over = append(over, make([]byte, (OperateMaxRet+1)*4)...)
+	if _, err := DecodeOperateResult(over); !errors.Is(err, ErrOperateCap) {
+		t.Fatalf("nRet over the cap: err = %v, want ErrOperateCap", err)
+	}
+
+	short := []byte{OperateStatusOK, 0, 0}
+	binary.BigEndian.PutUint16(short[1:], OperateMaxRet)
+	if _, err := DecodeOperateResult(short); !errors.Is(err, ErrShortArgs) {
+		t.Fatalf("nRet within the cap but past the byte budget: err = %v, want ErrShortArgs", err)
+	}
+}
