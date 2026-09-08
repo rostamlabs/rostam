@@ -277,7 +277,19 @@ func dynamicArgsFor(key []byte) *wire.OperateArgs {
 // exactly the cost the byte engine exists to avoid. The bound is the measured
 // figure, not a round number above it: slack here is coverage given away,
 // since a new per-call allocation would slip in under it unnoticed.
+//
+// Skipped under -race: the engine comes from dynamicEnginePool (sync.Pool),
+// and the race detector's sync.Pool.Put randomly drops about a quarter of
+// puts on the floor by design (see sync/pool.go's "Randomly drop x on floor",
+// gated on race.Enabled) specifically so pool-reliant code can't assume
+// retention. That is not a GC or timing flake this test can wait out — the
+// stdlib does it on purpose every run — so the budget is meaningless under
+// -race and is checked only in normal builds, where Get reliably returns
+// what the prior call Put back.
 func TestDynamicEngineAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("sync.Pool.Put randomly drops items under -race by design, which defeats this allocation budget; see race_detect_test.go")
+	}
 	rec := bigDynamicRecord(t, 1024)
 	a := dynamicArgsFor(keyU64(512))
 	a.Rets = nil

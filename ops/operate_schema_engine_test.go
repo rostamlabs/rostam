@@ -115,7 +115,19 @@ func sessionArgsFor(key []byte) *wire.OperateArgs {
 // path: one allocation for the record copy and one for the result frame. A
 // regression here means the engine started building something per call —
 // exactly the cost the byte engine exists to avoid.
+//
+// Skipped under -race: the engine comes from schemaEnginePool (sync.Pool),
+// and the race detector's sync.Pool.Put randomly drops about a quarter of
+// puts on the floor by design (see sync/pool.go's "Randomly drop x on floor",
+// gated on race.Enabled) specifically so pool-reliant code can't assume
+// retention. That is not a GC or timing flake this test can wait out — the
+// stdlib does it on purpose every run — so the budget is meaningless under
+// -race and is checked only in normal builds, where Get reliably returns
+// what the prior call Put back.
 func TestSchemaEngineAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("sync.Pool.Put randomly drops items under -race by design, which defeats this allocation budget; see race_detect_test.go")
+	}
 	rec := bigSessionRecord(t, 1024)
 	a := sessionArgsFor(keyU64(512))
 	a.Rets = nil
