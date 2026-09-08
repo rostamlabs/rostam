@@ -77,6 +77,10 @@ const schemaFlagStoreNames uint8 = 1 << 0
 
 // minUvarintLen returns the number of bytes binary.AppendUvarint would use to
 // encode v: the canonical (minimal) LEB128 length.
+//
+// TWIN: sdk/record/resolve.go carries an unexported copy so the record leaf can
+// enforce the same canonical-uvarint rule without importing it. Keep both in
+// lockstep.
 func minUvarintLen(v uint64) int {
 	n := 1
 	for v >= 0x80 {

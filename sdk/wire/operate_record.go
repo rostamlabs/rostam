@@ -323,6 +323,10 @@ func decodeCellDataCanonical(t uint8, n uint8, b []byte) (Cell, int, error) {
 	return c, m, nil
 }
 
+// TWIN: sdk/record/resolve.go carries an unexported copy of this helper (and of
+// minUvarintLen); keep both in lockstep, including the byte-length vs
+// element-count split described below.
+//
 // fitsRemaining reports whether a decoded byte-length n (as opposed to an
 // element count — CountFitsIn is for those) fits within remaining bytes,
 // without ever narrowing n to int: n can be an arbitrary attacker-controlled

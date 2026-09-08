@@ -96,17 +96,21 @@ func compileLeaf(f Filter) (Predicate, error) {
 	}
 	field := f.Field
 	want := f.Value
+	// The record path in field (when it has one) is a compile-time constant:
+	// newFieldLookup parses it ONCE here so the per-point work in the closures
+	// below is a map lookup plus at most one Resolve. See fieldLookup.
+	look := newFieldLookup(field)
 
 	switch f.Op {
 	case FilterEq:
 		return func(m Metadata) bool {
-			got, ok := lookupPath(m, field)
+			got, ok := look.get(m)
 			return ok && got.Equal(want)
 		}, nil
 	case FilterNe:
 		// Strict-exists: a missing field does NOT satisfy 'ne'.
 		return func(m Metadata) bool {
-			got, ok := lookupPath(m, field)
+			got, ok := look.get(m)
 			return ok && !got.Equal(want)
 		}, nil
 	case FilterGt, FilterGte, FilterLt, FilterLte:
@@ -138,8 +142,9 @@ func compileLeaf(f Filter) (Predicate, error) {
 // float64 (int and float interoperate); string fields compare lexicographically.
 // A kind mismatch or missing field evaluates to false.
 func compileOrdering(field string, op FilterOp, want Value) (Predicate, error) {
+	look := newFieldLookup(field)
 	return func(m Metadata) bool {
-		got, ok := lookupPath(m, field)
+		got, ok := look.get(m)
 		if !ok {
 			return false
 		}
@@ -243,11 +248,12 @@ func compareString(a, b string) int {
 // compileIn builds an 'in' predicate: the field's scalar value must be a
 // member of the want array (strings/ints/floats). Type checked at compile.
 func compileIn(field string, want Value) (Predicate, error) {
+	look := newFieldLookup(field)
 	switch want.Kind {
 	case ValueStrings:
 		set := want.Strs
 		return func(m Metadata) bool {
-			got, ok := lookupPath(m, field)
+			got, ok := look.get(m)
 			if !ok || got.Kind != ValueString {
 				return false
 			}
@@ -261,7 +267,7 @@ func compileIn(field string, want Value) (Predicate, error) {
 	case ValueInts:
 		set := want.Ints
 		return func(m Metadata) bool {
-			got, ok := lookupPath(m, field)
+			got, ok := look.get(m)
 			if !ok || got.Kind != ValueInt {
 				return false
 			}
@@ -275,7 +281,7 @@ func compileIn(field string, want Value) (Predicate, error) {
 	case ValueFloats:
 		set := want.Flts
 		return func(m Metadata) bool {
-			got, ok := lookupPath(m, field)
+			got, ok := look.get(m)
 			if !ok || got.Kind != ValueFloat {
 				return false
 			}
@@ -294,11 +300,12 @@ func compileIn(field string, want Value) (Predicate, error) {
 // compileContains builds a 'contains' predicate: the field must be an array
 // (strings/ints/floats) containing the want scalar. Type checked at compile.
 func compileContains(field string, want Value) (Predicate, error) {
+	look := newFieldLookup(field)
 	switch want.Kind {
 	case ValueString:
 		needle := want.Str
 		return func(m Metadata) bool {
-			got, ok := lookupPath(m, field)
+			got, ok := look.get(m)
 			if !ok || got.Kind != ValueStrings {
 				return false
 			}
@@ -312,7 +319,7 @@ func compileContains(field string, want Value) (Predicate, error) {
 	case ValueInt:
 		needle := want.Int
 		return func(m Metadata) bool {
-			got, ok := lookupPath(m, field)
+			got, ok := look.get(m)
 			if !ok || got.Kind != ValueInts {
 				return false
 			}
@@ -326,7 +333,7 @@ func compileContains(field string, want Value) (Predicate, error) {
 	case ValueFloat:
 		needle := want.Flt
 		return func(m Metadata) bool {
-			got, ok := lookupPath(m, field)
+			got, ok := look.get(m)
 			if !ok || got.Kind != ValueFloats {
 				return false
 			}
@@ -412,12 +419,13 @@ func elementKeysOf(v Value) []scalarKey {
 // tokenizes the field value (which is unavoidable without an index). An empty
 // query matches any present string/strings field. Missing/wrong-kind → false.
 func compileMatch(field string, want Value) (Predicate, error) {
+	look := newFieldLookup(field)
 	if want.Kind != ValueString {
 		return nil, fmt.Errorf("vector: filter op 'match' requires a string value, got kind %d", want.Kind)
 	}
 	queryTokens := tokenize(want.Str)
 	return func(m Metadata) bool {
-		got, ok := lookupPath(m, field)
+		got, ok := look.get(m)
 		if !ok {
 			return false
 		}
@@ -556,6 +564,7 @@ func tokenize(s string) []string {
 // closure. Matches a string field; for a strings field, ANY element matching
 // satisfies. Missing/wrong-kind → false.
 func compileRegex(field string, want Value) (Predicate, error) {
+	look := newFieldLookup(field)
 	if want.Kind != ValueString {
 		return nil, fmt.Errorf("vector: filter op 'regex' requires a string value, got kind %d", want.Kind)
 	}
@@ -564,7 +573,7 @@ func compileRegex(field string, want Value) (Predicate, error) {
 		return nil, fmt.Errorf("vector: filter op 'regex' has invalid pattern %q: %w", want.Str, err)
 	}
 	return func(m Metadata) bool {
-		got, ok := lookupPath(m, field)
+		got, ok := look.get(m)
 		if !ok {
 			return false
 		}
@@ -588,8 +597,9 @@ func compileRegex(field string, want Value) (Predicate, error) {
 // present with ValueNone, an empty string, or an empty array. It returns an
 // error for signature uniformity with the other leaf compilers; it never fails.
 func compileIsEmpty(field string) (Predicate, error) {
+	look := newFieldLookup(field)
 	return func(m Metadata) bool {
-		got, ok := lookupPath(m, field)
+		got, ok := look.get(m)
 		if !ok {
 			return true
 		}
@@ -631,8 +641,9 @@ func compileIsEmpty(field string) (Predicate, error) {
 // switch), so a present record already answers correctly — not null — with no
 // change needed here.
 func compileIsNull(field string) (Predicate, error) {
+	look := newFieldLookup(field)
 	return func(m Metadata) bool {
-		got, ok := lookupPath(m, field)
+		got, ok := look.get(m)
 		return ok && got.Kind == ValueNone
 	}, nil
 }
@@ -643,6 +654,7 @@ func compileIsNull(field string) (Predicate, error) {
 // closure. The field is read via numericValue (datetime stored as int64
 // unix-ms by convention). Missing/non-numeric field → false.
 func compileDatetime(field string, op FilterOp, want Value) (Predicate, error) {
+	look := newFieldLookup(field)
 	ms, ok := datetimeBound(want)
 	if !ok {
 		if want.Kind != ValueString {
@@ -652,7 +664,7 @@ func compileDatetime(field string, op FilterOp, want Value) (Predicate, error) {
 	}
 	bound := float64(ms)
 	return func(m Metadata) bool {
-		got, ok := lookupPath(m, field)
+		got, ok := look.get(m)
 		if !ok {
 			return false
 		}
@@ -711,6 +723,7 @@ func dtToOrdering(op FilterOp) FilterOp {
 // slice itself) and only reads the field via lookupPath, requiring a ValueGeo
 // (missing field or non-geo kind -> false).
 func compileGeo(field string, op FilterOp, g *GeoCondition) (Predicate, error) {
+	look := newFieldLookup(field)
 	if g == nil {
 		return nil, fmt.Errorf("vector: filter op %q requires a 'geo' condition", mustOpName(op))
 	}
@@ -727,7 +740,7 @@ func compileGeo(field string, op FilterOp, g *GeoCondition) (Predicate, error) {
 		}
 		centerLat, centerLon, radius := g.CenterLat, g.CenterLon, g.RadiusM
 		return func(m Metadata) bool {
-			got, ok := lookupPath(m, field)
+			got, ok := look.get(m)
 			if !ok || got.Kind != ValueGeo {
 				return false
 			}
@@ -750,7 +763,7 @@ func compileGeo(field string, op FilterOp, g *GeoCondition) (Predicate, error) {
 		}
 		minLat, minLon, maxLat, maxLon := g.MinLat, g.MinLon, g.MaxLat, g.MaxLon
 		return func(m Metadata) bool {
-			got, ok := lookupPath(m, field)
+			got, ok := look.get(m)
 			if !ok || got.Kind != ValueGeo {
 				return false
 			}
@@ -770,7 +783,7 @@ func compileGeo(field string, op FilterOp, g *GeoCondition) (Predicate, error) {
 			}
 		}
 		return func(m Metadata) bool {
-			got, ok := lookupPath(m, field)
+			got, ok := look.get(m)
 			if !ok || got.Kind != ValueGeo {
 				return false
 			}

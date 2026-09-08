@@ -1120,6 +1120,13 @@ func readCanonicalUvarint(b []byte, off int) (uint64, int, error) {
 
 // minUvarintLen returns the number of bytes binary.AppendUvarint uses for
 // v: the canonical LEB128 length.
+//
+// TWIN of sdk/wire/operate_schema.go's minUvarintLen. The two must stay in
+// LOCKSTEP: they define what "canonical uvarint" means on the read side, and
+// this package's whole hardening story is that it rejects exactly the encodings
+// the wire encoder would never produce. It is duplicated rather than exported
+// so this leaf keeps its own copy of the rule it enforces; change one and you
+// must change the other.
 func minUvarintLen(v uint64) int {
 	n := 1
 	for v >= 0x80 {
@@ -1133,6 +1140,12 @@ func minUvarintLen(v uint64) int {
 // bytes, without narrowing it to int first: a length prefix is an arbitrary
 // attacker-controlled uvarint, and converting before comparing would wrap
 // on a 32-bit int.
+//
+// TWIN of sdk/wire/operate_record.go's fitsRemaining; keep the two in
+// LOCKSTEP. Note the deliberate asymmetry it encodes — byte LENGTHS come
+// here, element COUNTS go to wire.CountFitsIn — because only the count form
+// may be narrowed to int after being bounded. Diverging on that is how a
+// 32-bit overflow gets back in.
 func fitsRemaining(n uint64, remaining int) bool {
 	if remaining < 0 {
 		return false

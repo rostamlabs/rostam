@@ -46,6 +46,16 @@ var recordResolver = record.NewResolver(1024)
 // cannot apply to THIS point's record must degrade to "field absent" rather
 // than fail the whole search. compileRowPresence is the one place a record
 // path is inspected for something other than a scalar value (row presence).
+//
+// IT PARSES PER CALL, AND THAT IS ONLY CORRECT FOR ITS REMAINING CALLERS. This
+// is the BARE-STRING entry: it is handed a field string with no compile step
+// behind it (order_by key extraction, the payload index's reindex resolve), so
+// it has nowhere to cache the parse. The filter leaves do NOT come through here
+// any more — compileLeaf and its sub-compilers build a fieldLookup once, at
+// compile time, and compileRowPresence caches its own record.Path the same way —
+// because on the scan hot path this parse would otherwise repeat per point for
+// an answer that is constant across the whole scan. Any NEW per-point caller
+// should compile a fieldLookup instead of calling this.
 func lookupPath(m Metadata, field string) (Value, bool) {
 	if m == nil {
 		return Value{}, false
@@ -68,6 +78,76 @@ func lookupPath(m Metadata, field string) (Value, bool) {
 		return Value{}, false
 	}
 	res, err := recordResolver.Resolve(rv.Rec, p)
+	if err != nil {
+		return Value{}, false
+	}
+	return record.ResultValue(res)
+}
+
+// fieldLookup is lookupPath with the record path parsed ONCE — at filter-COMPILE
+// time — instead of once per point. It exists because the two costs are not the
+// same cost: SplitField+ParsePath depends only on the filter's field STRING,
+// which is fixed for the whole scan, while only the Resolve depends on the
+// point. Calling lookupPath per point therefore re-derived a constant on every
+// row (strings.Split + a Segment slice per call), which is what made an ordinary
+// numeric record-path leaf allocate per point on the scan hot path.
+//
+// It is deliberately NOT a replacement for lookupPath: lookupPath stays the
+// bare-string entry for callers that have no compile step of their own (order_by
+// key extraction, the reindex resolve), and the two MUST agree exactly. They do,
+// by construction: every rejection lookupPath expresses by returning false — no
+// '/' in the field, a path that does not parse, a payload key that holds
+// something other than a ValueRecord, a Resolve error, a non-scalar result — is
+// reproduced here, with the first two hoisted to newFieldLookup (a field that
+// fails them can only ever be an exact-key match, for every point).
+type fieldLookup struct {
+	// field is the whole field string, always tried as an EXACT payload key
+	// first — so a payload key literally named "a/b" keeps winning over
+	// treating "a/b" as a record path, exactly as in lookupPath.
+	field string
+	// payloadKey and path are set only when field is path-shaped AND its path
+	// parses; isPath records that. When it is false the lookup is an exact-key
+	// lookup and nothing else.
+	payloadKey string
+	path       record.Path
+	isPath     bool
+}
+
+// newFieldLookup compiles field once. It never fails: a field that is not
+// path-shaped, or whose path is malformed, degrades to the exact-key lookup —
+// the same outcome lookupPath produces for it on every point.
+func newFieldLookup(field string) fieldLookup {
+	fl := fieldLookup{field: field}
+	payloadKey, pathStr, ok := record.SplitField(field)
+	if !ok {
+		return fl
+	}
+	p, err := record.ParsePath(pathStr)
+	if err != nil {
+		return fl
+	}
+	fl.payloadKey, fl.path, fl.isPath = payloadKey, p, true
+	return fl
+}
+
+// get is the per-point half: an exact-key lookup, then (only for a compiled
+// record path) one Resolve against this point's record bytes. Allocation-free
+// for a scalar result once the resolver's schema cache is warm.
+func (fl fieldLookup) get(m Metadata) (Value, bool) {
+	if m == nil {
+		return Value{}, false
+	}
+	if v, ok := m[fl.field]; ok {
+		return v, true
+	}
+	if !fl.isPath {
+		return Value{}, false
+	}
+	rv, ok := m[fl.payloadKey]
+	if !ok || rv.Kind != ValueRecord {
+		return Value{}, false
+	}
+	res, err := recordResolver.Resolve(rv.Rec, fl.path)
 	if err != nil {
 		return Value{}, false
 	}

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/rostamlabs/rostam/sdk/wire"
 )
 
 // ErrPath is wrapped by every error ParsePath and its helpers return for a
@@ -124,10 +126,14 @@ func ParsePath(s string) (Path, error) {
 // SplitField splits field at its first '/' into a payload key and a record
 // path. ok is false when field contains no '/' (payloadKey and path are
 // both "" in that case; the caller should treat field itself as an exact
-// payload key). A leading '/' (e.g. "/x") yields an empty payloadKey with
-// ok == true — SplitField does not reject that itself; the caller is
-// expected to reject an empty payload key, since an exact-match payload key
-// of "" is never valid.
+// payload key). A leading '/' (e.g. "/x") yields an EMPTY payloadKey with
+// ok == true, and that is a legal outcome, not one the caller must reject:
+// an empty payload key resolves against the metadata entry whose name is the
+// empty string, exactly as any other key resolves against its own entry.
+// vector.lookupPath relies on this — it looks up m[""] like any other key and
+// finds the record only if a point actually stored one under "" — and the
+// index side agrees, so the two never disagree about a "/x" field. Callers
+// that want to forbid an empty payload key must say so themselves.
 func SplitField(field string) (payloadKey, path string, ok bool) {
 	idx := strings.IndexByte(field, '/')
 	if idx < 0 {
@@ -199,9 +205,33 @@ func parseNameOrPos(s string) (name string, pos uint32, byPos bool, err error) {
 // quoted FIXED row key.
 func parseRowSeg(s string) (Segment, error) {
 	if s[0] == '"' {
+		// Bound the RAW inner length BEFORE unescaping. unescapeQuoted allocates
+		// len(inner) bytes, and this parse runs per point for a filter leaf that
+		// is not compiled (and once per compile for one that is), so an unbounded
+		// quoted key is a per-row allocation the caller controls: a filter field
+		// of session/"<30 MiB of x>"/col would allocate 30 MB for every point in
+		// the scan. Every escape is two bytes producing one, so an inner longer
+		// than 2*OperateMaxKeyLen cannot unescape to a legal key — checking the
+		// raw length first caps the unescape allocation at ~2*255 bytes, and the
+		// exact check below then holds the UNESCAPED key to the wire cap.
+		//
+		// The bound is semantically free: a key longer than OperateMaxKeyLen
+		// cannot name a row in any record. In schema mode findSchemaRow answers
+		// Absent on any key-width mismatch, and in dynamic mode a row key's
+		// length prefix is a u8 (sdk/wire/operate_record.go), so no encodable
+		// record has a longer key. Rejecting is therefore identical in meaning to
+		// resolving to Absent, and strictly cheaper.
+		if len(s) > 2+2*wire.OperateMaxKeyLen {
+			return Segment{}, fmt.Errorf("%w: quoted row key too long (%d raw bytes, cap is %d unescaped) %.64q",
+				ErrPath, len(s)-2, wire.OperateMaxKeyLen, s)
+		}
 		key, ok := unescapeQuoted(s)
 		if !ok {
 			return Segment{}, fmt.Errorf("%w: malformed quoted row key %q", ErrPath, s)
+		}
+		if len(key) > wire.OperateMaxKeyLen {
+			return Segment{}, fmt.Errorf("%w: quoted row key too long (%d bytes, cap is %d) %q",
+				ErrPath, len(key), wire.OperateMaxKeyLen, s)
 		}
 		return Segment{Kind: SegRow, Key: key, KeyText: s, KeyQuoted: true}, nil
 	}

@@ -19,7 +19,9 @@
 //	seg1        a field: a name, or "#N" for a position (N <= 65535)
 //	seg2        a row key: decimal digits ([0-9]+, <= 20 digits, must fit
 //	            uint64) for an integer key type, or a quoted string "..."
-//	            (with \" and \\ escapes) for a FIXED key type
+//	            (with \" and \\ escapes) for a FIXED key type, whose
+//	            UNESCAPED length must be <= 255 bytes (wire.OperateMaxKeyLen,
+//	            the widest row key any record can encode)
 //	seg3        a column: a name, or "#N" for a position
 //
 // A field segment may end with "#count" (e.g. "b#count"), in which case it
@@ -49,7 +51,10 @@
 // before slicing, every numeric parse is bounds-checked before the value is
 // trusted (position <= 65535, row-key digit count <= 20 and must fit
 // uint64), and no segment is treated as well-formed until it has been fully
-// validated. Resolver.Resolve extends the same discipline to the record
+// validated. The quoted row key is bounded before it is unescaped, not
+// after, so a hostile path cannot drive a large allocation on a parse that
+// is going to be rejected anyway. Resolver.Resolve extends the same
+// discipline to the record
 // bytes themselves, mirroring sdk/wire/operate_record.go: every offset
 // bounds-checked before use, every count bounded before allocation, and
 // only canonical uvarints accepted.

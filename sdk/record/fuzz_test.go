@@ -4,8 +4,11 @@ package record
 
 import (
 	"bytes"
+	"fmt"
+	"strings"
 	"testing"
 
+	"github.com/rostamlabs/rostam/sdk/vtypes"
 	"github.com/rostamlabs/rostam/sdk/wire"
 )
 
@@ -150,13 +153,22 @@ func fuzzDynamicSeed(f *testing.F) []byte {
 //     never returns an error outside ErrPath/ErrRecord;
 //   - Resolve never mutates its input.
 //
-// A third property holds only when the fuzzed bytes really are a
+// IndexEntries is fuzzed on the SAME inputs, and it has to be: it is the
+// other byte-level reader of a stored record, it runs on the WRITE path
+// (reindex) where a panic takes the collection down rather than one query,
+// and — unlike Resolve — it walks EVERY field of the record instead of
+// stopping on its own path, so it reaches decode states no path in fuzzPaths
+// can steer Resolve into. It holds the same three properties: no panic, an
+// error only ever wrapping ErrRecord/ErrPath, and no mutation of its input.
+//
+// A further property holds only when the fuzzed bytes really are a
 // well-formed record (wire.DecodeRecord accepts them): for every path in
 // fuzzPaths, Resolve must agree with the tree oracle (resolveTree,
 // oracle_test.go) — the same Result, or the same error class (ErrPath vs
-// ErrRecord, via errors.Is/errClass) — because on a well-formed record the
-// byte-level resolver and the decode-then-walk oracle are two
-// implementations of the identical rule and must never diverge.
+// ErrRecord, via errors.Is/errClass) — and IndexEntries must equal the
+// entries derived from that same decoded tree (indexEntriesTree). On a
+// well-formed record each byte-level reader and its decode-then-walk oracle
+// are two implementations of one rule and must never diverge.
 //
 // Seeded with the session (schema-mode) and dynamic-mode example records
 // (the same fixtures resolve_test.go's own tests use) plus a handful of
@@ -197,8 +209,15 @@ func FuzzResolve(f *testing.F) {
 				t.Fatalf("error %v returned a non-zero result %+v", err, res)
 			}
 		}
+		entries, ierr := r.IndexEntries(b)
+		if ierr != nil && errClass(ierr) == "other" {
+			t.Fatalf("IndexEntries returned an error outside ErrPath/ErrRecord: %v", ierr)
+		}
+		if ierr != nil && len(entries) != 0 {
+			t.Fatalf("IndexEntries error %v returned %d entries, want none", ierr, len(entries))
+		}
 		if !bytes.Equal(before, b) {
-			t.Fatal("Resolve mutated its input")
+			t.Fatal("Resolve or IndexEntries mutated its input")
 		}
 
 		dec, derr := wire.DecodeRecord(b)
@@ -215,5 +234,71 @@ func FuzzResolve(f *testing.F) {
 				t.Fatalf("path %+v: got %+v, oracle %+v", p, got, want)
 			}
 		}
+		if ierr != nil {
+			t.Fatalf("IndexEntries failed on a record wire.DecodeRecord accepts: %v", ierr)
+		}
+		if wantEntries := indexEntriesTree(dec); !entriesEqual(entries, wantEntries) {
+			t.Fatalf("IndexEntries = %v, oracle = %v", entriesString(entries), entriesString(wantEntries))
+		}
 	})
+}
+
+// indexEntriesTree is the decode-then-walk oracle for IndexEntries: it derives
+// the entries from the DECODED tree the same way the byte-level walk derives
+// them from the bytes. Kept deliberately dumb — a straight walk of the tree
+// with no offset arithmetic of its own — so that when the two disagree the
+// byte-level reader is the one under suspicion.
+//
+// It mirrors IndexEntries' documented rule exactly: one entry per top-level
+// scalar whose CellValue is defined and not NaN, one "<field>#count" entry per
+// top-level table, table columns never indexed, and schema-mode field names
+// spelled by schemaFieldLabel (the name, or "#N" for a names-less schema).
+func indexEntriesTree(rec *wire.Record) []Entry {
+	entries := make([]Entry, 0, len(rec.Fields))
+	for i := range rec.Fields {
+		f := &rec.Fields[i]
+		name := f.Name
+		if rec.Mode == wire.OperateModeSchema {
+			if rec.Schema == nil || i >= len(rec.Schema.Fields) {
+				return entries // a shape DecodeRecord would not have produced
+			}
+			name = schemaFieldLabel(rec.Schema.StoreNames, rec.Schema.Fields[i].Name, i)
+		}
+		if f.Cell.Type == wire.OperateTypeTable {
+			nRows := 0
+			if f.Table != nil {
+				nRows = len(f.Table.Rows)
+			}
+			entries = append(entries, Entry{Field: name + countSuffix, Value: vtypes.NewInt(int64(nRows))})
+			continue
+		}
+		if v, ok := CellValue(f.Cell); ok && !isNaNValue(v) {
+			entries = append(entries, Entry{Field: name, Value: v})
+		}
+	}
+	return entries
+}
+
+// entriesEqual compares two entry lists as ORDERED sequences: IndexEntries
+// promises a deterministic order (schema field order, or ascending stored name
+// order), so an order difference is a real divergence, not a formatting one.
+func entriesEqual(a, b []Entry) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Field != b[i].Field || !valuesEqual(a[i].Value, b[i].Value) {
+			return false
+		}
+	}
+	return true
+}
+
+// entriesString renders an entry list for a failure message.
+func entriesString(es []Entry) string {
+	parts := make([]string, 0, len(es))
+	for _, e := range es {
+		parts = append(parts, fmt.Sprintf("%s=%+v", e.Field, e.Value))
+	}
+	return "[" + strings.Join(parts, " ") + "]"
 }

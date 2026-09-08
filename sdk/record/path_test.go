@@ -166,3 +166,65 @@ func TestSplitField(t *testing.T) {
 		})
 	}
 }
+
+// TestParsePathQuotedRowKeyLengthBound pins the bound on a quoted row key.
+//
+// WHY IT IS A BOUND AND NOT JUST A VALIDATION. unescapeQuoted allocates the raw
+// inner length, and a filter's path is parsed against the record of every point
+// in a scan, so an unbounded quoted key is a per-row allocation the caller sizes:
+// a field of session/"<30 MiB of x>"/col cost ~30 MB per point. The raw length is
+// therefore checked BEFORE the unescape (every escape is two bytes producing one,
+// so 2*OperateMaxKeyLen raw is the widest input that could still be legal), and
+// the unescaped length is checked after.
+//
+// The bound is semantically free: a row key wider than OperateMaxKeyLen cannot
+// exist in any encodable record — schema mode answers Absent on a key-width
+// mismatch and a dynamic-mode key length is a u8 — so rejecting means exactly
+// what resolving would have meant.
+func TestParsePathQuotedRowKeyLengthBound(t *testing.T) {
+	quoted := func(n int) string { return `a/"` + strings.Repeat("k", n) + `"/c` }
+
+	t.Run("255 accepted", func(t *testing.T) {
+		p, err := ParsePath(quoted(255))
+		if err != nil {
+			t.Fatalf("ParsePath with a 255-byte quoted row key: %v, want nil", err)
+		}
+		if len(p.Segs) != 3 || p.Segs[1].Kind != SegRow || len(p.Segs[1].Key) != 255 {
+			t.Fatalf("unexpected parse: %+v", p)
+		}
+	})
+
+	t.Run("256 rejected", func(t *testing.T) {
+		_, err := ParsePath(quoted(256))
+		if err == nil || !errors.Is(err, ErrPath) {
+			t.Fatalf("ParsePath with a 256-byte quoted row key: err = %v, want an ErrPath", err)
+		}
+	})
+
+	// The hostile case: rejected on the RAW length, so nothing near this size is
+	// ever copied. A test that only asserted the error would pass even if the
+	// unescape still ran, so this one is the reason the raw check exists.
+	t.Run("1 MiB rejected", func(t *testing.T) {
+		_, err := ParsePath(quoted(1 << 20))
+		if err == nil || !errors.Is(err, ErrPath) {
+			t.Fatalf("ParsePath with a 1 MiB quoted row key: err = %v, want an ErrPath", err)
+		}
+	})
+
+	// Escapes count against the UNESCAPED length: 255 escaped pairs are 510 raw
+	// bytes and a legal 255-byte key, while 256 pairs are not. This is the case a
+	// raw-length-only bound would get wrong in both directions.
+	t.Run("escapes count unescaped", func(t *testing.T) {
+		esc := func(n int) string { return `a/"` + strings.Repeat(`\"`, n) + `"/c` }
+		p, err := ParsePath(esc(255))
+		if err != nil {
+			t.Fatalf("255 escaped pairs: %v, want nil", err)
+		}
+		if len(p.Segs[1].Key) != 255 {
+			t.Fatalf("unescaped key length = %d, want 255", len(p.Segs[1].Key))
+		}
+		if _, err := ParsePath(esc(256)); err == nil || !errors.Is(err, ErrPath) {
+			t.Fatalf("256 escaped pairs: err = %v, want an ErrPath", err)
+		}
+	})
+}
