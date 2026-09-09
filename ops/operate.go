@@ -212,6 +212,11 @@ func handleOperateAppend(tx *TxContext, args, dst []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+		// The one write branch, AFTER the store returns (an evicting Put can
+		// fire onRemove for the very key being written). The other two cases
+		// deliberately do not reach here: a failed CHECK stored nothing, and
+		// the delete branch is covered by the cache's onRemove → Set.Drop.
+		tx.reindexKV(a.Key, out)
 	}
 
 	return wire.AppendOperateResult(dst, &res)

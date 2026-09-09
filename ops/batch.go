@@ -22,9 +22,18 @@ func handlePutBatch(tx *TxContext, args []byte) ([]byte, error) {
 	}
 	var firstErr error
 	for _, e := range entries {
-		if perr := tx.Put(e.Key, e.Val, e.TTL); perr != nil && firstErr == nil {
-			firstErr = perr
+		if perr := tx.Put(e.Key, e.Val, e.TTL); perr != nil {
+			if firstErr == nil {
+				firstErr = perr
+			}
+			// This entry stored nothing, so it posts nothing — the same
+			// "N independent puts" equivalence the doc above states.
+			continue
 		}
+		// Per entry, and AFTER its own Put: an evicting Put can fire onRemove
+		// for the very key it is writing, so a posting made first would be
+		// dropped by that eviction.
+		tx.reindexKV(e.Key, e.Val)
 	}
 	if firstErr != nil {
 		return nil, firstErr

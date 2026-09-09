@@ -326,7 +326,7 @@ func newDurableRetryFSM(t *testing.T) (*fsm, chan struct{}) {
 	if err := ops.RegisterBuiltins(reg); err != nil {
 		t.Fatal(err)
 	}
-	f := newFSM(c, reg, true /* durable */, nil)
+	f := newFSM(c, reg, true /* durable */, nil, nil)
 	f.isReplicated = func() bool { return true }
 	f.applyRetryWait = time.Millisecond
 	stop := make(chan struct{})

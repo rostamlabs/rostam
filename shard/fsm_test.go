@@ -26,7 +26,7 @@ func newTestFSM(t *testing.T) (*fsm, *cache.Cache) {
 	if err := ops.RegisterBuiltins(reg); err != nil {
 		t.Fatal(err)
 	}
-	return newFSM(c, reg, false, nil), c
+	return newFSM(c, reg, false, nil, nil), c
 }
 
 func TestFSMApplyPut(t *testing.T) {
@@ -193,7 +193,7 @@ func TestFSMApplyBatchNoWatermarkRegression(t *testing.T) {
 	if err := ops.RegisterBuiltins(reg); err != nil {
 		t.Fatal(err)
 	}
-	f := newFSM(c, reg, true /* durable */, nil)
+	f := newFSM(c, reg, true /* durable */, nil, nil)
 
 	// Seed the persisted watermark high, as after normal operation.
 	c.SetAppliedIndex(500, true)

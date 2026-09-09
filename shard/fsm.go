@@ -15,6 +15,7 @@ import (
 
 	"github.com/rostamlabs/rostam/cache"
 	"github.com/rostamlabs/rostam/ops"
+	"github.com/rostamlabs/rostam/ops/kvindex"
 	"github.com/rostamlabs/rostam/vector"
 )
 
@@ -218,11 +219,19 @@ const (
 	applyRetryWaitCap     = time.Second
 )
 
-func newFSM(c *cache.Cache, r *ops.Registry, durable bool, vectors *vector.CollectionStore) *fsm {
+// newFSM builds the apply dispatcher for one shard group.
+//
+// kvIdx is THE KV record index of c — the same pointer the owning Store hands
+// its read-only TxContext, created once next to the cache by ops.NewKVIndexFor.
+// A second, private Set here would compile and then silently answer every
+// kv_query empty: writes would maintain the FSM's index while reads are served
+// from the Store's. nil is valid and means this FSM maintains no index (bare
+// FSMs in tests, embedders that never define one).
+func newFSM(c *cache.Cache, r *ops.Registry, durable bool, vectors *vector.CollectionStore, kvIdx *kvindex.Set) *fsm {
 	return &fsm{
 		cache:    c,
 		registry: r,
-		tx:       ops.NewTxContextWithVectors(c, vectors),
+		tx:       ops.NewTxContextWithIndex(c, vectors, kvIdx),
 		durable:  durable,
 		vectors:  vectors,
 	}
@@ -700,5 +709,20 @@ func (f *fsm) Restore(rc io.ReadCloser) error {
 	// skip consistent with the restored state.
 	f.advanceApplied(appliedIndex)
 	f.cache.SetAppliedIndex(appliedIndex, f.durable)
+
+	// The KV record index is NOT a durability unit — it is in no snapshot, no
+	// WAL and no log — so a restore leaves it describing the keyspace that was
+	// just replaced. restoreSnapshot REFILLS THE EXISTING cache (it does not
+	// install a new one), so the Set to rebuild is the one already wired to
+	// this cache's onRemove hook: rebuild it in place, never re-create it, or
+	// the Store's read-only dispatcher would keep pointing at the old one.
+	//
+	// Rebuild empties every posting, replays the restored keyspace through it
+	// and only then republishes readiness, so no query can be served from a
+	// half-filled index. It walks nothing when no definition is installed,
+	// which is the normal case for a restore (definitions arrive from the meta
+	// log). Safe here for locking too: we hold no cache lock, and Rebuild does
+	// not hold the index lock across the walk.
+	ops.RebuildKVIndex(f.tx.KVIndex(), f.cache)
 	return nil
 }

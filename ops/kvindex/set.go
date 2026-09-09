@@ -335,12 +335,27 @@ func (s *Set) Drop(key []byte) {
 // move the observer. Marking it ready is both the fix and the truth, because
 // the keyspace it was being built over no longer exists.
 //
-// The invalidated walk cannot undo this. grantReadyLocked only ever SETS
-// readiness, and reindexFor refuses to write into a generation it does not
-// own, so the stale walk publishes nothing and resurrects nothing — a key it
-// had already read from the pre-flush cache cannot be posted back into the
-// flushed index. Readiness only ever returns to false at the START of a new
-// Rebuild or Backfill, which is a walk that will publish its own result.
+// The invalidated walk cannot undo the READINESS. grantReadyLocked only ever
+// SETS readiness, so a stale walk publishes nothing; readiness returns to false
+// only at the START of a new Rebuild or Backfill, which is a walk that will
+// publish its own result.
+//
+// What a stale walk can still leave behind is narrower than "nothing", and the
+// distinction is worth stating exactly. A BACKFILL is token-checked —
+// reindexFor refuses to write into a generation it does not own — so a key it
+// read from the pre-flush cache can never be posted back. A REBUILD is not: it
+// replays through the plain Reindex, which posts unconditionally by design (a
+// write racing an activation must be recorded), so a Rebuild whose walk
+// straddles a flush may post keys the flush has already removed. Those are
+// stale HINTS and nothing worse — every candidate is re-read and re-checked
+// against the live value, so a posting for an absent key costs one lookup and
+// yields no row. They are unreachable by Drop (their keys are gone, so no
+// onRemove will ever name them); the reconcile pass is what sweeps them.
+//
+// CALL ORDER at the flush handler: Cache.Flush FIRST, Reset after, and only on
+// success. Resetting before the flush would claim an empty index over a
+// keyspace that still has keys in it, and resetting after a FAILED flush would
+// publish it as exact over shards that were never emptied. See ops.handleFlush.
 func (s *Set) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()

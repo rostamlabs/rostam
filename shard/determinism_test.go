@@ -58,7 +58,7 @@ func newDetReplica(t *testing.T, clock0 uint64, replicated bool, sweepMs int) *d
 	if err := ops.RegisterBuiltins(reg); err != nil {
 		t.Fatal(err)
 	}
-	return &detReplica{f: newFSM(c, reg, false, nil), c: c, clock: clk, cfg: cc}
+	return &detReplica{f: newFSM(c, reg, false, nil, nil), c: c, clock: clk, cfg: cc}
 }
 
 // newPersistentDetReplica is newDetReplica on the PRODUCTION persistent replicated
@@ -97,7 +97,7 @@ func (r *detReplica) open(t *testing.T) {
 	if err := ops.RegisterBuiltins(reg); err != nil {
 		t.Fatal(err)
 	}
-	r.c, r.f = c, newFSM(c, reg, false, nil)
+	r.c, r.f = c, newFSM(c, reg, false, nil, nil)
 }
 
 // restart closes the replica and reopens it over the SAME DataDir, replaying

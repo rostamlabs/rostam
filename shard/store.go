@@ -14,6 +14,7 @@ import (
 
 	"github.com/rostamlabs/rostam/cache"
 	"github.com/rostamlabs/rostam/ops"
+	"github.com/rostamlabs/rostam/ops/kvindex"
 	"github.com/rostamlabs/rostam/raft"
 	"github.com/rostamlabs/rostam/shard/pbisr"
 	"github.com/rostamlabs/rostam/vector"
@@ -35,6 +36,11 @@ type Store struct {
 	raft     replicator // the active data-plane engine (Raft by default; see replicator.go)
 	fsm      *fsm
 	tx       *ops.TxContext // reused across read-only Call paths; same caching rationale as fsm.tx
+
+	// kvIdx is THE KV record index of this shard's cache: one Set per cache,
+	// created in New, maintained by fsm.tx on the write path and read through
+	// tx on the read-only path. Both TxContexts hold this same pointer.
+	kvIdx *kvindex.Set
 
 	// readindex coalesces concurrent Linearizable-read barriers on THIS Store into
 	// one shared VerifyLeader+Barrier RTT, while guaranteeing no reader is served a
@@ -203,13 +209,36 @@ func New(cfg Config) (*Store, error) {
 		return nil, fmt.Errorf("shard: cache: %w", err)
 	}
 
+	// ############### ONE KV RECORD INDEX PER CACHE, CREATED HERE #############
+	//
+	// Created BEFORE the FSM and before the replication engine that drives it,
+	// then SHARED: the same pointer goes to newFSM (which maintains it from every
+	// write apply) and to storeTx (from which every read-only op is served — see
+	// Call). Two Sets would compile and be silently wrong: the write path would
+	// fill one while reads answered from the other, so every kv_query would come
+	// back empty.
+	//
+	// NewKVIndexFor also registers Set.Drop as the cache's SINGLE onRemove hook,
+	// which is how deletes, evictions and TTL expiry unpost keys. Doing it here,
+	// before raft.NewNode starts the apply goroutine, means no write can land
+	// before the hook is in place; the goroutine-start happens-before edge
+	// publishes both without a race.
+	kvIdx := ops.NewKVIndexFor(c)
+	// Warm start: a durable cache comes back holding content (rebuildIndexFromPages)
+	// that the index has never seen, because the index is re-derived rather than
+	// restored — it is in no snapshot, no WAL and no log. A no-op today, since no
+	// definition is installed this early and a rebuild with none walks nothing;
+	// kept because this is the one point where the cache is warm and the index is
+	// empty.
+	ops.RebuildKVIndex(kvIdx, c)
+
 	vectorStore, err := vector.OpenCollectionStorePersistent(cfg.DataDir, cfg.PersistentVectors)
 	if err != nil {
 		_ = c.Close()
 		return nil, fmt.Errorf("shard: open vector store: %w", err)
 	}
 
-	fsmImpl := newFSM(c, cfg.Ops, cfg.Cache.Durable, vectorStore)
+	fsmImpl := newFSM(c, cfg.Ops, cfg.Cache.Durable, vectorStore, kvIdx)
 	fsmImpl.wasmSnapshot = cfg.WASMSnapshot
 	fsmImpl.wasmRestore = cfg.WASMRestore
 	fsmImpl.onApplyRetry = cfg.OnApplyRetry
@@ -324,7 +353,10 @@ func New(cfg Config) (*Store, error) {
 		rep = rn
 	}
 
-	storeTx := ops.NewTxContextWithVectors(c, vectorStore)
+	// The SAME kvIdx the FSM got: read-only ops (kv_query among them) run
+	// handler(s.tx, args), so this is the dispatcher that must see the postings
+	// the write path maintains.
+	storeTx := ops.NewTxContextWithIndex(c, vectorStore, kvIdx)
 	storeTx.SetShardIndex(cfg.ShardIndex)
 	return &Store{
 		cfg:        cfg,
@@ -334,10 +366,22 @@ func New(cfg Config) (*Store, error) {
 		raft:       rep,
 		fsm:        fsmImpl,
 		tx:         storeTx,
+		kvIdx:      kvIdx,
 		stop:       stop,
 		pbFrontier: pbFrontier,
 	}, nil
 }
+
+// KVIndex returns this shard's KV record index — the single Set the FSM
+// maintains and read-only ops are served from. Never nil for a Store built by
+// New. The activation observer installs definitions into it and backfills them.
+func (s *Store) KVIndex() *kvindex.Set { return s.kvIdx }
+
+// CacheWalker returns this shard's chunked full-keyspace walk, in the shape
+// kvindex.Rebuild and kvindex.Backfill take. It releases each cache shard's
+// read lock every few thousand slots, so a backfill over a large keyspace does
+// not block writers for the length of a whole shard's walk.
+func (s *Store) CacheWalker() func(func(key, value []byte) bool) { return ops.CacheWalker(s.cache) }
 
 // raftReplicatedFn builds the FSM's isReplicated gate over a LIVE Raft group-size
 // source (raft.Node.NumServers). It FAILS CLOSED: the gate reports replicated

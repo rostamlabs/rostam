@@ -100,11 +100,19 @@ func NewDirect(cfg DirectConfig) (Store, error) {
 		_ = c.Close()
 		return nil, fmt.Errorf("rostam: open vector store: %w", err)
 	}
+	// One KV record index per cache, exactly as shard.New does it — but simpler
+	// here, because a directStore has a SINGLE TxContext serving both its reads
+	// and its writes, so there is no second dispatcher to keep in step.
+	// NewKVIndexFor also installs Set.Drop as the cache's onRemove hook (deletes,
+	// evictions and TTL expiry unpost through it), and the rebuild covers a warm
+	// start off durable pages. Both happen before the store is reachable.
+	kvIdx := ops.NewKVIndexFor(c)
+	ops.RebuildKVIndex(kvIdx, c)
 	return &directStore{
 		cache:    c,
 		registry: cfg.Ops,
 		vectors:  vectorStore,
-		tx:       ops.NewTxContextWithVectors(c, vectorStore),
+		tx:       ops.NewTxContextWithIndex(c, vectorStore, kvIdx),
 		opMu:     make([]sync.Mutex, c.NumShards()),
 	}, nil
 }
@@ -157,7 +165,20 @@ func (d *directStore) Put(_ context.Context, key, value []byte, ttl time.Duratio
 	mu := &d.opMu[d.cache.ShardIndex(key)]
 	mu.Lock()
 	defer mu.Unlock()
-	return d.cache.Put(key, value, ttl)
+	if err := d.cache.Put(key, value, ttl); err != nil {
+		return err
+	}
+	// This is the ONE write that does not go through an op handler, so it has to
+	// maintain the record index itself — otherwise a Put here would leave the
+	// posting describing the PREVIOUS value and a query for the new one would
+	// miss the key, which is the one failure mode the index may not have. AFTER
+	// the Put, for the same reason handlers do it after (an evicting Put can
+	// fire onRemove for the key being written). Del needs no counterpart: it
+	// removes a live slot, so onRemove → Set.Drop already fires.
+	if idx := d.tx.KVIndex(); idx != nil {
+		idx.Reindex(key, value)
+	}
+	return nil
 }
 
 func (d *directStore) Del(_ context.Context, key []byte) (bool, error) {

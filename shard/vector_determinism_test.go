@@ -105,7 +105,7 @@ func newVecReplica(t *testing.T, clock0 int64, replicated bool) *vecReplica {
 	if err := ops.RegisterBuiltins(reg); err != nil {
 		t.Fatal(err)
 	}
-	return &vecReplica{f: newFSM(c, reg, false, vs), c: c, vs: vs, clock: clk}
+	return &vecReplica{f: newFSM(c, reg, false, vs, nil), c: c, vs: vs, clock: clk}
 }
 
 func (r *vecReplica) apply(t *testing.T, index uint64, entry []byte) {

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/rostamlabs/rostam/cache"
+	"github.com/rostamlabs/rostam/ops/kvindex"
 	"github.com/rostamlabs/rostam/sdk/wire"
 	"github.com/rostamlabs/rostam/vector"
 )
@@ -36,6 +37,26 @@ type TxContext struct {
 	// those paths are byte-for-byte unchanged.
 	applyStamped bool
 	applyNowMs   uint64
+
+	// kvIdx is the KV record index this dispatcher maintains, or nil when the
+	// dispatcher was built without one (NewTxContext / NewTxContextWithVectors:
+	// the legacy KV-only call sites and most tests).
+	//
+	// ############ ONE Set PER cache.Cache, SHARED BY EVERY TxContext ##########
+	//
+	// A cache has exactly one index, created next to it (ops.NewKVIndexFor) and
+	// handed to every TxContext built over that cache — the FSM's, which
+	// maintains it on the write path, AND the store's read-only one, which
+	// answers kv_query from it. Two Sets over one cache is not merely wasteful,
+	// it is silently wrong: reads would be served from a Set no write ever
+	// reached, so every query would answer empty. See shard.New / NewDirect.
+	//
+	// It is never a durability unit: nothing here is snapshotted, logged or
+	// replicated. Reindex is a pure function of (key, value, definitions) with
+	// no clock in it, so maintaining it inside a replicated apply cannot
+	// diverge replicas, and a resolve failure means "no posting" and nothing
+	// else — see reindexKV.
+	kvIdx *kvindex.Set
 
 	// shardIdx is the index of the shard GROUP whose dispatcher owns this
 	// TxContext. It is set once when the dispatcher is built (one TxContext per
@@ -103,6 +124,95 @@ func NewTxContext(c *cache.Cache) *TxContext {
 // variant; legacy KV-only call sites use NewTxContext.
 func NewTxContextWithVectors(c *cache.Cache, v *vector.CollectionStore) *TxContext {
 	return &TxContext{c: c, vectors: v}
+}
+
+// NewTxContextWithIndex constructs a TxContext that also maintains a KV record
+// index. It is the dispatcher constructor for a store that has one: shard.New
+// builds a single Set next to the cache and passes the SAME pointer here for
+// the FSM's TxContext and for the store's read-only one.
+func NewTxContextWithIndex(c *cache.Cache, v *vector.CollectionStore, idx *kvindex.Set) *TxContext {
+	return &TxContext{c: c, vectors: v, kvIdx: idx}
+}
+
+// KVIndex returns the KV record index, or nil when the dispatcher was built
+// without one. Callers must handle nil: the KV builtins work identically with
+// and without an index, and every embedder that predates it has none.
+func (tx *TxContext) KVIndex() *kvindex.Set { return tx.kvIdx }
+
+// kvIndexResolverCache is how many decoded record schemas one index's resolver
+// keeps. A shard sees few distinct schemas and reuses them on every write, so
+// the cache turns a schema-mode resolve into offset arithmetic.
+const kvIndexResolverCache = 1024
+
+// kvIndexWalkBatch is how many index slots a rebuild's chunked walk holds a
+// cache shard's read lock for before releasing it. It matches the cache's own
+// sweep batch: large enough that the per-chunk bookkeeping disappears, small
+// enough that a writer never waits for a whole shard's walk.
+const kvIndexWalkBatch = 4096
+
+// NewKVIndexFor creates THE record index for c and installs its Drop as c's
+// onRemove hook.
+//
+// Call it exactly once per cache.Cache, next to cache.New, and share the
+// returned pointer with every TxContext built over that cache. Both halves
+// matter: a second Set would be maintained by only one of the two dispatchers
+// (see TxContext.kvIdx), and a second SetOnRemove would REPLACE the first —
+// cache.SetOnRemove stores one hook, so the earlier index would stop hearing
+// about removals and would keep postings for keys that no longer exist.
+//
+// The hook runs under a cache shard's write lock, which is why Drop is the
+// hook and not a closure that reads the cache: lock order is cache → index,
+// one way, always.
+func NewKVIndexFor(c *cache.Cache) *kvindex.Set {
+	idx := kvindex.New(kvIndexResolverCache)
+	c.SetOnRemove(idx.Drop)
+	return idx
+}
+
+// CacheWalker returns c's chunked full-keyspace walk in the shape
+// kvindex.Rebuild and kvindex.Backfill take.
+func CacheWalker(c *cache.Cache) func(func(key, value []byte) bool) {
+	return func(fn func(key, value []byte) bool) { c.IterateChunked(kvIndexWalkBatch, fn) }
+}
+
+// RebuildKVIndex refills idx from c's live entries: the warm-start and
+// post-Restore rebuild point, where the cache has content the index has never
+// seen (the index is not snapshotted, not logged, and not replicated — it is
+// always re-derived by walking the cache).
+//
+// With NO definition installed it walks NOTHING. That is not just an
+// optimisation: a rebuild over an empty definition set has no result to
+// publish, so paying for a full-keyspace walk at every start — which is the
+// common case, since definitions arrive later from the meta log — would be
+// pure cost. Installing a definition later starts its own backfill.
+//
+// idx or c being nil is a no-op, so a store built without an index can call it
+// unconditionally.
+func RebuildKVIndex(idx *kvindex.Set, c *cache.Cache) {
+	if idx == nil || c == nil || len(idx.Defs()) == 0 {
+		return
+	}
+	idx.Rebuild(CacheWalker(c))
+}
+
+// reindexKV is the single seam every KV write handler calls, with the bytes it
+// just stored, AFTER the store returns.
+//
+// AFTER, never before: an evicting Cache.Put can fire onRemove for the very key
+// being written (its old copy sits on the page the write retires), so a posting
+// made before the Put would be dropped by that eviction and the fresh value
+// would be unfindable. See cache.SetOnRemove.
+//
+// It is a no-op when the dispatcher was built without an index, never returns
+// an error, and never touches the cache — an index failure must not change what
+// the apply stored. That is what lets definitions be installed node-locally:
+// the index is derived state, so a node whose index disagrees answers fewer
+// candidates, never a different keyspace.
+func (tx *TxContext) reindexKV(key, value []byte) {
+	if tx.kvIdx == nil {
+		return
+	}
+	tx.kvIdx.Reindex(key, value)
 }
 
 // Vectors returns the CollectionStore (nil if the dispatcher wasn't built

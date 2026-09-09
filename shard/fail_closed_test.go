@@ -57,7 +57,7 @@ func newGatedFSM(t *testing.T, c *cache.Cache, replicated bool, onFatal func(err
 	if err := ops.RegisterBuiltins(reg); err != nil {
 		t.Fatal(err)
 	}
-	f := newFSM(c, reg, false, nil)
+	f := newFSM(c, reg, false, nil, nil)
 	f.isReplicated = func() bool { return replicated }
 	f.onFatalApply = onFatal
 	return f
@@ -555,7 +555,7 @@ func TestFSMApplyBatchFatalRecordsSuccessfulPrefix(t *testing.T) {
 	if err := ops.RegisterBuiltins(reg); err != nil {
 		t.Fatal(err)
 	}
-	f := newFSM(c, reg, true /* durable */, nil)
+	f := newFSM(c, reg, true /* durable */, nil, nil)
 	f.isReplicated = func() bool { return true }
 	var fired error
 	f.onFatalApply = func(e error) { fired = e }
