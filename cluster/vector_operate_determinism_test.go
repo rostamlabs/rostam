@@ -107,7 +107,7 @@ func TestVectorOperateReplicasAgreeByteForByte(t *testing.T) {
 	if err != nil {
 		t.Fatalf("vector_operate: %v", err)
 	}
-	found, res, err := wire.DecodeVectorOperateResult(body)
+	found, res, _, err := wire.DecodeVectorOperateResult(body)
 	if err != nil {
 		t.Fatalf("DecodeVectorOperateResult: %v", err)
 	}
@@ -303,7 +303,7 @@ func TestVectorOperateReplicasAgreeWithAPerKeyDeadline(t *testing.T) {
 		if err != nil {
 			t.Fatalf("vector_operate: %v", err)
 		}
-		found, res, err := wire.DecodeVectorOperateResult(body)
+		found, res, _, err := wire.DecodeVectorOperateResult(body)
 		if err != nil {
 			t.Fatalf("DecodeVectorOperateResult: %v", err)
 		}

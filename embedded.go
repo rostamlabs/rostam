@@ -1656,14 +1656,14 @@ var ErrOperateDuringReshard = ops.ErrOperateDuringReshard
 // part that lasts minutes rather than microseconds.
 func (e *embedded) vectorOperate(opName, collection string, id uint64, payloadKey string,
 	a *wire.OperateArgs, opts []WriteOpts,
-) (bool, *wire.OperateResult, error) {
+) (bool, *wire.OperateResult, uint64, error) {
 	collection = e.resolveAlias(collection)
 	live, _, dual := e.dualTargets(collection, id)
 	if dual {
 		// ops.OperateDuringReshardErr is the one producer of the detailed form:
 		// the shape the transport classifiers anchor on, with the caller's
 		// collection name bounded.
-		return false, nil, ops.OperateDuringReshardErr(collection)
+		return false, nil, 0, ops.OperateDuringReshardErr(collection)
 	}
 	if live != "" {
 		collection = live
@@ -1672,15 +1672,15 @@ func (e *embedded) vectorOperate(opName, collection string, id uint64, payloadKe
 	exp, hasExp := wo.expectedVersion()
 	args, err := wire.EncodeVectorOperateArgs(collection, id, payloadKey, a, exp, hasExp)
 	if err != nil {
-		return false, nil, err
+		return false, nil, 0, err
 	}
 	body, err := e.Call(context.Background(), opName, args)
 	if err != nil {
-		return false, nil, err
+		return false, nil, 0, err
 	}
 	if wo.wcActive() {
 		if err := e.barrierPhys(collection, wo); err != nil {
-			return false, nil, err
+			return false, nil, 0, err
 		}
 	}
 	return ops.DecodeVectorOperateResult(body)
@@ -1692,19 +1692,19 @@ func (e *embedded) vectorOperate(opName, collection string, id uint64, payloadKe
 //
 // Unlike VectorSetPayload it does NOT dual-write during a reshard; see
 // vectorOperate and ErrOperateDuringReshard.
-func (e *embedded) VectorOperate(_ context.Context, collection string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, error) {
+func (e *embedded) VectorOperate(_ context.Context, collection string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, uint64, error) {
 	return e.vectorOperate("vector_operate", collection, id, payloadKey, a, opts)
 }
 
 // VectorNamedOperate is VectorOperate against a named-vector point's shared
 // payload. See vectorOperate.
-func (e *embedded) VectorNamedOperate(_ context.Context, name string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, error) {
+func (e *embedded) VectorNamedOperate(_ context.Context, name string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, uint64, error) {
 	return e.vectorOperate("vector_named_operate", name, id, payloadKey, a, opts)
 }
 
 // VectorMVOperate is VectorOperate against a multi-vector document's payload.
 // See vectorOperate.
-func (e *embedded) VectorMVOperate(_ context.Context, name string, docID uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, error) {
+func (e *embedded) VectorMVOperate(_ context.Context, name string, docID uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, uint64, error) {
 	return e.vectorOperate("vector_mv_operate", name, docID, payloadKey, a, opts)
 }
 

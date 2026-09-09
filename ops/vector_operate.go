@@ -125,15 +125,21 @@ func handleVectorOperate(tx *TxContext, args []byte) ([]byte, error) {
 	fn := vectorOperateMutator(a, stampMs, &res)
 
 	var applied bool
+	var version uint64
 	if stamped {
-		applied, _, err = tx.vectors.MutatePayloadRecordCASAt(name, id, pk, fn, cas, stampMs)
+		applied, version, err = tx.vectors.MutatePayloadRecordCASAt(name, id, pk, fn, cas, stampMs)
 	} else {
-		applied, _, err = tx.vectors.MutatePayloadRecordCAS(name, id, pk, fn, cas)
+		applied, version, err = tx.vectors.MutatePayloadRecordCAS(name, id, pk, fn, cas)
 	}
 	if err != nil {
 		return nil, err // incl. ErrVersionConflict, ErrPayloadKeyNotRecord, ErrRecordTooLarge
 	}
-	return wire.EncodeVectorOperateResult(applied, res)
+	// version is the point's version AFTER the call — bumped when the op-list
+	// applied, and the CURRENT unbumped one when it was a deliberate no-op (a
+	// failed CHECK). Returning it lets a CAS loop feed the next attempt straight
+	// from this result instead of re-reading the point, which is both a round trip
+	// and a race.
+	return wire.EncodeVectorOperateResult(applied, res, version)
 }
 
 // handleNamedVectorOperate is handleVectorOperate against a named-vector
@@ -156,15 +162,21 @@ func handleNamedVectorOperate(tx *TxContext, args []byte) ([]byte, error) {
 	fn := vectorOperateMutator(a, stampMs, &res)
 
 	var applied bool
+	var version uint64
 	if stamped {
-		applied, _, err = tx.vectors.NamedMutatePayloadRecordCASAt(name, id, pk, fn, cas, stampMs)
+		applied, version, err = tx.vectors.NamedMutatePayloadRecordCASAt(name, id, pk, fn, cas, stampMs)
 	} else {
-		applied, _, err = tx.vectors.NamedMutatePayloadRecordCAS(name, id, pk, fn, cas)
+		applied, version, err = tx.vectors.NamedMutatePayloadRecordCAS(name, id, pk, fn, cas)
 	}
 	if err != nil {
 		return nil, err // incl. ErrVersionConflict, ErrPayloadKeyNotRecord, ErrRecordTooLarge
 	}
-	return wire.EncodeVectorOperateResult(applied, res)
+	// version is the point's version AFTER the call — bumped when the op-list
+	// applied, and the CURRENT unbumped one when it was a deliberate no-op (a
+	// failed CHECK). Returning it lets a CAS loop feed the next attempt straight
+	// from this result instead of re-reading the point, which is both a round trip
+	// and a race.
+	return wire.EncodeVectorOperateResult(applied, res, version)
 }
 
 // handleMVVectorOperate is handleVectorOperate against a multi-vector
@@ -187,15 +199,21 @@ func handleMVVectorOperate(tx *TxContext, args []byte) ([]byte, error) {
 	fn := vectorOperateMutator(a, stampMs, &res)
 
 	var applied bool
+	var version uint64
 	if stamped {
-		applied, _, err = tx.vectors.MVMutatePayloadRecordCASAt(name, docID, pk, fn, cas, stampMs)
+		applied, version, err = tx.vectors.MVMutatePayloadRecordCASAt(name, docID, pk, fn, cas, stampMs)
 	} else {
-		applied, _, err = tx.vectors.MVMutatePayloadRecordCAS(name, docID, pk, fn, cas)
+		applied, version, err = tx.vectors.MVMutatePayloadRecordCAS(name, docID, pk, fn, cas)
 	}
 	if err != nil {
 		return nil, err // incl. ErrVersionConflict, ErrPayloadKeyNotRecord, ErrRecordTooLarge
 	}
-	return wire.EncodeVectorOperateResult(applied, res)
+	// version is the point's version AFTER the call — bumped when the op-list
+	// applied, and the CURRENT unbumped one when it was a deliberate no-op (a
+	// failed CHECK). Returning it lets a CAS loop feed the next attempt straight
+	// from this result instead of re-reading the point, which is both a round trip
+	// and a race.
+	return wire.EncodeVectorOperateResult(applied, res, version)
 }
 
 // checkVectorOperateArgs re-asserts, at the handler boundary, the two rules the

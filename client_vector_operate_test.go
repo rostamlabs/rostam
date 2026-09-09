@@ -125,7 +125,7 @@ func TestOperateEndToEndKeepsTheIndexExact(t *testing.T) {
 		if err != nil {
 			t.Fatalf("build operate args for %d: %v", id, err)
 		}
-		found, res, err := col.Operate(ctx, client.OperateRequest{ID: id, PayloadKey: "session", Args: a})
+		found, res, _, err := col.Operate(ctx, client.OperateRequest{ID: id, PayloadKey: "session", Args: a})
 		if err != nil {
 			t.Fatalf("Operate %d: %v", id, err)
 		}
@@ -179,5 +179,98 @@ func TestOperateEndToEndKeepsTheIndexExact(t *testing.T) {
 		if !want[id] {
 			t.Errorf("Search returned id %d (rc=%d) the predicate rejects", id, finalRC[id])
 		}
+	}
+}
+
+// TestOperateReturnedVersionDrivesACASLoopWithoutAReRead is the reason the
+// result frame carries the applied version at all: a CAS-looping caller can feed
+// the version this call returned straight into the next call's precondition and
+// never re-read the point.
+//
+// The re-read it replaces is not just a round trip, it is a race — another
+// writer can land between the read and the retry, so the loop can livelock on a
+// version that was already stale when it was read. The test therefore does the
+// thing that used to be impossible: after a CAS mismatch it recovers using ONLY
+// values the server handed back, with no Get anywhere in the loop.
+func TestOperateReturnedVersionDrivesACASLoopWithoutAReRead(t *testing.T) {
+	col, cleanup := mustCollection(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	const id = uint64(1)
+	if err := col.Upsert(ctx, client.WriteRequest{
+		ID: id, Vector: []float32{1, 0, 0, 0},
+		Metadata: vtypes.Metadata{"session": vtypes.NewRecord(sessionRecordBytesRC(t, 0))},
+	}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	bump := func(t *testing.T) *wire.OperateArgs {
+		t.Helper()
+		a, err := client.NewOperate(nil).Add(client.F("rc"), 1).Return(client.F("rc")).Args()
+		if err != nil {
+			t.Fatalf("build operate args: %v", err)
+		}
+		return a
+	}
+
+	// 1. An unconditional call: the version it returns is the ONLY thing the loop
+	//    below starts from.
+	found, res, version, err := col.Operate(ctx, client.OperateRequest{ID: id, PayloadKey: "session", Args: bump(t)})
+	if err != nil {
+		t.Fatalf("Operate: %v", err)
+	}
+	if !found {
+		t.Fatal("found = false, want true")
+	}
+	if version == 0 {
+		t.Fatal("version = 0 after an applied operate — the result frame did not carry it")
+	}
+	if cell, derr := client.DecodeOperateValue(res.Values[0]); derr != nil || cell.U != 1 {
+		t.Fatalf("rc = %+v (%v), want 1", cell, derr)
+	}
+
+	// 2. The CAS call with that version succeeds, and returns the NEXT version.
+	found, res, next, err := col.Operate(ctx, client.OperateRequest{
+		ID: id, PayloadKey: "session", Args: bump(t),
+		ExpectedVersion: version, HasExpectedVersion: true,
+	})
+	if err != nil {
+		t.Fatalf("CAS operate with the returned version: %v", err)
+	}
+	if !found {
+		t.Fatal("CAS operate: found = false, want true")
+	}
+	if next <= version {
+		t.Fatalf("version did not advance: %d -> %d", version, next)
+	}
+	if cell, derr := client.DecodeOperateValue(res.Values[0]); derr != nil || cell.U != 2 {
+		t.Fatalf("rc = %+v (%v), want 2", cell, derr)
+	}
+
+	// 3. A stale precondition still conflicts — the version is a real CAS token,
+	//    not a decorative field.
+	if _, _, _, err := col.Operate(ctx, client.OperateRequest{
+		ID: id, PayloadKey: "session", Args: bump(t),
+		ExpectedVersion: version, HasExpectedVersion: true,
+	}); err == nil {
+		t.Fatal("a stale expectedVersion was accepted — the precondition is not being honored")
+	}
+
+	// 4. Recover from that conflict with NO re-read: the version from step 2 is
+	//    still the newest one the server told us about, because the conflicting
+	//    call changed nothing.
+	found, res, _, err = col.Operate(ctx, client.OperateRequest{
+		ID: id, PayloadKey: "session", Args: bump(t),
+		ExpectedVersion: next, HasExpectedVersion: true,
+	})
+	if err != nil {
+		t.Fatalf("retry with the last returned version: %v", err)
+	}
+	if !found {
+		t.Fatal("retry: found = false, want true")
+	}
+	if cell, derr := client.DecodeOperateValue(res.Values[0]); derr != nil || cell.U != 3 {
+		t.Fatalf("rc = %+v (%v), want 3 — the loop lost an increment", cell, derr)
 	}
 }

@@ -417,11 +417,13 @@ args, err := client.NewOperate(nil).WithSchema(schema).
 if err != nil {
     return err
 }
-found, res, err := posts.Operate(ctx, client.OperateRequest{
+found, res, version, err := posts.Operate(ctx, client.OperateRequest{
     ID: 1, PayloadKey: "session", Args: args,
 })
 // found: false if the point is absent, tombstoned or expired (res is nil then)
 // res.Values[0]: the new "rc", res.Values[1]: the "b" table's row count
+// version: the point's version AFTER the call — feed it to the next call's
+// ExpectedVersion to run a CAS loop without re-reading the point
 ```
 
 This mirrors `TestVectorOperateAgainstSchemaRecord` (`ops/vector_operate_test.go`):

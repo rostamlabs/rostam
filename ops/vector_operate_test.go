@@ -46,7 +46,7 @@ func callVecOperate(t *testing.T, tx *TxContext, h vecOperateHandler, stampMs in
 	if herr != nil {
 		return false, nil, herr
 	}
-	found, res, derr := DecodeVectorOperateResult(body)
+	found, res, _, derr := DecodeVectorOperateResult(body)
 	if derr != nil {
 		t.Fatalf("DecodeVectorOperateResult: %v", derr)
 	}
@@ -594,5 +594,79 @@ func TestVectorOperateHandlerDefendsInnerKeyAndTTL(t *testing.T) {
 		{Opcode: wire.OperateOpADD, Type: wire.OperateTypeU64, Path: namePath("rc"), A: 1}}}
 	if err := checkVectorOperateArgs(ok); err != nil {
 		t.Fatalf("a well-formed call was rejected: %v", err)
+	}
+}
+
+// callVecOperateV is callVecOperate keeping the version the reply frame now
+// carries, which callVecOperate drops so its many callers stay unchanged.
+func callVecOperateV(t *testing.T, tx *TxContext, h vecOperateHandler, stampMs int64,
+	col string, id uint64, pk string, a *wire.OperateArgs,
+) (bool, *wire.OperateResult, uint64) {
+	t.Helper()
+	args, err := EncodeVectorOperateArgs(col, id, pk, a, 0, false)
+	if err != nil {
+		t.Fatalf("EncodeVectorOperateArgs: %v", err)
+	}
+	tx.SetApplyStamp(uint64(stampMs), stampMs != 0) //nolint:gosec // test stamps are small positive millis
+	defer tx.SetApplyStamp(0, false)
+	body, herr := h(tx, args)
+	if herr != nil {
+		t.Fatalf("handler: %v", herr)
+	}
+	found, res, version, derr := DecodeVectorOperateResult(body)
+	if derr != nil {
+		t.Fatalf("DecodeVectorOperateResult: %v", derr)
+	}
+	return found, res, version
+}
+
+// TestVectorOperateReturnsTheAppliedVersion pins the handler's version
+// threading, which is what lets a CAS loop retry from the reply frame instead of
+// re-reading the point. Three properties, all of them checkable only here
+// because only the handler sees both the engine's version and the wire frame:
+// an applied call reports the point's NEW version, a failed CHECK reports the
+// CURRENT unbumped one (so the retry has something to fence on), and a
+// not-found point reports 0.
+//
+// Each version is cross-checked against what a real get op reports, so a
+// plausible-looking but wrong number fails.
+func TestVectorOperateReturnsTheAppliedVersion(t *testing.T) {
+	tx := newDenseOperateTx(t, nil)
+
+	found, _, v1 := callVecOperateV(t, tx, handleVectorOperate, 0, "docs", 1, "session", setDyn("rc", 1))
+	if !found {
+		t.Fatal("found = false, want true")
+	}
+	_, getV1 := densePayload(t, tx, 1)
+	if v1 == 0 || v1 != getV1 {
+		t.Fatalf("version = %d, want the point's version %d (non-zero)", v1, getV1)
+	}
+
+	_, _, v2 := callVecOperateV(t, tx, handleVectorOperate, 0, "docs", 1, "session", setDyn("rc", 2))
+	_, getV2 := densePayload(t, tx, 1)
+	if v2 <= v1 || v2 != getV2 {
+		t.Fatalf("version = %d after a second apply, want > %d and == the point's %d", v2, v1, getV2)
+	}
+
+	// A failed CHECK writes nothing and bumps nothing, and must still report the
+	// version a caller would retry against.
+	checkFails := &wire.OperateArgs{Create: wire.OperateCreateDynamic, Ops: []wire.OperateOp{
+		{Opcode: wire.OperateOpCHECK, Aux: wire.OperateCmpEQ, Path: namePath("rc"), A: 99},
+	}}
+	found, res, vFail := callVecOperateV(t, tx, handleVectorOperate, 0, "docs", 1, "session", checkFails)
+	if !found || res == nil || res.Status != wire.OperateStatusCheckFailed {
+		t.Fatalf("found=%v res=%+v, want a CheckFailed result", found, res)
+	}
+	if vFail != v2 {
+		t.Fatalf("version = %d on a failed CHECK, want the current unbumped %d", vFail, v2)
+	}
+
+	// An absent point is the not-found flag, and carries no version.
+	found, _, vMissing := callVecOperateV(t, tx, handleVectorOperate, 0, "docs", 9999, "session", setDyn("rc", 1))
+	if found {
+		t.Fatal("found = true for an absent point")
+	}
+	if vMissing != 0 {
+		t.Fatalf("version = %d for an absent point, want 0", vMissing)
 	}
 }

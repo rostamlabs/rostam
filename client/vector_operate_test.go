@@ -46,7 +46,7 @@ func TestCollectionOperateIncrements(t *testing.T) {
 		payload, err := wire.EncodeVectorOperateResult(true, &wire.OperateResult{
 			Status: wire.OperateStatusOK,
 			Values: [][]byte{wire.AppendTaggedCell(nil, wire.Cell{Type: wire.OperateTypeU32, U: uint64(n)})},
-		})
+		}, uint64(n))
 		if err != nil {
 			t.Fatalf("EncodeVectorOperateResult: %v", err)
 		}
@@ -70,12 +70,18 @@ func TestCollectionOperateIncrements(t *testing.T) {
 		if err != nil {
 			t.Fatalf("build operate args: %v", err)
 		}
-		found, res, err := col.Operate(ctx, OperateRequest{ID: 1, PayloadKey: "session", Args: a})
+		found, res, version, err := col.Operate(ctx, OperateRequest{ID: 1, PayloadKey: "session", Args: a})
 		if err != nil {
 			t.Fatalf("Operate: %v", err)
 		}
 		if !found {
 			t.Fatal("found = false, want true")
+		}
+		// The applied version rides back in the same frame: the fake server stamps
+		// it with the same counter it uses for the returned rc, so a wrong or
+		// dropped field shows up as a mismatch rather than as a plausible zero.
+		if version != uint64(want) {
+			t.Fatalf("version = %d, want %d", version, want)
 		}
 		cell, err := DecodeOperateValue(res.Values[0])
 		if err != nil {
@@ -117,7 +123,7 @@ func TestCollectionOperateBuilderKeyAndTTLRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build operate args (keyed): %v", err)
 	}
-	_, res, err := col.Operate(ctx, OperateRequest{ID: 1, PayloadKey: "session", Args: keyed})
+	_, res, _, err := col.Operate(ctx, OperateRequest{ID: 1, PayloadKey: "session", Args: keyed})
 	if !errors.Is(err, wire.ErrOperateArgs) {
 		t.Fatalf("err = %v, want wire.ErrOperateArgs", err)
 	}
@@ -132,7 +138,7 @@ func TestCollectionOperateBuilderKeyAndTTLRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build operate args (ttled): %v", err)
 	}
-	_, res, err = col.Operate(ctx, OperateRequest{ID: 1, PayloadKey: "session", Args: ttled})
+	_, res, _, err = col.Operate(ctx, OperateRequest{ID: 1, PayloadKey: "session", Args: ttled})
 	if !errors.Is(err, wire.ErrOperateArgs) {
 		t.Fatalf("err = %v, want wire.ErrOperateArgs", err)
 	}
@@ -150,7 +156,7 @@ func TestCollectionOperateBuilderKeyAndTTLRejected(t *testing.T) {
 // exactly like every other point write.
 func TestCollectionOperateMissingPoint(t *testing.T) {
 	addr, stop := startFakeServer(t, func(body []byte) (uint8, []byte) {
-		payload, err := wire.EncodeVectorOperateResult(false, nil)
+		payload, err := wire.EncodeVectorOperateResult(false, nil, 0)
 		if err != nil {
 			t.Fatalf("EncodeVectorOperateResult: %v", err)
 		}
@@ -169,7 +175,7 @@ func TestCollectionOperateMissingPoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build operate args: %v", err)
 	}
-	found, res, err := col.Operate(context.Background(), OperateRequest{ID: 1, PayloadKey: "session", Args: a})
+	found, res, _, err := col.Operate(context.Background(), OperateRequest{ID: 1, PayloadKey: "session", Args: a})
 	if err != nil {
 		t.Fatalf("Operate: %v", err)
 	}
@@ -206,7 +212,7 @@ func TestCollectionOperateRecordAbsentIsErrNotFound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build operate args: %v", err)
 	}
-	found, res, err := col.Operate(context.Background(), OperateRequest{ID: 1, PayloadKey: "session", Args: a})
+	found, res, _, err := col.Operate(context.Background(), OperateRequest{ID: 1, PayloadKey: "session", Args: a})
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
@@ -225,10 +231,12 @@ func TestCollectionOperateRecordAbsentIsErrNotFound(t *testing.T) {
 // normal outcome of a well-formed call, not a transport or CAS error.
 func TestCollectionOperateCheckFailedResult(t *testing.T) {
 	addr, stop := startFakeServer(t, func(body []byte) (uint8, []byte) {
+		// A failed CHECK still carries the point's CURRENT, unbumped version, so a
+		// caller can retry the whole read-modify-write without a re-read.
 		payload, err := wire.EncodeVectorOperateResult(true, &wire.OperateResult{
 			Status:   wire.OperateStatusCheckFailed,
 			FailedOp: 2,
-		})
+		}, 41)
 		if err != nil {
 			t.Fatalf("EncodeVectorOperateResult: %v", err)
 		}
@@ -250,7 +258,7 @@ func TestCollectionOperateCheckFailedResult(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build operate args: %v", err)
 	}
-	found, res, err := col.Operate(context.Background(), OperateRequest{ID: 1, PayloadKey: "session", Args: a})
+	found, res, _, err := col.Operate(context.Background(), OperateRequest{ID: 1, PayloadKey: "session", Args: a})
 	if err != nil {
 		t.Fatalf("Operate: %v", err)
 	}
@@ -289,7 +297,7 @@ func TestCollectionOperateCASConflict(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build operate args: %v", err)
 	}
-	_, res, err := col.Operate(context.Background(), OperateRequest{
+	_, res, _, err := col.Operate(context.Background(), OperateRequest{
 		ID: 1, PayloadKey: "session", Args: a,
 		ExpectedVersion: 999, HasExpectedVersion: true,
 	})
@@ -312,7 +320,7 @@ func TestCollectionOperateNilArgs(t *testing.T) {
 	defer func() { _ = c.Close() }()
 	col := c.Collection("posts")
 
-	found, res, err := col.Operate(context.Background(), OperateRequest{ID: 1, PayloadKey: "session"})
+	found, res, _, err := col.Operate(context.Background(), OperateRequest{ID: 1, PayloadKey: "session"})
 	if !errors.Is(err, wire.ErrOperateArgs) {
 		t.Fatalf("err = %v, want wire.ErrOperateArgs", err)
 	}

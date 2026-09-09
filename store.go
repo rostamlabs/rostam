@@ -612,7 +612,13 @@ type Store interface {
 	// The op is REFUSED with ErrOperateDuringReshard while the collection is
 	// mid-reshard: it is non-idempotent, so the dual-write VectorSetPayload uses
 	// would double-count every ADD across the two generations. Retry after cutover.
-	VectorOperate(ctx context.Context, collection string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (found bool, res *wire.OperateResult, err error)
+	// version is the point's version AFTER the call: bumped when the op-list
+	// applied, and the CURRENT unbumped one when it was a deliberate no-op (a
+	// failed CHECK). It is 0 when found is false. Feed it to the next call's
+	// opts[0].ExpectedVersion to run a CAS loop without re-reading the point —
+	// the re-read is both a round trip and a race, since another writer can land
+	// between it and the retry.
+	VectorOperate(ctx context.Context, collection string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (found bool, res *wire.OperateResult, version uint64, err error)
 
 	// VectorNamedGet retrieves a named-vector point by id: its per-space vectors
 	// (map[name][]float32; omitted spaces absent), shared payload, and remaining
@@ -661,7 +667,7 @@ type Store interface {
 
 	// VectorNamedOperate is VectorOperate against a named-vector point's SHARED
 	// payload. Same contract in every respect — see VectorOperate.
-	VectorNamedOperate(ctx context.Context, name string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (found bool, res *wire.OperateResult, err error)
+	VectorNamedOperate(ctx context.Context, name string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (found bool, res *wire.OperateResult, version uint64, err error)
 
 	// VectorMVGet retrieves a multi-vector document by id: its token matrix
 	// ([][]float32) and payload. found is false (not an error) for an absent
@@ -728,7 +734,7 @@ type Store interface {
 
 	// VectorMVOperate is VectorOperate against a multi-vector document's payload.
 	// Same contract in every respect — see VectorOperate.
-	VectorMVOperate(ctx context.Context, name string, docID uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (found bool, res *wire.OperateResult, err error)
+	VectorMVOperate(ctx context.Context, name string, docID uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (found bool, res *wire.OperateResult, version uint64, err error)
 }
 
 // getFlags builds the get-op projection flags byte from the with_vector /

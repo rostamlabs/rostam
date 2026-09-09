@@ -136,7 +136,7 @@ func TestVectorOperateUnpartitionedPassThrough(t *testing.T) {
 	ctx := context.Background()
 	seedOperateCollection(t, s, "docs", 0, 1)
 
-	found, res, err := s.VectorOperate(ctx, "docs", 1, "session", bumpRC())
+	found, res, _, err := s.VectorOperate(ctx, "docs", 1, "session", bumpRC())
 	must(t, err)
 	if !found {
 		t.Fatal("first operate: found=false, want true (the point exists)")
@@ -145,7 +145,7 @@ func TestVectorOperateUnpartitionedPassThrough(t *testing.T) {
 		t.Fatalf("first operate rc = %d, want 1", got)
 	}
 
-	found, res, err = s.VectorOperate(ctx, "docs", 1, "session", bumpRC())
+	found, res, _, err = s.VectorOperate(ctx, "docs", 1, "session", bumpRC())
 	must(t, err)
 	if !found {
 		t.Fatal("second operate: found=false")
@@ -173,7 +173,7 @@ func TestVectorOperatePartitionedRoutesToOwningPartition(t *testing.T) {
 
 	for id := uint64(1); id <= N; id++ {
 		for round := 1; round <= 2; round++ {
-			found, res, err := s.VectorOperate(ctx, coll, id, "session", bumpRC())
+			found, res, _, err := s.VectorOperate(ctx, coll, id, "session", bumpRC())
 			if err != nil {
 				t.Fatalf("operate id=%d round=%d: %v", id, round, err)
 			}
@@ -240,7 +240,7 @@ func assertOperateCAS(t *testing.T, s Store, coll string, id uint64) {
 	ctx := context.Background()
 
 	// Seed a record so the CAS attempts have something to fail against.
-	found, res, err := s.VectorOperate(ctx, coll, id, "session", bumpRC())
+	found, res, _, err := s.VectorOperate(ctx, coll, id, "session", bumpRC())
 	must(t, err)
 	if !found || retRC(t, res) != 1 {
 		t.Fatalf("seed operate: found=%v res=%+v", found, res)
@@ -253,16 +253,16 @@ func assertOperateCAS(t *testing.T, s Store, coll string, id uint64) {
 
 	// Wrong version ⇒ conflict, nothing applied.
 	wrong := ver + 999
-	if _, _, err := s.VectorOperate(ctx, coll, id, "session", bumpRC(), WriteOpts{ExpectedVersion: &wrong}); !isCASConflict(err) {
+	if _, _, _, err := s.VectorOperate(ctx, coll, id, "session", bumpRC(), WriteOpts{ExpectedVersion: &wrong}); !isCASConflict(err) {
 		t.Fatalf("operate with the WRONG expected version = %v, want a version conflict (the CAS guard was dropped)", err)
 	}
-	if _, res, err := s.VectorOperate(ctx, coll, id, "session", bumpRC()); err != nil || retRC(t, res) != 2 {
+	if _, res, _, err := s.VectorOperate(ctx, coll, id, "session", bumpRC()); err != nil || retRC(t, res) != 2 {
 		t.Fatalf("after the refused CAS the counter should read 2: err=%v res=%+v", err, res)
 	}
 
 	// Right version ⇒ applied.
 	right := pointVersion(t, s, coll, id)
-	found, res, err = s.VectorOperate(ctx, coll, id, "session", bumpRC(), WriteOpts{ExpectedVersion: &right})
+	found, res, _, err = s.VectorOperate(ctx, coll, id, "session", bumpRC(), WriteOpts{ExpectedVersion: &right})
 	must(t, err)
 	if !found || retRC(t, res) != 3 {
 		t.Fatalf("operate with the RIGHT expected version: found=%v res=%+v, want rc=3", found, res)
@@ -294,7 +294,8 @@ func TestVectorOperateCASSurvivesFanOut(t *testing.T) {
 		if cerr != nil {
 			return false, nil, cerr
 		}
-		return ops.DecodeVectorOperateResult(body)
+		found, res, _, derr := ops.DecodeVectorOperateResult(body)
+		return found, res, derr
 	}
 
 	// Seed the record through the fan-out itself.
@@ -336,7 +337,7 @@ func TestVectorOperateRefusedDuringReshard(t *testing.T) {
 	// The insert dual-writes, so the point exists in BOTH generations.
 	must(t, ee.VectorInsert(ctx, coll, id, []float32{1, 0, 0, 0}))
 
-	_, _, err := ee.VectorOperate(ctx, coll, id, "session", bumpRC())
+	_, _, _, err := ee.VectorOperate(ctx, coll, id, "session", bumpRC())
 	if !errors.Is(err, ErrOperateDuringReshard) {
 		t.Fatalf("operate during a reshard = %v, want ErrOperateDuringReshard", err)
 	}
@@ -348,7 +349,7 @@ func TestVectorOperateRefusedDuringReshard(t *testing.T) {
 
 	// Clearing the reshard state makes the identical call succeed.
 	must(t, ee.catalog.SetReshardState(coll, ReshardState{Status: 0}))
-	found, res, err := ee.VectorOperate(ctx, coll, id, "session", bumpRC())
+	found, res, _, err := ee.VectorOperate(ctx, coll, id, "session", bumpRC())
 	must(t, err)
 	if !found || retRC(t, res) != 1 {
 		t.Fatalf("operate after the reshard cleared: found=%v res=%+v, want rc=1", found, res)
@@ -374,14 +375,14 @@ func TestVectorOperateMissingPointFlagThroughFanOut(t *testing.T) {
 	if err != nil {
 		t.Fatalf("operate on an absent point returned an error: %v (want the found=false FLAG)", err)
 	}
-	found, _, err := ops.DecodeVectorOperateResult(body)
+	found, _, _, err := ops.DecodeVectorOperateResult(body)
 	must(t, err)
 	if found {
 		t.Fatal("operate on an absent point: found=true, want false")
 	}
 
 	// The Store path agrees.
-	found, _, err = s.VectorOperate(context.Background(), coll, 9999, "session", bumpRC())
+	found, _, _, err = s.VectorOperate(context.Background(), coll, 9999, "session", bumpRC())
 	must(t, err)
 	if found {
 		t.Fatal("Store.VectorOperate on an absent point: found=true, want false")
@@ -411,7 +412,7 @@ func TestVectorOperateAliasResolves(t *testing.T) {
 	must(t, err)
 	body, err := fan.Call("vector_operate", args)
 	must(t, err)
-	found, res, err := ops.DecodeVectorOperateResult(body)
+	found, res, _, err := ops.DecodeVectorOperateResult(body)
 	must(t, err)
 	if !found || retRC(t, res) != 1 {
 		t.Fatalf("operate via alias through the dispatcher: found=%v res=%+v, want rc=1", found, res)
@@ -424,7 +425,7 @@ func TestVectorOperateAliasResolves(t *testing.T) {
 	}
 
 	// The Store path resolves the alias too, and sees the SAME record.
-	found, res, err = s.VectorOperate(ctx, prod, id, "session", bumpRC())
+	found, res, _, err = s.VectorOperate(ctx, prod, id, "session", bumpRC())
 	must(t, err)
 	if !found || retRC(t, res) != 2 {
 		t.Fatalf("Store.VectorOperate via alias: found=%v res=%+v, want rc=2 (same record)", found, res)
@@ -458,24 +459,24 @@ func TestVectorOperateNamedAndMVThroughStoreAndFanOut(t *testing.T) {
 	for _, fam := range []struct {
 		op    string
 		coll  string
-		store func(ctx context.Context, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, error)
+		store func(ctx context.Context, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, uint64, error)
 	}{
 		{
 			op: "vector_named_operate", coll: "named",
-			store: func(ctx context.Context, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, error) {
+			store: func(ctx context.Context, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, uint64, error) {
 				return s.VectorNamedOperate(ctx, "named", id, "session", a, opts...)
 			},
 		},
 		{
 			op: "vector_mv_operate", coll: "mv",
-			store: func(ctx context.Context, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, error) {
+			store: func(ctx context.Context, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, uint64, error) {
 				return s.VectorMVOperate(ctx, "mv", id, "session", a, opts...)
 			},
 		},
 	} {
 		t.Run(fam.op, func(t *testing.T) {
 			// Through the Store method.
-			found, res, err := fam.store(ctx, bumpRC())
+			found, res, _, err := fam.store(ctx, bumpRC())
 			must(t, err)
 			if !found || retRC(t, res) != 1 {
 				t.Fatalf("Store %s: found=%v res=%+v, want rc=1", fam.op, found, res)
@@ -485,7 +486,7 @@ func TestVectorOperateNamedAndMVThroughStoreAndFanOut(t *testing.T) {
 			must(t, err)
 			body, err := fan.Call(fam.op, args)
 			must(t, err)
-			found, res, err = ops.DecodeVectorOperateResult(body)
+			found, res, _, err = ops.DecodeVectorOperateResult(body)
 			must(t, err)
 			if !found || retRC(t, res) != 2 {
 				t.Fatalf("fan %s: found=%v res=%+v, want rc=2", fam.op, found, res)
@@ -495,7 +496,7 @@ func TestVectorOperateNamedAndMVThroughStoreAndFanOut(t *testing.T) {
 			must(t, err)
 			body, err = fan.Call(fam.op, missing)
 			must(t, err)
-			found, _, err = ops.DecodeVectorOperateResult(body)
+			found, _, _, err = ops.DecodeVectorOperateResult(body)
 			must(t, err)
 			if found {
 				t.Fatalf("fan %s on an absent id: found=true, want false", fam.op)

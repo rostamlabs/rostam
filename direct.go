@@ -873,32 +873,32 @@ func (d *directStore) VectorClearPayload(_ context.Context, collection string, i
 // why only ExpectedVersion is read.
 func (d *directStore) vectorOperate(opName, collection string, id uint64, payloadKey string,
 	a *wire.OperateArgs, opts []WriteOpts,
-) (bool, *wire.OperateResult, error) {
+) (bool, *wire.OperateResult, uint64, error) {
 	exp, hasExp := firstWriteOpts(opts).expectedVersion()
 	args, err := wire.EncodeVectorOperateArgs(collection, id, payloadKey, a, exp, hasExp)
 	if err != nil {
-		return false, nil, err
+		return false, nil, 0, err
 	}
 	body, err := d.Call(context.Background(), opName, args)
 	if err != nil {
-		return false, nil, err
+		return false, nil, 0, err
 	}
 	return ops.DecodeVectorOperateResult(body)
 }
 
 // VectorOperate runs the dense operate op against the single in-process shard,
 // honoring the CAS precondition. See Store.VectorOperate.
-func (d *directStore) VectorOperate(_ context.Context, collection string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, error) {
+func (d *directStore) VectorOperate(_ context.Context, collection string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, uint64, error) {
 	return d.vectorOperate("vector_operate", collection, id, payloadKey, a, opts)
 }
 
 // VectorNamedOperate is VectorOperate against the named family. See vectorOperate.
-func (d *directStore) VectorNamedOperate(_ context.Context, name string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, error) {
+func (d *directStore) VectorNamedOperate(_ context.Context, name string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, uint64, error) {
 	return d.vectorOperate("vector_named_operate", name, id, payloadKey, a, opts)
 }
 
 // VectorMVOperate is VectorOperate against the multi-vector family. See vectorOperate.
-func (d *directStore) VectorMVOperate(_ context.Context, name string, docID uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, error) {
+func (d *directStore) VectorMVOperate(_ context.Context, name string, docID uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, uint64, error) {
 	return d.vectorOperate("vector_mv_operate", name, docID, payloadKey, a, opts)
 }
 

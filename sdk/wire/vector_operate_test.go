@@ -236,37 +236,82 @@ func TestVectorOperateArgsLyingArgsLen(t *testing.T) {
 }
 
 func TestVectorOperateResultRoundtrip(t *testing.T) {
-	enc, err := EncodeVectorOperateResult(false, nil)
+	enc, err := EncodeVectorOperateResult(false, nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	found, r, err := DecodeVectorOperateResult(enc)
-	if err != nil || found || r != nil {
-		t.Fatalf("found=false: got (%v,%+v,%v)", found, r, err)
+	found, r, v, err := DecodeVectorOperateResult(enc)
+	if err != nil || found || r != nil || v != 0 {
+		t.Fatalf("found=false: got (%v,%+v,%d,%v)", found, r, v, err)
+	}
+	// found=false ignores the version entirely: an absent point has none, and the
+	// frame stays the single zero byte it has always been.
+	if enc2, err := EncodeVectorOperateResult(false, nil, 7); err != nil || len(enc2) != 1 {
+		t.Fatalf("found=false with a version: enc=%x err=%v, want the 1-byte frame", enc2, err)
 	}
 
 	rOK := &OperateResult{Status: OperateStatusOK, Values: [][]byte{AppendTaggedCell(nil, Cell{Type: OperateTypeU8, U: 9}), {OperateTypeUnset}}}
-	enc, err = EncodeVectorOperateResult(true, rOK)
+	enc, err = EncodeVectorOperateResult(true, rOK, 42)
 	if err != nil {
 		t.Fatal(err)
 	}
-	found, got, err := DecodeVectorOperateResult(enc)
-	if err != nil || !found || !reflect.DeepEqual(got, rOK) {
-		t.Fatalf("found=true OK: got (%v,%+v,%v) want %+v", found, got, err, rOK)
+	found, got, v, err := DecodeVectorOperateResult(enc)
+	if err != nil || !found || !reflect.DeepEqual(got, rOK) || v != 42 {
+		t.Fatalf("found=true OK: got (%v,%+v,%d,%v) want %+v/42", found, got, v, err, rOK)
 	}
 
 	rFail := &OperateResult{Status: OperateStatusCheckFailed, FailedOp: 3}
-	enc, err = EncodeVectorOperateResult(true, rFail)
+	enc, err = EncodeVectorOperateResult(true, rFail, 41)
 	if err != nil {
 		t.Fatal(err)
 	}
-	found, got, err = DecodeVectorOperateResult(enc)
-	if err != nil || !found || !reflect.DeepEqual(got, rFail) {
-		t.Fatalf("found=true CheckFailed: got (%v,%+v,%v) want %+v", found, got, err, rFail)
+	found, got, v, err = DecodeVectorOperateResult(enc)
+	if err != nil || !found || !reflect.DeepEqual(got, rFail) || v != 41 {
+		t.Fatalf("found=true CheckFailed: got (%v,%+v,%d,%v) want %+v/41", found, got, v, err, rFail)
 	}
 
-	if _, err := EncodeVectorOperateResult(true, nil); !errors.Is(err, ErrOperateArgs) {
+	// The full uint64 range survives, not just small versions.
+	enc, err = EncodeVectorOperateResult(true, rOK, ^uint64(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, v, err = DecodeVectorOperateResult(enc); err != nil || v != ^uint64(0) {
+		t.Fatalf("max version: got (%d,%v)", v, err)
+	}
+
+	if _, err := EncodeVectorOperateResult(true, nil, 0); !errors.Is(err, ErrOperateArgs) {
 		t.Fatalf("found=true r=nil: err = %v, want ErrOperateArgs", err)
+	}
+}
+
+// TestVectorOperateResultVersionIsAppendOnly pins the two halves of the
+// append-only contract the version field was added under: a frame written
+// BEFORE the field existed (the inner blob and nothing after it) still decodes,
+// as version 0; and a remainder that is neither 0 nor exactly 8 bytes is
+// REJECTED rather than silently truncated, so the frame keeps the exact
+// trailing-bytes guarantee the rest of this codec relies on.
+func TestVectorOperateResultVersionIsAppendOnly(t *testing.T) {
+	rOK := &OperateResult{Status: OperateStatusOK, Values: [][]byte{AppendTaggedCell(nil, Cell{Type: OperateTypeU8, U: 9})}}
+	enc, err := EncodeVectorOperateResult(true, rOK, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preVersion := enc[:len(enc)-8] // exactly what the pre-version encoder produced
+
+	found, got, v, err := DecodeVectorOperateResult(preVersion)
+	if err != nil || !found || !reflect.DeepEqual(got, rOK) || v != 0 {
+		t.Fatalf("pre-version frame: got (%v,%+v,%d,%v), want the result and version 0", found, got, v, err)
+	}
+
+	for _, extra := range []int{1, 2, 7, 9, 16} {
+		frame := append(append([]byte(nil), preVersion...), make([]byte, extra)...)
+		if _, _, _, err := DecodeVectorOperateResult(frame); !errors.Is(err, ErrOperateArgs) {
+			t.Errorf("%d trailing bytes: err = %v, want ErrOperateArgs", extra, err)
+		}
+	}
+	// One byte short of the full version is truncation, not a pre-version frame.
+	if _, _, _, err := DecodeVectorOperateResult(enc[:len(enc)-1]); !errors.Is(err, ErrOperateArgs) {
+		t.Errorf("version truncated by one byte: err = %v, want ErrOperateArgs", err)
 	}
 }
 

@@ -167,11 +167,25 @@ func DecodeVectorOperateArgs(args []byte) (collection string, id uint64, payload
 }
 
 // EncodeVectorOperateResult encodes a vector_operate result frame.
-// Wire: [found u8] | [1][resLen u32][operateResult]. found=false writes just
-// the zero byte and r is ignored entirely — there is nothing else to say
-// about a call that found no record. found=true with r == nil is
-// ErrOperateArgs: a caller claiming a result exists must supply one.
-func EncodeVectorOperateResult(found bool, r *OperateResult) ([]byte, error) {
+// Wire: [found u8] | [1][resLen u32][operateResult][version u64]. found=false
+// writes just the zero byte and r and version are ignored entirely — there is
+// nothing else to say about a call that found no record, and an absent point has
+// no version. found=true with r == nil is ErrOperateArgs: a caller claiming a
+// result exists must supply one.
+//
+// version is the point's version AFTER the call: bumped when the op-list
+// applied, and the CURRENT unbumped one when it was a deliberate no-op (a failed
+// CHECK). It exists so a CAS loop can feed the next call's expectedVersion
+// straight from this result instead of re-reading the point — the re-read is
+// both a round trip and a race, since another writer can land between it and the
+// retry.
+//
+// APPEND-ONLY. The version is written LAST, after the inner blob the previous
+// shape ended with, and DecodeVectorOperateResult reads it only if it is there.
+// A frame from before this field decodes as version 0. Any future field goes at
+// the end too, read the same way: this frame has an exact trailing-bytes check,
+// so a field inserted anywhere else is a wire break, not an extension.
+func EncodeVectorOperateResult(found bool, r *OperateResult, version uint64) ([]byte, error) {
 	if !found {
 		return []byte{0}, nil
 	}
@@ -182,10 +196,11 @@ func EncodeVectorOperateResult(found bool, r *OperateResult) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	buf := make([]byte, 0, 1+4+len(inner))
+	buf := make([]byte, 0, 1+4+len(inner)+8)
 	buf = append(buf, 1)
 	buf = binary.BigEndian.AppendUint32(buf, uint32(len(inner))) //nolint:gosec // inner is bounded well under 4G by OperateMaxRet
 	buf = append(buf, inner...)
+	buf = binary.BigEndian.AppendUint64(buf, version)
 	return buf, nil
 }
 
@@ -194,40 +209,52 @@ func EncodeVectorOperateResult(found bool, r *OperateResult) ([]byte, error) {
 // DecodeVectorOperateArgs: found is read and validated against {0,1} first,
 // resLen is a raw-uint32-before-int-conversion length check, the inner blob is
 // handed to DecodeOperateResult verbatim, and a frame with bytes left over
-// after the declared inner blob is ErrOperateArgs.
-func DecodeVectorOperateResult(b []byte) (found bool, r *OperateResult, err error) {
+// after the declared inner blob and the optional trailing version is
+// ErrOperateArgs.
+//
+// The trailing version is the frame's ONE optional field and it is read the only
+// way an append-only field can be: exactly 8 bytes after the inner blob, or
+// nothing at all. Zero remaining bytes is a pre-version frame and yields
+// version 0; any other remainder — 1..7 bytes, or 9+ — is a frame that is not
+// what it claims to be, so it is rejected rather than silently truncated. That
+// keeps the trailing-bytes guarantee the rest of this codec relies on.
+func DecodeVectorOperateResult(b []byte) (found bool, r *OperateResult, version uint64, err error) {
 	if len(b) < 1 {
-		return false, nil, ErrVectorArgsTruncated
+		return false, nil, 0, ErrVectorArgsTruncated
 	}
 	flag := b[0]
 	if flag > 1 {
-		return false, nil, ErrOperateArgs
+		return false, nil, 0, ErrOperateArgs
 	}
 	if flag == 0 {
 		if len(b) != 1 {
-			return false, nil, ErrOperateArgs
+			return false, nil, 0, ErrOperateArgs
 		}
-		return false, nil, nil
+		return false, nil, 0, nil
 	}
 
 	off := 1
 	if len(b)-off < 4 {
-		return false, nil, ErrVectorArgsTruncated
+		return false, nil, 0, ErrVectorArgsTruncated
 	}
 	rawResLen := binary.BigEndian.Uint32(b[off:])
 	off += 4
 	if uint64(rawResLen) > uint64(len(b)-off) {
-		return false, nil, ErrVectorArgsTruncated
+		return false, nil, 0, ErrVectorArgsTruncated
 	}
 	resLen := int(rawResLen)
 
 	res, derr := DecodeOperateResult(b[off : off+resLen])
 	if derr != nil {
-		return false, nil, derr
+		return false, nil, 0, derr
 	}
 	off += resLen
-	if off != len(b) {
-		return false, nil, ErrOperateArgs
+	switch len(b) - off {
+	case 0:
+		return true, res, 0, nil // a frame written before the version field existed
+	case 8:
+		return true, res, binary.BigEndian.Uint64(b[off:]), nil
+	default:
+		return false, nil, 0, ErrOperateArgs
 	}
-	return true, res, nil
 }

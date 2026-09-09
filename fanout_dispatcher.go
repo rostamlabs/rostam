@@ -992,7 +992,7 @@ func (f *fanoutDispatcher) fanMVOperate(name string, args []byte, r fanRoute) ([
 }
 
 // operateFn is the shape the three embedded operate methods share.
-type operateFn func(ctx context.Context, coll string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, error)
+type operateFn func(ctx context.Context, coll string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, uint64, error)
 
 // fanOperateVia is the shared body of the three operate fan handlers.
 func (f *fanoutDispatcher) fanOperateVia(name string, args []byte, r fanRoute, call operateFn) ([]byte, error) {
@@ -1008,11 +1008,11 @@ func (f *fanoutDispatcher) fanOperateVia(name string, args []byte, r fanRoute, c
 		v := exp
 		wo.ExpectedVersion = &v // WriteOpts carries the precondition as a *uint64
 	}
-	found, res, err := call(context.Background(), coll, id, pk, a, wo)
+	found, res, version, err := call(context.Background(), coll, id, pk, a, wo)
 	if err != nil {
 		return nil, err
 	}
-	return ops.EncodeVectorOperateResult(found, res)
+	return ops.EncodeVectorOperateResult(found, res, version)
 }
 
 // fanSetPayload merges a payload patch on the owning physical partition. Like

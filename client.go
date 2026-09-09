@@ -833,33 +833,33 @@ func (n *networkedStore) VectorClearPayload(ctx context.Context, collection stri
 // write-consistency options, which is all it was ever carrying.
 func (n *networkedStore) vectorOperate(ctx context.Context, opName, collection string, id uint64, payloadKey string,
 	a *wire.OperateArgs, opts []WriteOpts,
-) (bool, *wire.OperateResult, error) {
+) (bool, *wire.OperateResult, uint64, error) {
 	wo := firstWriteOpts(opts)
 	exp, hasExp := wo.expectedVersion()
 	args, err := wire.EncodeVectorOperateArgs(collection, id, payloadKey, a, exp, hasExp)
 	if err != nil {
-		return false, nil, err
+		return false, nil, 0, err
 	}
 	body, err := n.wcCall(ctx, opName, args, wo)
 	if err != nil {
-		return false, nil, mapErr(err)
+		return false, nil, 0, mapErr(err)
 	}
 	return ops.DecodeVectorOperateResult(body)
 }
 
 // VectorOperate sends the dense operate op with the CAS precondition in the args.
 // See Store.VectorOperate.
-func (n *networkedStore) VectorOperate(ctx context.Context, collection string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, error) {
+func (n *networkedStore) VectorOperate(ctx context.Context, collection string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, uint64, error) {
 	return n.vectorOperate(ctx, "vector_operate", collection, id, payloadKey, a, opts)
 }
 
 // VectorNamedOperate is VectorOperate against the named family. See vectorOperate.
-func (n *networkedStore) VectorNamedOperate(ctx context.Context, name string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, error) {
+func (n *networkedStore) VectorNamedOperate(ctx context.Context, name string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, uint64, error) {
 	return n.vectorOperate(ctx, "vector_named_operate", name, id, payloadKey, a, opts)
 }
 
 // VectorMVOperate is VectorOperate against the multi-vector family. See vectorOperate.
-func (n *networkedStore) VectorMVOperate(ctx context.Context, name string, docID uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, error) {
+func (n *networkedStore) VectorMVOperate(ctx context.Context, name string, docID uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, uint64, error) {
 	return n.vectorOperate(ctx, "vector_mv_operate", name, docID, payloadKey, a, opts)
 }
 
