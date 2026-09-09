@@ -10,6 +10,7 @@ import (
 
 	"github.com/rostamlabs/rostam/cache"
 	"github.com/rostamlabs/rostam/ops"
+	"github.com/rostamlabs/rostam/sdk/wire"
 	"github.com/rostamlabs/rostam/shard"
 	"github.com/rostamlabs/rostam/vector"
 )
@@ -421,4 +422,49 @@ func TestMapResultOperateDuringReshardIsClientFacing(t *testing.T) {
 			t.Fatalf("payload = %q, want the redacted message", msg)
 		}
 	})
+}
+
+// TestMapResultMalformedOperateFrameIsClientFacing pins a malformed operate
+// frame as the caller's mistake on the binary transport. wire.ErrOperateArgs is
+// what DecodeVectorOperateArgs, ops.checkVectorOperateArgs and the KV
+// DecodeOperateArgs raise for args that do not decode, that name a second target,
+// or that carry a TTL the op does not own. Unclassified, a client protocol
+// mistake read as a server fault and the message was redacted, leaving the caller
+// nothing to act on.
+//
+// KV operate raises the same sentinel from the same decoder, so this one arm
+// covers both ops.
+func TestMapResultMalformedOperateFrameIsClientFacing(t *testing.T) {
+	disp := &fakeDispatcher{}
+	// A real production shape, not a hand-written sentinel: a structurally
+	// complete frame declaring an EMPTY payload key, which
+	// DecodeVectorOperateArgs rejects with ErrOperateArgs.
+	frame := append([]byte{4, 'd', 'o', 'c', 's'}, make([]byte, 8)...) // colLen, "docs", id=0
+	frame = append(frame, 0, 0)                                       // pkLen = 0
+	_, _, _, _, _, _, decErr := wire.DecodeVectorOperateArgs(frame)
+	if !errors.Is(decErr, wire.ErrOperateArgs) {
+		t.Fatalf("decoder fixture drifted: err = %v, want wire.ErrOperateArgs", decErr)
+	}
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", wire.ErrOperateArgs},
+		{"wrapped (%w, exercises errors.Is identity)", fmt.Errorf("vector_operate: %w", wire.ErrOperateArgs)},
+		{"as the decoder actually returns it", decErr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, payload := mapResult(disp, nil, tc.err, "")
+			if status != StatusError {
+				t.Fatalf("status = %d, want StatusError (%d)", status, StatusError)
+			}
+			msg, _ := DecodeErrorPayload(payload)
+			if msg == "internal error" {
+				t.Fatalf("a malformed frame was redacted to %q — a client protocol mistake reads as a server fault", msg)
+			}
+			if msg != tc.err.Error() {
+				t.Fatalf("payload = %q, want the verbatim message %q", msg, tc.err.Error())
+			}
+		})
+	}
 }

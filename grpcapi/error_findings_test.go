@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/rostamlabs/rostam/ops"
+	"github.com/rostamlabs/rostam/sdk/wire"
 	"github.com/rostamlabs/rostam/vector"
 )
 
@@ -262,4 +263,25 @@ func TestGrpcErrorOperateDuringReshardIsUnavailable(t *testing.T) {
 			t.Errorf("grpcError(%v) = %v, want Internal", err, got)
 		}
 	})
+}
+
+// TestGrpcErrorMalformedOperateFrameIsInvalidArgument pins a malformed operate
+// frame as InvalidArgument, matching HTTP's 400 and the binary transport's
+// client-facing answer for the same sentinel. Unclassified it fell to Internal,
+// which reads as a server fault for a frame the caller built. KV operate raises
+// the same sentinel from the same decoder, so this arm covers both ops.
+func TestGrpcErrorMalformedOperateFrameIsInvalidArgument(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", wire.ErrOperateArgs},
+		{"wrapped (%w, exercises errIs identity)", fmt.Errorf("vector_operate: %w", wire.ErrOperateArgs)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := status.Code(grpcError(tc.err)); got != codes.InvalidArgument {
+				t.Errorf("grpcError(%v) = %v, want InvalidArgument", tc.err, got)
+			}
+		})
+	}
 }

@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/rostamlabs/rostam/ops"
+	"github.com/rostamlabs/rostam/sdk/wire"
 	"github.com/rostamlabs/rostam/vector"
 )
 
@@ -496,4 +497,26 @@ func TestStatusForErrorOperateDuringReshard(t *testing.T) {
 			t.Errorf("statusForError(%v) = %d, want 500", err, got)
 		}
 	})
+}
+
+// TestStatusForErrorMalformedOperateFrame pins a malformed operate frame as a
+// 400, matching the binary transport's client-facing answer for the same
+// sentinel (server.TestMapResultMalformedOperateFrameIsClientFacing). The caller
+// built the frame; unclassified it was a redacted 500 that read as a server
+// fault. KV operate raises the same sentinel from the same decoder, so this arm
+// covers both ops.
+func TestStatusForErrorMalformedOperateFrame(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", wire.ErrOperateArgs},
+		{"wrapped (%w, exercises errors.Is identity)", fmt.Errorf("vector_operate: %w", wire.ErrOperateArgs)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := statusForError(tc.err); got != http.StatusBadRequest {
+				t.Errorf("statusForError = %d, want 400", got)
+			}
+		})
+	}
 }

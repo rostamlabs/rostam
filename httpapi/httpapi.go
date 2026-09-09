@@ -18,6 +18,7 @@ import (
 	"github.com/rostamlabs/rostam/authz"
 	"github.com/rostamlabs/rostam/dashboard"
 	"github.com/rostamlabs/rostam/ops"
+	"github.com/rostamlabs/rostam/sdk/wire"
 	"github.com/rostamlabs/rostam/vector"
 )
 
@@ -572,7 +573,19 @@ func statusForError(err error) int {
 		// mistakes with obvious remedies → 400, message unredacted (it names only
 		// sizes and the op the caller sent). Kept in sync with
 		// server.clientFacingErr by the shared const.
-		strings.Contains(err.Error(), ops.WASMRegistrationRefusedMsg):
+		strings.Contains(err.Error(), ops.WASMRegistrationRefusedMsg),
+		// wire.ErrOperateArgs: a malformed operate frame — a vector_operate or a KV
+		// operate whose args do not decode, or which names a second target or a
+		// TTL the op does not carry (DecodeVectorOperateArgs /
+		// ops.checkVectorOperateArgs / DecodeOperateArgs). The caller built the
+		// frame, so it is their mistake to fix; unclassified it read as a server
+		// fault. The message names no key, no path and no size — only that the
+		// arguments are invalid — so it is safe verbatim.
+		//
+		// Sentinel only, no message-shape arm: this error is raised by the
+		// decoder the handler itself calls, so it reaches the classifier with its
+		// identity intact.
+		errors.Is(err, wire.ErrOperateArgs):
 		return http.StatusBadRequest
 	case errors.Is(err, ops.ErrVectorRecordAbsent),
 		// The clustered path stringifies the sentinel across the Raft boundary, so
