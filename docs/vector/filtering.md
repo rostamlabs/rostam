@@ -144,10 +144,17 @@ unescaped bytes verbatim. For a **schema**-mode record, the row key's type and
 width come from the schema, and a decimal segment denotes that width's
 little-endian encoding.
 
+Which spelling applies follows the record: a **schema**-mode record always
+accepts positions (`session/#0`, `session/#5/42/#1`), and accepts names only
+when its schema stores them — a names-less schema is addressable by position
+alone. A **dynamic**-mode record is the mirror image: names only, never a
+position, since it has no schema to number its fields against.
+
 A path that cannot apply — an unknown field, an absent row or column, a
-row/column segment against a scalar field, a position against a schema that
-stores no names, or a payload key that holds something other than a record —
-evaluates as "no such field": no match, never a filter error. `row_exists`
+row/column segment against a scalar field, a *name* against a schema that
+stores no names, a *position* against a dynamic record, or a payload key that
+holds something other than a record — evaluates as "no such field": no match,
+never a filter error. `row_exists`
 and `row_absent` are the one exception: their `field` string's path **shape**
 is validated once, at filter-compile time (see below), because that shape
 depends only on the string, never on any point's data.
