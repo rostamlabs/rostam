@@ -440,7 +440,7 @@ func TestMapResultMalformedOperateFrameIsClientFacing(t *testing.T) {
 	// complete frame declaring an EMPTY payload key, which
 	// DecodeVectorOperateArgs rejects with ErrOperateArgs.
 	frame := append([]byte{4, 'd', 'o', 'c', 's'}, make([]byte, 8)...) // colLen, "docs", id=0
-	frame = append(frame, 0, 0)                                       // pkLen = 0
+	frame = append(frame, 0, 0)                                        // pkLen = 0
 	_, _, _, _, _, _, decErr := wire.DecodeVectorOperateArgs(frame)
 	if !errors.Is(decErr, wire.ErrOperateArgs) {
 		t.Fatalf("decoder fixture drifted: err = %v, want wire.ErrOperateArgs", decErr)
