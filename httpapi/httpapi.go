@@ -511,6 +511,11 @@ func statusForError(err error) int {
 		// whole collection, so refusing at the door is the client-fixable
 		// mistake. Keeps this classifier in sync with server.clientFacingErr.
 		errors.Is(err, vector.ErrRecordMalformed),
+		// A vector_operate against a payload key holding a non-record value: 400,
+		// not 500. Silently replacing that value would destroy data the caller can
+		// still read, so the op refuses — a client-fixable mistake. Keeps this
+		// classifier in sync with server.clientFacingErr.
+		errors.Is(err, vector.ErrPayloadKeyNotRecord),
 		errors.Is(err, vector.ErrEmptyFilter),
 		errors.Is(err, vector.ErrEmptyGroupBy),
 		errors.Is(err, vector.ErrSparseMismatch),

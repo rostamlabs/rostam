@@ -190,6 +190,8 @@ var hostileDecoders = []struct {
 	{"DecodeVectorInsertArgsCAS", DecodeVectorInsertArgsCAS},
 	{"DecodeVectorInsertArgsKeyExpires", DecodeVectorInsertArgsKeyExpires},
 	{"DecodeVectorInsertArgsKeyTTL", DecodeVectorInsertArgsKeyTTL},
+	{"DecodeVectorOperateArgs", DecodeVectorOperateArgs},
+	{"DecodeVectorOperateResult", DecodeVectorOperateResult},
 	{"DecodeVectorSearchArgs", DecodeVectorSearchArgs},
 	{"DecodeVectorSearchArgsOpts", DecodeVectorSearchArgsOpts},
 	{"DecodeVectorSearchResults", DecodeVectorSearchResults},
@@ -250,7 +252,7 @@ func TestNoDecoderPanicsOnHostileBytes(t *testing.T) {
 	// A floor on the roster, because the failure mode of this sweep is silent:
 	// deleting entries makes it pass faster, not fail. Raise it when decoders are
 	// added; only lower it deliberately, when an op is genuinely removed.
-	const minDecoders = 148
+	const minDecoders = 150
 	if len(hostileDecoders) < minDecoders {
 		t.Fatalf("only %d decoders in the sweep (floor %d) — entries were removed, "+
 			"which narrows the coverage without failing anything", len(hostileDecoders), minDecoders)

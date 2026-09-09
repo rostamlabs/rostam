@@ -122,6 +122,7 @@ var builtinHandlers = map[string]Handler{
 	"vector_get":                       handleVectorGet,
 	"vector_get_batch":                 handleVectorGetBatch,
 	"vector_set_payload":               handleVectorSetPayload,
+	"vector_operate":                   handleVectorOperate,
 	"vector_overwrite_payload":         handleVectorOverwritePayload,
 	"vector_delete_payload_keys":       handleVectorDeletePayloadKeys,
 	"vector_clear_payload":             handleVectorClearPayload,
@@ -158,6 +159,7 @@ var builtinHandlers = map[string]Handler{
 	"vector_mv_get":                    handleMVGet,
 	"vector_mv_get_batch":              handleMVGetBatch,
 	"vector_mv_set_payload":            handleMVSetPayload,
+	"vector_mv_operate":                handleMVVectorOperate,
 	"vector_mv_overwrite_payload":      handleMVOverwritePayload,
 	"vector_mv_delete_payload_keys":    handleMVDeletePayloadKeys,
 	"vector_mv_clear_payload":          handleMVClearPayload,
@@ -172,6 +174,7 @@ var builtinHandlers = map[string]Handler{
 	"vector_named_get":                 handleNamedGet,
 	"vector_named_get_batch":           handleNamedGetBatch,
 	"vector_named_set_payload":         handleNamedSetPayload,
+	"vector_named_operate":             handleNamedVectorOperate,
 	"vector_named_overwrite_payload":   handleNamedOverwritePayload,
 	"vector_named_delete_payload_keys": handleNamedDeletePayloadKeys,
 	"vector_named_clear_payload":       handleNamedClearPayload,
@@ -203,6 +206,10 @@ var builtinHandlers = map[string]Handler{
 //   - "caex"    (read-write) args: [keyLen u16][key][expLen u32][expected][ttlMs u64] → 1-byte 1=TTL refreshed/0=mismatch|absent
 //   - "mget"    (read-only)  args: [count u16]([keyLen u16][key])*         → [count u16]([found u8](+[valLen u32][val] if found))*
 //   - "operate" (read-write) args: see sdk/wire/operate.go → [status u8][failedOp u16?][nRet u16]{[vlen u32][value]}*
+//   - "vector_operate" / "vector_named_operate" / "vector_mv_operate" (read-write)
+//     args: see sdk/wire/vector_operate.go — the SAME operate call, wrapped in
+//     [colLen u8][col][id u64][pkLen u16][payloadKey][casPresent u8][?expectedVersion u64][argsLen u32][operateArgs],
+//     applied to the record under a POINT's payload key → [found u8](+[resLen u32][operateResult] if found)
 //   - "flush"   (read-write) args: (ignored)                               → empty (wipes the ENTIRE keyspace; broadcast to every shard group in cluster mode)
 //   - "__ping__" (read-only) args: (ignored)                             → empty
 //

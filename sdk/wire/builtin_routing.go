@@ -91,6 +91,11 @@ var BuiltinOps = []BuiltinOp{
 	{"vector_overwrite_payload", OpReadWrite, routeAt1.ke, routeAt1.layout, false},
 	{"vector_delete_payload_keys", OpReadWrite, routeAt1.ke, routeAt1.layout, false},
 	{"vector_clear_payload", OpReadWrite, routeAt1.ke, routeAt1.layout, false},
+	// vector_operate applies an operate op-list to a record inside a point's
+	// payload. Its args lead with [colLen:u8][col][id:u64] — the At1 layout of the
+	// payload-mutation family — so it routes by collection like every other point
+	// write and PointIDFor can read its id for the __wc__ barrier.
+	{"vector_operate", OpReadWrite, routeAt1.ke, routeAt1.layout, false},
 	{"vector_search", OpReadOnly, routeAt2.ke, routeAt2.layout, false},
 	{"vector_hybrid_search", OpReadOnly, routeAt2.ke, routeAt2.layout, false},
 	{"vector_hybrid_lanes", OpReadOnly, routeAt2.ke, routeAt2.layout, false},
@@ -142,6 +147,9 @@ var BuiltinOps = []BuiltinOp{
 	{"vector_mv_overwrite_payload", OpReadWrite, routeAt1.ke, routeAt1.layout, false},
 	{"vector_mv_delete_payload_keys", OpReadWrite, routeAt1.ke, routeAt1.layout, false},
 	{"vector_mv_clear_payload", OpReadWrite, routeAt1.ke, routeAt1.layout, false},
+	// vector_mv_operate: the multi-vector twin of vector_operate, sharing its exact
+	// arg wire ([colLen:u8][col][docID:u64]...) — At1, routed by collection.
+	{"vector_mv_operate", OpReadWrite, routeAt1.ke, routeAt1.layout, false},
 	{"vector_mv_get_config", OpReadOnly, routeAt1.ke, routeAt1.layout, false},
 	{"vector_mv_scan_vectors", OpReadOnly, routeAt1.ke, routeAt1.layout, false},
 	{"vector_mv_scroll", OpReadOnly, routeAt1.ke, routeAt1.layout, false},
@@ -160,6 +168,9 @@ var BuiltinOps = []BuiltinOp{
 	{"vector_named_overwrite_payload", OpReadWrite, routeAt1.ke, routeAt1.layout, false},
 	{"vector_named_delete_payload_keys", OpReadWrite, routeAt1.ke, routeAt1.layout, false},
 	{"vector_named_clear_payload", OpReadWrite, routeAt1.ke, routeAt1.layout, false},
+	// vector_named_operate: the named-collection twin of vector_operate, sharing its
+	// exact arg wire ([colLen:u8][col][id:u64]...) — At1, routed by collection.
+	{"vector_named_operate", OpReadWrite, routeAt1.ke, routeAt1.layout, false},
 	{"vector_named_search", OpReadOnly, routeAt1.ke, routeAt1.layout, false},
 	{"vector_named_sparse_search", OpReadOnly, routeAt1.ke, routeAt1.layout, false},
 	{"vector_named_hybrid_search", OpReadOnly, routeAt2.ke, routeAt2.layout, false},

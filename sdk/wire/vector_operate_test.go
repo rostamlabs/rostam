@@ -3,6 +3,7 @@
 package wire
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"reflect"
@@ -266,5 +267,55 @@ func TestVectorOperateResultRoundtrip(t *testing.T) {
 
 	if _, err := EncodeVectorOperateResult(true, nil); !errors.Is(err, ErrOperateArgs) {
 		t.Fatalf("found=true r=nil: err = %v, want ErrOperateArgs", err)
+	}
+}
+
+// TestVectorOperateRoutesByCollectionAndID pins the routing half of the op: the
+// args layout is the At1 payload-mutation shape ([colLen:u8][col][id:u64]...),
+// so all three families must appear in CollectionNameFor, CollectionNameOffset
+// and singlePointWriteOps. A MISSING row here is silent: the op would route to
+// shard 0 for every collection, and the __wc__ barrier would target the wrong
+// partition — neither fails loudly anywhere else.
+func TestVectorOperateRoutesByCollectionAndID(t *testing.T) {
+	args, err := EncodeVectorOperateArgs("docs", 42, "session", vecOpArgs(), 0, false)
+	if err != nil {
+		t.Fatalf("EncodeVectorOperateArgs: %v", err)
+	}
+	for _, op := range []string{"vector_operate", "vector_named_operate", "vector_mv_operate"} {
+		t.Run(op, func(t *testing.T) {
+			name, ok := CollectionNameFor(op, args)
+			if !ok || name != "default/docs" {
+				t.Fatalf("CollectionNameFor = (%q,%v), want (default/docs,true)", name, ok)
+			}
+			off, ok := CollectionNameOffset(op)
+			if !ok || off != 0 {
+				t.Fatalf("CollectionNameOffset = (%d,%v), want (0,true)", off, ok)
+			}
+			id, ok := PointIDFor(op, args)
+			if !ok || id != 42 {
+				t.Fatalf("PointIDFor = (%d,%v), want (42,true)", id, ok)
+			}
+			// RewriteCollectionName swaps the name in place and preserves every
+			// other byte, so the alias pass-through path cannot corrupt the call.
+			out, ok := RewriteCollectionName(op, args, "acme/docs")
+			if !ok {
+				t.Fatal("RewriteCollectionName: ok = false")
+			}
+			gotCol, gotID, gotKey, inner, _, hasExpected, derr := DecodeVectorOperateArgs(out)
+			if derr != nil {
+				t.Fatalf("rewritten args do not decode: %v", derr)
+			}
+			if gotCol != "acme/docs" || gotID != 42 || gotKey != "session" || hasExpected {
+				t.Fatalf("rewritten args = (%q,%d,%q,hasExpected=%v)", gotCol, gotID, gotKey, hasExpected)
+			}
+			if len(inner.Ops) != 1 || inner.Ops[0].Opcode != OperateOpADD {
+				t.Fatalf("rewritten inner op list = %+v", inner.Ops)
+			}
+			// The tail past the name field is byte-identical.
+			tail := args[1+len("docs"):]
+			if !bytes.Equal(out[1+len("acme/docs"):], tail) {
+				t.Fatal("RewriteCollectionName altered bytes after the collection name")
+			}
+		})
 	}
 }

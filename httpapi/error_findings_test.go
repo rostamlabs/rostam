@@ -350,3 +350,15 @@ func TestStatusForErrorMalformedRecord(t *testing.T) {
 		t.Errorf("statusForError(ErrRecordTooLarge) = %d, want 400 (the sibling bound)", got)
 	}
 }
+
+// TestStatusForErrorPayloadKeyNotRecord pins vector_operate's "that key does not
+// hold a record" refusal as a 400. The op deliberately refuses rather than
+// overwriting a plain value with a record, so the caller has a key to fix; an
+// unmatched sentinel here would have surfaced that as an opaque, redacted 500.
+// Kept in sync with server.clientFacingErr.
+func TestStatusForErrorPayloadKeyNotRecord(t *testing.T) {
+	err := fmt.Errorf("%w: payload key %q holds a value of kind %d", vector.ErrPayloadKeyNotRecord, "country", 2)
+	if got := statusForError(err); got != http.StatusBadRequest {
+		t.Errorf("statusForError(ErrPayloadKeyNotRecord) = %d, want 400", got)
+	}
+}

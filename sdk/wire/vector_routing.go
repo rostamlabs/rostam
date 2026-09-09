@@ -206,7 +206,11 @@ func CollectionNameFor(op string, args []byte) (name string, ok bool) {
 		// vector_query (unified Query API) leads with [colLen:u8][col] — the
 		// QuerySpec blob is opaque to routing, so the collection sits at offset 0.
 		// vector_named_query / vector_mv_query share the exact same arg wire (At1).
-		"vector_query", "vector_named_query", "vector_mv_query":
+		"vector_query", "vector_named_query", "vector_mv_query",
+		// The operate family leads with [colLen:u8][col][id:u64] — the same At1
+		// layout as the set_payload rows above. All three families share one arg
+		// wire (EncodeVectorOperateArgs); the op NAME selects the family.
+		"vector_operate", "vector_named_operate", "vector_mv_operate":
 		ke = VectorKeyColAt1
 	default:
 		return "", false
@@ -253,7 +257,10 @@ func CollectionNameOffset(op string) (off int, ok bool) {
 		// vector_bm25_stats: [colLen:u8][col]... — collection at offset 0 (At1).
 		"vector_bm25_stats",
 		// vector_query / vector_named_query / vector_mv_query: [colLen:u8][col]... — collection at offset 0.
-		"vector_query", "vector_named_query", "vector_mv_query":
+		"vector_query", "vector_named_query", "vector_mv_query",
+		// The operate family: [colLen:u8][col][id:u64]... — collection at offset 0,
+		// the same At1 layout as the set_payload rows above.
+		"vector_operate", "vector_named_operate", "vector_mv_operate":
 		return 0, true
 	default:
 		return 0, false
@@ -312,6 +319,7 @@ var singlePointWriteOps = map[string]struct{}{
 	// At1 layout (offset 0): [colLen:u8][col][id:u64]...
 	"vector_delete":                    {},
 	"vector_set_payload":               {},
+	"vector_operate":                   {},
 	"vector_overwrite_payload":         {},
 	"vector_delete_payload_keys":       {},
 	"vector_clear_payload":             {},
@@ -319,12 +327,14 @@ var singlePointWriteOps = map[string]struct{}{
 	"vector_mv_add_versioned":          {},
 	"vector_mv_delete":                 {},
 	"vector_mv_set_payload":            {},
+	"vector_mv_operate":                {},
 	"vector_mv_overwrite_payload":      {},
 	"vector_mv_delete_payload_keys":    {},
 	"vector_mv_clear_payload":          {},
 	"vector_named_insert":              {},
 	"vector_named_delete":              {},
 	"vector_named_set_payload":         {},
+	"vector_named_operate":             {},
 	"vector_named_overwrite_payload":   {},
 	"vector_named_delete_payload_keys": {},
 	"vector_named_clear_payload":       {},

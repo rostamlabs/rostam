@@ -223,3 +223,16 @@ func TestClientFacingErrMalformedRecord(t *testing.T) {
 		t.Error("clientFacingErr(ErrRecordTooLarge) = false, want true (the sibling bound)")
 	}
 }
+
+// TestClientFacingErrPayloadKeyNotRecord pins the TCP transport's half of
+// httpapi.TestStatusForErrorPayloadKeyNotRecord. vector_operate refuses a
+// payload key that holds a plain value rather than a record — replacing it would
+// destroy data the caller can still read — and that refusal names the caller's
+// own key, so it must reach the client verbatim instead of being redacted to
+// "internal error", which would read as a server fault for a caller mistake.
+func TestClientFacingErrPayloadKeyNotRecord(t *testing.T) {
+	err := fmt.Errorf("%w: payload key %q holds a value of kind %d", vector.ErrPayloadKeyNotRecord, "country", 2)
+	if !clientFacingErr(err) {
+		t.Error("clientFacingErr(ErrPayloadKeyNotRecord) = false, want true")
+	}
+}

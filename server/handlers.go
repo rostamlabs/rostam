@@ -206,6 +206,12 @@ func clientFacingErr(err error) bool {
 		// caller sent those bytes, the remedy is to send a well-formed record,
 		// and the message names only the payload key the caller chose.
 		errors.Is(err, vector.ErrRecordMalformed),
+		// vector.ErrPayloadKeyNotRecord: a vector_operate aimed at a payload key
+		// that holds a plain value (or the reserved content key) rather than a
+		// record. Same bucket and same reasoning as the two above — the caller
+		// chose the key, the remedy is to name a record key, and the message
+		// discloses only that key and the kind stored under it.
+		errors.Is(err, vector.ErrPayloadKeyNotRecord),
 		errors.Is(err, vector.ErrEmptyFilter),
 		errors.Is(err, vector.ErrEmptyGroupBy),
 		errors.Is(err, vector.ErrSparseMismatch),

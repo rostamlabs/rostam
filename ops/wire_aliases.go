@@ -263,6 +263,8 @@ var (
 	DecodeVectorInsertArgsKeyExpires          = wire.DecodeVectorInsertArgsKeyExpires
 	DecodeVectorInsertArgsKeyExpiresInto      = wire.DecodeVectorInsertArgsKeyExpiresInto
 	DecodeVectorInsertArgsKeyTTL              = wire.DecodeVectorInsertArgsKeyTTL
+	DecodeVectorOperateArgs                   = wire.DecodeVectorOperateArgs
+	DecodeVectorOperateResult                 = wire.DecodeVectorOperateResult
 	DecodeVectorSearchArgs                    = wire.DecodeVectorSearchArgs
 	DecodeVectorSearchArgsInto                = wire.DecodeVectorSearchArgsInto
 	DecodeVectorSearchArgsOpts                = wire.DecodeVectorSearchArgsOpts
@@ -426,6 +428,8 @@ var (
 	EncodeVectorInsertArgsKeyTTL              = wire.EncodeVectorInsertArgsKeyTTL
 	EncodeVectorInsertArgsVersioned           = wire.EncodeVectorInsertArgsVersioned
 	EncodeVectorInsertArgsVersionedKeyExpires = wire.EncodeVectorInsertArgsVersionedKeyExpires
+	EncodeVectorOperateArgs                   = wire.EncodeVectorOperateArgs
+	EncodeVectorOperateResult                 = wire.EncodeVectorOperateResult
 	EncodeVectorSearchArgs                    = wire.EncodeVectorSearchArgs
 	AppendVectorSearchArgs                    = wire.AppendVectorSearchArgs
 	AppendVectorSearchArgsExt                 = wire.AppendVectorSearchArgsExt
