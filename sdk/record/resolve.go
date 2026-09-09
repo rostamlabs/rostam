@@ -105,6 +105,11 @@ type schemaEntry struct {
 // Absent (binary search cannot see the disorder, and it never returns a row
 // whose key does not match), and a field with no further segment resolves
 // to Table without reading the table's bytes at all.
+//
+// Both consequences are safe for a filter leaf, which reads Absent as "this
+// point does not match", and unsafe for an operator that reads Absent as a
+// positive answer. RowAbsentProven is that operator's entry point: it pays for
+// one walk of the table to turn Absent into a proof.
 type Resolver struct {
 	mu    sync.RWMutex
 	cache map[string]*schemaEntry
@@ -178,21 +183,12 @@ func (r *Resolver) resolveSchema(rec []byte, p Path) (Result, error) {
 	}
 
 	seg := p.Segs[0]
-	var pos int
-	if seg.ByPos {
-		if uint64(seg.Pos) >= uint64(len(s.Fields)) {
-			return Result{Kind: Absent}, nil
-		}
-		pos = int(seg.Pos)
-	} else {
-		if !s.StoreNames {
-			return Result{}, fmt.Errorf("%w: schema stores no names, use a position", ErrPath)
-		}
-		i, ok := s.FieldPos(seg.Name)
-		if !ok {
-			return Result{Kind: Absent}, nil
-		}
-		pos = i
+	pos, found, err := schemaFieldPos(s, seg)
+	if err != nil {
+		return Result{}, err
+	}
+	if !found {
+		return Result{Kind: Absent}, nil
 	}
 
 	fdef := &s.Fields[pos]
@@ -283,6 +279,28 @@ func (r *Resolver) resolveSchema(rec []byte, p Path) (Result, error) {
 		return Result{}, err
 	}
 	return Result{Kind: Scalar, Cell: cell}, nil
+}
+
+// schemaFieldPos resolves a path's first segment to a schema field position.
+// found is false when the segment names nothing in this schema (an unknown
+// name, or a position past the end) — the Absent outcome, which is never an
+// error. The one error is a NAME against a schema that stores none, which
+// cannot apply to this record's shape at all.
+func schemaFieldPos(s *wire.Schema, seg Segment) (pos int, found bool, err error) {
+	if seg.ByPos {
+		if uint64(seg.Pos) >= uint64(len(s.Fields)) {
+			return 0, false, nil
+		}
+		return int(seg.Pos), true, nil
+	}
+	if !s.StoreNames {
+		return 0, false, fmt.Errorf("%w: schema stores no names, use a position", ErrPath)
+	}
+	i, ok := s.FieldPos(seg.Name)
+	if !ok {
+		return 0, false, nil
+	}
+	return i, true, nil
 }
 
 // schemaFieldOffset returns the offset of field target's stored value. A
@@ -526,6 +544,285 @@ func compareLEBytes(a, b []byte) int {
 	default:
 		return 0
 	}
+}
+
+// --- proven absence -------------------------------------------------------
+
+// RowAbsentProven reports whether p — a field segment then a row segment —
+// names a row that is PROVABLY absent from a table this record really has.
+//
+// # Why Resolve is not enough
+//
+// Resolve reads only the bytes its path touches, which is what makes a
+// schema-mode row lookup one binary search over stored bytes. The price is
+// stated in the Resolver doc comment: a table whose rows are NOT in the
+// ascending key order DecodeRecord enforces can answer Absent for a row that
+// is actually stored, because a binary search cannot see the disorder, and a
+// field with no further segment answers Table without reading the table at
+// all. For a filter LEAF that is harmless — the row is reported missing, the
+// point does not match. For the row_absent OPERATOR it is not: a malformed
+// record would turn into a positive match, so a caller who can store bytes
+// under a payload key could make a point match a filter it does not satisfy.
+//
+// # What "proven" means
+//
+// Only on the Absent outcome does this walk the table once, verifying that the
+// keys are strictly ascending and that none of them is the one p names. It
+// returns true only when that walk completes: absence is then a fact about the
+// bytes, not an inference from an ordering the record merely claims. A record
+// that fails the walk is malformed and reports an error wrapping ErrRecord; a
+// row that IS present, a field that is not a table, and a field the record does
+// not have all report (false, nil), which is the same "cannot assert" answer
+// Resolve gives for them.
+//
+// The walk is bounded by the row count Resolve already bounded against the
+// record's remaining bytes, so it is O(rows) with no allocation, and it runs
+// only for points that resolved Absent. Row PRESENCE needs none of this and
+// must keep using Resolve: a matched row is proof of itself.
+func (r *Resolver) RowAbsentProven(rec []byte, p Path) (bool, error) {
+	if len(p.Segs) != 2 || p.Segs[0].Kind != SegField || p.Segs[1].Kind != SegRow {
+		return false, fmt.Errorf("%w: RowAbsentProven needs a field/row path", ErrPath)
+	}
+	res, err := r.Resolve(rec, p)
+	if err != nil {
+		return false, err
+	}
+	if res.Kind != Absent {
+		return false, nil
+	}
+	// The field must resolve to a TABLE for "the row is missing" to mean
+	// anything: resolveSchema answers Absent for a field name that is not in
+	// the schema BEFORE it looks for a row, and resolveDynamic does the same
+	// for a name no field carries.
+	fres, err := r.Resolve(rec, Path{Segs: p.Segs[:1:1]})
+	if err != nil {
+		return false, err
+	}
+	if fres.Kind != Table {
+		return false, nil
+	}
+	// rec[0] was validated by the Resolve calls above; the default arm is
+	// unreachable and fails closed rather than guessing a mode.
+	switch rec[0] {
+	case wire.OperateModeSchema:
+		if err := r.proveSchemaRowAbsent(rec, p); err != nil {
+			return false, err
+		}
+	case wire.OperateModeDynamic:
+		if err := proveDynamicRowAbsent(rec, p); err != nil {
+			return false, err
+		}
+	default:
+		return false, fmt.Errorf("%w: unknown mode byte %d", ErrRecord, rec[0])
+	}
+	return true, nil
+}
+
+// proveSchemaRowAbsent walks a schema-mode table's fixed-width rows once,
+// checking that their keys are strictly ascending and that none equals the key
+// p's row segment names. A nil error means the row is provably absent.
+func (r *Resolver) proveSchemaRowAbsent(rec []byte, p Path) error {
+	e, err := r.schemaFor(rec)
+	if err != nil {
+		return err
+	}
+	s, l := e.schema, e.layout
+	base := 1 + e.blobLen
+	if base > len(rec) {
+		return fmt.Errorf("%w: record ends inside its schema blob", ErrRecord)
+	}
+	pos, found, err := schemaFieldPos(s, p.Segs[0])
+	if err != nil {
+		return err
+	}
+	fdef := &s.Fields[pos]
+	// Unreachable: the caller resolved this field to Table already.
+	if !found || fdef.Type != wire.OperateTypeTable || fdef.Table == nil || l.Tables[pos] == nil {
+		return fmt.Errorf("%w: field is not a table", ErrRecord)
+	}
+	tl := l.Tables[pos]
+	off, err := schemaFieldOffset(rec, base, s, l, pos)
+	if err != nil {
+		return err
+	}
+	nRows, rowsOff, err := schemaTableHeader(rec, off, tl)
+	if err != nil {
+		return err
+	}
+
+	keyType := fdef.Table.KeyType
+	target, targetVal, matchable := schemaRowTarget(p.Segs[1], tl.KeyWidth)
+	if !matchable {
+		// No row of this table CAN carry that key — a quoted key of the wrong
+		// length, or a decimal too large for the key width. Absence follows from
+		// the key alone, so the ordering of rows that could never match it is
+		// not part of the proof.
+		return nil
+	}
+	kw := tl.KeyWidth
+	var prev []byte
+	for i := 0; i < int(nRows); i++ {
+		k := rec[rowsOff+i*tl.RowWidth:][:kw]
+		if prev != nil && compareStoredKeyBytes(prev, k, keyType) >= 0 {
+			return fmt.Errorf("%w: table rows are not in ascending key order", ErrRecord)
+		}
+		prev = k
+		var cmp int
+		if target != nil {
+			cmp = compareStoredKeyBytes(k, target, keyType)
+		} else {
+			cmp = compareStoredKeyValue(k, targetVal, keyType)
+		}
+		if cmp == 0 {
+			// Only reachable on a record whose rows are out of order in a way
+			// the ascending check above has not reached yet — a present row the
+			// binary search missed is the malformation, not an absence.
+			return fmt.Errorf("%w: the row is present but the ordered lookup missed it", ErrRecord)
+		}
+	}
+	return nil
+}
+
+// schemaRowTarget renders a row segment as the key it names at width kw, the
+// same way findSchemaRow does: quoted segments compare by their bytes, decimal
+// ones by value. matchable is false when no row of that width can carry the
+// key the segment names.
+func schemaRowTarget(seg Segment, kw int) (target []byte, targetVal uint64, matchable bool) {
+	if seg.KeyQuoted {
+		if len(seg.Key) != kw {
+			return nil, 0, false
+		}
+		return seg.Key, 0, true
+	}
+	v, err := strconv.ParseUint(seg.KeyText, 10, 64)
+	if err != nil {
+		return nil, 0, false
+	}
+	if kw < 8 && v >= uint64(1)<<(8*uint(kw)) {
+		return nil, 0, false
+	}
+	return nil, v, true
+}
+
+// proveDynamicRowAbsent is proveSchemaRowAbsent's dynamic-mode half. It walks
+// EVERY field, not just up to the named one: resolveDynamic stops early on the
+// first name greater than the one it wants, which is correct for a record whose
+// fields are ascending and is exactly what a malformed record subverts, so the
+// proof cannot reuse that shortcut. The same applies to the table's rows.
+func proveDynamicRowAbsent(rec []byte, p Path) error {
+	seg := p.Segs[0]
+	if seg.ByPos {
+		return fmt.Errorf("%w: dynamic records address fields by name, not position", ErrPath)
+	}
+	nFields, m, err := readCanonicalUvarint(rec, 1)
+	if err != nil {
+		return err
+	}
+	off := 1 + m
+	if nFields > wire.OperateMaxFields {
+		return fmt.Errorf("%w: record declares %d fields", ErrRecord, nFields)
+	}
+	if !wire.CountFitsIn(int(nFields), len(rec)-off, 3) {
+		return fmt.Errorf("%w: record declares %d fields but is too short", ErrRecord, nFields)
+	}
+
+	var prevName []byte
+	proved := false
+	for i := uint64(0); i < nFields; i++ {
+		name, next, err := readName(rec, off)
+		if err != nil {
+			return err
+		}
+		off = next
+		// Strict ascending order over the WHOLE field list also rules out a
+		// duplicate name, which is the other way a record could hide a second
+		// table under the name being asked about.
+		if prevName != nil && bytes.Compare(prevName, name) >= 0 {
+			return fmt.Errorf("%w: fields out of order", ErrRecord)
+		}
+		prevName = name
+		typ, n, valOff, err := readTypeTag(rec, off)
+		if err != nil {
+			return err
+		}
+		if compareBytesString(name, seg.Name) == 0 {
+			if typ != wire.OperateTypeTable {
+				return fmt.Errorf("%w: field is not a table", ErrRecord)
+			}
+			inner, _, err := dynamicTableInner(rec, valOff)
+			if err != nil {
+				return err
+			}
+			if err := proveDynamicTableRowAbsent(inner, p.Segs[1]); err != nil {
+				return err
+			}
+			proved = true
+		}
+		off, err = skipDynamicValue(rec, valOff, typ, n)
+		if err != nil {
+			return err
+		}
+	}
+	if !proved {
+		// Unreachable: the caller resolved this field to Table already.
+		return fmt.Errorf("%w: field is not in the record", ErrRecord)
+	}
+	return nil
+}
+
+// proveDynamicTableRowAbsent walks all of a dynamic table's rows, checking the
+// keys are strictly ascending and that none is the one seg names.
+func proveDynamicTableRowAbsent(inner []byte, seg Segment) error {
+	nRows, rowsOff, err := dynamicTableRows(inner)
+	if err != nil {
+		return err
+	}
+	var keyBuf [8]byte
+	target := seg.Key
+	if !seg.KeyQuoted {
+		v, perr := strconv.ParseUint(seg.KeyText, 10, 64)
+		if perr != nil {
+			// No row can carry a key this segment does not name (resolveDynamic
+			// answers Absent for it too), so absence follows from the key alone.
+			return nil
+		}
+		binary.LittleEndian.PutUint64(keyBuf[:], v)
+		target = keyBuf[:]
+	}
+
+	off := rowsOff
+	var prevKey []byte
+	for i := uint64(0); i < nRows; i++ {
+		rowLen, m, err := readCanonicalUvarint(inner, off)
+		if err != nil {
+			return err
+		}
+		off += m
+		if !fitsRemaining(rowLen, len(inner)-off) {
+			return fmt.Errorf("%w: row runs past its table", ErrRecord)
+		}
+		row := inner[off : off+int(rowLen)]
+		off += int(rowLen)
+		if len(row) < 1 {
+			return fmt.Errorf("%w: empty row", ErrRecord)
+		}
+		klen := int(row[0])
+		if klen == 0 || klen > wire.OperateMaxKeyLen {
+			return fmt.Errorf("%w: row key length %d", ErrRecord, klen)
+		}
+		if len(row)-1 < klen {
+			return fmt.Errorf("%w: row ends inside its key", ErrRecord)
+		}
+		key := row[1 : 1+klen]
+		if prevKey != nil && bytes.Compare(prevKey, key) >= 0 {
+			return fmt.Errorf("%w: rows out of order", ErrRecord)
+		}
+		prevKey = key
+		if bytes.Equal(key, target) {
+			return fmt.Errorf("%w: the row is present but the ordered lookup missed it", ErrRecord)
+		}
+	}
+	return nil
 }
 
 // --- schema cache ---------------------------------------------------------

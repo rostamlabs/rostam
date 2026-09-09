@@ -203,7 +203,12 @@ really is a table). All of the following make **both** ops false:
 - that point's record has **no such field at all**: an unknown field name, or
   a position past the end of its schema;
 - the path cannot apply to that point's record shape, e.g. the field holds a
-  scalar, not a table.
+  scalar, not a table;
+- the record is **malformed** where it matters — for `row_absent`, a table
+  whose rows are not in the ascending key order the format requires. Absence is
+  proved by walking the table, not inferred from an ordering the bytes merely
+  claim, so a damaged table asserts nothing. (`row_exists` needs no such check:
+  a matched row is proof of itself.)
 
 "The row is absent" presupposes a table to search, and a point that cannot
 even be asked the question is not in a position to assert that.

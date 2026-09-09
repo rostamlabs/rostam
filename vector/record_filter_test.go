@@ -3,6 +3,7 @@
 package vector
 
 import (
+	"bytes"
 	"encoding/binary"
 	"math/rand"
 	"strings"
@@ -216,6 +217,66 @@ func TestCompileFilterRowPresenceCompileErrors(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestRowPresenceRefusesUnorderedTable is the vector-side half of the proven-
+// absence fix. Record bytes are not validated at ingest in this phase, so a
+// caller can store a table whose rows are NOT in the ascending key order the
+// format requires. A schema-mode row lookup is a binary search, which cannot
+// see the disorder, so it answers Absent for a row that IS stored — and
+// row_absent used to read that as a positive match. A point could then satisfy
+// a filter it does not satisfy, chosen by the bytes the caller stored.
+//
+// Both ops must answer FALSE on such a table: row_exists because the search
+// finds nothing, row_absent because absence is now PROVED by walking the table
+// (record.Resolver.RowAbsentProven) and the walk sees the disorder.
+//
+// The record is patched at the byte level — the encoder sorts rows and
+// DecodeRecord refuses the result — which is the test-only stand-in for the
+// hostile writer this defends against.
+func TestRowPresenceRefusesUnorderedTable(t *testing.T) {
+	enc := sessionRecordBytes(t)
+	ordered := Metadata{"session": NewRecord(append([]byte(nil), enc...))}
+
+	// The two stored rows of table b, byte for byte: an 8-byte little-endian
+	// key then two little-endian u32 columns. They are the last 32 bytes of the
+	// record (b is the last field), and swapping them leaves every offset and
+	// length in the record unchanged — only the ORDER becomes illegal.
+	row42 := []byte{42, 0, 0, 0, 0, 0, 0, 0, 0xF4, 0x01, 0, 0, 1, 0, 0, 0}
+	row99 := []byte{99, 0, 0, 0, 0, 0, 0, 0, 0x07, 0, 0, 0, 2, 0, 0, 0}
+	at := bytes.Index(enc, row42)
+	if at < 0 || !bytes.Equal(enc[at+16:], row99) {
+		t.Fatalf("fixture changed: rows 42/99 are not the last 32 bytes of the record (%x)", enc)
+	}
+	copy(enc[at:], row99)
+	copy(enc[at+16:], row42)
+	unordered := Metadata{"session": NewRecord(enc)}
+
+	for _, c := range []struct {
+		field                  string
+		wantExists, wantAbsent bool // on the ORDERED record
+	}{
+		{"session/b/42", true, false}, // a present row
+		{"session/b/99", true, false}, // the other present row
+		{"session/b/7", false, true},  // a row that really is absent
+	} {
+		t.Run(c.field, func(t *testing.T) {
+			for _, tc := range []struct {
+				op      FilterOp
+				ordered bool
+			}{{FilterRowExists, c.wantExists}, {FilterRowAbsent, c.wantAbsent}} {
+				p := compileOrFail(t, Filter{Op: tc.op, Field: c.field})
+				// The control: on the well-formed record the op answers normally.
+				if got := p(ordered); got != tc.ordered {
+					t.Errorf("%s on the ordered record = %v, want %v", mustOpName(tc.op), got, tc.ordered)
+				}
+				// The fix: on the damaged one, neither op asserts anything.
+				if got := p(unordered); got {
+					t.Errorf("%s on an out-of-order table = true, want false", mustOpName(tc.op))
+				}
+			}
+		})
 	}
 }
 

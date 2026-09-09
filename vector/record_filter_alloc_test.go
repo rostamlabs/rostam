@@ -34,6 +34,12 @@ func TestRecordPathPredicateAllocFree(t *testing.T) {
 		{"eq record path", Filter{Op: FilterEq, Field: "session/bc", Value: NewInt(3)}, true, "session/bc"},
 		{"count record path", Filter{Op: FilterEq, Field: "session/b#count", Value: NewInt(2)}, true, "session/b#count"},
 		{"gt plain key", Filter{Op: FilterGt, Field: "plain", Value: NewInt(1)}, true, "plain"},
+		// Row presence is on the same hot path. row_absent is the expensive
+		// one — it proves absence by walking the table (RowAbsentProven)
+		// instead of trusting the ordered lookup — so it is pinned here to
+		// keep that walk allocation-free.
+		{"row_exists record path", Filter{Op: FilterRowExists, Field: "session/b/42"}, true, "session/b/42"},
+		{"row_absent record path", Filter{Op: FilterRowAbsent, Field: "session/b/7"}, true, "session/b/7"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pred, err := CompileFilter(tc.f)
