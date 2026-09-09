@@ -362,3 +362,29 @@ func TestStatusForErrorPayloadKeyNotRecord(t *testing.T) {
 		t.Errorf("statusForError(ErrPayloadKeyNotRecord) = %d, want 400", got)
 	}
 }
+
+// TestStatusForErrorVectorRecordAbsent pins vector_operate's create=NONE refusal
+// as a 404, the HTTP rendering of the not-found status the binary transport
+// answers for the same signal (server.TestMapResultVectorRecordAbsentIsNotFound).
+// The caller declined to create a record and there was none: the thing they
+// named does not exist, which is what 404 means — not the redacted 500 an
+// unclassified sentinel would have produced.
+//
+// The substring arm covers the clustered path, where the sentinel is stringified
+// across the Raft boundary and errors.Is stops matching.
+func TestStatusForErrorVectorRecordAbsent(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", ops.ErrVectorRecordAbsent},
+		{"wrapped", fmt.Errorf("shard 3: %w", ops.ErrVectorRecordAbsent)},
+		{"stringified across Raft", errors.New("apply: " + ops.ErrVectorRecordAbsent.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := statusForError(tc.err); got != http.StatusNotFound {
+				t.Errorf("statusForError = %d, want 404", got)
+			}
+		})
+	}
+}

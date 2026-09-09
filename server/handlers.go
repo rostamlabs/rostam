@@ -139,7 +139,25 @@ func mapResult(disp Dispatcher, result []byte, err error, reqID string) (uint8, 
 	switch {
 	case err == nil:
 		return StatusOK, result
-	case errors.Is(err, cache.ErrNotFound):
+	case errors.Is(err, cache.ErrNotFound),
+		// ops.ErrVectorRecordAbsent: vector_operate with create = NONE against a
+		// payload key that holds no record. It is the vector twin of the signal
+		// handleOperate raises for the same call against an absent KV key —
+		// handleOperate maps that one to cache.ErrNotFound (ops.handleOperate's
+		// doc comment; TestOperateCreateNoneOnAbsent pins it), which this very
+		// case already answers StatusNotFound for. Answering the same status for
+		// the vector twin is what keeps KV and vector operate telling a caller the
+		// same thing; classified nowhere, it fell through to the redacted
+		// StatusError bucket and read as a server fault.
+		//
+		// It is classified HERE rather than in clientFacingErr because the status
+		// is what carries the meaning: not-found is its own wire status, not a
+		// client-facing error message.
+		errors.Is(err, ops.ErrVectorRecordAbsent),
+		// The clustered path stringifies the sentinel across the Raft boundary, so
+		// errors.Is stops matching — the same reason clientFacingErr carries string
+		// fallbacks. Comparing against the sentinel's own text cannot drift from it.
+		strings.Contains(err.Error(), ops.ErrVectorRecordAbsent.Error()):
 		return StatusNotFound, nil
 	case errors.Is(err, shard.ErrNotLeader):
 		var nle *shard.NotLeaderError

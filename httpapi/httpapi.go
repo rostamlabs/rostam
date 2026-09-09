@@ -568,6 +568,18 @@ func statusForError(err error) int {
 		// server.clientFacingErr by the shared const.
 		strings.Contains(err.Error(), ops.WASMRegistrationRefusedMsg):
 		return http.StatusBadRequest
+	case errors.Is(err, ops.ErrVectorRecordAbsent),
+		// The clustered path stringifies the sentinel across the Raft boundary, so
+		// errors.Is stops matching there; the sentinel's own text cannot drift.
+		strings.Contains(err.Error(), ops.ErrVectorRecordAbsent.Error()):
+		// vector_operate with create = NONE against a payload key that holds no
+		// record: the caller declined to create one and there was none, so the
+		// thing they named does not exist → 404. This is the HTTP rendering of the
+		// StatusNotFound the binary transport answers for the same signal (see
+		// server.mapResult), which in turn matches what KV operate answers for
+		// create = NONE against an absent key. Unclassified it was a redacted 500,
+		// which reads as a server fault for an ordinary miss.
+		return http.StatusNotFound
 	case errors.Is(err, vector.ErrAPIKeyExists):
 		// Online key-admin: POST /v1/admin/keys with an already-registered token.
 		// 409 Conflict (the standard create-conflict code).

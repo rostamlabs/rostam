@@ -236,3 +236,37 @@ func TestClientFacingErrPayloadKeyNotRecord(t *testing.T) {
 		t.Error("clientFacingErr(ErrPayloadKeyNotRecord) = false, want true")
 	}
 }
+
+// TestMapResultVectorRecordAbsentIsNotFound pins vector_operate's create=NONE
+// refusal as the SAME wire status KV operate answers with. handleOperate maps
+// its create=NONE-against-an-absent-key case to cache.ErrNotFound, which
+// mapResult already answers StatusNotFound for (TestOperateCreateNoneOnAbsent
+// pins the KV half); ops.ErrVectorRecordAbsent is that signal for a record held
+// in a point's payload, so the two transports must not disagree about it. Left
+// unclassified it fell through to the redacted StatusError bucket, telling a
+// caller "internal error" for a record that simply is not there.
+//
+// The substring arm covers the clustered path, where the sentinel is stringified
+// across the Raft boundary and errors.Is stops matching — the same reason
+// clientFacingErr carries string fallbacks.
+func TestMapResultVectorRecordAbsentIsNotFound(t *testing.T) {
+	disp := &fakeDispatcher{}
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", ops.ErrVectorRecordAbsent},
+		{"wrapped", fmt.Errorf("shard 3: %w", ops.ErrVectorRecordAbsent)},
+		{"stringified across Raft", errors.New("apply: " + ops.ErrVectorRecordAbsent.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, payload := mapResult(disp, nil, tc.err, "")
+			if status != StatusNotFound {
+				t.Fatalf("status = %d, want StatusNotFound (%d)", status, StatusNotFound)
+			}
+			if payload != nil {
+				t.Fatalf("payload = %q, want nil (the not-found status carries no body, as for cache.ErrNotFound)", payload)
+			}
+		})
+	}
+}
