@@ -226,8 +226,38 @@ func grpcError(err error) error {
 		// fallback uses vector.IsRecordTooLargeMessage, NOT strings.Contains — a
 		// bare substring check would also match an unrelated internal error that
 		// merely wraps the sentinel, leaking it to the caller unredacted.
-		vector.IsRecordTooLargeMessage(err.Error()):
+		vector.IsRecordTooLargeMessage(err.Error()),
+		errIs(err, vector.ErrRecordMalformed),
+		// vector.ErrRecordMalformed: a payload carrying record bytes no operate
+		// engine can open. A caller mistake with a clear remedy (send a
+		// well-formed record) whose message names only the payload key the
+		// caller chose, so the same InvalidArgument bucket as the cap above.
+		strings.Contains(err.Error(), vector.ErrRecordMalformed.Error()),
+		errIs(err, vector.ErrPayloadKeyNotRecord),
+		// vector.ErrPayloadKeyNotRecord: a vector_operate aimed at a payload
+		// key that holds a plain value rather than a record. Same
+		// InvalidArgument bucket and reasoning — the caller chose the key, the
+		// remedy is to name a record key, and the message discloses only that
+		// key and the kind stored under it.
+		//
+		// These last two matched by sentinel AND by string: shard.decodePBResult
+		// rebuilds op errors with errors.New(string(payload)) across
+		// replication, so a clustered apply loses errors.Is identity — the same
+		// reason server.clientFacingErr and httpapi.statusForError carry the
+		// string fallback. Comparing against the sentinel's own .Error() text
+		// cannot drift from it.
+		strings.Contains(err.Error(), vector.ErrPayloadKeyNotRecord.Error()):
 		return status.Error(codes.InvalidArgument, err.Error())
+	case errIs(err, ops.ErrVectorRecordAbsent),
+		// ops.ErrVectorRecordAbsent: vector_operate with create=NONE against a
+		// payload key that holds no record — the caller declined to create one
+		// and there was none, so the thing they named does not exist ->
+		// NotFound, mirroring server.mapResult's StatusNotFound and
+		// httpapi.statusForError's 404 for the same signal (both keep KV and
+		// vector operate telling every transport's caller the same thing).
+		// The substring arm covers the same clustered-apply stringification.
+		strings.Contains(err.Error(), ops.ErrVectorRecordAbsent.Error()):
+		return status.Error(codes.NotFound, err.Error())
 	case errIs(err, vector.ErrAPIKeyExists):
 		// Online key-admin: KeysAdd of an already-registered token. AlreadyExists
 		// (the etcd/gRPC create-conflict code) — the caller revokes first or picks a

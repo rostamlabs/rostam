@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/rostamlabs/rostam/ops"
 	"github.com/rostamlabs/rostam/vector"
 )
 
@@ -111,5 +112,65 @@ func TestGrpcErrorRecordTooLarge(t *testing.T) {
 		if got := status.Code(grpcError(tc.err)); got != codes.Internal {
 			t.Errorf("%s: grpcError = %v, want Internal", tc.name, got)
 		}
+	}
+}
+
+// TestGrpcErrorVectorRecordMalformedAndPayloadKeyNotRecord pins the gRPC
+// transport's classification of vector_operate's two ingest/shape refusals —
+// vector.ErrRecordMalformed and vector.ErrPayloadKeyNotRecord — as
+// InvalidArgument, mirroring server.clientFacingErr / httpapi.statusForError's
+// 400 bucket for the same sentinels (PR #102 found these unclassified here,
+// falling through to codes.Internal). vector.ErrRecordTooLarge shares the
+// bucket and is pinned by TestGrpcErrorRecordTooLarge above.
+//
+// Three arms per error, like server.TestClientFacingErrMalformedRecord /
+// httpapi.TestStatusForErrorMalformedRecord: sentinel, wrapped, and
+// stringified across the Raft boundary — shard.decodePBResult rebuilds op
+// errors with errors.New across replication, so errors.Is alone loses the
+// sentinel there and grpcError's string fallback is what keeps this
+// InvalidArgument instead of a redacted Internal.
+func TestGrpcErrorVectorRecordMalformedAndPayloadKeyNotRecord(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"malformed-sentinel", vector.ErrRecordMalformed},
+		{"malformed-wrapped", fmt.Errorf("%w: payload key %q: bad", vector.ErrRecordMalformed, "session")},
+		{"malformed-stringified", errors.New("apply: " + vector.ErrRecordMalformed.Error())},
+		{"not-record-sentinel", vector.ErrPayloadKeyNotRecord},
+		{"not-record-wrapped", fmt.Errorf("%w: payload key %q holds a value of kind %d", vector.ErrPayloadKeyNotRecord, "country", 2)},
+		{"not-record-stringified", errors.New("apply: " + vector.ErrPayloadKeyNotRecord.Error())},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := status.Code(grpcError(tc.err)); got != codes.InvalidArgument {
+				t.Errorf("grpcError(%v) = %v, want InvalidArgument", tc.err, got)
+			}
+		})
+	}
+}
+
+// TestGrpcErrorVectorRecordAbsentIsNotFound pins vector_operate's create=NONE
+// refusal (ops.ErrVectorRecordAbsent) as NotFound over gRPC, the same status
+// server.mapResult (StatusNotFound) and httpapi.statusForError (404) answer
+// for the identical signal — every transport tells the caller the same thing
+// for a record that simply is not there.
+//
+// Three arms, for the same clustered-apply stringification reason as above.
+func TestGrpcErrorVectorRecordAbsentIsNotFound(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", ops.ErrVectorRecordAbsent},
+		{"wrapped", fmt.Errorf("shard 3: %w", ops.ErrVectorRecordAbsent)},
+		{"stringified", errors.New("apply: " + ops.ErrVectorRecordAbsent.Error())},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := status.Code(grpcError(tc.err)); got != codes.NotFound {
+				t.Errorf("grpcError(%v) = %v, want NotFound", tc.err, got)
+			}
+		})
 	}
 }
