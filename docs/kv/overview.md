@@ -422,6 +422,14 @@ same stored bytes. See
 [record paths in filters](../vector/filtering.md#record-paths) for the path
 grammar, value mapping, and what a collection auto-indexes.
 
+The same `operate` op-list above also runs, unchanged, against a record held
+in a vector point's payload: `vector_operate` (and its `vector_named_operate`/
+`vector_mv_operate` twins) apply an op-list to the record under one payload
+key instead of one KV key, atomically and under the collection's write lock.
+See [updating a record in place](../vector/filtering.md#updating-a-record-in-place)
+for the call shape, what differs from a plain `operate` call, and a worked
+example.
+
 ## TTL semantics
 
 TTLs are absolute deadlines computed at write time. Expiry is enforced lazily on

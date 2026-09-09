@@ -38,6 +38,32 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   [the KV overview](kv/overview.md#atomic-multi-field-updates-operate) for
   the full path/type/op vocabulary, caps, and worked examples.
 
+- **`vector_operate`: mutate a record stored in a vector payload in place.**
+  New built-in ops `vector_operate` / `vector_named_operate` / `vector_mv_operate`
+  apply the same `operate` op-list to the record held under one point's
+  payload key, atomically, under the collection's write lock, in one apply —
+  the read-back paths, types and `OperateResult` are exactly `operate`'s. A
+  point's TTL and the op-list's inner key don't apply here and are rejected
+  rather than silently ignored; `create` can still create the record, and
+  `create = NONE` against a missing one is an error, matching KV `operate`.
+  The mutated record's top-level fields are reindexed in the same apply, so a
+  filtered search sees the change immediately. The call is refused while its
+  collection is resharding (retryable after cutover) and is not replayable.
+  Available on the Go client via the typed `Collection.Operate` (dense
+  collections; named/MV have engine support with a typed client handle as a
+  follow-up). See
+  [updating a record in place](vector/filtering.md#updating-a-record-in-place).
+
+- **Malformed record payload values are now rejected at ingest.** Every entry
+  that stores a payload value of kind `record` — insert, insert-if-absent,
+  upsert, `set_payload`, `overwrite_payload`, and the bulk paths — now
+  validates the bytes decode as a well-formed `operate` record, not just that
+  they fit the size cap. A caller that hands in bytes no `operate` engine can
+  open now gets a 400 at write time instead of a payload that later poisons
+  that key's filter acceleration for the whole collection. Only a record
+  written by a version before this change can still be malformed; the
+  fail-closed indexing behaviour for that case is unchanged.
+
 - **New `-online-compaction` flag.** Opts every replicated mmap reject-writes
   shard into online relocating compaction, so a write/overwrite-heavy replicated
   shard reclaims dead ("ghost") bytes while the process runs instead of only at

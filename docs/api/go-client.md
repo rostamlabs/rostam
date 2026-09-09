@@ -96,6 +96,37 @@ for _, e := range errs { // nil/empty slice means everything succeeded
 }
 ```
 
+### Operating on a record
+
+`Collection.Operate` applies one atomic
+[`operate` op-list](../kv/overview.md#atomic-multi-field-updates-operate) to
+the record stored under one payload key of one point — see
+[updating a record in place](../vector/filtering.md#updating-a-record-in-place)
+for the full contract (what's rejected, what `create` does, the reshard
+refusal). Build the op-list with `client.NewOperate`, a two-statement pattern:
+build the args, check the build error, then call:
+
+```go
+args, err := client.NewOperate(nil).Dynamic().
+	AddT(client.F("hits"), wire.OperateTypeI64, 1).
+	Return(client.F("hits")).
+	Args() // Args() reports a build-time error (bad path, wrong type); nothing sent yet
+if err != nil { ... }
+
+found, res, err := posts.Operate(ctx, client.OperateRequest{
+	ID: 1, PayloadKey: "session", Args: args,
+})
+// found: false if the point is absent/tombstoned/expired — res is nil then, not an error
+n, err := client.DecodeOperateValue(res.Values[0])
+```
+
+`Collection.Operate` is **not replayable**: an ambiguous post-commit transport
+failure (the call may or may not have landed) surfaces as an error instead of
+being retried automatically, because a retried `ADD` after an ambiguous
+failure would double-count. A caller that needs at-most-once semantics across
+a retry should use `CHECK` in the op-list, or `OperateRequest.ExpectedVersion`
+to fence on the point's version.
+
 ### Reading
 
 ```go
