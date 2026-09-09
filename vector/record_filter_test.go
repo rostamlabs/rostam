@@ -341,3 +341,66 @@ func TestRecordPathFilterFirstMatchesBruteForce(t *testing.T) {
 		t.Fatal("every filter's brute-force match set was empty; test proves nothing — fixture is broken")
 	}
 }
+
+// TestRowPresenceExactPayloadKeyWins pins the exact-payload-key-first rule for
+// row_exists / row_absent.
+//
+// A filter's field string is tried as an EXACT payload key first, and only then
+// split at the first '/'; lookupPath and fieldLookup.get both do this, and the
+// rule exists so two seams never disagree about one field string. The row
+// presence closure used to skip the exact lookup entirely, so a point holding
+// BOTH a record under "session" AND a literal "session/b/42" key answered
+// row_exists true while lookupPath on the same field returned the literal
+// string. Both ops must answer false: the field named a value, not a table, and
+// "the row is absent" presupposes a table to search.
+func TestRowPresenceExactPayloadKeyWins(t *testing.T) {
+	enc := sessionRecordBytes(t)
+	// "session/b/42" is a PRESENT row in the record and "session/b/7" is an
+	// absent one, so the two literal keys pin both directions: without the fix
+	// the first answers row_exists true and the second answers row_absent true.
+	m := Metadata{
+		"session":      NewRecord(enc),
+		"session/b/42": NewString("literal-wins"),
+		"session/b/7":  NewString("literal-wins-too"),
+	}
+
+	// The control: lookupPath resolves both fields to the LITERAL value, which
+	// is the answer row presence has to agree with.
+	for _, field := range []string{"session/b/42", "session/b/7"} {
+		got, ok := lookupPath(m, field)
+		if !ok || got.Kind != ValueString {
+			t.Fatalf("precondition: lookupPath(%q) = (%+v, %v), want the literal string", field, got, ok)
+		}
+	}
+
+	for _, c := range []struct {
+		name  string
+		f     Filter
+		want  bool
+		alone bool // the answer when the literal key is NOT present
+	}{
+		{"row_exists over a literal key shadowing a present row",
+			Filter{Op: FilterRowExists, Field: "session/b/42"}, false, true},
+		{"row_absent over a literal key shadowing a present row",
+			Filter{Op: FilterRowAbsent, Field: "session/b/42"}, false, false},
+		{"row_exists over a literal key shadowing an absent row",
+			Filter{Op: FilterRowExists, Field: "session/b/7"}, false, false},
+		{"row_absent over a literal key shadowing an absent row",
+			Filter{Op: FilterRowAbsent, Field: "session/b/7"}, false, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p := compileOrFail(t, c.f)
+			if got := p(m); got != c.want {
+				t.Errorf("%s over a shadowed field = %v, want %v — the literal payload key must win",
+					mustOpName(c.f.Op), got, c.want)
+			}
+			// Drop the literal key and the SAME filter resolves through the
+			// record again, so the fix shadows only what it should.
+			bare := Metadata{"session": NewRecord(enc)}
+			if got := p(bare); got != c.alone {
+				t.Errorf("%s with no literal key = %v, want %v — record resolution must be unaffected",
+					mustOpName(c.f.Op), got, c.alone)
+			}
+		})
+	}
+}

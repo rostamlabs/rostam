@@ -822,6 +822,13 @@ func validateLatLon(lat, lon float64) error {
 // scalar where this filter expects a table) — already falls out of the
 // Kind != RowPresent check, so row_exists needs no separate branch for it.
 //
+// The per-point closure tries the EXACT payload key m[f.Field] first, like
+// every other leaf op (lookupPath, fieldLookup.get): a literal payload key
+// that itself contains '/' wins over splitting the field. Both ops answer
+// false for such a point — the field named a value, not a table. Only the
+// SHAPE check above is compile-time; whether a literal key exists varies per
+// point and cannot be hoisted.
+//
 // row_absent is DELIBERATELY NOT simply "not row_exists": it reports true
 // only when Resolve AFFIRMATIVELY finds the row missing from a REAL table on
 // this point (Kind == Absent) — never for a point that cannot even be asked
@@ -846,8 +853,28 @@ func compileRowPresence(f Filter) (Predicate, error) {
 		return nil, fmt.Errorf("vector: filter op %q requires a path naming exactly a table row (field/row), got %q", mustOpName(f.Op), pathStr)
 	}
 	exists := f.Op == FilterRowExists
+	field := f.Field
 	return func(m Metadata) bool {
 		if m == nil {
+			return false
+		}
+		// EXACT PAYLOAD KEY FIRST, exactly as lookupPath and fieldLookup.get
+		// resolve a field string: a literal payload key wins over splitting at
+		// the first '/'. Whether the literal key exists is a per-POINT fact, so
+		// this cannot be hoisted to the compile-time validation above; only the
+		// path SHAPE can be.
+		//
+		// Both ops answer false here, and for the same reason: the field named a
+		// literal payload value, not a table, so there was never a table to
+		// search. row_exists is false because no row was found; row_absent is
+		// false by the same asymmetry documented above — a point that cannot be
+		// asked the question is not in a position to assert anything about a row.
+		// Without this, a point holding both {"session": <record>} and a literal
+		// "session/b/42" key answered row_exists true while lookupPath on the
+		// same field returned the literal value, so two seams disagreed about one
+		// field string — the divergence the exact-key-first rule exists to
+		// prevent.
+		if _, exact := m[field]; exact {
 			return false
 		}
 		rv, ok := m[payloadKey]
