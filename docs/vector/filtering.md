@@ -181,10 +181,17 @@ a compile error, since that shape never depends on the data. `row_exists` is
 true iff the row is present. `row_absent` is **not** simply "not
 `row_exists`": it is true only when the row is affirmatively missing from a
 real table on that point (the payload key holds a record and the named field
-really is a table). A missing payload key, a payload key holding something
-other than a record, or a path that cannot apply to that point's record
-shape (e.g. the field is a scalar, not a table) makes **both** ops false —
-"the row is absent" presupposes a table to search, and a point that cannot
+really is a table). All of the following make **both** ops false:
+
+- the field string matches an **exact payload key** on that point — a literal
+  key wins over splitting, exactly as it does for every other op;
+- the payload key is missing, or holds something other than a record;
+- that point's record has **no such field at all**: an unknown field name, or
+  a position past the end of its schema;
+- the path cannot apply to that point's record shape, e.g. the field holds a
+  scalar, not a table.
+
+"The row is absent" presupposes a table to search, and a point that cannot
 even be asked the question is not in a position to assert that.
 
 ### Value mapping

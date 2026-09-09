@@ -15,8 +15,12 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   `contains`/`match`/`regex`/`row_exists`/`row_absent` are always evaluated
   against the live record. A point whose stored record is malformed fails
   the whole payload key closed (evaluated live, still correct) until it is
-  repaired or reclaimed. See
-  [record paths in filters](vector/filtering.md#record-paths).
+  repaired or reclaimed. `row_exists` and `row_absent` follow the same
+  exact-payload-key-first rule as every other op — a literal key such as
+  `"session/b/42"` wins over splitting, and makes both ops false — and
+  `row_absent` is true only when the named field really is a table on that
+  point, so a record with no such field at all answers false rather than
+  true. See [record paths in filters](vector/filtering.md#record-paths).
 
 - **`operate`: server-side atomic multi-field updates on a record.** A new
   built-in op updates several fields of one record atomically, in one round

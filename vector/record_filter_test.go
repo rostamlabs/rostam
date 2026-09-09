@@ -404,3 +404,66 @@ func TestRowPresenceExactPayloadKeyWins(t *testing.T) {
 		})
 	}
 }
+
+// TestRowAbsentRequiresATableAtTheField pins row_absent's contract against the
+// case that used to slip through it: a field the record does not have AT ALL.
+//
+// resolveSchema answers Kind == Absent for a field name that is not in the
+// record's schema, and for an out-of-range positional segment, BEFORE it looks
+// for a row — so "session/zzz/42" reached the closure as Absent and read as "the
+// row is missing from that table". That contradicts the documented contract
+// ("the row is absent" presupposes a table to search) and it disagreed with the
+// neighbouring case: a scalar at the field errors with ErrPath and correctly
+// answers false, though both are "no table at that field".
+//
+// row_absent is now true only when the field itself resolves to a TABLE. The
+// row_exists column is asserted alongside it in every case, because "both false"
+// is precisely the outcome the contract calls for when the question cannot be
+// asked.
+func TestRowAbsentRequiresATableAtTheField(t *testing.T) {
+	m := Metadata{"session": NewRecord(sessionRecordBytes(t))}
+	// A dynamic-mode record has no schema at all; a field it does not carry
+	// must answer the same way a schema-mode unknown field does.
+	dyn := Metadata{"session": NewRecord(goodDynamicRecord(t, 5))}
+
+	cases := []struct {
+		name       string
+		m          Metadata
+		field      string
+		wantExists bool
+		wantAbsent bool
+	}{
+		// The regression: the schema has no "zzz" field whatsoever. There is no
+		// table to search, so neither op may assert anything.
+		{"field absent from the schema", m, "session/zzz/42", false, false},
+		// Same shape by position: #9 is past the end of a 6-field schema.
+		{"positional segment out of range", m, "session/#9/42", false, false},
+		// A dynamic record that simply has no such field.
+		{"field absent from a dynamic record", dyn, "session/zzz/42", false, false},
+		// The neighbouring case that was always right, kept here so the two are
+		// asserted side by side: a SCALAR at the field errors with ErrPath.
+		{"scalar at the field", m, "session/rc/1", false, false},
+		{"scalar at the field, dynamic", dyn, "session/a/1", false, false},
+		// The genuine cases must be unaffected: a real table with the row
+		// missing, and one with the row present.
+		{"table present, row missing", m, "session/b/7", false, true},
+		{"table present, row present", m, "session/b/42", true, false},
+		// Positional addressing of a REAL table still works — the fix is about
+		// what the field resolves to, not how it is spelled.
+		{"table addressed by position, row missing", m, "session/#5/7", false, true},
+		{"table addressed by position, row present", m, "session/#5/42", true, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			for _, tc := range []struct {
+				op   FilterOp
+				want bool
+			}{{FilterRowExists, c.wantExists}, {FilterRowAbsent, c.wantAbsent}} {
+				p := compileOrFail(t, Filter{Op: tc.op, Field: c.field})
+				if got := p(c.m); got != tc.want {
+					t.Errorf("%s(%q) = %v, want %v", mustOpName(tc.op), c.field, got, tc.want)
+				}
+			}
+		})
+	}
+}

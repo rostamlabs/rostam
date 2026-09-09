@@ -833,13 +833,14 @@ func validateLatLon(lat, lon float64) error {
 // only when Resolve AFFIRMATIVELY finds the row missing from a REAL table on
 // this point (Kind == Absent) — never for a point that cannot even be asked
 // the question. Concretely, row_absent answers false (not true) when the
-// payload key is missing, holds something other than a ValueRecord, or
-// Resolve errors (e.g. this point's schema has a scalar, not a table, at
-// that field). The rationale: "the row is absent" presupposes there was a
-// table to search; a point with no such record, or no such table, is not in
-// a position to assert anything about a row inside one. This is the one
-// asymmetry in an otherwise-mirrored pair of ops, and it is why row_absent
-// cannot be compiled as `!rowExists(m)`.
+// payload key is missing, holds something other than a ValueRecord, holds a
+// record whose shape has NO SUCH FIELD at all (an unknown field name, or an
+// out-of-range position), or when Resolve errors (e.g. this point's record
+// has a scalar, not a table, at that field). The rationale: "the row is
+// absent" presupposes there was a table to search; a point with no such
+// record, or no such table, is not in a position to assert anything about a
+// row inside one. This is the one asymmetry in an otherwise-mirrored pair of
+// ops, and it is why row_absent cannot be compiled as `!rowExists(m)`.
 func compileRowPresence(f Filter) (Predicate, error) {
 	payloadKey, pathStr, ok := record.SplitField(f.Field)
 	if !ok {
@@ -854,6 +855,11 @@ func compileRowPresence(f Filter) (Predicate, error) {
 	}
 	exists := f.Op == FilterRowExists
 	field := f.Field
+	// The FIELD-ONLY prefix of the same path, cached beside it for row_absent's
+	// "is there a table here at all?" question — see the closure below. Sliced
+	// with a full slice expression so an append through either Path can never
+	// reach the other's backing array.
+	fieldPath := record.Path{Segs: p.Segs[:1:1]}
 	return func(m Metadata) bool {
 		if m == nil {
 			return false
@@ -888,7 +894,31 @@ func compileRowPresence(f Filter) (Predicate, error) {
 		if exists {
 			return res.Kind == record.RowPresent
 		}
-		return res.Kind == record.Absent
+		if res.Kind != record.Absent {
+			return false
+		}
+		// Absent is ambiguous, and only for row_absent. resolveSchema answers
+		// Absent for a field NAME that is not in this record's schema (and for
+		// an out-of-range positional segment) BEFORE it ever looks for a row, so
+		// "session/zzz/42" on a record with no zzz field reached here as Absent
+		// and read as "the row is missing from the table". That contradicts the
+		// contract above, and it disagreed with the neighbouring case: a SCALAR
+		// at the field errors with ErrPath and correctly answers false, though
+		// both are "no table at that field".
+		//
+		// Resolve the FIELD-ONLY prefix to disambiguate: Kind == Table means the
+		// field really is a table, so the earlier Absent was a genuinely missing
+		// row. This is a second Resolve, and there is no cheaper "is this field a
+		// table" question in the resolver — but it runs ONLY on the row_absent
+		// branch and ONLY for points that already resolved Absent, and it is the
+		// cheapest kind of Resolve there is: in schema mode a field with no
+		// further segment answers Table off the cached schema without reading the
+		// table's bytes at all.
+		fres, ferr := recordResolver.Resolve(rv.Rec, fieldPath)
+		if ferr != nil {
+			return false
+		}
+		return fres.Kind == record.Table
 	}, nil
 }
 
