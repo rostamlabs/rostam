@@ -3,6 +3,7 @@
 package vector
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -1007,7 +1008,7 @@ func (m *MultiVectorIndex) MultiRestoreAddSparse(docID uint64, tokens [][]float3
 // WAL-log: durability rides the Raft-replicated batch op that re-executes this on
 // replay (mirrors the dense bulk path), so callers must drive it through an op.
 func (m *MultiVectorIndex) MultiBulkBuild(recs []MultiScanRecord, workers int) (bool, error) {
-	for _, r := range recs {
+	for i, r := range recs {
 		if len(r.Tokens) == 0 {
 			return false, ErrEmptyDocument
 		}
@@ -1020,6 +1021,22 @@ func (m *MultiVectorIndex) MultiBulkBuild(recs []MultiScanRecord, workers int) (
 			if err := r.Sparse.Validate(); err != nil {
 				return false, err
 			}
+		}
+		// THIS ENTRY IS WIRE-REACHABLE and it is NOT a replay body, so it runs the
+		// record ingest gate. ops/mv_batch.go decodes a batch straight off the wire
+		// and calls it as the FAST PATH whenever the target index is empty,
+		// falling through to the gated MultiRestoreAddSparse only once documents
+		// exist — so without this the same op is gated or ungated depending on the
+		// target's emptiness, and the ungated case (a fresh partition) is exactly
+		// the one an offline MV resplit drives. The loop below writes r.Metadata
+		// into docMeta and reindexes it directly, with nothing else in front.
+		//
+		// The WHOLE batch is validated before m.mu is taken, so one bad record
+		// refuses every record rather than leaving a half-built index that can
+		// never use the fast path again. The offending row is named, exactly as
+		// checkRecordValuesAll names it for the dense bulk path.
+		if err := checkRecordValues(r.Metadata); err != nil {
+			return false, fmt.Errorf("payload %d: %w", i, err)
 		}
 	}
 	m.startSweeper()
