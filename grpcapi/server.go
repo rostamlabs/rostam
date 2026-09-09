@@ -299,6 +299,20 @@ func grpcError(err error) error {
 		// Internal (which retry policies hammer). String fallbacks cover the
 		// clustered/stringified path.
 		return status.Error(codes.ResourceExhausted, err.Error())
+	case errIs(err, ops.ErrOperateDuringReshard),
+		// ops.ErrOperateDuringReshard: a vector_operate against a collection a
+		// reshard is dual-writing. operate is not idempotent, so the store refuses
+		// rather than double-applying the op-list; the refusal lasts the minutes a
+		// reshard runs and the caller retries after cutover. Unavailable is the
+		// gRPC rendering of HTTP's 503 and the code standard retry policies and
+		// service meshes DO retry — unlike the Internal an unclassified sentinel
+		// fell to, which they hammer or hard-fail.
+		//
+		// Sentinel AND exact message shape, for the usual clustered-apply reason;
+		// ops.IsOperateDuringReshardMessage, not strings.Contains, so an internal
+		// fault that merely mentions the refusal is not leaked.
+		ops.IsOperateDuringReshardMessage(err.Error()):
+		return status.Error(codes.Unavailable, err.Error())
 	case strings.Contains(err.Error(), "not leader"),
 		strings.Contains(err.Error(), "no leader"),
 		strings.Contains(err.Error(), "no reachable owner"):

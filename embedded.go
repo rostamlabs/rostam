@@ -1625,7 +1625,11 @@ func (e *embedded) VectorClearPayload(_ context.Context, collection string, id u
 // Refusing costs the caller the use of vector_operate on ONE collection for the
 // minutes a reshard runs, visibly. Dual-writing would cost a permanently
 // double-counted counter, invisibly.
-var ErrOperateDuringReshard = errors.New("rostam: vector_operate is refused while a reshard is dual-writing; retry after cutover")
+// The sentinel itself is DECLARED in ops so server, httpapi and grpcapi — none
+// of which can import this package without a layering cycle — can classify the
+// refusal as retryable by identity rather than by substring. This name stays the
+// one callers of the root store use; it is the same error value.
+var ErrOperateDuringReshard = ops.ErrOperateDuringReshard
 
 // vectorOperate is the shared body of VectorOperate / VectorNamedOperate /
 // VectorMVOperate: the three families differ only in the op name they dispatch,
@@ -1656,7 +1660,10 @@ func (e *embedded) vectorOperate(opName, collection string, id uint64, payloadKe
 	collection = e.resolveAlias(collection)
 	live, _, dual := e.dualTargets(collection, id)
 	if dual {
-		return false, nil, fmt.Errorf("%w: collection %q", ErrOperateDuringReshard, collection)
+		// ops.OperateDuringReshardErr is the one producer of the detailed form:
+		// the shape the transport classifiers anchor on, with the caller's
+		// collection name bounded.
+		return false, nil, ops.OperateDuringReshardErr(collection)
 	}
 	if live != "" {
 		collection = live

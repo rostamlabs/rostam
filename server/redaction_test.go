@@ -368,3 +368,57 @@ func TestMapResultVectorRecordAbsentIsNotFound(t *testing.T) {
 		}
 	})
 }
+
+// TestMapResultOperateDuringReshardIsClientFacing pins the reshard refusal as a
+// client-facing signal on the binary transport. A vector_operate against a
+// collection a reshard is dual-writing is REFUSED — the op-list is not
+// idempotent, so applying it to both generations would double-count — and the
+// whole design rests on the caller learning it should retry after cutover.
+// Unclassified, the refusal fell to the redacted internal-error bucket and a
+// retryable transient read as a server fault.
+//
+// StatusError with the verbatim message is the same answer this transport gives
+// the other retryable conditions ("no reachable owner" and friends); StatusNotLeader
+// is specifically a leader hint and this is not a leadership condition.
+//
+// A negative control asserts an unrelated fault that merely wraps the refusal
+// text with a foreign prefix stays redacted — the exact class a bare
+// strings.Contains arm would leak.
+func TestMapResultOperateDuringReshardIsClientFacing(t *testing.T) {
+	disp := &fakeDispatcher{}
+	detailed := ops.OperateDuringReshardErr("docs")
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", ops.ErrOperateDuringReshard},
+		{"production detailed form (names the collection)", detailed},
+		{"wrapped (%w, exercises errors.Is identity)", fmt.Errorf("shard 3: %w", ops.ErrOperateDuringReshard)},
+		{"stringified across Raft, bare shape", errors.New(ops.ErrOperateDuringReshard.Error())},
+		{"stringified across Raft, detailed shape", errors.New(detailed.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, payload := mapResult(disp, nil, tc.err, "")
+			if status != StatusError {
+				t.Fatalf("status = %d, want StatusError (%d)", status, StatusError)
+			}
+			msg, _ := DecodeErrorPayload(payload)
+			if msg == "internal error" {
+				t.Fatalf("the refusal was redacted to %q — the caller is never told to retry", msg)
+			}
+			if msg != tc.err.Error() {
+				t.Fatalf("payload = %q, want the verbatim refusal %q", msg, tc.err.Error())
+			}
+		})
+	}
+	t.Run("negative/unrelated fault wrapping the refusal with a foreign prefix", func(t *testing.T) {
+		err := errors.New("apply: " + detailed.Error())
+		status, payload := mapResult(disp, nil, err, "")
+		if status != StatusError {
+			t.Fatalf("status = %d, want StatusError (%d)", status, StatusError)
+		}
+		if msg, _ := DecodeErrorPayload(payload); msg != "internal error" {
+			t.Fatalf("payload = %q, want the redacted message", msg)
+		}
+	})
+}

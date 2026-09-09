@@ -228,3 +228,38 @@ func TestGrpcErrorVectorRecordAbsentIsNotFound(t *testing.T) {
 		}
 	})
 }
+
+// TestGrpcErrorOperateDuringReshardIsUnavailable pins the reshard refusal as
+// Unavailable over gRPC — the code standard retry policies and service meshes DO
+// retry — matching HTTP's 503 and the binary transport's client-facing
+// StatusError for the identical signal. Unclassified it fell to Internal, which
+// those same policies hammer or hard-fail, for a condition that clears itself at
+// cutover.
+//
+// A negative control asserts an unrelated fault that merely wraps the refusal
+// text with a foreign prefix stays Internal.
+func TestGrpcErrorOperateDuringReshardIsUnavailable(t *testing.T) {
+	detailed := ops.OperateDuringReshardErr("docs")
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", ops.ErrOperateDuringReshard},
+		{"production detailed form (names the collection)", detailed},
+		{"wrapped (%w, exercises errIs identity)", fmt.Errorf("shard 3: %w", ops.ErrOperateDuringReshard)},
+		{"stringified across replication, bare shape", errors.New(ops.ErrOperateDuringReshard.Error())},
+		{"stringified across replication, detailed shape", errors.New(detailed.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := status.Code(grpcError(tc.err)); got != codes.Unavailable {
+				t.Errorf("grpcError(%v) = %v, want Unavailable", tc.err, got)
+			}
+		})
+	}
+	t.Run("negative/unrelated fault wrapping the refusal with a foreign prefix", func(t *testing.T) {
+		err := errors.New("apply: " + detailed.Error())
+		if got := status.Code(grpcError(err)); got != codes.Internal {
+			t.Errorf("grpcError(%v) = %v, want Internal", err, got)
+		}
+	})
+}

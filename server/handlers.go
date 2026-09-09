@@ -254,6 +254,22 @@ func clientFacingErr(err error) bool {
 		// fault, whichever transport carried it.
 		errors.Is(err, ops.ErrMalformedPayloadJSON):
 		return true
+	case errors.Is(err, ops.ErrOperateDuringReshard),
+		// ops.ErrOperateDuringReshard: a vector_operate against a collection a
+		// reshard is dual-writing. operate is not idempotent, so the store
+		// REFUSES rather than sending the op-list to both generations — and the
+		// whole design rests on the caller being told to retry after cutover.
+		// Unclassified it fell to the redacted internal-error bucket, so the
+		// retryability never reached the client and a transient read as a server
+		// fault. Same bucket as the leadership/ownership transients below (this
+		// transport carries no separate retryable status: StatusNotLeader is
+		// specifically a leader hint, and this is not a leadership condition).
+		//
+		// Sentinel AND exact message shape, for the usual clustered-apply reason;
+		// ops.IsOperateDuringReshardMessage, not strings.Contains, so an internal
+		// fault that merely mentions the refusal is not leaked.
+		ops.IsOperateDuringReshardMessage(err.Error()):
+		return true
 	case errors.Is(err, vector.ErrInvalidDim),
 		errors.Is(err, vector.ErrInvalidMetric),
 		errors.Is(err, vector.ErrInvalidM),

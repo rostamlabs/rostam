@@ -684,6 +684,22 @@ func statusForError(err error) int {
 		// policies hammer, and which pages operators on client-side throttling). String
 		// fallbacks cover the clustered/stringified path.
 		return http.StatusTooManyRequests
+	case errors.Is(err, ops.ErrOperateDuringReshard),
+		// ops.ErrOperateDuringReshard: a vector_operate against a collection a
+		// reshard is dual-writing. operate is not idempotent, so the store refuses
+		// rather than double-applying the op-list, and the refusal is transient —
+		// it lasts the minutes a reshard runs and the caller retries after
+		// cutover. 503, the same bucket as the leadership/ownership transients
+		// below and the same one the other retryable conditions on this transport
+		// use (no Retry-After: none of them set one). Unclassified it was a
+		// redacted 500, so the retryability docs/vector/filtering.md promises
+		// never reached the caller.
+		//
+		// Sentinel AND exact message shape, for the usual clustered-apply reason;
+		// ops.IsOperateDuringReshardMessage, not strings.Contains, so an internal
+		// fault that merely mentions the refusal is not leaked.
+		ops.IsOperateDuringReshardMessage(err.Error()):
+		return http.StatusServiceUnavailable
 	case strings.Contains(err.Error(), "not leader"),
 		strings.Contains(err.Error(), "no leader"),
 		strings.Contains(err.Error(), "no reachable owner"):

@@ -459,3 +459,41 @@ func TestStatusForErrorVectorRecordAbsent(t *testing.T) {
 		}
 	})
 }
+
+// TestStatusForErrorOperateDuringReshard pins the reshard refusal as a 503, the
+// HTTP rendering of the retryable answer the binary transport gives for the same
+// signal (server.TestMapResultOperateDuringReshardIsClientFacing). A
+// vector_operate against a collection a reshard is dual-writing is refused
+// because the op-list is not idempotent; the refusal lasts the minutes the
+// reshard runs and the caller retries after cutover. Unclassified it was a
+// redacted 500, so the retryability docs/vector/filtering.md promises never
+// reached the caller. No Retry-After: none of this transport's other retryable
+// buckets set one.
+//
+// A negative control asserts an unrelated fault that merely wraps the refusal
+// text with a foreign prefix stays a redacted 500.
+func TestStatusForErrorOperateDuringReshard(t *testing.T) {
+	detailed := ops.OperateDuringReshardErr("docs")
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", ops.ErrOperateDuringReshard},
+		{"production detailed form (names the collection)", detailed},
+		{"wrapped (%w, exercises errors.Is identity)", fmt.Errorf("shard 3: %w", ops.ErrOperateDuringReshard)},
+		{"stringified across Raft, bare shape", errors.New(ops.ErrOperateDuringReshard.Error())},
+		{"stringified across Raft, detailed shape", errors.New(detailed.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := statusForError(tc.err); got != http.StatusServiceUnavailable {
+				t.Errorf("statusForError = %d, want 503", got)
+			}
+		})
+	}
+	t.Run("negative/unrelated fault wrapping the refusal with a foreign prefix", func(t *testing.T) {
+		err := errors.New("apply: " + detailed.Error())
+		if got := statusForError(err); got != http.StatusInternalServerError {
+			t.Errorf("statusForError(%v) = %d, want 500", err, got)
+		}
+	})
+}
