@@ -2,6 +2,14 @@
 
 package wire
 
+// KVIndexDef's own length prefixes are single bytes (no endianness to speak
+// of); EncodeKVIndexList's leading count field is the one multi-byte field
+// this file writes, and it is big-endian, like every other frame in this
+// package. The phase-3 plan's task-1 brief says "little-endian counts" —
+// that line was wrong (this package is ~780 BigEndian call sites against 39
+// LittleEndian ones, the latter confined to the operate record cell layout);
+// this codec follows the package convention, not the brief's typo.
+
 import (
 	"encoding/binary"
 	"errors"

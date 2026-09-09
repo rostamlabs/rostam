@@ -2,12 +2,21 @@
 
 package wire
 
+// Every multi-byte length/count field in this file's frames (kv_query args,
+// the cursor sub-frame, and the kv_query result) is big-endian, like every
+// other frame in this package. The phase-3 plan's task-1 brief says
+// "little-endian counts" — that line was wrong (this package is ~780
+// BigEndian call sites against 39 LittleEndian ones, the latter confined to
+// the operate record cell layout); this codec follows the package
+// convention, not the brief's typo.
+
 import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 
 	"github.com/rostamlabs/rostam/sdk/vtypes"
 )
@@ -234,7 +243,16 @@ func EncodeKVQueryArgs(a KVQueryArgs) ([]byte, error) {
 		return nil, err
 	}
 
-	hasFilter := !a.Filter.IsZero()
+	// NOT a.Filter.IsZero(): that helper only checks Op/Field/And/Or/Not/Geo
+	// and treats Value.IsZero() (Kind==ValueNone) as "no value" REGARDLESS of
+	// the other Value fields — a JSON filter blob whose "value" object sets
+	// e.g. "int" without a matching "kind" decodes to exactly such a
+	// Filter (Kind stays its zero value, Int is set directly, unmarshal does
+	// not gate one field on the other). IsZero() would then call that
+	// non-empty Filter "absent" and silently drop it on re-encode — found by
+	// FuzzDecodeKVQueryArgs. A full structural comparison against the
+	// literal zero value has no such blind spot.
+	hasFilter := !reflect.DeepEqual(a.Filter, vtypes.Filter{})
 	var filterJSON []byte
 	if hasFilter {
 		if err := CheckFilterBudget(a.Filter, KVQueryMaxFilterNodes, KVQueryMaxFilterDepth); err != nil {
