@@ -540,3 +540,269 @@ func benchVectorTableRecord(b *testing.B, size int) []byte {
 	}
 	return enc
 }
+
+// TestRecordValuesGatedAtMVBulkBuild covers the entry the first round missed.
+//
+// MultiBulkBuild is the MV analogue of the dense bulk stage+build, and it is
+// WIRE-REACHABLE: ops/mv_batch.go (handleMVAddBatch) decodes the batch straight
+// off the wire and calls it as the FAST PATH whenever the target index is empty,
+// falling through to the gated MultiRestoreAddSparse only once documents exist.
+// So the same op was gated or ungated depending on the target's emptiness, and
+// the ungated case — a fresh partition — is exactly the one an offline MV resplit
+// drives. It stored the caller's metadata into docMeta and reindexed it with no
+// check at all: a malformed record poisoned badRecords for that key across the
+// whole collection, and an oversize one made the collection unsnapshottable.
+//
+// The gate runs over the WHOLE batch before m.mu is taken, so one bad record
+// refuses every record in the batch rather than leaving a half-built index.
+func TestRecordValuesGatedAtMVBulkBuild(t *testing.T) {
+	tokens := [][]float32{{1, 0, 0, 0}}
+	for _, tc := range []struct {
+		name string
+		meta Metadata
+		want error
+	}{
+		{"malformed", malformedRecord(), ErrRecordMalformed},
+		{"oversize", oversizeRecord(), ErrRecordTooLarge},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, err := NewMultiVectorIndex(MultiVectorConfig{Dim: 4, M: 16, EfConstruction: 200, EfSearch: 64, Seed: 1})
+			if err != nil {
+				t.Fatalf("NewMultiVectorIndex: %v", err)
+			}
+			// The GOOD record comes first, so a gate that only checked the
+			// offending row would already have written doc 1.
+			recs := []MultiScanRecord{
+				{ID: 1, Tokens: tokens, Metadata: Metadata{"session": NewRecord(sessionRecordBytes(t))}},
+				{ID: 2, Tokens: tokens, Metadata: tc.meta},
+			}
+			built, err := m.MultiBulkBuild(recs, 1)
+			if built {
+				t.Fatal("MultiBulkBuild reported a build for a batch it must refuse")
+			}
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v, want %v", err, tc.want)
+			}
+			for _, id := range []uint64{1, 2} {
+				if _, _, _, ok := m.Get(id); ok {
+					t.Errorf("refused batch still stored doc %d", id)
+				}
+			}
+			m.mu.RLock()
+			poisoned := m.payloadIdx.badRecords.poisoned("session")
+			m.mu.RUnlock()
+			if poisoned {
+				t.Error("refused batch still poisoned the payload key")
+			}
+			// The index was never mutated, so it is still EMPTY and the fast path
+			// is still available to a corrected batch — a gate that half-built
+			// would have forced the caller onto the per-record path forever.
+			built, err = m.MultiBulkBuild([]MultiScanRecord{
+				{ID: 1, Tokens: tokens, Metadata: Metadata{"session": NewRecord(sessionRecordBytes(t))}},
+			}, 1)
+			if err != nil || !built {
+				t.Fatalf("corrected batch: built=%v err=%v, want true/nil", built, err)
+			}
+			if _, _, _, ok := m.Get(1); !ok {
+				t.Fatal("the corrected batch did not land")
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// how many times one write decodes the same record
+// ---------------------------------------------------------------------------
+
+// countValidates runs fn with the package's record-validation seam swapped for a
+// counting wrapper, and reports how many times a record was decoded. The seam is
+// restored on cleanup, and no test that uses it runs in parallel.
+func countValidates(t *testing.T, fn func()) int {
+	t.Helper()
+	n := 0
+	orig := validateRecord
+	validateRecord = func(rec []byte) error {
+		n++
+		return orig(rec)
+	}
+	t.Cleanup(func() { validateRecord = orig })
+	fn()
+	return n
+}
+
+// TestRecordValidationCountPerWrite pins how many times each ingest path decodes
+// a record value. The shape check is O(record) with allocations
+// (BenchmarkCheckRecordValues), so an unnoticed extra pass multiplies the write
+// cost of every record-bearing payload; this test is what makes that visible.
+//
+// Every path is ONE except the two that do something irreversible before the
+// engine body they delegate to runs its own gate. Those are 2 on purpose, and
+// TestMalformedRecordRejectedAtIngestDense (upsert) and
+// TestStagedBatchSurvivesARejectedRecord (bulk) are the tests that fail if the
+// duplicate is "optimised" away:
+//
+//   - Upsert deletes before it inserts, so its wrapper pass must reject BEFORE
+//     the delete or a refused write destroys the point it was replacing.
+//   - BuildStaged clears the stage buffer before the engine's gate runs, so
+//     StageBulkPayloads must reject while the caller's batch still exists.
+func TestRecordValidationCountPerWrite(t *testing.T) {
+	rec := func() Metadata { return Metadata{"session": NewRecord(sessionRecordBytes(t))} }
+	vec := []float32{1, 0, 0, 0}
+	newDense := func(name string) *Collection {
+		t.Helper()
+		c, err := NewCollection(name, oversizeDenseConfig())
+		if err != nil {
+			t.Fatalf("NewCollection: %v", err)
+		}
+		return c
+	}
+
+	c := newDense("default/count")
+	nc, err := NewNamedCollection("default/count-named", namedTestConfig())
+	if err != nil {
+		t.Fatalf("NewNamedCollection: %v", err)
+	}
+	namedVecs := map[string][]float32{"title": {1, 0, 0, 0}, "image": {1, 0, 0}}
+	m, err := NewMultiVectorIndex(MultiVectorConfig{Dim: 4, M: 16, EfConstruction: 200, EfSearch: 64, Seed: 1})
+	if err != nil {
+		t.Fatalf("NewMultiVectorIndex: %v", err)
+	}
+	tokens := [][]float32{{1, 0, 0, 0}}
+
+	cases := []struct {
+		name string
+		want int
+		why  string
+		run  func()
+	}{
+		{"Insert", 1, "", func() {
+			if err := c.Insert(1, vec, 0, rec(), nil); err != nil {
+				t.Fatalf("Insert: %v", err)
+			}
+		}},
+		{"InsertIfAbsent", 1, "", func() {
+			if _, err := c.InsertIfAbsent(2, vec, 0, rec(), nil); err != nil {
+				t.Fatalf("InsertIfAbsent: %v", err)
+			}
+		}},
+		{"SetPayload", 1, "", func() {
+			if err := c.SetPayload(1, rec(), nil); err != nil {
+				t.Fatalf("SetPayload: %v", err)
+			}
+		}},
+		{"OverwritePayload", 1, "", func() {
+			if err := c.OverwritePayload(1, rec(), nil); err != nil {
+				t.Fatalf("OverwritePayload: %v", err)
+			}
+		}},
+		{"RestoreInsert", 1, "", func() {
+			if err := c.RestoreInsert(3, vec, 0, rec(), nil, nil, 5); err != nil {
+				t.Fatalf("RestoreInsert: %v", err)
+			}
+		}},
+		{"BuildConcurrentMeta", 1, "", func() {
+			if err := newDense("default/count-bcm").BuildConcurrentMeta(
+				[]uint64{9}, [][]float32{vec}, []Metadata{rec()}, 1); err != nil {
+				t.Fatalf("BuildConcurrentMeta: %v", err)
+			}
+		}},
+		{"named Insert", 1, "", func() {
+			if err := nc.Insert(1, namedVecs, rec(), 0); err != nil {
+				t.Fatalf("named Insert: %v", err)
+			}
+		}},
+		{"named SetPayload", 1, "", func() {
+			if err := nc.SetPayload(1, rec(), nil); err != nil {
+				t.Fatalf("named SetPayload: %v", err)
+			}
+		}},
+		{"MV Add", 1, "", func() {
+			if err := m.Add(1, tokens, rec()); err != nil {
+				t.Fatalf("MV Add: %v", err)
+			}
+		}},
+		{"MV MultiRestoreAdd", 1, "", func() {
+			if err := m.MultiRestoreAdd(2, tokens, rec(), nil, 5); err != nil {
+				t.Fatalf("MV MultiRestoreAdd: %v", err)
+			}
+		}},
+		{"MV MultiBulkBuild", 1, "", func() {
+			mb, merr := NewMultiVectorIndex(MultiVectorConfig{Dim: 4, M: 16, EfConstruction: 200, EfSearch: 64, Seed: 1})
+			if merr != nil {
+				t.Fatalf("NewMultiVectorIndex: %v", merr)
+			}
+			if _, berr := mb.MultiBulkBuild([]MultiScanRecord{{ID: 1, Tokens: tokens, Metadata: rec()}}, 1); berr != nil {
+				t.Fatalf("MultiBulkBuild: %v", berr)
+			}
+		}},
+		{"Upsert", 2, "delete-then-insert: the wrapper must reject before the delete", func() {
+			if err := c.Upsert(1, vec, "doc", 0, rec(), nil); err != nil {
+				t.Fatalf("Upsert: %v", err)
+			}
+		}},
+		{"StageBulkPayloads + BuildStaged", 2, "BuildStaged clears the stage buffer before the engine's gate runs", func() {
+			b := newDense("default/count-stage")
+			if err := b.StageBulkPayloads([]uint64{9}, [][]float32{vec}, []Metadata{rec()}); err != nil {
+				t.Fatalf("StageBulkPayloads: %v", err)
+			}
+			if err := b.BuildStaged(1); err != nil {
+				t.Fatalf("BuildStaged: %v", err)
+			}
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := countValidates(t, tc.run)
+			if got != tc.want {
+				msg := ""
+				if tc.why != "" {
+					msg = " (" + tc.why + ")"
+				}
+				t.Errorf("%s decoded the record %d times, want %d%s", tc.name, got, tc.want, msg)
+			}
+		})
+	}
+}
+
+// TestStagedBatchSurvivesARejectedRecord is the reason StageBulkPayloads keeps
+// the FULL gate even though BuildConcurrentMeta runs it again.
+//
+// BuildStaged hands the staged slices to the engine and clears the stage buffer
+// BEFORE the engine's gate runs, so a bad record that got past staging would be
+// discovered with the caller's whole batch already destroyed — a rejected write
+// taking unrelated, still-valid staged rows with it. Rejecting at stage time
+// keeps the buffer intact and names the offending row while the caller can still
+// fix it. Measured directly: downgrading the stage check to size-only leaves 0
+// staged rows after the failed build.
+func TestStagedBatchSurvivesARejectedRecord(t *testing.T) {
+	c, err := NewCollection("default/stage-survives", oversizeDenseConfig())
+	if err != nil {
+		t.Fatalf("NewCollection: %v", err)
+	}
+	vec := []float32{1, 0, 0, 0}
+	// A good batch first, so the test proves the REJECTED batch left it alone
+	// rather than that the buffer happened to be empty.
+	if err := c.StageBulkPayloads([]uint64{1, 2}, [][]float32{vec, vec},
+		[]Metadata{{"session": NewRecord(sessionRecordBytes(t))}, nil}); err != nil {
+		t.Fatalf("good stage: %v", err)
+	}
+	wantMalformed(t, "StageBulkPayloads", c.StageBulkPayloads(
+		[]uint64{3}, [][]float32{vec}, []Metadata{malformedRecord()}))
+
+	c.stageMu.Lock()
+	staged := len(c.stageIDs)
+	c.stageMu.Unlock()
+	if staged != 2 {
+		t.Fatalf("staged rows after a rejected stage = %d, want the 2 already there", staged)
+	}
+	// And the build still works, which is the whole point of refusing early.
+	if err := c.BuildStaged(1); err != nil {
+		t.Fatalf("BuildStaged after a rejected stage: %v, want nil", err)
+	}
+	for _, id := range []uint64{1, 2} {
+		if _, _, _, _, _, ok := c.Get(id); !ok {
+			t.Errorf("point %d did not survive to the build", id)
+		}
+	}
+}

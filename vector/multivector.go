@@ -1036,7 +1036,7 @@ func (m *MultiVectorIndex) MultiBulkBuild(recs []MultiScanRecord, workers int) (
 			}
 		}
 		// THIS ENTRY IS WIRE-REACHABLE and it is NOT a replay body, so it runs the
-		// record ingest gate. ops/mv_batch.go decodes a batch straight off the wire
+		// full ingest gate. ops/mv_batch.go decodes a batch straight off the wire
 		// and calls it as the FAST PATH whenever the target index is empty,
 		// falling through to the gated MultiRestoreAddSparse only once documents
 		// exist — so without this the same op is gated or ungated depending on the

@@ -746,6 +746,13 @@ func (c *Collection) StageBulk(ids []uint64, vecs [][]float32) error {
 // point. Everything StageBulk documents about dimension checking applies here
 // unchanged.
 func (c *Collection) StageBulkPayloads(ids []uint64, vecs [][]float32, metas []Metadata) error {
+	// THE FULL GATE, HERE, EVEN THOUGH BuildConcurrentMeta RUNS IT AGAIN.
+	// BuildStaged takes the staged slices and CLEARS the buffer before it calls
+	// the engine, so a record that got past staging is discovered with the
+	// caller's whole staged batch already gone. Rejecting at stage time keeps the
+	// buffer intact and names the offending row while the caller can still fix it
+	// — the same reason the dimension check is here rather than only in the
+	// builder. See TestStagedBatchSurvivesARejectedRecord.
 	if err := checkRecordValuesAll(metas); err != nil {
 		return err
 	}
@@ -838,6 +845,13 @@ func (c *Collection) UpsertCAS(id uint64, vec []float32, content string, ttl tim
 // deadlines; the WAL logs them so replay restores them verbatim. Empty/nil
 // keyTTLMs is the zero-overhead path.
 func (c *Collection) UpsertCASKeyTTL(id uint64, vec []float32, content string, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond) (uint64, error) {
+	// THE FULL GATE, HERE, EVEN THOUGH insertBody RUNS IT AGAIN. Upsert is
+	// delete-then-insert, and the delete below is irreversible: downgrade this to
+	// checkRecordValuesSize and a malformed record deletes the existing point and
+	// only THEN fails inside c.idx.Insert, so a REFUSED write destroys the data it
+	// was replacing. That is the one shape of this bug that is worse than the
+	// poison the gate prevents, so this path decodes the record twice on purpose.
+	// See checkRecordValues' doc and TestRecordValidationCountPerWrite.
 	if err := checkRecordValues(meta); err != nil {
 		return 0, err
 	}
@@ -1338,6 +1352,9 @@ func (c *Collection) DeleteByFilterAt(filter Filter, nowMs int64) (int, error) {
 // precheck + unconditional delete), then re-inserts via InsertAt so the point/per-key
 // deadlines are stamped identically on every replica (#4 vector TTL determinism).
 func (c *Collection) UpsertCASKeyTTLAt(id uint64, vec []float32, content string, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond, nowMs int64) (uint64, error) {
+	// The full gate before the tombstone, for the reason UpsertCASKeyTTL states:
+	// this path deletes before it inserts, so a size-only check here would let a
+	// malformed record destroy the point it was refused from replacing.
 	if err := checkRecordValues(meta); err != nil {
 		return 0, err
 	}

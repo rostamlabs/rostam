@@ -176,8 +176,29 @@ var ErrRecordTooLarge = errors.New("vector: record payload value exceeds the sto
 // rejects a ValueRecord that is oversize (ErrRecordTooLarge) or that no operate
 // engine could open (ErrRecordMalformed). Every wire-reachable mutation entry
 // calls it BEFORE it touches any state or stages a WAL write; the inner helpers
-// those entries share deliberately do NOT repeat it, so each op pays exactly one
-// pass over its own payload.
+// those entries share deliberately do NOT repeat it, so almost every op pays
+// exactly one pass over its own payload.
+//
+// TWO OPS PAY TWO PASSES, AND BOTH ARE LOAD-BEARING — see
+// TestRecordValidationCountPerWrite, which pins the count for every path.
+// UpsertCASKeyTTL[At] and StageBulkPayloads each do something IRREVERSIBLE
+// before the engine body they delegate to runs its own gate, so their pass
+// cannot be dropped or downgraded to size-only:
+//
+//   - Upsert is delete-then-insert. Its wrapper pass runs before
+//     idxDeleteLogged; without it a malformed record deletes the existing point
+//     and only then fails in insertBody, so a REJECTED write destroys the data it
+//     was replacing. TestMalformedRecordRejectedAtIngestDense fails exactly that
+//     way if the wrapper is downgraded.
+//   - BuildStaged hands the staged slices to the engine and CLEARS the stage
+//     buffer before BuildConcurrentMeta's gate runs, so a record that got past
+//     staging takes the caller's whole staged batch down with it.
+//     TestStagedBatchSurvivesARejectedRecord pins this.
+//
+// The duplicate pass costs one extra decode of the same bytes on those two paths
+// (BenchmarkCheckRecordValues sizes it). That is the price of failing before an
+// irreversible step, and it is the right trade: the alternative is losing a
+// point, or a batch, on a request that was refused.
 //
 // TWO CHECKS, TWO REACHES.
 //
@@ -214,12 +235,23 @@ func checkRecordValues(m Metadata) error {
 			return fmt.Errorf("%w: payload key %s holds a %d-byte record, the cap is %d bytes",
 				ErrRecordTooLarge, clipField(k), len(v.Rec), maxRecordValueBytes)
 		}
-		if err := record.Validate(v.Rec); err != nil {
+		if err := validateRecord(v.Rec); err != nil {
 			return fmt.Errorf("%w: payload key %s: %w", ErrRecordMalformed, clipField(k), err)
 		}
 	}
 	return nil
 }
+
+// validateRecord is record.Validate behind a package-level indirection, so a test
+// can COUNT how many times one write decodes the same record bytes. The count is
+// a real invariant, not a curiosity: the shape check is O(record) with
+// allocations (see BenchmarkCheckRecordValues), so a path that silently grew a
+// third pass would multiply the write cost of every record-bearing payload with
+// nothing to show for it. TestRecordValidationCountPerWrite pins the number for
+// every ingest path and documents the two that are legitimately two.
+//
+// Swapped only by tests, never concurrently with a live write.
+var validateRecord = record.Validate
 
 // checkRecordValuesSize is checkRecordValues WITHOUT the shape check: the size
 // bound only. It is what the REPLAY bodies call — the ones whose metadata comes

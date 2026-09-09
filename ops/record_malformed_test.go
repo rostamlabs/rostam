@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/rostamlabs/rostam/sdk/vtypes"
+	"github.com/rostamlabs/rostam/sdk/wire"
 	"github.com/rostamlabs/rostam/vector"
 )
 
@@ -15,6 +16,27 @@ import (
 // still answers from a record shaped like it — the asymmetry that poisons a
 // payload key for the whole collection.
 var malformedRecordBytes = []byte{0x01, 0xFF}
+
+// sessionRecordForOps is a small well-formed schema-mode record, so the tests
+// below can show the gate accepting as well as rejecting.
+func sessionRecordForOps(t *testing.T) []byte {
+	t.Helper()
+	sch := &wire.Schema{Version: 1, StoreNames: true, Fields: []wire.FieldDef{
+		{Name: "rc", Type: wire.OperateTypeU8},
+		{Name: "tag", Type: wire.OperateTypeBytes},
+	}}
+	if err := sch.Validate(); err != nil {
+		t.Fatalf("schema invalid: %v", err)
+	}
+	enc := (&wire.Record{Mode: wire.OperateModeSchema, Schema: sch, Fields: []wire.Field{
+		{Cell: wire.Cell{Type: wire.OperateTypeU8, U: 7}},
+		{Cell: wire.Cell{Type: wire.OperateTypeBytes, B: []byte("de")}},
+	}}).Encode()
+	if enc == nil {
+		t.Fatal("session record failed to encode")
+	}
+	return enc
+}
 
 // TestVectorInsertMalformedRecordRejectedOnBothWirePaths is the shape sibling of
 // TestVectorInsertOversizeRecordRejectedOnBothWirePaths, and it exists for the
@@ -77,5 +99,93 @@ func TestVectorInsertMalformedRecordRejectedOnBothWirePaths(t *testing.T) {
 	}
 	if ex, _ := DecodeExistsResult(eb); !ex {
 		t.Fatal("the legitimate version-preserving reinsert did not land")
+	}
+}
+
+// TestMVAddBatchGatesRecordValuesOnBothPaths is the handler-level regression for
+// the fix-round-1 finding: vector_mv_add_batch has TWO downstream paths and only
+// one of them was gated.
+//
+// handleMVAddBatch calls MultiBulkBuild first — a concurrent whole-batch build
+// that only runs when the target index is EMPTY — and falls through to the
+// per-record MultiRestoreAddSparse when documents already exist. MultiBulkBuild
+// wrote the caller's metadata into docMeta and reindexed it with no record gate
+// at all, so the SAME op accepted or refused a malformed record depending on
+// whether the target happened to be empty. The empty case is not the rare one: an
+// offline MV resplit copies into fresh partitions, which is precisely it.
+//
+// Both paths, both bounds, are driven through the real handler.
+func TestMVAddBatchGatesRecordValuesOnBothPaths(t *testing.T) {
+	good := vtypes.Metadata{"session": vtypes.NewRecord(sessionRecordForOps(t))}
+	tokens := [][]float32{{1, 0}}
+
+	for _, path := range []struct {
+		name string
+		seed bool // seed a document first, so MultiBulkBuild declines and the
+		// per-record MultiRestoreAddSparse path runs instead
+	}{
+		{"empty target (MultiBulkBuild fast path)", false},
+		{"non-empty target (MultiRestoreAddSparse path)", true},
+	} {
+		for _, bad := range []struct {
+			name string
+			meta vtypes.Metadata
+			want error
+		}{
+			{"malformed", vtypes.Metadata{"session": vtypes.NewRecord(malformedRecordBytes)}, vector.ErrRecordMalformed},
+			{"oversize", vtypes.Metadata{"session": vtypes.NewRecord(make([]byte, overCapRecordBytes))}, vector.ErrRecordTooLarge},
+		} {
+			t.Run(path.name+"/"+bad.name, func(t *testing.T) {
+				tx := newVecTx(t)
+				cfg := vector.MultiVectorConfig{Dim: 2, M: 4, EfConstruction: 10, EfSearch: 10, Seed: 1}
+				if _, err := handleMVCreate(tx, EncodeMVCreateArgs("mv", cfg)); err != nil {
+					t.Fatalf("create MV: %v", err)
+				}
+				if path.seed {
+					if _, err := handleMVAdd(tx, EncodeMVAddArgs("mv", 100, tokens, good)); err != nil {
+						t.Fatalf("seed add: %v", err)
+					}
+				}
+				// The BAD record comes first on the non-empty path, where the
+				// handler applies records one at a time and a later failure would
+				// leave the earlier ones stored (ordinary batch semantics). On the
+				// empty path the whole batch is refused regardless of order, which
+				// the vector-level test pins directly.
+				recs := []vtypes.MultiScanRecord{
+					{ID: 1, Tokens: tokens, Metadata: bad.meta},
+					{ID: 2, Tokens: tokens, Metadata: good},
+				}
+				_, err := handleMVAddBatch(tx, EncodeMVAddBatchArgs("mv", recs))
+				if err == nil {
+					t.Fatalf("batch carrying a %s record: got nil error, want %v", bad.name, bad.want)
+				}
+				if !errors.Is(err, bad.want) {
+					t.Fatalf("err = %v, want %v", err, bad.want)
+				}
+				for _, id := range []uint64{1, 2} {
+					eb, eerr := handleMVExists(tx, EncodeMVExistsArgs("mv", id))
+					if eerr != nil {
+						t.Fatalf("mv exists(%d): %v", id, eerr)
+					}
+					if ex, _ := DecodeExistsResult(eb); ex {
+						t.Errorf("refused batch still stored doc %d", id)
+					}
+				}
+				// The gate is not over-broad: an all-good batch still lands on
+				// whichever path this case exercises.
+				if _, err := handleMVAddBatch(tx, EncodeMVAddBatchArgs("mv", []vtypes.MultiScanRecord{
+					{ID: 3, Tokens: tokens, Metadata: good},
+				})); err != nil {
+					t.Fatalf("all-good batch: %v, want nil", err)
+				}
+				eb, eerr := handleMVExists(tx, EncodeMVExistsArgs("mv", 3))
+				if eerr != nil {
+					t.Fatalf("mv exists(3): %v", eerr)
+				}
+				if ex, _ := DecodeExistsResult(eb); !ex {
+					t.Fatal("the all-good batch did not land")
+				}
+			})
+		}
 	}
 }
