@@ -5,6 +5,7 @@ package vector
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/rostamlabs/rostam/sdk/record"
 )
@@ -199,6 +200,119 @@ func checkRecordValuesAll(metas []Metadata) error {
 		}
 	}
 	return nil
+}
+
+// IsRecordTooLargeMessage reports whether s is the EXACT serialised form of an
+// ErrRecordTooLarge error produced by checkRecordValues (single-payload) or
+// checkRecordValuesAll (bulk) — byte for byte apart from the caller-controlled
+// key and the two decimal sizes.
+//
+// WHY THIS EXISTS INSTEAD OF errors.Is. shard.decodePBResult rebuilds a
+// replicated op error with errors.New(string(...)), so a clustered apply loses
+// the sentinel's identity and errors.Is(err, ErrRecordTooLarge) no longer
+// matches. A classifier that needs to recognize the replicated form must match
+// the message text instead — but a bare strings.Contains(err.Error(),
+// ErrRecordTooLarge.Error()) is unsafe: it makes ANY error whose message
+// merely mentions the sentinel text client-facing, including an unrelated
+// internal error that wraps it, e.g.
+// fmt.Errorf("wal append failed at %s: %w", path, ErrRecordTooLarge) — that
+// would bypass internal-error redaction and leak the WAL path to the caller.
+//
+// This matcher anchors on the exact prefix and suffix checkRecordValues /
+// checkRecordValuesAll produce, so only their own output — not an arbitrary
+// superstring of the sentinel — is recognized. The three recognized shapes (N
+// and M are decimal byte counts; <key> is clipField's bounded rendering of the
+// caller's payload key, arbitrary content within that bound):
+//
+//	vector: record payload value exceeds the storage cap
+//	vector: record payload value exceeds the storage cap: payload key <key> holds a N-byte record, the cap is M bytes
+//	payload I: vector: record payload value exceeds the storage cap: payload key <key> holds a N-byte record, the cap is M bytes
+//
+// The first (bare sentinel text, no detail) is not produced by any current
+// call site — every real one goes through checkRecordValues, which always
+// appends the detail — but is matched anyway by exact equality so a future
+// path that stringifies the bare sentinel (e.g. errors.New(ErrRecordTooLarge.
+// Error())) is not silently redacted; the equality check cannot mis-fire on
+// anything else, so it costs nothing to include.
+//
+// Phase 2 adds the same treatment for ErrRecordMalformed, ErrPayloadKeyNotRecord,
+// and ErrVectorRecordAbsent; this helper does not attempt those.
+func IsRecordTooLargeMessage(s string) bool {
+	if len(s) == 0 || len(s) > maxRecordTooLargeMessageLen {
+		return false
+	}
+	if s == ErrRecordTooLarge.Error() {
+		return true
+	}
+	rest, ok := cutRecordTooLargePrefix(s)
+	if !ok {
+		return false
+	}
+	return hasRecordTooLargeSuffix(rest)
+}
+
+// maxRecordTooLargeMessageLen bounds the input IsRecordTooLargeMessage scans,
+// so classification cost cannot scale with an attacker-chosen string's length.
+// The largest real message (bulk form, clipField at its longest) sits well
+// under 400 bytes; this leaves generous headroom without opening a scan-cost
+// vector on unbounded input.
+const maxRecordTooLargeMessageLen = 2048
+
+// recordTooLargeSinglePrefix is the fixed text that opens the single-payload
+// form, ending right before the caller-controlled clipField(k) rendering.
+var recordTooLargeSinglePrefix = ErrRecordTooLarge.Error() + ": payload key "
+
+// recordTooLargeSuffixMid and recordTooLargeSuffixTail bracket the two decimal
+// byte counts in the fixed tail that follows clipField(k): "... holds a
+// <N>-byte record, the cap is <maxRecordValueBytes> bytes". The cap is a
+// compile-time constant, so its rendered text is fixed too.
+const recordTooLargeSuffixMid = " holds a "
+
+var recordTooLargeSuffixTail = fmt.Sprintf("-byte record, the cap is %d bytes", maxRecordValueBytes)
+
+// cutRecordTooLargePrefix strips either the single-payload prefix or the bulk
+// "payload <digits>: " wrapper followed by the single-payload prefix, and
+// returns what follows (the clipField rendering plus the fixed numeric tail).
+func cutRecordTooLargePrefix(s string) (string, bool) {
+	if rest, ok := strings.CutPrefix(s, recordTooLargeSinglePrefix); ok {
+		return rest, true
+	}
+	rest, ok := strings.CutPrefix(s, "payload ")
+	if !ok {
+		return "", false
+	}
+	i := 0
+	for i < len(rest) && rest[i] >= '0' && rest[i] <= '9' {
+		i++
+	}
+	if i == 0 {
+		return "", false
+	}
+	rest, ok = strings.CutPrefix(rest[i:], ": ")
+	if !ok {
+		return "", false
+	}
+	return strings.CutPrefix(rest, recordTooLargeSinglePrefix)
+}
+
+// hasRecordTooLargeSuffix reports whether s ends with the fixed tail that
+// follows clipField(k): a decimal byte count, then the fixed suffix text.
+// Whatever precedes " holds a " is the clipField rendering — arbitrary within
+// its own bound — so this only anchors the fixed structure around it, the same
+// way cutRecordTooLargePrefix anchors the fixed structure that precedes it.
+func hasRecordTooLargeSuffix(s string) bool {
+	rest, ok := strings.CutSuffix(s, recordTooLargeSuffixTail)
+	if !ok {
+		return false
+	}
+	i := len(rest)
+	for i > 0 && rest[i-1] >= '0' && rest[i-1] <= '9' {
+		i--
+	}
+	if i == len(rest) {
+		return false
+	}
+	return strings.HasSuffix(rest[:i], recordTooLargeSuffixMid)
 }
 
 // recordPoison is the READ side of the payload index's per-payload-key

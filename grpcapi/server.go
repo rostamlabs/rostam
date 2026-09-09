@@ -219,12 +219,14 @@ func grpcError(err error) error {
 		// same sentinel. Unclassified it fell to codes.Internal, which reads as a
 		// server fault and which standard gRPC retry policies hammer.
 		//
-		// Matched by sentinel AND by string: shard.decodePBResult rebuilds an op
-		// error with errors.New(string(payload)) across replication, so a
-		// clustered apply loses errors.Is identity — the same reason the other two
-		// classifiers carry string fallbacks. Comparing against the sentinel's own
-		// .Error() text cannot drift from it.
-		strings.Contains(err.Error(), vector.ErrRecordTooLarge.Error()):
+		// Matched by sentinel AND by exact message shape: shard.decodePBResult
+		// rebuilds an op error with errors.New(string(payload)) across
+		// replication, so a clustered apply loses errors.Is identity — the same
+		// reason the other two classifiers carry a message-shape fallback. The
+		// fallback uses vector.IsRecordTooLargeMessage, NOT strings.Contains — a
+		// bare substring check would also match an unrelated internal error that
+		// merely wraps the sentinel, leaking it to the caller unredacted.
+		vector.IsRecordTooLargeMessage(err.Error()):
 		return status.Error(codes.InvalidArgument, err.Error())
 	case errIs(err, vector.ErrAPIKeyExists):
 		// Online key-admin: KeysAdd of an already-registered token. AlreadyExists

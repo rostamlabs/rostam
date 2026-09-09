@@ -191,13 +191,16 @@ func clientFacingErr(err error) bool {
 		// record), and the message names the key and both sizes — all of which
 		// the caller sent — so it is safe to return verbatim, like a bad dim.
 		//
-		// Matched by sentinel AND by string: shard.decodePBResult rebuilds an op
-		// error with errors.New across replication, so a clustered apply loses
-		// errors.Is identity and the error would fall through to the redacted
-		// internal-fault bucket. Comparing against the sentinel's own .Error()
-		// text cannot drift from it.
+		// Matched by sentinel AND by exact message shape: shard.decodePBResult
+		// rebuilds an op error with errors.New across replication, so a
+		// clustered apply loses errors.Is identity and the error would fall
+		// through to the redacted internal-fault bucket. The message-shape arm
+		// uses vector.IsRecordTooLargeMessage, NOT strings.Contains — a bare
+		// substring check would also match an unrelated internal error that
+		// merely wraps the sentinel (e.g. a WAL/path error), leaking it to the
+		// caller unredacted.
 		errors.Is(err, vector.ErrRecordTooLarge),
-		strings.Contains(err.Error(), vector.ErrRecordTooLarge.Error()),
+		vector.IsRecordTooLargeMessage(err.Error()),
 		errors.Is(err, vector.ErrEmptyFilter),
 		errors.Is(err, vector.ErrEmptyGroupBy),
 		errors.Is(err, vector.ErrSparseMismatch),

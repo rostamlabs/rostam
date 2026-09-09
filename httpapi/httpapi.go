@@ -497,13 +497,15 @@ func statusForError(err error) int {
 		// client-fixable mistake and the message is the caller's own data.
 		// Keeps this classifier in sync with server.clientFacingErr.
 		//
-		// Matched by sentinel AND by string: a clustered apply rebuilds the op
-		// error with errors.New across the replication boundary
+		// Matched by sentinel AND by exact message shape: a clustered apply
+		// rebuilds the op error with errors.New across the replication boundary
 		// (shard.decodePBResult), so errors.Is alone loses it there and the error
-		// would fall through to the redacted 500 bucket. Comparing against the
-		// sentinel's own .Error() text cannot drift from it.
+		// would fall through to the redacted 500 bucket. The message-shape arm
+		// uses vector.IsRecordTooLargeMessage, NOT strings.Contains — a bare
+		// substring check would also match an unrelated internal error that
+		// merely wraps the sentinel, leaking it to the caller unredacted.
 		errors.Is(err, vector.ErrRecordTooLarge),
-		strings.Contains(err.Error(), vector.ErrRecordTooLarge.Error()),
+		vector.IsRecordTooLargeMessage(err.Error()),
 		errors.Is(err, vector.ErrEmptyFilter),
 		errors.Is(err, vector.ErrEmptyGroupBy),
 		errors.Is(err, vector.ErrSparseMismatch),
