@@ -539,9 +539,16 @@ func (e *ambiguousError) Unwrap() error { return e.err }
 // server-side CAS), so a blind replay after an ambiguous post-commit failure
 // would apply every increment twice; it surfaces the ambiguous error instead,
 // exactly like "incr_ex".
+// "vector_operate" and its named / multi-vector twins are the SAME op-list
+// applied to a record held inside a POINT's payload instead of under a KV key,
+// so they inherit "operate"'s reasoning verbatim: a replayed ADD double-counts,
+// and a replayed CHECK is evaluated against a record the first attempt already
+// changed. They are listed individually rather than matched by a "vector_"
+// prefix so a future read-only vector op cannot be swept in by accident.
 func nonReplayableOp(op string) bool {
 	switch op {
-	case "set_nx", "cas", "cad", "getdel", "getset", "incr_ex", "caex", "persist", "flush", "__flush_shard__", "operate":
+	case "set_nx", "cas", "cad", "getdel", "getset", "incr_ex", "caex", "persist", "flush", "__flush_shard__", "operate",
+		"vector_operate", "vector_named_operate", "vector_mv_operate":
 		return true
 	}
 	return false

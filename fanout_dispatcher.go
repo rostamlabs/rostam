@@ -10,6 +10,7 @@ import (
 
 	"github.com/rostamlabs/rostam/cluster"
 	"github.com/rostamlabs/rostam/ops"
+	"github.com/rostamlabs/rostam/sdk/wire"
 )
 
 // innerDispatcher is the minimal surface the decorator wraps. Both *cluster.Node
@@ -190,7 +191,7 @@ var dataPlaneAliasOps = map[string]struct{}{
 	"vector_insert": {}, "vector_upsert": {}, "vector_insert_if_absent": {},
 	"vector_delete": {}, "vector_exists": {}, "vector_get": {}, "vector_get_batch": {},
 	"vector_set_payload": {}, "vector_overwrite_payload": {},
-	"vector_delete_payload_keys": {}, "vector_clear_payload": {},
+	"vector_delete_payload_keys": {}, "vector_clear_payload": {}, "vector_operate": {},
 	"vector_mv_add": {}, "vector_mv_delete": {}, "vector_mv_search": {},
 	"vector_mv_hybrid_search": {},
 	"vector_mv_query":         {},
@@ -198,7 +199,7 @@ var dataPlaneAliasOps = map[string]struct{}{
 	"vector_mv_add_if_absent": {}, "vector_mv_exists": {}, "vector_mv_get": {},
 	"vector_mv_get_batch": {}, "vector_mv_scroll": {},
 	"vector_mv_set_payload": {}, "vector_mv_overwrite_payload": {},
-	"vector_mv_delete_payload_keys": {}, "vector_mv_clear_payload": {},
+	"vector_mv_delete_payload_keys": {}, "vector_mv_clear_payload": {}, "vector_mv_operate": {},
 	"vector_named_insert": {}, "vector_named_delete": {}, "vector_named_search": {},
 	"vector_named_sparse_search": {},
 	"vector_named_hybrid_search": {},
@@ -206,7 +207,7 @@ var dataPlaneAliasOps = map[string]struct{}{
 	"vector_named_search_docs":   {}, "vector_named_scroll": {}, "vector_named_get": {},
 	"vector_named_get_batch":   {},
 	"vector_named_set_payload": {}, "vector_named_overwrite_payload": {},
-	"vector_named_delete_payload_keys": {}, "vector_named_clear_payload": {},
+	"vector_named_delete_payload_keys": {}, "vector_named_clear_payload": {}, "vector_named_operate": {},
 }
 
 // Call routes a single op. Known read ops on a partitioned collection fan out
@@ -259,6 +260,8 @@ func (f *fanoutDispatcher) Call(name string, args []byte) ([]byte, error) {
 		return f.fanDeletePayloadKeys(name, args, r)
 	case "vector_clear_payload":
 		return f.fanClearPayload(name, args, r)
+	case "vector_operate":
+		return f.fanOperate(name, args, r)
 	case "vector_create_collection":
 		return f.fanCreateCollection(name, args, r)
 	case "vector_drop_collection":
@@ -281,6 +284,8 @@ func (f *fanoutDispatcher) Call(name string, args []byte) ([]byte, error) {
 		return f.fanMVDeletePayloadKeys(name, args, r)
 	case "vector_mv_clear_payload":
 		return f.fanMVClearPayload(name, args, r)
+	case "vector_mv_operate":
+		return f.fanMVOperate(name, args, r)
 	case "vector_mv_search":
 		return f.fanMVSearch(name, args, r)
 	case "vector_mv_scroll":
@@ -305,6 +310,8 @@ func (f *fanoutDispatcher) Call(name string, args []byte) ([]byte, error) {
 		return f.fanNamedDeletePayloadKeys(name, args, r)
 	case "vector_named_clear_payload":
 		return f.fanNamedClearPayload(name, args, r)
+	case "vector_named_operate":
+		return f.fanNamedOperate(name, args, r)
 	case "vector_named_search":
 		return f.fanNamedSearch(name, args, r)
 	case "vector_named_sparse_search":
@@ -952,6 +959,60 @@ func (f *fanoutDispatcher) fanGetBatch(name string, args []byte, r fanRoute) ([]
 		rows = append(rows, ops.GetBatchRow{ID: id, Found: false})
 	}
 	return ops.EncodeVectorGetBatchResult(rows), nil
+}
+
+// fanOperate applies an operate op-list to a record inside a point's payload on
+// the owning physical partition. It is the fan-out row for all three families:
+// one wire shape (EncodeVectorOperateArgs), one decoder, and the op NAME picks
+// which embedded method runs — so the three handlers below differ only in that
+// call and cannot drift apart in their CAS handling.
+//
+// The CAS precondition is REBUILT into a WriteOpts and handed to the embedded
+// method, which re-encodes it into the physical-partition args. fanSetPayload
+// decodes with ops.DecodeSetPayloadArgsOpts, the NON-CAS decoder, so a
+// partitioned set_payload silently loses the guard between the client and the
+// partition. Nothing else in this file can restore it once it is dropped here,
+// which is why the decode is the CAS-carrying one.
+//
+// It cannot recurse: resolveRoute short-circuits names containing '#'/'@' to
+// partitioned=false, and the embedded method substitutes the physical partition
+// name before its own Call.
+func (f *fanoutDispatcher) fanOperate(name string, args []byte, r fanRoute) ([]byte, error) {
+	return f.fanOperateVia(name, args, r, f.e.VectorOperate)
+}
+
+// fanNamedOperate is fanOperate for the named family. See fanOperate.
+func (f *fanoutDispatcher) fanNamedOperate(name string, args []byte, r fanRoute) ([]byte, error) {
+	return f.fanOperateVia(name, args, r, f.e.VectorNamedOperate)
+}
+
+// fanMVOperate is fanOperate for the multi-vector family. See fanOperate.
+func (f *fanoutDispatcher) fanMVOperate(name string, args []byte, r fanRoute) ([]byte, error) {
+	return f.fanOperateVia(name, args, r, f.e.VectorMVOperate)
+}
+
+// operateFn is the shape the three embedded operate methods share.
+type operateFn func(ctx context.Context, coll string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, error)
+
+// fanOperateVia is the shared body of the three operate fan handlers.
+func (f *fanoutDispatcher) fanOperateVia(name string, args []byte, r fanRoute, call operateFn) ([]byte, error) {
+	if !r.partitioned {
+		return f.inner.Call(name, args)
+	}
+	coll, id, pk, a, exp, hasExp, err := ops.DecodeVectorOperateArgs(args)
+	if err != nil {
+		return nil, err
+	}
+	var wo WriteOpts
+	if hasExp {
+		v := exp
+		wo.ExpectedVersion = &v // WriteOpts carries the precondition as a *uint64
+	}
+	found, res, err := call(context.Background(), coll, id, pk, a, wo)
+	if err != nil {
+		return nil, err
+	}
+	return ops.EncodeVectorOperateResult(found, res)
 }
 
 // fanSetPayload merges a payload patch on the owning physical partition. Like

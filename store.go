@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/rostamlabs/rostam/ops"
+	"github.com/rostamlabs/rostam/sdk/wire"
 	"github.com/rostamlabs/rostam/vector"
 )
 
@@ -590,6 +591,29 @@ type Store interface {
 	// an error) for an absent point.
 	VectorClearPayload(ctx context.Context, collection string, id uint64, opts ...WriteOpts) (applied bool, err error)
 
+	// VectorOperate applies one operate op-list to the RECORD stored in the
+	// point's payload under payloadKey — the same op-list a KV operate runs,
+	// against a record held inside a point instead of under a KV key. The whole
+	// read-modify-write happens inside the collection's write lock, so it is
+	// atomic: one WAL record, one version bump, and a failed CHECK leaves the
+	// point byte-identical AND unbumped.
+	//
+	// found is false (NOT an error) for an absent/tombstoned/expired point,
+	// exactly like VectorSetPayload's applied flag. A point that exists but whose
+	// payload key holds no record, when a.Create is OperateCreateNone, is
+	// ops.ErrVectorRecordAbsent — a real error, not a silent no-op. A payload key
+	// holding a non-record value is vector.ErrPayloadKeyNotRecord.
+	//
+	// opts[0].ExpectedVersion is honored on EVERY backend: it rides in the ARGS
+	// (wire.EncodeVectorOperateArgs), not in the write-consistency envelope, so a
+	// mismatch returns vector.ErrVersionConflict with no mutation whether the call
+	// went out embedded, networked or direct.
+	//
+	// The op is REFUSED with ErrOperateDuringReshard while the collection is
+	// mid-reshard: it is non-idempotent, so the dual-write VectorSetPayload uses
+	// would double-count every ADD across the two generations. Retry after cutover.
+	VectorOperate(ctx context.Context, collection string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (found bool, res *wire.OperateResult, err error)
+
 	// VectorNamedGet retrieves a named-vector point by id: its per-space vectors
 	// (map[name][]float32; omitted spaces absent), shared payload, and remaining
 	// TTL. found is false (not an error) for an absent/expired point. See VectorGet.
@@ -634,6 +658,10 @@ type Store interface {
 	// VectorNamedClearPayload removes id's entire shared payload. applied false (not
 	// an error) for absent.
 	VectorNamedClearPayload(ctx context.Context, name string, id uint64, opts ...WriteOpts) (applied bool, err error)
+
+	// VectorNamedOperate is VectorOperate against a named-vector point's SHARED
+	// payload. Same contract in every respect — see VectorOperate.
+	VectorNamedOperate(ctx context.Context, name string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (found bool, res *wire.OperateResult, err error)
 
 	// VectorMVGet retrieves a multi-vector document by id: its token matrix
 	// ([][]float32) and payload. found is false (not an error) for an absent
@@ -697,6 +725,10 @@ type Store interface {
 	// VectorMVClearPayload removes docID's entire payload. applied false (not an
 	// error) for an absent document.
 	VectorMVClearPayload(ctx context.Context, name string, docID uint64, opts ...WriteOpts) (applied bool, err error)
+
+	// VectorMVOperate is VectorOperate against a multi-vector document's payload.
+	// Same contract in every respect — see VectorOperate.
+	VectorMVOperate(ctx context.Context, name string, docID uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (found bool, res *wire.OperateResult, err error)
 }
 
 // getFlags builds the get-op projection flags byte from the with_vector /

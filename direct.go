@@ -11,6 +11,7 @@ import (
 
 	"github.com/rostamlabs/rostam/cache"
 	"github.com/rostamlabs/rostam/ops"
+	"github.com/rostamlabs/rostam/sdk/wire"
 	"github.com/rostamlabs/rostam/server"
 	"github.com/rostamlabs/rostam/vector"
 	"github.com/rostamlabs/rostam/wasm"
@@ -859,6 +860,46 @@ func (d *directStore) VectorClearPayload(_ context.Context, collection string, i
 		return false, err
 	}
 	return ops.DecodePayloadResult(body)
+}
+
+// vectorOperate is the shared body of the three direct operate methods.
+//
+// opts is USED, not discarded: directStore.VectorSetPayload takes
+// `_ ...WriteOpts` and throws the caller's CAS precondition away outright. A
+// direct-mode store has no Raft layer and no other guard on a single-node write,
+// so the precondition in the args is the only thing standing between two
+// concurrent read-modify-writes and a lost update. The write-consistency knobs in
+// WriteOpts genuinely do not apply here (there is nothing to barrier), which is
+// why only ExpectedVersion is read.
+func (d *directStore) vectorOperate(opName, collection string, id uint64, payloadKey string,
+	a *wire.OperateArgs, opts []WriteOpts,
+) (bool, *wire.OperateResult, error) {
+	exp, hasExp := firstWriteOpts(opts).expectedVersion()
+	args, err := wire.EncodeVectorOperateArgs(collection, id, payloadKey, a, exp, hasExp)
+	if err != nil {
+		return false, nil, err
+	}
+	body, err := d.Call(context.Background(), opName, args)
+	if err != nil {
+		return false, nil, err
+	}
+	return ops.DecodeVectorOperateResult(body)
+}
+
+// VectorOperate runs the dense operate op against the single in-process shard,
+// honoring the CAS precondition. See Store.VectorOperate.
+func (d *directStore) VectorOperate(_ context.Context, collection string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, error) {
+	return d.vectorOperate("vector_operate", collection, id, payloadKey, a, opts)
+}
+
+// VectorNamedOperate is VectorOperate against the named family. See vectorOperate.
+func (d *directStore) VectorNamedOperate(_ context.Context, name string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, error) {
+	return d.vectorOperate("vector_named_operate", name, id, payloadKey, a, opts)
+}
+
+// VectorMVOperate is VectorOperate against the multi-vector family. See vectorOperate.
+func (d *directStore) VectorMVOperate(_ context.Context, name string, docID uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, error) {
+	return d.vectorOperate("vector_mv_operate", name, docID, payloadKey, a, opts)
 }
 
 func (d *directStore) VectorNamedGet(ctx context.Context, name string, id uint64, withVector, withPayload bool) (bool, map[string][]float32, VectorMetadata, time.Duration, error) {

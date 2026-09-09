@@ -19,6 +19,7 @@ import (
 	"github.com/rostamlabs/rostam/cache"
 	"github.com/rostamlabs/rostam/cluster"
 	"github.com/rostamlabs/rostam/ops"
+	"github.com/rostamlabs/rostam/sdk/wire"
 	"github.com/rostamlabs/rostam/shard"
 	"github.com/rostamlabs/rostam/vector"
 )
@@ -1605,6 +1606,99 @@ func (e *embedded) VectorClearPayload(_ context.Context, collection string, id u
 		return false, err
 	}
 	return ops.DecodePayloadResult(body)
+}
+
+// ErrOperateDuringReshard is returned by the three Store operate methods while a
+// reshard is dual-writing the target collection. It is RETRYABLE: the caller
+// should retry after cutover, when the collection has a single live generation
+// again.
+//
+// The refusal exists because operate is NOT idempotent. applyDualWrite sends the
+// SAME op to both the live and the target generation, which is safe for
+// set_payload (storing a payload twice stores the same payload) and is exactly
+// wrong for an op-list whose ADD/MUL/SHL accumulate and whose CHECK is evaluated
+// against whatever record each generation happens to hold. The reshard backfill
+// copies points between generations and can land before, between or after the two
+// legs, so the two copies can disagree by an arbitrary number of increments — and
+// the disagreement survives cutover, silently, forever.
+//
+// Refusing costs the caller the use of vector_operate on ONE collection for the
+// minutes a reshard runs, visibly. Dual-writing would cost a permanently
+// double-counted counter, invisibly.
+var ErrOperateDuringReshard = errors.New("rostam: vector_operate is refused while a reshard is dual-writing; retry after cutover")
+
+// vectorOperate is the shared body of VectorOperate / VectorNamedOperate /
+// VectorMVOperate: the three families differ only in the op name they dispatch,
+// so the alias resolution, the reshard refusal, the CAS threading and the
+// write-consistency barrier live here once rather than in three copies that can
+// drift apart (the same reason the set_payload family shares applyDualWrite).
+//
+// Two things it does that the set_payload family does NOT:
+//
+//   - It REFUSES rather than dual-writes when dualTargets reports a reshard. See
+//     ErrOperateDuringReshard.
+//   - It threads the CAS precondition into the ARGS. networkedStore and
+//     directStore's set_payload siblings drop the precondition on the floor
+//     (client.go's non-CAS encoder, direct.go's `_ ...WriteOpts`); every operate
+//     path honors it.
+//
+// The refusal is a CHECK, not a fence: dualTargets reads the LOCAL catalog, so a
+// reshard that begins between that read and the Raft apply lets one operate land
+// on the live generation only, and if the backfill already copied that point the
+// increment is lost at cutover. The window is one op's dispatch latency at the
+// instant a reshard starts — the same TOCTOU class set_payload's dual-write
+// already lives with. Closing it needs a catalog-epoch fence on the apply path
+// and is a recorded follow-up; this closes the STEADY-STATE reshard, which is the
+// part that lasts minutes rather than microseconds.
+func (e *embedded) vectorOperate(opName, collection string, id uint64, payloadKey string,
+	a *wire.OperateArgs, opts []WriteOpts,
+) (bool, *wire.OperateResult, error) {
+	collection = e.resolveAlias(collection)
+	live, _, dual := e.dualTargets(collection, id)
+	if dual {
+		return false, nil, fmt.Errorf("%w: collection %q", ErrOperateDuringReshard, collection)
+	}
+	if live != "" {
+		collection = live
+	}
+	wo := firstWriteOpts(opts)
+	exp, hasExp := wo.expectedVersion()
+	args, err := wire.EncodeVectorOperateArgs(collection, id, payloadKey, a, exp, hasExp)
+	if err != nil {
+		return false, nil, err
+	}
+	body, err := e.Call(context.Background(), opName, args)
+	if err != nil {
+		return false, nil, err
+	}
+	if wo.wcActive() {
+		if err := e.barrierPhys(collection, wo); err != nil {
+			return false, nil, err
+		}
+	}
+	return ops.DecodeVectorOperateResult(body)
+}
+
+// VectorOperate applies an operate op-list to the record under payloadKey in the
+// point's payload, on the live gen's owning physical partition. found=false (the
+// decoded flag) for an absent point — not an error.
+//
+// Unlike VectorSetPayload it does NOT dual-write during a reshard; see
+// vectorOperate and ErrOperateDuringReshard.
+func (e *embedded) VectorOperate(_ context.Context, collection string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, error) {
+	return e.vectorOperate("vector_operate", collection, id, payloadKey, a, opts)
+}
+
+// VectorNamedOperate is VectorOperate against a named-vector point's shared
+// payload. See vectorOperate.
+func (e *embedded) VectorNamedOperate(_ context.Context, name string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, error) {
+	return e.vectorOperate("vector_named_operate", name, id, payloadKey, a, opts)
+}
+
+// VectorMVOperate is VectorOperate against a multi-vector document's payload.
+// See vectorOperate.
+func (e *embedded) VectorMVOperate(_ context.Context, name string, docID uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, error) {
+	return e.vectorOperate("vector_mv_operate", name, docID, payloadKey, a, opts)
 }
 
 func (e *embedded) CreateCollection(_ context.Context, name string, cfg VectorConfig) error {

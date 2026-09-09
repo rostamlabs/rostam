@@ -822,6 +822,47 @@ func (n *networkedStore) VectorClearPayload(ctx context.Context, collection stri
 	return ops.DecodePayloadResult(body)
 }
 
+// vectorOperate is the shared body of the three networked operate methods: the
+// families differ only in the op name, and the CAS threading is the part that
+// must not be re-derived per family.
+//
+// The CAS guard rides in the ARGS, not in opts. networkedStore.VectorSetPayload
+// encodes with ops.EncodeSetPayloadArgsOpts — the NON-CAS encoder — so its
+// caller's ExpectedVersion reaches wcCall and nothing else, and the write applies
+// unconditionally. Do not copy that here. wcCall still carries the
+// write-consistency options, which is all it was ever carrying.
+func (n *networkedStore) vectorOperate(ctx context.Context, opName, collection string, id uint64, payloadKey string,
+	a *wire.OperateArgs, opts []WriteOpts,
+) (bool, *wire.OperateResult, error) {
+	wo := firstWriteOpts(opts)
+	exp, hasExp := wo.expectedVersion()
+	args, err := wire.EncodeVectorOperateArgs(collection, id, payloadKey, a, exp, hasExp)
+	if err != nil {
+		return false, nil, err
+	}
+	body, err := n.wcCall(ctx, opName, args, wo)
+	if err != nil {
+		return false, nil, mapErr(err)
+	}
+	return ops.DecodeVectorOperateResult(body)
+}
+
+// VectorOperate sends the dense operate op with the CAS precondition in the args.
+// See Store.VectorOperate.
+func (n *networkedStore) VectorOperate(ctx context.Context, collection string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, error) {
+	return n.vectorOperate(ctx, "vector_operate", collection, id, payloadKey, a, opts)
+}
+
+// VectorNamedOperate is VectorOperate against the named family. See vectorOperate.
+func (n *networkedStore) VectorNamedOperate(ctx context.Context, name string, id uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, error) {
+	return n.vectorOperate(ctx, "vector_named_operate", name, id, payloadKey, a, opts)
+}
+
+// VectorMVOperate is VectorOperate against the multi-vector family. See vectorOperate.
+func (n *networkedStore) VectorMVOperate(ctx context.Context, name string, docID uint64, payloadKey string, a *wire.OperateArgs, opts ...WriteOpts) (bool, *wire.OperateResult, error) {
+	return n.vectorOperate(ctx, "vector_mv_operate", name, docID, payloadKey, a, opts)
+}
+
 func (n *networkedStore) VectorNamedGet(ctx context.Context, name string, id uint64, withVector, withPayload bool) (bool, map[string][]float32, VectorMetadata, time.Duration, error) {
 	return n.VectorNamedGetExt(ctx, name, id, withVector, withPayload, ReadOpts{})
 }
