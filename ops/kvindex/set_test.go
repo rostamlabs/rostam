@@ -847,6 +847,254 @@ func TestInstallDuringWalkLeavesTheNewDefBuilding(t *testing.T) {
 	}
 }
 
+// TestOverlappingWalksNeverPublishPartial is the deterministic version of the
+// interleaving a pointer-identity guard cannot see.
+//
+// Rebuild and Backfill both reset their posting IN PLACE, so during an overlap
+// s.posts[name] is the same *posting for both walks and a pointer check still
+// holds. The damage: a backfill fills k:000-k:049, a rebuild then empties the
+// posting and refills only k:000-k:019, and the backfill — which started first
+// and is still holding a valid pointer — finishes and grants ready over the
+// rebuild's partial refill. The index is then published holding neither walk's
+// result, and an eq query for a value only a lost key holds returns nothing
+// while that key is live. That is the missing-candidate class this package
+// exists to make impossible, so readiness is granted against the GENERATION,
+// not the pointer.
+//
+// The two walks are stepped by hand here — no goroutines, no timing.
+func TestOverlappingWalksNeverPublishPartial(t *testing.T) {
+	const n = 100
+	ks := keyspace{vals: make(map[string][]byte, n)}
+	for i := 0; i < n; i++ {
+		k := fmt.Sprintf("k:%03d", i)
+		ks.keys = append(ks.keys, k)
+		ks.vals[k] = intRec("rc", int64(i))
+	}
+	d := mustDef(t, "ix", "", "rc", wire.KVIndexKindScalar)
+	s := New(1024)
+	s.Install([]Def{d})
+
+	// stepped hands out a walk that emits ks.keys[from:to] when driven.
+	stepped := func(from, to int) func(func(key, value []byte) bool) {
+		return func(fn func(key, value []byte) bool) {
+			for _, k := range ks.keys[from:to] {
+				if !fn([]byte(k), ks.vals[k]) {
+					return
+				}
+			}
+		}
+	}
+
+	// The backfill's walk runs in two halves, with a whole rebuild in between.
+	var rebuildDone bool
+	s.Backfill("ix", func(fn func(key, value []byte) bool) {
+		stepped(0, 50)(fn)        // the backfill fills k:000-k:049
+		s.Rebuild(stepped(0, 20)) // a rebuild empties it and refills k:000-k:019
+		rebuildDone = true
+		stepped(50, 100)(fn) // the backfill's tail, into a generation it no longer owns
+	})
+	if !rebuildDone {
+		t.Fatal("the overlapping rebuild did not run")
+	}
+
+	// The rebuild owns the current generation, so IT published — and what it
+	// published is exactly what it walked, with nothing the stale walk added.
+	if !s.IsReady("ix") {
+		t.Fatal("the rebuild that owns the generation did not publish its result")
+	}
+	if keys, _ := s.Stats("ix"); keys != 20 {
+		t.Fatalf("index holds %d keys, want the rebuild's 20 — a stale walk wrote into a generation it does not own", keys)
+	}
+	// A published index must not be missing a candidate for anything it covers.
+	sel := Selector{Def: d, Op: vtypes.FilterEq, Values: []vtypes.Value{vtypes.NewInt(19)}}
+	if got := mustCandidates(t, s, sel, nil, bigBudget); !equalStrings(got, []string{"k:019"}) {
+		t.Fatalf("eq 19 over the published index: got %v, want [k:019]", got)
+	}
+}
+
+func TestRebuildWithNilWalkPublishesNothing(t *testing.T) {
+	d := mustDef(t, "ix", "", "rc", wire.KVIndexKindScalar)
+	s := New(1024)
+	s.Install([]Def{d})
+
+	// A nil walker walked nothing, so it is not evidence of an empty keyspace
+	// and may not publish an empty posting set as exact.
+	s.Rebuild(nil)
+	if s.IsReady("ix") {
+		t.Fatal("Rebuild(nil) published an unwalked index as ready")
+	}
+	s.Backfill("ix", nil)
+	if s.IsReady("ix") {
+		t.Fatal("Backfill(nil) published an unwalked index as ready")
+	}
+}
+
+func TestCandidatesRejectsAStaleDef(t *testing.T) {
+	old := mustDef(t, "ix", "u:", "rc", wire.KVIndexKindScalar)
+	s := readySet(old)
+	s.Reindex([]byte("u:k"), intRec("rc", 1))
+
+	sel := Selector{Def: old, Op: vtypes.FilterEq, Values: []vtypes.Value{vtypes.NewInt(1)}}
+	if _, err := s.Candidates(sel, nil, bigBudget); err != nil {
+		t.Fatalf("current definition: %v", err)
+	}
+
+	// A re-issued, byte-identical definition at a newer meta index is the SAME
+	// index and must still answer.
+	reissued := old
+	reissued.MetaIndex = 77
+	s.Install([]Def{reissued})
+	if _, err := s.Candidates(sel, nil, bigBudget); err != nil {
+		t.Fatalf("re-issued identical definition: %v", err)
+	}
+
+	// A definition whose PATH moved is a different index wearing the same name:
+	// its postings answer a different question, so they are not a superset of
+	// the caller's predicate and must not be served to it.
+	moved := mustDef(t, "ix", "u:", "sc", wire.KVIndexKindScalar)
+	s.Install([]Def{moved})
+	s.MarkReady("ix")
+	if _, err := s.Candidates(sel, nil, bigBudget); !errors.Is(err, ErrIndexChanged) {
+		t.Fatalf("moved path: err = %v, want ErrIndexChanged", err)
+	}
+
+	// Same for a definition whose PREFIX moved.
+	rescoped := mustDef(t, "ix", "o:", "rc", wire.KVIndexKindScalar)
+	s.Install([]Def{rescoped})
+	s.MarkReady("ix")
+	if _, err := s.Candidates(sel, nil, bigBudget); !errors.Is(err, ErrIndexChanged) {
+		t.Fatalf("moved prefix: err = %v, want ErrIndexChanged", err)
+	}
+}
+
+// TestCandidatesRangeChargesDistinctValues pins the cost a range walk pays
+// even when it matches nothing. The walk is O(distinct values) whatever the
+// answer size is, and it runs under the read lock, so an uncharged walk over a
+// high-cardinality index blocks every write for its duration while reporting
+// "0 candidates, well inside budget". Charging the examinations turns that
+// into an honest typed refusal.
+func TestCandidatesRangeChargesDistinctValues(t *testing.T) {
+	d := mustDef(t, "ix", "", "rc", wire.KVIndexKindScalar)
+	s := readySet(d)
+	const distinct = 500
+	for i := 0; i < distinct; i++ {
+		s.Reindex([]byte(fmt.Sprintf("k%04d", i)), intRec("rc", int64(i)))
+	}
+	if _, got := s.Stats("ix"); got != distinct {
+		t.Fatalf("setup: %d distinct values, want %d", got, distinct)
+	}
+
+	// Matches NOTHING (every value is >= 0), so no key is ever charged — the
+	// examinations are the whole cost, and they must be refused.
+	empty := Selector{Def: d, Op: vtypes.FilterLt, Values: []vtypes.Value{vtypes.NewInt(0)}}
+	if _, err := s.Candidates(empty, nil, distinct/2); !errors.Is(err, ErrCandidateBudget) {
+		t.Fatalf("zero-match range over %d distinct values with budget %d: err = %v, want ErrCandidateBudget",
+			distinct, distinct/2, err)
+	}
+	// With room for the walk it answers normally, empty.
+	if got := mustCandidates(t, s, empty, nil, distinct+1); len(got) != 0 {
+		t.Fatalf("zero-match range: got %v", got)
+	}
+	// A budget that covers the examinations but not the keys they admit is
+	// still a refusal.
+	all := Selector{Def: d, Op: vtypes.FilterGte, Values: []vtypes.Value{vtypes.NewInt(0)}}
+	if _, err := s.Candidates(all, nil, distinct+10); !errors.Is(err, ErrCandidateBudget) {
+		t.Fatalf("full-match range: err = %v, want ErrCandidateBudget", err)
+	}
+	if got := mustCandidates(t, s, all, nil, 2*distinct); len(got) != distinct {
+		t.Fatalf("full-match range with room: got %d keys, want %d", len(got), distinct)
+	}
+
+	// An eq selector pays only for the keys it unions, unchanged: the walk
+	// there is one map probe, not a scan of the distinct values.
+	eq := Selector{Def: d, Op: vtypes.FilterEq, Values: []vtypes.Value{vtypes.NewInt(3)}}
+	if got := mustCandidates(t, s, eq, nil, 1); !equalStrings(got, []string{"k0003"}) {
+		t.Fatalf("eq with a budget of exactly 1 key: got %v", got)
+	}
+
+	// A bound no ordering can use examines nothing at all, so it answers even
+	// with a budget of zero.
+	boolBound := Selector{Def: d, Op: vtypes.FilterGt, Values: []vtypes.Value{vtypes.NewBool(true)}}
+	if got := mustCandidates(t, s, boolBound, nil, 0); len(got) != 0 {
+		t.Fatalf("unusable bound with budget 0: got %v", got)
+	}
+}
+
+// TestCandidatesSortsOutsideTheLock pins that a big page's sort does not block
+// writers. Sorting dominates the call (n log n byte comparisons against one
+// map walk), and Reindex/Drop both want the write lock — Drop while holding a
+// cache shard's write lock — so a sort inside the read lock stalls the shard
+// for its whole duration.
+//
+// Timing-tolerant by construction: the assertion is a RATIO (one write must
+// complete in well under the time the whole call takes), it is retried, and it
+// fails deterministically when the sort moves back inside the lock, where a
+// write blocks for essentially the entire call.
+func TestCandidatesSortsOutsideTheLock(t *testing.T) {
+	n := 250_000
+	if testing.Short() {
+		n = 100_000
+	}
+	d := mustDef(t, "ix", "", "rc", wire.KVIndexKindScalar)
+	s := readySet(d)
+	val := intRec("rc", 1) // one value, so the whole keyspace is one answer
+	for i := 0; i < n; i++ {
+		s.Reindex([]byte(fmt.Sprintf("k%07d", i)), val)
+	}
+	sel := Selector{Def: d, Op: vtypes.FilterEq, Values: []vtypes.Value{vtypes.NewInt(1)}}
+	other := intRec("rc", 2)
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		var (
+			wg       sync.WaitGroup
+			total    time.Duration
+			maxWrite time.Duration
+			writes   int
+		)
+		done := make(chan struct{})
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			start := time.Now()
+			got, err := s.Candidates(sel, nil, 4*n)
+			total = time.Since(start)
+			close(done)
+			if err != nil || len(got) != n {
+				t.Errorf("Candidates: %d keys, err %v", len(got), err)
+			}
+		}()
+
+		for i := 0; ; i++ {
+			select {
+			case <-done:
+			default:
+				w := time.Now()
+				s.Reindex([]byte(fmt.Sprintf("w%07d", i)), other)
+				if el := time.Since(w); el > maxWrite {
+					maxWrite = el
+				}
+				writes++
+				continue
+			}
+			break
+		}
+		wg.Wait()
+
+		if writes == 0 {
+			t.Fatal("no write raced the query; the fixture is too small to prove anything")
+		}
+		// With the sort outside the lock a write waits only for the copy loop,
+		// which is a fraction of the call. With it inside, a write waits for
+		// essentially all of it.
+		if maxWrite < total/2 {
+			t.Logf("attempt %d: Candidates %v, %d concurrent writes, slowest %v", attempt, total, writes, maxWrite)
+			return
+		}
+		t.Logf("attempt %d: Candidates %v, slowest write %v (>= half the call) — retrying", attempt, total, maxWrite)
+	}
+	t.Fatal("a concurrent write was blocked for at least half of every Candidates call: the sort is holding the read lock")
+}
+
 // TestSetNeverCallsBack proves the Set never reaches into a store on its own.
 // It matters because Drop runs UNDER a cache shard's write lock (the onRemove
 // hook): a Set method that called back into the cache while holding Set.mu

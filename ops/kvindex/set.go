@@ -12,6 +12,7 @@ import (
 
 	"github.com/rostamlabs/rostam/sdk/record"
 	"github.com/rostamlabs/rostam/sdk/vtypes"
+	"github.com/rostamlabs/rostam/sdk/wire"
 )
 
 var (
@@ -26,7 +27,21 @@ var (
 	// node's budget. It is a refusal, never a truncated page: a truncated
 	// candidate set is indistinguishable from a complete one at the caller.
 	ErrCandidateBudget = errors.New("kvindex: candidate budget exceeded")
+	// ErrIndexChanged means the caller's Def no longer describes the installed
+	// definition of that name: its path or its key prefix moved between the
+	// Lookup that produced the Selector and this call. The postings under that
+	// name now answer a DIFFERENT question, so they are not a superset of the
+	// caller's predicate — serving them would lose rows. The caller should
+	// re-read the definition (or fall back to a scan).
+	ErrIndexChanged = errors.New("kvindex: index definition changed under the query")
 )
+
+// maxSeenHint caps the size hint for the duplicate-value set an `in` selector
+// builds. The hint is derived from attacker-influenced input (the filter's
+// value list), and a size hint allocates eagerly — so it is clamped, and the
+// map is left to grow on its own for the rare selector that really carries
+// more values than this.
+const maxSeenHint = 256
 
 // keySet is the set of cache keys posted under one scalar value. Keys are
 // held as strings so the map owns its bytes: the []byte a caller hands
@@ -46,6 +61,13 @@ type posting struct {
 	vals  map[scalarKey]keySet
 	keys  map[string]scalarKey
 	ready bool
+	// gen counts the times this posting has been emptied. A walk captures it
+	// at the start and refuses to publish readiness if it has moved — see
+	// Rebuild. A POINTER identity check alone is not enough: Rebuild and
+	// Backfill reset a posting IN PLACE, so an overlapping pair of walks both
+	// still see the same *posting and the later-finishing one would grant
+	// ready over the earlier one's partial refill.
+	gen uint64
 }
 
 func newPosting() *posting {
@@ -106,6 +128,7 @@ func (p *posting) removeFrom(key []byte, sk scalarKey) {
 func (p *posting) reset() {
 	p.vals = make(map[scalarKey]keySet)
 	p.keys = make(map[string]scalarKey)
+	p.gen++
 }
 
 // Set is a shard's whole KV index: every installed definition and its
@@ -148,8 +171,17 @@ func (s *Set) Install(defs []Def) {
 	for _, d := range s.defs {
 		old[d.Name] = d
 	}
-	next := make([]Def, 0, len(defs))
-	posts := make(map[string]*posting, len(defs))
+	// Size hints are bounded before allocating: len(defs) reaches here from a
+	// decoded meta-log entry, and wire.KVIndexMaxDefs is the cluster-wide cap
+	// on how many definitions can legitimately exist. Anything above it is
+	// still installed (rejecting is the meta FSM's job, not this cache's), it
+	// just does not get to pick the allocation size.
+	hint := len(defs)
+	if hint > wire.KVIndexMaxDefs {
+		hint = wire.KVIndexMaxDefs
+	}
+	next := make([]Def, 0, hint)
+	posts := make(map[string]*posting, hint)
 	for _, d := range defs {
 		if _, dup := posts[d.Name]; dup {
 			continue
@@ -177,12 +209,7 @@ func (s *Set) Defs() []Def {
 func (s *Set) Lookup(name string) (Def, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	for i := range s.defs {
-		if s.defs[i].Name == name {
-			return s.defs[i], true
-		}
-	}
-	return Def{}, false
+	return s.lookupLocked(name)
 }
 
 // IsReady reports whether name's backfill has completed. An index that is not
@@ -195,6 +222,13 @@ func (s *Set) IsReady(name string) bool {
 }
 
 // MarkReady records that name's postings now cover every live key.
+//
+// IT IS A RAW OVERRIDE and bypasses both of Rebuild/Backfill's guards (the
+// posting identity and its generation). Production code must reach readiness
+// only by finishing a Rebuild or a Backfill, which grant it exactly when the
+// walk that filled the posting is still the one that owns it. Calling this
+// directly on a definition that has not been walked publishes a proper subset
+// of the truth.
 func (s *Set) MarkReady(name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -312,43 +346,75 @@ func (s *Set) Reset() {
 // because Reindex is idempotent in (key, value). The cache's chunked walk can
 // visit a key twice for the same reason (it restarts on a table swap).
 func (s *Set) Rebuild(walk func(func(key, value []byte) bool)) {
+	if walk == nil {
+		// Nothing was walked, so nothing may be published as complete. An empty
+		// posting set is only exact over an empty keyspace, and a nil walker is
+		// not evidence of one.
+		return
+	}
 	s.mu.Lock()
-	started := make(map[string]*posting, len(s.posts))
+	started := make(map[string]walkToken, len(s.posts))
 	for name, p := range s.posts {
 		p.reset()
 		// NOT ready until the walk finishes: a query served from a half-filled
 		// posting set is a proper subset of the truth, which is the one answer
 		// this index may never give.
 		p.ready = false
-		started[name] = p
+		started[name] = walkToken{p: p, gen: p.gen}
 	}
 	s.mu.Unlock()
 
-	if walk != nil {
-		walk(func(key, value []byte) bool {
-			s.Reindex(key, value)
-			return true
-		})
-	}
+	walk(func(key, value []byte) bool {
+		s.Reindex(key, value)
+		return true
+	})
 
 	s.mu.Lock()
-	for name, p := range started {
-		// Only the postings this walk actually filled are marked ready. An
-		// Install during the walk swaps in a FRESH posting for any definition
-		// whose shape moved, and that one has seen only the tail of the
-		// keyspace: marking it ready would publish a proper subset. It stays
-		// building until its own backfill runs.
-		if s.posts[name] == p {
-			p.ready = true
-		}
+	for name, tok := range started {
+		s.grantReadyLocked(name, tok)
 	}
 	s.mu.Unlock()
+}
+
+// walkToken identifies one filling pass over one posting: the posting itself
+// and the generation it was emptied at.
+type walkToken struct {
+	p   *posting
+	gen uint64
+}
+
+// valid reports whether the posting this token was taken on is still the
+// installed one AND has not been emptied since.
+func (s *Set) tokenValidLocked(name string, tok walkToken) bool {
+	return s.posts[name] == tok.p && tok.p.gen == tok.gen
+}
+
+// grantReadyLocked publishes a walk's result, and ONLY if that walk is still
+// the one that filled the posting. Two things can invalidate it, and both
+// would otherwise publish a proper subset of the truth:
+//
+//   - an Install replaced the definition mid-walk, so a FRESH posting is
+//     installed under the name and has seen only the tail of the keyspace
+//     (pointer check);
+//   - another walk (a Rebuild overlapping a Backfill, say) emptied the SAME
+//     posting and is refilling it, so what is in there now is that walk's
+//     partial progress, not this one's finished result (generation check).
+//
+// The invalidated walk simply publishes nothing; the walk that owns the
+// current generation publishes when it finishes.
+func (s *Set) grantReadyLocked(name string, tok walkToken) {
+	if s.tokenValidLocked(name, tok) {
+		tok.p.ready = true
+	}
 }
 
 // Backfill is Rebuild for a single definition: the one a meta write just
 // added. Unknown names are a no-op. The other definitions keep their postings
 // and their readiness throughout.
 func (s *Set) Backfill(name string, walk func(func(key, value []byte) bool)) {
+	if walk == nil {
+		return // see Rebuild: a nil walker publishes nothing.
+	}
 	s.mu.Lock()
 	p := s.posts[name]
 	if p == nil {
@@ -357,34 +423,30 @@ func (s *Set) Backfill(name string, walk func(func(key, value []byte) bool)) {
 	}
 	p.reset()
 	p.ready = false
+	tok := walkToken{p: p, gen: p.gen}
 	s.mu.Unlock()
 
-	if walk != nil {
-		walk(func(key, value []byte) bool {
-			s.reindexFor(name, p, key, value)
-			return true
-		})
-	}
+	walk(func(key, value []byte) bool {
+		s.reindexFor(name, tok, key, value)
+		return true
+	})
 
 	s.mu.Lock()
-	// Same guard as Rebuild's: if an Install replaced this definition while the
-	// walk ran, the posting we filled is no longer the installed one, and the
-	// one that IS installed has not been backfilled.
-	if s.posts[name] == p {
-		p.ready = true
-	}
+	s.grantReadyLocked(name, tok)
 	s.mu.Unlock()
 }
 
 // reindexFor is Reindex scoped to one definition — the backfill's inner step.
 // Reindexing every definition there would be correct but would pay for
 // resolving paths whose postings are already complete.
-func (s *Set) reindexFor(name string, want *posting, key, value []byte) {
+func (s *Set) reindexFor(name string, tok walkToken, key, value []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if p := s.posts[name]; p == nil || p != want {
-		// Replaced (or removed) mid-backfill: this walk is stale and must not
-		// write into the definition that took its place.
+	if !s.tokenValidLocked(name, tok) {
+		// Replaced, removed, or emptied by another walk: this walk is stale. It
+		// will publish nothing, so filling a posting that belongs to someone
+		// else's generation is pure waste (and would leave that walk's result
+		// carrying entries it did not verify).
 		return
 	}
 	for i := range s.defs {
@@ -395,7 +457,7 @@ func (s *Set) reindexFor(name string, want *posting, key, value []byte) {
 		if !bytes.HasPrefix(key, d.Prefix) {
 			return
 		}
-		s.reindexOne(want, d, key, value)
+		s.reindexOne(tok.p, d, key, value)
 		return
 	}
 }
@@ -443,24 +505,48 @@ type Selector struct {
 // The caller reads the cache next, and holding s.mu across a cache read
 // self-deadlocks (package doc, lock order).
 func (s *Set) Candidates(sel Selector, after []byte, budget int) ([][]byte, error) {
+	if err := checkSelector(sel); err != nil {
+		return nil, err
+	}
 	if budget < 0 {
 		budget = 0
 	}
+	out, err := s.collectCandidates(sel, after, budget)
+	if err != nil {
+		return nil, err
+	}
+	// SORTED WITH s.mu RELEASED. Sorting a full page dominates the whole call
+	// (n log n byte comparisons against one map walk), and every millisecond of
+	// it under the lock is a millisecond no write to this shard can be indexed —
+	// Reindex and Drop both want the write lock, and Drop holds a cache shard's
+	// write lock while it waits.
+	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i], out[j]) < 0 })
+	return out, nil
+}
+
+// checkSelector rejects a selector no candidate set can honour. Only POSITIVE
+// leaves narrow: a negation or an absence test has a posting set that is not a
+// superset of anything, so accepting one would lose rows.
+func checkSelector(sel Selector) error {
 	switch sel.Op {
 	case vtypes.FilterEq, vtypes.FilterIn:
 		if len(sel.Values) == 0 {
-			return nil, fmt.Errorf("kvindex: selector for index %q carries no values", sel.Def.Name)
+			return fmt.Errorf("kvindex: selector for index %q carries no values", sel.Def.Name)
 		}
 	case vtypes.FilterGt, vtypes.FilterGte, vtypes.FilterLt, vtypes.FilterLte:
 		if len(sel.Values) != 1 {
-			return nil, fmt.Errorf("kvindex: range selector for index %q carries %d values, want 1", sel.Def.Name, len(sel.Values))
+			return fmt.Errorf("kvindex: range selector for index %q carries %d values, want 1", sel.Def.Name, len(sel.Values))
 		}
 	default:
-		// A negation or an absence test narrows nothing: its posting set is not
-		// a superset of anything, so accepting one here would lose rows.
-		return nil, fmt.Errorf("kvindex: filter op %d is not a candidate selector", sel.Op)
+		return fmt.Errorf("kvindex: filter op %d is not a candidate selector", sel.Op)
 	}
+	return nil
+}
 
+// collectCandidates does the locked half of Candidates: it charges the budget,
+// copies the matching keys, and releases the lock. The copies are fresh, so
+// nothing the caller holds afterwards points into the index.
+func (s *Set) collectCandidates(sel Selector, after []byte, budget int) ([][]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -468,17 +554,24 @@ func (s *Set) Candidates(sel Selector, after []byte, budget int) ([][]byte, erro
 	if p == nil {
 		return nil, ErrNoSuchIndex
 	}
+	// The NAME is not enough to identify an index. If the installed definition's
+	// path or prefix has moved since the caller looked it up, these postings
+	// answer a different question and are not a superset of the caller's
+	// predicate.
+	if installed, ok := s.lookupLocked(sel.Def.Name); !ok || !sameShape(installed, sel.Def) {
+		return nil, ErrIndexChanged
+	}
 	if !p.ready {
 		return nil, ErrIndexBuilding
 	}
 
-	sets, total, err := p.selectSets(sel, budget)
+	sets, keyTotal, err := p.selectSets(sel, budget)
 	if err != nil {
 		return nil, err
 	}
-	// total is bounded by budget, so the one allocation this makes is bounded
-	// by node config and not by anything the caller sent.
-	out := make([][]byte, 0, total)
+	// keyTotal is bounded by budget (node config), so this allocation is not
+	// sized by anything the caller sent.
+	out := make([][]byte, 0, keyTotal)
 	afterStr := string(after)
 	for _, st := range sets {
 		for k := range st {
@@ -488,32 +581,58 @@ func (s *Set) Candidates(sel Selector, after []byte, budget int) ([][]byte, erro
 			out = append(out, []byte(k))
 		}
 	}
-	// Map iteration order must never be observable. Sorting also makes the
-	// page a caller cuts off deterministic.
-	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i], out[j]) < 0 })
 	return out, nil
 }
 
-// selectSets collects the posting sets the selector unions, charging each
-// one's size against budget BEFORE anything is copied. Caller holds the read
-// lock.
+func (s *Set) lookupLocked(name string) (Def, bool) {
+	for i := range s.defs {
+		if s.defs[i].Name == name {
+			return s.defs[i], true
+		}
+	}
+	return Def{}, false
+}
+
+// selectSets collects the posting sets the selector unions, charging the
+// budget BEFORE anything is copied. Caller holds the read lock.
+//
+// WHAT IS CHARGED. Every posting key a matching set contributes, and — in the
+// ordering family — every DISTINCT VALUE the walk examines. The second half
+// matters because that walk is O(distinct values) whatever the answer size is:
+// without it a range over a high-cardinality index walks a million map entries
+// under the read lock and blocks every write for the duration, while
+// truthfully reporting "0 candidates, well inside budget". Charging it turns
+// that into an honest typed refusal ("use a different index"), which is the
+// same answer this package gives to every other cost it cannot pay.
+//
+// An `in` selector's probes are NOT charged: their count is the caller's own
+// value list, which the filter frame's byte cap (wire.KVQueryMaxFilterBytes,
+// 64 KiB) already bounds to a few thousand allocation-free map lookups — three
+// orders of magnitude below what the distinct-value walk can reach.
 //
 // The sets are disjoint by construction: the reverse map gives every key
 // exactly one scalar key per definition, so no key can appear under two
 // distinct values and the union needs no deduplication.
 func (p *posting) selectSets(sel Selector, budget int) ([]keySet, int, error) {
 	var sets []keySet
-	used := 0
+	used, keyTotal := 0, 0
 	// Subtraction form, not addition: used <= budget always holds, so
-	// budget-used cannot overflow, and no sum can wrap on a 32-bit int.
+	// budget-used cannot overflow and no sum can wrap on a 32-bit int.
+	charge := func(n int) bool {
+		if n > budget-used {
+			return false
+		}
+		used += n
+		return true
+	}
 	add := func(st keySet) bool {
 		if len(st) == 0 {
 			return true
 		}
-		if len(st) > budget-used {
+		if !charge(len(st)) {
 			return false
 		}
-		used += len(st)
+		keyTotal += len(st)
 		sets = append(sets, st)
 		return true
 	}
@@ -522,7 +641,11 @@ func (p *posting) selectSets(sel Selector, budget int) ([]keySet, int, error) {
 	case vtypes.FilterEq, vtypes.FilterIn:
 		var seen map[scalarKey]struct{}
 		if len(sel.Values) > 1 {
-			seen = make(map[scalarKey]struct{}, len(sel.Values))
+			hint := len(sel.Values)
+			if hint > maxSeenHint {
+				hint = maxSeenHint
+			}
+			seen = make(map[scalarKey]struct{}, hint)
 		}
 		for _, v := range sel.Values {
 			sk, ok := scalarKeyOf(v)
@@ -541,33 +664,36 @@ func (p *posting) selectSets(sel Selector, budget int) ([]keySet, int, error) {
 				return nil, 0, ErrCandidateBudget
 			}
 		}
-	default: // the ordering family, checked by the caller
+	default: // the ordering family, already checked by checkSelector
 		bound := sel.Values[0]
-		if bf, ok := numericBound(bound); ok {
-			// Cross-kind numeric, matching compileOrdering: an int posting and a
-			// float bound compare as float64. A NaN bound admits nothing
-			// (orderingHoldsFloat), which is right — nothing satisfies it.
-			for sk, st := range p.vals {
+		bf, numeric := numericBound(bound)
+		if !numeric && bound.Kind != vtypes.ValueString {
+			// No field of any kind satisfies an ordering against a bool, a list,
+			// a geo point or a record (compileOrdering rejects every one), so the
+			// answer is empty without examining anything.
+			return nil, 0, nil
+		}
+		for sk, st := range p.vals {
+			if !charge(1) { // the EXAMINATION, matching or not
+				return nil, 0, ErrCandidateBudget
+			}
+			if numeric {
+				// Cross-kind numeric, matching compileOrdering: an int posting and
+				// a float bound compare as float64. A NaN bound admits nothing
+				// (orderingHoldsFloat), which is right — nothing satisfies it.
 				kf, ok := numericKey(sk)
 				if !ok || !orderingHoldsFloat(sel.Op, kf, bf) {
 					continue
 				}
-				if !add(st) {
-					return nil, 0, ErrCandidateBudget
-				}
-			}
-		} else if bound.Kind == vtypes.ValueString {
-			for sk, st := range p.vals {
+			} else {
 				if sk.kind != vtypes.ValueString || !orderingHolds(sel.Op, strings.Compare(sk.str, bound.Str)) {
 					continue
 				}
-				if !add(st) {
-					return nil, 0, ErrCandidateBudget
-				}
+			}
+			if !add(st) {
+				return nil, 0, ErrCandidateBudget
 			}
 		}
-		// Any other bound kind (bool, a list, geo, a record) admits nothing,
-		// because compileOrdering rejects every field against it.
 	}
-	return sets, used, nil
+	return sets, keyTotal, nil
 }
