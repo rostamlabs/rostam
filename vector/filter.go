@@ -215,6 +215,14 @@ func orderingHolds(op FilterOp, cmp int) bool {
 // field is NaN previously matched `field >= b` and `field <= b` for EVERY bound
 // b, and now matches no range predicate at all. Nothing else moves — Eq/Ne/In
 // already compared NaN with `==` (never equal to itself) and are untouched.
+//
+// TWIN: ops/kvindex/def.go carries orderingHoldsFloat, orderingHolds and
+// numericValue (as numericKey/numericBound) for the KV record posting index —
+// that package is engine-free by design and cannot import this one. Keep the
+// two in lockstep: the KV index admits a posting to a range answer using ITS
+// copy of these rules, and the moment the copies disagree the candidate set
+// stops being a superset of what this predicate accepts, which silently loses
+// rows.
 func orderingHoldsFloat(op FilterOp, a, b float64) bool {
 	// a != a is the allocation-free, math-import-free NaN test; the compiler
 	// lowers it to the same UCOMISD parity check math.IsNaN compiles to.

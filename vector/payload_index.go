@@ -41,6 +41,12 @@ type scalarKey struct {
 // is exactly the equivalence every posting set's exactness proof needs. A NaN
 // BOUND is declined for the same reason and with the same consequence: the
 // filter simply stops narrowing and the (rejecting) predicate answers.
+//
+// TWIN: ops/kvindex/def.go carries the same scalarKey/scalarKeyOf pair for the
+// KV record posting index (that package is engine-free by design and cannot
+// import this one). Keep the two in lockstep — if they ever disagree about
+// which values are indexable, the KV postings stop being a superset of the
+// predicate they narrow, which is the one thing that index may never be.
 func scalarKeyOf(v Value) (scalarKey, bool) {
 	switch v.Kind {
 	case ValueString:
