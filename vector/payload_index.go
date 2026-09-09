@@ -880,6 +880,19 @@ func indexNarrowable(field string, op FilterOp, poison recordPoison) bool {
 	if !ok {
 		return true // no '/': an ordinary literal key, indexed as it always was
 	}
+	// A record hanging off $content is invisible to the index for the SAME
+	// reason $content itself is: reindex skips the contentField entry before it
+	// reaches the ValueRecord branch, so no synthetic posting is ever written
+	// for any path under it. Without this, "$content/rc" splits, parses, and
+	// satisfies both recordShapeIndexed and recordOpIndexed, so the planner
+	// grades a permanently EMPTY posting set as exact and filter-first drops
+	// every matching row — the bare-$content hole one level deeper. Declining
+	// here (rather than teaching reindex to expand records under $content)
+	// keeps "$content is never a filter key" whole and keeps ONE record
+	// expansion site.
+	if payloadKey == contentField {
+		return false
+	}
 	p, err := record.ParsePath(path)
 	if err != nil {
 		// A literal key that merely CONTAINS a '/' but is not a valid path
