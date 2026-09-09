@@ -29,6 +29,16 @@ func TestIsPayloadKeyNotRecordMessage(t *testing.T) {
 	_, _, detailedFloat := currentRecordValue(Metadata{"widerKind": {Kind: ValueFloat, Flt: 1.5}}, "widerKind", false)
 	detailedFloatMsg := detailedFloat.Error()
 
+	// A caller-chosen key of arbitrary length must not blow up the message: the
+	// producer clips it with clipField, exactly like ErrRecordMalformed /
+	// ErrRecordTooLarge, so even a 1 MiB key yields a short, bounded message.
+	bigKey := strings.Repeat("k", 1<<20)
+	_, _, detailedBig := currentRecordValue(Metadata{bigKey: {Kind: ValueInt, Int: 5}}, bigKey, false)
+	detailedBigMsg := detailedBig.Error()
+	if len(detailedBigMsg) >= 256 {
+		t.Fatalf("clipField did not bound a 1 MiB key: message length %d (%q)", len(detailedBigMsg), detailedBigMsg)
+	}
+
 	accept := []struct {
 		name string
 		msg  string
@@ -36,6 +46,7 @@ func TestIsPayloadKeyNotRecordMessage(t *testing.T) {
 		{"bare sentinel text (guard-clause form)", ErrPayloadKeyNotRecord.Error()},
 		{"detailed form, short key", detailedMsg},
 		{"detailed form, different kind digit", detailedFloatMsg},
+		{"detailed form, 1 MiB key clipped to a short message", detailedBigMsg},
 		{"bare form re-stringified (simulates decodePBResult)", errors.New(ErrPayloadKeyNotRecord.Error()).Error()},
 		{"detailed form re-stringified (simulates decodePBResult)", errors.New(detailedMsg).Error()},
 	}
@@ -66,8 +77,8 @@ func TestIsPayloadKeyNotRecordMessage(t *testing.T) {
 			ErrPayloadKeyNotRecord.Error() + `: payload key "k" holds a value of kind `},
 		{"looks like the marker but missing a space",
 			ErrPayloadKeyNotRecord.Error() + `: payload key "k" holds a value of kind5`},
-		{"oversize input beyond the length bound",
-			ErrPayloadKeyNotRecord.Error() + `: payload key "` + strings.Repeat("k", 5000) + `" holds a value of kind 2`},
+		{"oversize input beyond the length bound (structurally well-formed but longer than any real clipField output)",
+			payloadKeyNotRecordPrefix + strings.Repeat("k", 600) + payloadKeyNotRecordSuffixMid + "2"},
 	}
 	for _, tc := range reject {
 		t.Run("reject/"+tc.name, func(t *testing.T) {

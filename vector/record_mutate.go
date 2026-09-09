@@ -69,7 +69,13 @@ func currentRecordValue(meta Metadata, key string, expired bool) (rec []byte, ex
 		return nil, false, nil
 	}
 	if v.Kind != ValueRecord {
-		return nil, false, fmt.Errorf("%w: payload key %q holds a value of kind %d", ErrPayloadKeyNotRecord, key, v.Kind)
+		// The key goes through clipField, not %q: it is caller-supplied and
+		// unbounded, and this message is returned VERBATIM to the caller on
+		// every transport (a client error, classified 400 / InvalidArgument)
+		// and carried across replication as a string. Keep in step with
+		// checkRecordValues / checkRecordValuesAll (vector/metadata.go), which
+		// clip the key for the same reason.
+		return nil, false, fmt.Errorf("%w: payload key %s holds a value of kind %d", ErrPayloadKeyNotRecord, clipField(key), v.Kind)
 	}
 	return v.Rec, true, nil
 }
@@ -81,9 +87,8 @@ func currentRecordValue(meta Metadata, key string, expired bool) (rec []byte, ex
 // errors.New, losing errors.Is identity, and a bare strings.Contains fallback
 // would make any error that merely mentions the sentinel text client-facing.
 //
-// The two recognized shapes (<key> is the RAW payload key rendered by %q —
-// unlike ErrRecordMalformed/ErrRecordTooLarge this producer does not run it
-// through clipField, so a caller-chosen key of any length can appear here;
+// The two recognized shapes (<key> is clipField's bounded rendering of the
+// caller's payload key, exactly as for ErrRecordMalformed/ErrRecordTooLarge;
 // <N> is the decimal vtypes.ValueKind of whatever the key actually holds):
 //
 //	vector: payload key does not hold a record
@@ -117,13 +122,14 @@ func IsPayloadKeyNotRecordMessage(s string) bool {
 
 // maxPayloadKeyNotRecordMessageLen bounds the input IsPayloadKeyNotRecordMessage
 // scans, so classification cost cannot scale with an attacker-chosen key's
-// length (the key here is unbounded — see IsPayloadKeyNotRecordMessage's doc).
-// A key longer than this cap simply fails to match and falls through to the
-// redacted internal-error bucket, which is the safe direction to fail in.
-const maxPayloadKeyNotRecordMessageLen = 4096
+// length. clipField already bounds the key to ~64 source bytes (worst-case
+// quoted/escaped well under 300), so — unlike before clipField was used here —
+// even a caller-chosen key of arbitrary length (a 1 MiB key, say) produces a
+// message well under this cap; mirrors maxRecordTooLargeMessageLen's reasoning.
+const maxPayloadKeyNotRecordMessageLen = 512
 
 // payloadKeyNotRecordPrefix is the fixed text that opens the detailed form,
-// ending right before the caller-controlled %q(key) rendering.
+// ending right before the caller-controlled clipField(key) rendering.
 var payloadKeyNotRecordPrefix = ErrPayloadKeyNotRecord.Error() + ": payload key "
 
 // payloadKeyNotRecordSuffixMid is the fixed text between the caller-controlled
