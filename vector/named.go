@@ -670,7 +670,10 @@ func (nc *NamedCollection) insertLockedAt(id uint64, vectors map[string][]float3
 // normal bump (an old record predating the version block defaults a fresh insert
 // to 1).
 func (nc *NamedCollection) RestoreInsert(id uint64, vectors map[string][]float32, sparseVectors map[string]*SparseVector, payload Metadata, ttl time.Duration, keyExpires map[string]uint64, version uint64) error {
-	if err := checkRecordValues(payload); err != nil {
+	// REPLAY body: size only. Its only caller is named_wal.go's replay, which
+	// discards the error — a shape check here would silently drop an acked
+	// write. No ops handler reaches it. See checkRecordValuesSize.
+	if err := checkRecordValuesSize(payload); err != nil {
 		return err
 	}
 	if err := nc.validateInsertSpaces(vectors, sparseVectors); err != nil {
@@ -1368,6 +1371,13 @@ func (nc *NamedCollection) mutatePayloadRecordLockedAt(id uint64, key string, fn
 		// same cap on the ingest side, but it only ever sees a caller's patch —
 		// it cannot reach bytes the operate engine just produced, which is what
 		// this site exists for. Keep the two in step.
+		//
+		// SIZE ONLY, DELIBERATELY: no record.Validate here. These bytes come from
+		// applyRecordBytes, which phase 1 held to the tree oracle, so they are
+		// well-formed by construction; re-decoding the whole record on every
+		// counter increment would double the op's cost for a case that cannot
+		// arise. The shape check belongs where bytes arrive from a CALLER, which
+		// is checkRecordValues.
 		if len(rec) > maxRecordValueBytes {
 			return nil, nil, 0, false, fmt.Errorf("%w: payload key %q would hold a %d-byte record, the cap is %d bytes",
 				ErrRecordTooLarge, key, len(rec), maxRecordValueBytes)

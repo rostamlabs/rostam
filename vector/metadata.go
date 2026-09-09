@@ -172,17 +172,82 @@ func (fl fieldLookup) get(m Metadata) (Value, bool) {
 // transports like ErrDimMismatch.
 var ErrRecordTooLarge = errors.New("vector: record payload value exceeds the storage cap")
 
-// checkRecordValues rejects a payload carrying an oversize ValueRecord. Every
-// mutation entry calls it BEFORE it touches any state or stages a WAL write;
-// the inner helpers those entries share deliberately do NOT repeat it, so each
-// op pays exactly one pass over its own payload.
+// checkRecordValues is the INGEST gate for every payload a caller supplies. It
+// rejects a ValueRecord that is oversize (ErrRecordTooLarge) or that no operate
+// engine could open (ErrRecordMalformed). Every wire-reachable mutation entry
+// calls it BEFORE it touches any state or stages a WAL write; the inner helpers
+// those entries share deliberately do NOT repeat it, so each op pays exactly one
+// pass over its own payload.
 //
-// It is one of TWO sites for this bound, and the divergence is deliberate: this
-// one sees a CALLER's patch, while mutatePayloadRecordBody (vector/hnsw.go, with
-// twins in vector/ivf.go and in the named/MV mutatePayloadRecordLockedAt) bounds
-// the POST-mutation bytes the operate engine just produced, which no patch check
-// can reach. Keep the two in step.
+// TWO CHECKS, TWO REACHES.
+//
+//   - The SIZE bound is one of two sites, and the divergence is deliberate: this
+//     one sees a CALLER's patch, while mutatePayloadRecordBody (vector/hnsw.go,
+//     with twins in vector/ivf.go and in the named/MV mutatePayloadRecordLockedAt)
+//     bounds the POST-mutation bytes the operate engine just produced, which no
+//     patch check can reach. Keep the two in step.
+//   - The SHAPE check (record.Validate) closes the poison hole phase 1 could only
+//     fail closed around: a record IndexEntries cannot enumerate but Resolve still
+//     answers from makes every path under that payload key decline to accelerate,
+//     for every point in the collection, and a later vector_operate on the same
+//     key fails with wire.ErrOperateRecord. Refusing it at the door costs the
+//     caller one error; accepting it costs the collection a payload key.
+//
+// WHY THE ORDER MATTERS: size first. An oversize value is refused without ever
+// being decoded, so a 16 MiB+1 payload cannot be used to make the gate itself
+// expensive.
+//
+// The replay bodies call checkRecordValuesSize instead — see its doc for which
+// ones and why.
 func checkRecordValues(m Metadata) error {
+	for k, v := range m {
+		if v.Kind != ValueRecord {
+			continue
+		}
+		// Both messages put the key through clipField, not %q: it is
+		// caller-supplied and bounded only by the route body cap, and both are
+		// returned VERBATIM to the caller on every transport (client errors,
+		// classified 400 / InvalidArgument) and carried across replication as a
+		// string. A short key renders exactly as %q did. Keep in step with
+		// checkRecordValuesSize.
+		if len(v.Rec) > maxRecordValueBytes {
+			return fmt.Errorf("%w: payload key %s holds a %d-byte record, the cap is %d bytes",
+				ErrRecordTooLarge, clipField(k), len(v.Rec), maxRecordValueBytes)
+		}
+		if err := record.Validate(v.Rec); err != nil {
+			return fmt.Errorf("%w: payload key %s: %w", ErrRecordMalformed, clipField(k), err)
+		}
+	}
+	return nil
+}
+
+// checkRecordValuesSize is checkRecordValues WITHOUT the shape check: the size
+// bound only. It is what the REPLAY bodies call — the ones whose metadata comes
+// from a WAL record or a snapshot this store already acked, never from a live
+// caller:
+//
+//	hnsw.restoreInsertBody / hnsw.RestorePayload
+//	ivf.restoreInsertBody  / ivf.RestorePayload
+//	NamedCollection.RestoreInsert (its only caller is named_wal.go replay)
+//	MultiVectorIndex.restoreAdd   (mv_wal.go replay; the WIRE entry above it,
+//	                               MultiRestoreAddSparse, does the full check)
+//
+// WHY REPLAY MUST NOT VALIDATE SHAPE. Replay's job is to rebuild state that was
+// already ACKNOWLEDGED. A shape check there could refuse a record written before
+// this gate existed and silently drop the write (named_wal.go and mv_wal.go
+// discard the restore error), turning a lost acceleration into lost data — a
+// strictly worse failure than the poison the gate prevents. The size bound is
+// safe to keep here because nothing the WAL or a snapshot can hold can fail it
+// (writeOptMeta refuses to encode an oversize record and readValue caps at
+// maxRecordValueBytes), so on these paths it can only ever fire for a caller
+// that reached the engine body directly.
+//
+// The WIRE-reachable members of the restore family are NOT in this list:
+// Collection.RestoreInsert/RestoreInsertAt (ops/builtin.go routes a wire insert
+// carrying a non-zero version to them) and MultiVectorIndex.MultiRestoreAddSparse
+// (ops/multivector.go, ops/mv_batch.go) carry the caller's own metadata, so they
+// run the full checkRecordValues like any other ingest entry.
+func checkRecordValuesSize(m Metadata) error {
 	for k, v := range m {
 		if v.Kind == ValueRecord && len(v.Rec) > maxRecordValueBytes {
 			// The key goes through clipField, not %q: it is caller-supplied and

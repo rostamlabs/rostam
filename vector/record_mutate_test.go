@@ -577,11 +577,9 @@ func TestMutateRecordReindexesBadRecordPoison(t *testing.T) {
 	}
 	// A mode byte followed by a torn schema blob: IndexEntries cannot
 	// enumerate it, so the payload key is poisoned and nothing under it
-	// accelerates.
-	if _, _, err := h.Insert(1, []float32{1, 0, 0, 0},
-		0, Metadata{"session": NewRecord([]byte{0x01, 0xFF})}, nil, nil, CASCond{}); err != nil {
-		t.Fatal(err)
-	}
+	// accelerates. Seeded through the REPLAY entry because the public ones now
+	// refuse a malformed record (ErrRecordMalformed) — see insertViaReplay.
+	insertViaReplay(t, h, 1, []float32{1, 0, 0, 0}, Metadata{"session": NewRecord([]byte{0x01, 0xFF})})
 	if !h.payloadIdx.badRecords.poisoned("session") {
 		t.Fatal("the malformed record did not poison the payload key — the fixture is wrong")
 	}
@@ -780,6 +778,11 @@ type mutateHarness struct {
 	setPayload func(t *testing.T, id uint64, meta Metadata, keyTTLMs map[string]int64)
 	mutate     func(id uint64, key string, fn RecordMutator, cas CASCond) (version uint64, changed bool, err error)
 	mutateAt   func(id uint64, key string, fn RecordMutator, cas CASCond, nowMs int64) (version uint64, changed bool, err error)
+	// mutateAtKE is mutateAt keeping the RESULTING per-key deadline map, which
+	// mutateAt drops. It is normalised to int64 unix-millis (the slot-keyed
+	// engines report uint64, the id-keyed ones int64) so one table can assert on
+	// all four engines.
+	mutateAtKE func(id uint64, key string, fn RecordMutator, cas CASCond, nowMs int64) (map[string]int64, uint64, bool, error)
 	// payload is the live payload as a reader sees it at the pinned clock
 	// (per-key-expired keys already dropped); ok=false for a dead/absent point.
 	payload func(id uint64) (Metadata, bool)
@@ -861,6 +864,10 @@ func vectorIndexHarness(name string, ix VectorIndex, setNow func(int64)) mutateH
 			_, _, version, changed, err := ix.MutatePayloadRecordAt(id, key, fn, cas, nowMs)
 			return version, changed, err
 		},
+		mutateAtKE: func(id uint64, key string, fn RecordMutator, cas CASCond, nowMs int64) (map[string]int64, uint64, bool, error) {
+			_, ke, version, changed, err := ix.MutatePayloadRecordAt(id, key, fn, cas, nowMs)
+			return deadlinesInt64(ke), version, changed, err
+		},
 		payload: func(id uint64) (Metadata, bool) {
 			_, meta, _, _, _, ok := ix.Get(id)
 			return meta, ok
@@ -877,6 +884,20 @@ func vectorIndexHarness(name string, ix VectorIndex, setNow func(int64)) mutateH
 			return storedMeta(t, ix, id)
 		},
 	}
+}
+
+// deadlinesInt64 converts a slot-keyed engine's absolute per-key deadline map to
+// the int64 unix-millis the id-keyed engines already report, so the shared table
+// compares like with like.
+func deadlinesInt64(ke map[string]uint64) map[string]int64 {
+	if ke == nil {
+		return nil
+	}
+	out := make(map[string]int64, len(ke))
+	for k, v := range ke {
+		out[k] = int64(v) //nolint:gosec // absolute unix-millis deadlines fit int64
+	}
+	return out
 }
 
 // mutateCase is one engine-level scenario, run against every engine so no copy

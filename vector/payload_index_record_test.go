@@ -205,9 +205,9 @@ func recordCorpus(t *testing.T, n, dim int) (*hnsw, map[uint64][]float32, map[ui
 		}
 		corpus[id] = v
 		metas[id] = m
-		if _, _, err := h.Insert(id, v, 0, m, nil, nil, CASCond{}); err != nil {
-			t.Fatal(err)
-		}
+		// A few of these points carry a DAMAGED record under "torn", which the
+		// public entries now refuse (ErrRecordMalformed) — see insertViaReplay.
+		insertViaReplay(t, h, id, v, m)
 	}
 	return h, corpus, metas
 }

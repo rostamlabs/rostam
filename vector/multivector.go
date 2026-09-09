@@ -677,7 +677,10 @@ func (m *MultiVectorIndex) addLockedAt(docID uint64, tokens [][]float32, meta Me
 // does NOT WAL-log. A version of 0 falls back to the normal bump (an old record
 // predating the version block defaults a fresh add to 1).
 func (m *MultiVectorIndex) restoreAdd(docID uint64, tokens [][]float32, meta Metadata, keyExpires map[string]uint64, version uint64, sparse *SparseVector) error {
-	if err := checkRecordValues(meta); err != nil {
+	// REPLAY body: size only. mv_wal.go replays through here directly, so a
+	// shape check would refuse an acked doc; the WIRE entry above it,
+	// MultiRestoreAddSparse, runs the full check. See checkRecordValuesSize.
+	if err := checkRecordValuesSize(meta); err != nil {
 		return err
 	}
 	if len(tokens) == 0 {
@@ -962,6 +965,16 @@ func (m *MultiVectorIndex) MultiRestoreAddSparse(docID uint64, tokens [][]float3
 		if err := sparse.Validate(); err != nil {
 			return err
 		}
+	}
+	// THIS ENTRY IS WIRE-REACHABLE, its inner restoreAdd is not: ops/multivector.go
+	// (handleMVRestoreAdd) and ops/mv_batch.go route a client's own metadata here,
+	// while mv_wal.go replays straight into restoreAdd. So the full ingest gate runs
+	// HERE — restoreAdd keeps the size-only check for the replay path. The size half
+	// is therefore walked twice on this path; that is one pass over a map on an
+	// offline backfill, and the alternative is a shape check on replay, which could
+	// discard an acked document.
+	if err := checkRecordValues(meta); err != nil {
+		return err
 	}
 	// keyExpires carries the doc's ABSOLUTE per-key payload deadlines (from the scan
 	// trailer); restoreAdd sets them VERBATIM (NOT recomputed). nil ⇒ the no-key-TTL
@@ -1553,6 +1566,13 @@ func (m *MultiVectorIndex) mutatePayloadRecordLockedAt(docID uint64, key string,
 		// same cap on the ingest side, but it only ever sees a caller's patch —
 		// it cannot reach bytes the operate engine just produced, which is what
 		// this site exists for. Keep the two in step.
+		//
+		// SIZE ONLY, DELIBERATELY: no record.Validate here. These bytes come from
+		// applyRecordBytes, which phase 1 held to the tree oracle, so they are
+		// well-formed by construction; re-decoding the whole record on every
+		// counter increment would double the op's cost for a case that cannot
+		// arise. The shape check belongs where bytes arrive from a CALLER, which
+		// is checkRecordValues.
 		if len(rec) > maxRecordValueBytes {
 			return nil, nil, 0, false, fmt.Errorf("%w: payload key %q would hold a %d-byte record, the cap is %d bytes",
 				ErrRecordTooLarge, key, len(rec), maxRecordValueBytes)

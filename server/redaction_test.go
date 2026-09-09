@@ -207,3 +207,19 @@ func TestMapResultKeepsRecordTooLargeVisible(t *testing.T) {
 		})
 	}
 }
+
+// TestClientFacingErrMalformedRecord pins the TCP transport's half of the same
+// classification the HTTP edge makes (httpapi.TestStatusForErrorMalformedRecord).
+// vector.ErrRecordMalformed is a caller mistake — bytes the caller sent that no
+// operate engine can open — so its message must reach the client verbatim rather
+// than being redacted to "internal error", which would leave a client unable to
+// tell a bad payload from a server fault.
+func TestClientFacingErrMalformedRecord(t *testing.T) {
+	err := fmt.Errorf("%w: payload key %q: bad", vector.ErrRecordMalformed, "session")
+	if !clientFacingErr(err) {
+		t.Error("clientFacingErr(ErrRecordMalformed) = false, want true")
+	}
+	if !clientFacingErr(vector.ErrRecordTooLarge) {
+		t.Error("clientFacingErr(ErrRecordTooLarge) = false, want true (the sibling bound)")
+	}
+}

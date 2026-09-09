@@ -548,7 +548,9 @@ func (ix *ivf) RestoreInsertAt(id uint64, vec []float32, ttl time.Duration, meta
 }
 
 func (ix *ivf) restoreInsertBody(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64, stamped bool, nowMs uint64) error {
-	if err := checkRecordValues(meta); err != nil {
+	// REPLAY body: size only — the IVF twin of hnsw.restoreInsertBody. See
+	// checkRecordValuesSize.
+	if err := checkRecordValuesSize(meta); err != nil {
 		return err
 	}
 	if len(vec) != ix.cfg.Dim {
@@ -3723,6 +3725,13 @@ func (ix *ivf) mutatePayloadRecordBody(id uint64, key string, fn RecordMutator, 
 		// same cap on the ingest side, but it only ever sees a caller's patch —
 		// it cannot reach bytes the operate engine just produced, which is what
 		// this site exists for. Keep the two in step.
+		//
+		// SIZE ONLY, DELIBERATELY: no record.Validate here. These bytes come from
+		// applyRecordBytes, which phase 1 held to the tree oracle, so they are
+		// well-formed by construction; re-decoding the whole record on every
+		// counter increment would double the op's cost for a case that cannot
+		// arise. The shape check belongs where bytes arrive from a CALLER, which
+		// is checkRecordValues.
 		if len(rec) > maxRecordValueBytes {
 			return nil, nil, 0, false, fmt.Errorf("%w: payload key %q would hold a %d-byte record, the cap is %d bytes",
 				ErrRecordTooLarge, key, len(rec), maxRecordValueBytes)
@@ -3836,7 +3845,9 @@ func (ix *ivf) clearPayloadBody(id uint64, cas CASCond, stamped bool, nowMs uint
 }
 
 func (ix *ivf) RestorePayload(id uint64, meta Metadata, keyExpires map[string]uint64, version uint64) error {
-	if err := checkRecordValues(meta); err != nil {
+	// REPLAY body: size only — the IVF twin of hnsw.RestorePayload. See
+	// checkRecordValuesSize.
+	if err := checkRecordValuesSize(meta); err != nil {
 		return err
 	}
 	ix.mu.Lock()

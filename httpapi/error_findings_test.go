@@ -333,3 +333,20 @@ func TestStatusForErrorRecordTooLarge(t *testing.T) {
 		}
 	}
 }
+
+// TestStatusForErrorMalformedRecord pins the ingest gate's shape rejection as a
+// 400. vector.ErrRecordMalformed is what every wire-reachable entry returns for
+// record bytes no operate engine can open, and it arrived with the phase-2
+// ingest validation — a sentinel that matched nothing here would have surfaced a
+// caller's own bad bytes as an opaque 500 with the message redacted, so this
+// keeps it in the same bucket as ErrRecordTooLarge and in sync with
+// server.clientFacingErr.
+func TestStatusForErrorMalformedRecord(t *testing.T) {
+	err := fmt.Errorf("%w: payload key %q: bad", vector.ErrRecordMalformed, "session")
+	if got := statusForError(err); got != http.StatusBadRequest {
+		t.Errorf("statusForError(ErrRecordMalformed) = %d, want 400", got)
+	}
+	if got := statusForError(vector.ErrRecordTooLarge); got != http.StatusBadRequest {
+		t.Errorf("statusForError(ErrRecordTooLarge) = %d, want 400 (the sibling bound)", got)
+	}
+}

@@ -125,6 +125,13 @@ list-valued payload shares its slice. Read it, never write through it — mutati
 it changes the live record while the index still describes the old bytes. Copy
 the slice if you need to keep or edit it.
 
+Every write that stores a record value is **validated at ingest** — insert,
+insert-if-absent, upsert, `set_payload`, `overwrite_payload` and the bulk
+paths alike. Bytes no operate engine could open are refused with a 400 before
+anything changes (`vector: record payload value is not a decodable operate
+record`), and so is a record above the 16 MiB storage cap. A mis-encoded `rec`
+is therefore a rejected request, not a stored value that misbehaves later.
+
 ### Path grammar
 
 A filter's `field` string is tried as an exact payload key first. Only when
@@ -261,9 +268,14 @@ the index for **every point**, for as long as the malformed record survives:
 filtered search and delete/scroll selection fall back to evaluating the live
 record, which stays correct. The key regains acceleration automatically once
 the malformed point's payload is repaired, cleared, or the point itself is
-reclaimed; it is a tracked state, not a one-way trip. Since a hand-crafted
-byte string can trigger this, produce records only through `operate` or its
-SDK encoder, never by hand.
+reclaimed; it is a tracked state, not a one-way trip.
+
+Ingest validation (above) means a write can no longer put the collection into
+this state: every entry that stores a record value refuses one that cannot be
+decoded. The fail-closed machinery remains as the backstop for records written
+before that gate existed and for anything restored from an older snapshot or
+log, which replay must never refuse. Produce records only through `operate` or
+its SDK encoder, never by hand.
 
 ### Known limits
 

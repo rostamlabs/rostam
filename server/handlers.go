@@ -201,6 +201,11 @@ func clientFacingErr(err error) bool {
 		// caller unredacted.
 		errors.Is(err, vector.ErrRecordTooLarge),
 		vector.IsRecordTooLargeMessage(err.Error()),
+		// vector.ErrRecordMalformed: a payload carrying record bytes no operate
+		// engine can open. Same bucket and same reasoning as the cap above — the
+		// caller sent those bytes, the remedy is to send a well-formed record,
+		// and the message names only the payload key the caller chose.
+		errors.Is(err, vector.ErrRecordMalformed),
 		errors.Is(err, vector.ErrEmptyFilter),
 		errors.Is(err, vector.ErrEmptyGroupBy),
 		errors.Is(err, vector.ErrSparseMismatch),

@@ -506,6 +506,11 @@ func statusForError(err error) int {
 		// merely wraps the sentinel, leaking it to the caller unredacted.
 		errors.Is(err, vector.ErrRecordTooLarge),
 		vector.IsRecordTooLargeMessage(err.Error()),
+		// Record bytes no operate engine can open: 400, not 500. Storing them
+		// would poison every accelerated filter under that payload key for the
+		// whole collection, so refusing at the door is the client-fixable
+		// mistake. Keeps this classifier in sync with server.clientFacingErr.
+		errors.Is(err, vector.ErrRecordMalformed),
 		errors.Is(err, vector.ErrEmptyFilter),
 		errors.Is(err, vector.ErrEmptyGroupBy),
 		errors.Is(err, vector.ErrSparseMismatch),

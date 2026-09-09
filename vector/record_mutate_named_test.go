@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"testing"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -30,6 +31,14 @@ func walAppendFails(w *wal) { w.poisoned.Store(true) }
 // still writes, but f.Sync() on a pipe fails with EINVAL, so the append succeeds
 // and commitWaitStaged fails — the tail error return. The pipe's read end is
 // held open for the test's lifetime so the write never draws EPIPE.
+//
+// CLEANUP ORDERING. t.Cleanup runs LIFO, and the store's own `_ = cs.Close()`
+// cleanup is registered FIRST (by seedB2Named/seedB2MV), so this one runs
+// BEFORE it: by the time Close reaches the WAL, w.f is a closed pipe and its
+// final Sync fails. That is harmless here and deliberate — those callers discard
+// Close's error, and the swapped-away real log file is closed by this cleanup
+// rather than leaked. A future caller that ASSERTS on Close's error must swap
+// w.f back instead of relying on this ordering.
 func walSyncFails(t *testing.T, w *wal) {
 	t.Helper()
 	pr, pw, err := os.Pipe()
@@ -205,6 +214,10 @@ func namedMutateHarness(t *testing.T) mutateHarness {
 			_, _, v, changed, err := nc.mutatePayloadRecordLockedAt(id, key, fn, cas, nowMs)
 			return v, changed, err
 		},
+		mutateAtKE: func(id uint64, key string, fn RecordMutator, cas CASCond, nowMs int64) (map[string]int64, uint64, bool, error) {
+			_, ke, v, changed, err := nc.mutatePayloadRecordLockedAt(id, key, fn, cas, nowMs)
+			return ke, v, changed, err
+		},
 		payload: func(id uint64) (Metadata, bool) {
 			_, meta, _, _, ok := nc.Get(id)
 			return meta, ok
@@ -254,6 +267,10 @@ func mvMutateHarness(t *testing.T) mutateHarness {
 		mutateAt: func(id uint64, key string, fn RecordMutator, cas CASCond, nowMs int64) (uint64, bool, error) {
 			_, _, v, changed, err := m.mutatePayloadRecordLockedAt(id, key, fn, cas, nowMs)
 			return v, changed, err
+		},
+		mutateAtKE: func(id uint64, key string, fn RecordMutator, cas CASCond, nowMs int64) (map[string]int64, uint64, bool, error) {
+			_, ke, v, changed, err := m.mutatePayloadRecordLockedAt(id, key, fn, cas, nowMs)
+			return ke, v, changed, err
 		},
 		payload: func(id uint64) (Metadata, bool) {
 			_, meta, _, ok := m.Get(id)
@@ -439,6 +456,103 @@ func TestMutateRecordNamedAndMVMatchDense(t *testing.T) {
 			})
 		}
 	})
+
+	// A mutation touches ONE key. The engines rebuild the whole per-key deadline
+	// map when they write, so the hazard is not that the other key's VALUE
+	// changes — the "creates under an absent key" case already covers that — but
+	// that its DEADLINE is dropped or recomputed on the way through, silently
+	// making a key with hours left expire now or never.
+	t.Run("a mutation preserves the other keys' deadlines", func(t *testing.T) {
+		for _, newH := range allMutateHarnesses(t) {
+			h := newH(t)
+			t.Run(h.name, func(t *testing.T) {
+				// At now=4000: "session" gets deadline 5000, "other" gets 9000.
+				h.setNow(4000)
+				h.setPayload(t, 1, Metadata{
+					"session": NewRecord(sessionRecordBytes(t)),
+					"other":   NewString("keep me"),
+				}, map[string]int64{"session": 1000, "other": 5000})
+
+				ke, _, changed, err := h.mutateAtKE(1, "session",
+					storeFn(sessionRecordBytesRC(t, 8)), CASCond{}, 4500)
+				if err != nil {
+					t.Fatalf("mutateAtKE(4500): %v", err)
+				}
+				if !changed {
+					t.Fatal("changed=false storing under a live key")
+				}
+				if got := ke["other"]; got != 9000 {
+					t.Errorf("the untouched key's deadline = %d, want 9000 (deadlines: %v)", got, ke)
+				}
+
+				// And it is a real deadline, not just a number in the returned
+				// map: the key is live before 9000 and gone after it.
+				h.setNow(8999)
+				if meta, ok := h.payload(1); !ok || !meta["other"].Equal(NewString("keep me")) {
+					t.Errorf("the untouched key is not live at now=8999: %v", meta)
+				}
+				h.setNow(9000)
+				if meta, ok := h.payload(1); ok {
+					if _, present := meta["other"]; present {
+						t.Errorf("the untouched key outlived its deadline at now=9000: %v", meta)
+					}
+				}
+			})
+		}
+	})
+}
+
+// TestMutateRecordNamedPointTTLExpiryGate is the named family's POINT-ttl gate,
+// the twin of the dense TestMutateRecordDeadPointNotFound. A point whose own TTL
+// has passed is gone: the mutation must report ErrIDNotFound against the STAMPED
+// clock, and — because a mutator is caller code that may have side effects — it
+// must never run at all.
+func TestMutateRecordNamedPointTTLExpiryGate(t *testing.T) {
+	nc := newTestNamed(t)
+	nc.now = func() int64 { return mutateHarnessBase }
+	// A 1s point TTL: the deadline is mutateHarnessBase+1000.
+	if _, err := nc.InsertCAS(1, namedVecs(),
+		Metadata{"session": NewRecord(sessionRecordBytes(t))}, time.Second, CASCond{}); err != nil {
+		t.Fatalf("InsertCAS: %v", err)
+	}
+	// The wall clock is moved far past the deadline, so any judgement below that
+	// comes out "live" proves the stamp — not the clock — decided it.
+	nc.now = func() int64 { return mutateHarnessBase + 9_000_000 }
+
+	// One millisecond before the deadline the point is still there.
+	var called bool
+	if _, _, _, changed, err := nc.mutatePayloadRecordLockedAt(1, "session",
+		func(_ []byte, _ bool) ([]byte, RecordMutation, error) {
+			called = true
+			return nil, RecordUnchanged, nil
+		}, CASCond{}, mutateHarnessBase+999); err != nil {
+		t.Fatalf("mutate at stamp base+999: %v, want nil", err)
+	} else if changed {
+		t.Error("changed=true for RecordUnchanged")
+	}
+	if !called {
+		t.Fatal("the mutator never ran against a live point — the wall clock was consulted")
+	}
+
+	// At the deadline it is gone.
+	called = false
+	version, changed, err := func() (uint64, bool, error) {
+		_, _, v, ch, e := nc.mutatePayloadRecordLockedAt(1, "session",
+			func(_ []byte, _ bool) ([]byte, RecordMutation, error) {
+				called = true
+				return sessionRecordBytesRC(t, 8), RecordStore, nil
+			}, CASCond{}, mutateHarnessBase+1000)
+		return v, ch, e
+	}()
+	if !errors.Is(err, ErrIDNotFound) {
+		t.Fatalf("err = %v, want ErrIDNotFound", err)
+	}
+	if called {
+		t.Error("the mutator ran against a point past its TTL")
+	}
+	if changed || version != 0 {
+		t.Errorf("changed=%v version=%d against an expired point, want false/0", changed, version)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -535,8 +649,15 @@ func TestMutateRecordNamedSharedPayloadReindex(t *testing.T) {
 		// A mode byte followed by a torn schema blob: IndexEntries cannot
 		// enumerate it, so the payload key is poisoned and nothing under it
 		// accelerates. The accounting is per-ID here, not per-slot.
-		if _, err := nc.InsertCAS(1, namedVecs(), Metadata{"session": NewRecord([]byte{0x01, 0xFF})}, 0, CASCond{}); err != nil {
-			t.Fatalf("InsertCAS: %v", err)
+		//
+		// Seeded through NamedCollection.RestoreInsert, the named family's REPLAY
+		// entry (size-checked, not shape-checked — see checkRecordValuesSize):
+		// InsertCAS now refuses a malformed record with ErrRecordMalformed, so
+		// this state is only reachable the way it originally arose, from bytes
+		// stored before the gate existed. version 0 bumps a fresh point to 1
+		// exactly as InsertCAS did.
+		if err := nc.RestoreInsert(1, namedVecs(), nil, Metadata{"session": NewRecord([]byte{0x01, 0xFF})}, 0, nil, 0); err != nil {
+			t.Fatalf("RestoreInsert: %v", err)
 		}
 		if !nc.payloadIdx.badRecords.poisoned("session") {
 			t.Fatal("the malformed record did not poison the payload key — the fixture is wrong")

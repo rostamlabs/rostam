@@ -5,9 +5,13 @@ package vector
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/rostamlabs/rostam/sdk/record"
+	"github.com/rostamlabs/rostam/sdk/wire"
 )
 
 // A ValueRecord above maxRecordValueBytes is the one payload value the
@@ -27,15 +31,85 @@ import (
 
 // oversizeRecord builds a payload whose record value is one byte past the cap.
 // It is not a valid record — it never needs to be, because the size check runs
-// before anything looks inside it.
+// BEFORE the shape check (checkRecordValues), which is what keeps an oversize
+// payload from being an expensive way to make the gate decode 16 MiB.
 func oversizeRecord() Metadata {
 	return Metadata{"session": NewRecord(make([]byte, maxRecordValueBytes+1))}
 }
 
 // atCapRecord is the largest record the codec accepts: the boundary must be
 // inclusive, or the check would move the limit rather than enforce it.
-func atCapRecord() Metadata {
-	return Metadata{"session": NewRecord(make([]byte, maxRecordValueBytes))}
+func atCapRecord(t *testing.T) Metadata {
+	t.Helper()
+	return Metadata{"session": NewRecord(atCapRecordBytes(t))}
+}
+
+// atCapRecordBytes builds a WELL-FORMED record of EXACTLY maxRecordValueBytes.
+//
+// It used to be maxRecordValueBytes zero bytes, which was enough while the gate
+// only bounded a record's SIZE. Now that checkRecordValues also validates its
+// SHAPE, a run of zeroes is rejected as malformed and the boundary test would
+// pass for the wrong reason — it would stop saying anything about the cap. So
+// the fixture has to be legal in both senses.
+//
+// Shape: a dynamic-mode record of BYTES fields. One BYTES value is capped at
+// wire.OperateMaxBytesLen (64 KiB), so reaching 16 MiB takes ~256 of them, and
+// two trailing fields (always present, so the field count never changes) carry
+// the padding that lands the encoding exactly on the cap. The length is TUNED by
+// measurement rather than computed, because a length prefix is a uvarint whose
+// own width changes with the value it holds.
+func atCapRecordBytes(t *testing.T) []byte {
+	t.Helper()
+	const full = wire.OperateMaxBytesLen
+
+	build := func(n, tailTotal int) []byte {
+		a := tailTotal
+		if a > full {
+			a = full
+		}
+		fields := make([]wire.Field, 0, n+2)
+		for i := 0; i < n; i++ {
+			fields = append(fields, wire.Field{
+				Name: fmt.Sprintf("f%04d", i),
+				Cell: wire.Cell{Type: wire.OperateTypeBytes, B: make([]byte, full)},
+			})
+		}
+		fields = append(fields,
+			wire.Field{Name: "g0", Cell: wire.Cell{Type: wire.OperateTypeBytes, B: make([]byte, a)}},
+			wire.Field{Name: "g1", Cell: wire.Cell{Type: wire.OperateTypeBytes, B: make([]byte, tailTotal-a)}},
+		)
+		return (&wire.Record{Mode: wire.OperateModeDynamic, Fields: fields}).Encode()
+	}
+
+	// Two small encodes give the per-field cost and the fixed overhead, so the
+	// full-field count is chosen in one step instead of by growing the record.
+	l1, l2 := len(build(1, 0)), len(build(2, 0))
+	per := l2 - l1
+	if per <= 0 {
+		t.Fatalf("per-field size = %d, want > 0", per)
+	}
+	n := (maxRecordValueBytes - (l1 - per) - full) / per // aim the tail at ~half its range
+
+	tail := full
+	for range 8 {
+		enc := build(n, tail)
+		if enc == nil {
+			t.Fatal("at-cap record failed to encode")
+		}
+		delta := maxRecordValueBytes - len(enc)
+		if delta == 0 {
+			if err := record.Validate(enc); err != nil {
+				t.Fatalf("the at-cap fixture is not a decodable record: %v", err)
+			}
+			return enc
+		}
+		if tail+delta < 0 || tail+delta > 2*full {
+			t.Fatalf("cannot tune the padding to the cap: n=%d tail=%d delta=%d", n, tail, delta)
+		}
+		tail += delta
+	}
+	t.Fatal("the at-cap record length did not converge")
+	return nil
 }
 
 func wantTooLarge(t *testing.T, what string, err error) {
@@ -204,7 +278,7 @@ func TestRecordAtCapAccepted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCollection: %v", err)
 	}
-	if err := c.Insert(1, []float32{1, 0, 0, 0}, 0, atCapRecord(), nil); err != nil {
+	if err := c.Insert(1, []float32{1, 0, 0, 0}, 0, atCapRecord(t), nil); err != nil {
 		t.Fatalf("Insert at exactly the cap: %v, want nil", err)
 	}
 }
@@ -417,7 +491,7 @@ func TestRestoreAtCapAccepted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCollection: %v", err)
 	}
-	if err := c.RestoreInsert(1, []float32{1, 0, 0, 0}, 0, atCapRecord(), nil, nil, 5); err != nil {
+	if err := c.RestoreInsert(1, []float32{1, 0, 0, 0}, 0, atCapRecord(t), nil, nil, 5); err != nil {
 		t.Fatalf("RestoreInsert at exactly the cap: %v, want nil", err)
 	}
 	if _, _, _, _, version, ok := c.Get(1); !ok || version != 5 {

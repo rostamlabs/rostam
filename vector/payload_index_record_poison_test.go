@@ -86,6 +86,28 @@ func namelessSchemaRecord(t *testing.T, a int64) []byte {
 	return enc
 }
 
+// insertViaReplay places a point through the engine's REPLAY entry, which checks
+// a record value's SIZE but not its SHAPE (see checkRecordValuesSize).
+//
+// WHY THE CORPORA BELOW NO LONGER USE Insert. The public ingest entries now run
+// record.Validate on every ValueRecord and refuse a malformed one with
+// ErrRecordMalformed, so no client can put a torn record under a payload key any
+// more — which is exactly what that gate is for. The fail-closed machinery this
+// file tests must still hold for records stored BEFORE the gate existed, so the
+// fixtures reach that state the only way it is still reachable: the replay path,
+// which must never refuse an acked write.
+//
+// It is otherwise the same insert. RestoreInsert runs the identical
+// placeLockedAt (arena insert, payload-index update, version, level draw) and the
+// identical runLink, and version 0 bumps a fresh point to 1 exactly as Insert
+// does — so the corpus is byte-identical to the one Insert used to build.
+func insertViaReplay(t *testing.T, h *hnsw, id uint64, vec []float32, m Metadata) {
+	t.Helper()
+	if err := h.RestoreInsert(id, vec, 0, m, nil, nil, 0); err != nil {
+		t.Fatalf("RestoreInsert(%d): %v", id, err)
+	}
+}
+
 // TestRecordTornFixturesReproduceTheAsymmetry pins the PRECONDITION of every
 // test below: these bytes really do fail IndexEntries while still resolving a
 // field. If a future change to sdk/record makes IndexEntries partial (or makes
@@ -132,9 +154,7 @@ func poisonCorpus(t *testing.T, n int, badID uint64, bad []byte) (*hnsw, map[uin
 		}
 		corpus[id] = v
 		metas[id] = m
-		if _, _, err := h.Insert(id, v, 0, m, nil, nil, CASCond{}); err != nil {
-			t.Fatal(err)
-		}
+		insertViaReplay(t, h, id, v, m)
 	}
 	return h, corpus, metas
 }
