@@ -1042,3 +1042,116 @@ func TestMutateRecordIVFMatchesHNSW(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// the stamped/unstamped asymmetry on a key that carries a deadline
+// ---------------------------------------------------------------------------
+
+// TestMutateRecordUnstampedKeepsTheKeyDeadline pins the rule that makes an
+// unstamped replicated apply deterministic: on the UNSTAMPED path the mutator
+// must not consult the clock for the payload key's deadline at all.
+//
+// Without it, two replicas applying the same entry with wall clocks either side
+// of the deadline disagree about whether the record EXISTS — one creates a fresh
+// record, the other increments the stored one — and they hold different bytes
+// forever. So the unstamped path treats a deadline-passed record as present,
+// mutates it in place, and passes the deadline through untouched; only the
+// stamped path (whose clock is the leader's, identical everywhere) may expire
+// the key. See recordKeyPastDeadline (vector/record_mutate.go).
+//
+// Runs on all four engines, because the rule lives in four bodies.
+func TestMutateRecordUnstampedKeepsTheKeyDeadline(t *testing.T) {
+	const deadline = mutateHarnessBase + 1000
+
+	t.Run("unstamped mutates in place and keeps the deadline", func(t *testing.T) {
+		for _, newH := range allMutateHarnesses(t) {
+			h := newH(t)
+			t.Run(h.name, func(t *testing.T) {
+				// Seed an absolute deadline of base+1000 on the record key.
+				h.setNow(mutateHarnessBase)
+				h.setPayload(t, 1, Metadata{"session": NewRecord(sessionRecordBytes(t))},
+					map[string]int64{"session": 1000})
+
+				// Move this "replica's" wall clock well past the deadline.
+				h.setNow(deadline + 4000)
+
+				want := sessionRecordBytesRC(t, 8)
+				var sawOld []byte
+				var sawExists bool
+				version, changed, err := h.mutate(1, "session", func(old []byte, exists bool) ([]byte, RecordMutation, error) {
+					sawOld, sawExists = append([]byte(nil), old...), exists
+					return want, RecordStore, nil
+				}, CASCond{})
+				if err != nil {
+					t.Fatalf("%s: unstamped mutate past the deadline: %v", h.name, err)
+				}
+				if !sawExists {
+					t.Fatalf("%s: the unstamped mutator saw the record as ABSENT — a wall clock decided whether it exists, "+
+						"which is exactly what makes two replicas store different bytes", h.name)
+				}
+				if !bytes.Equal(sawOld, sessionRecordBytes(t)) {
+					t.Fatalf("%s: the unstamped mutator got old=%x, want the stored record %x",
+						h.name, sawOld, sessionRecordBytes(t))
+				}
+				if !changed || version == 0 {
+					t.Fatalf("%s: changed=%v version=%d, want a real applied mutation", h.name, changed, version)
+				}
+
+				// The deadline survived: BEFORE it the freshly written record is
+				// visible, AFTER it the key is gone again. A dropped deadline would
+				// leave the key visible at both clocks.
+				h.setNow(deadline - 1)
+				if rec, ok := h.record(t, 1, "session"); !ok || !bytes.Equal(rec, want) {
+					t.Fatalf("%s: before the deadline the mutated record is not readable (ok=%v)", h.name, ok)
+				}
+				h.setNow(deadline)
+				if _, ok := h.record(t, 1, "session"); ok {
+					t.Fatalf("%s: the key is still live at its deadline — the unstamped mutation DROPPED the deadline "+
+						"instead of passing it through", h.name)
+				}
+			})
+		}
+	})
+
+	// The control: the stamped path is the one that may expire the key, and it
+	// still does. A stamp past the deadline reads the record as absent and drops
+	// the stale deadline, so the record it writes is immediately visible.
+	t.Run("stamped past the deadline still reads absent", func(t *testing.T) {
+		for _, newH := range allMutateHarnesses(t) {
+			h := newH(t)
+			t.Run(h.name, func(t *testing.T) {
+				h.setNow(mutateHarnessBase)
+				h.setPayload(t, 1, Metadata{"session": NewRecord(sessionRecordBytes(t))},
+					map[string]int64{"session": 1000})
+				// The wall clock stays BEFORE the deadline: anything that comes out
+				// "expired" below was decided by the stamp, not by the clock.
+				h.setNow(mutateHarnessBase)
+
+				want := sessionRecordBytesRC(t, 9)
+				var sawExists bool
+				ke, version, changed, err := h.mutateAtKE(1, "session", func(_ []byte, exists bool) ([]byte, RecordMutation, error) {
+					sawExists = exists
+					return want, RecordStore, nil
+				}, CASCond{}, deadline)
+				if err != nil {
+					t.Fatalf("%s: stamped mutate at the deadline: %v", h.name, err)
+				}
+				if sawExists {
+					t.Fatalf("%s: the stamped mutator saw the deadline-passed record as PRESENT — the stamp was ignored", h.name)
+				}
+				if !changed || version == 0 {
+					t.Fatalf("%s: changed=%v version=%d, want a real applied mutation", h.name, changed, version)
+				}
+				if _, present := ke["session"]; present {
+					t.Fatalf("%s: the stale deadline survived a stamped mutation: %v", h.name, ke)
+				}
+				// The record just written is visible at a clock past the old deadline.
+				h.setNow(deadline + 4000)
+				if rec, ok := h.record(t, 1, "session"); !ok || !bytes.Equal(rec, want) {
+					t.Fatalf("%s: the record stored by the stamped mutation is invisible (ok=%v) — the stale deadline was not dropped",
+						h.name, ok)
+				}
+			})
+		}
+	})
+}

@@ -26,6 +26,7 @@ package cluster
 import (
 	"bytes"
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -201,5 +202,202 @@ func TestVectorOperateReplicasAgreeByteForByte(t *testing.T) {
 	// directly.
 	if _, ok := fields["t"]; !ok {
 		t.Fatalf("record carries no STAMPed field %q: %+v", "t", rec.Fields)
+	}
+}
+
+// setNodeVectorClock pins n's TTL wall clock on every shard store it hosts. The
+// clock reaches only the NON-apply expiry sites plus the wall-clock branch of the
+// write paths (vector.CollectionStore.SetNowFunc's contract), which is exactly
+// what an unstamped replicated apply reads — so skewing it per node is how a
+// replica's local clock is put either side of a per-key deadline.
+func setNodeVectorClock(t *testing.T, n *Node, fn func() int64) {
+	t.Helper()
+	for _, s := range n.shards {
+		if s == nil {
+			continue
+		}
+		if vs := s.VectorStore(); vs != nil {
+			vs.SetNowFunc(fn)
+		}
+	}
+}
+
+// TestVectorOperateReplicasAgreeWithAPerKeyDeadline is the byte-agreement proof
+// for the case the STAMP test cannot reach: the record's payload key carries a
+// per-key DEADLINE, and the replicas' wall clocks straddle it.
+//
+// With the leader apply stamp off (it is off cluster-wide today) every replica
+// applies with its own wall clock. If the mutator were allowed to judge the key's
+// deadline against that clock, a replica past the deadline would read the record
+// as ABSENT and create a fresh one while a replica short of it would increment
+// the stored one — both commit, both bump the version, neither errors, and the
+// two replicas hold different bytes forever. The engines therefore refuse to
+// consult the clock for the key's deadline unless the apply is stamped (see
+// vector.recordKeyPastDeadline), which is what this test pins end to end.
+//
+// The clocks are pinned through CollectionStore.SetNowFunc on each node's shard
+// stores, including for the final read: a node whose clock is past the deadline
+// would otherwise hide the key from its own vector_get and the comparison would
+// read two empty payloads that trivially agree.
+func TestVectorOperateReplicasAgreeWithAPerKeyDeadline(t *testing.T) {
+	const numShards = 4
+	tc := newTestCluster(t, 3, numShards, 3) // RF=3: every node replicates every shard
+	ctx := context.Background()
+
+	const coll = "operate/ttl"
+	physCol := string(ops.PartitionKeyGen(coll, 0, 0))
+	cfg := vector.Config{Dim: 4, Metric: vector.L2, M: 8, EfConstruction: 50, EfSearch: 64, Seed: 1}
+	if _, err := tc.client.Call(ctx, "vector_create_collection", ops.EncodeCreateCollectionArgs(physCol, cfg)); err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+
+	nodes := make([]*Node, 0, len(tc.nodes))
+	for _, n := range tc.nodes {
+		if n != nil {
+			nodes = append(nodes, n)
+		}
+	}
+	if len(nodes) != 3 {
+		t.Fatalf("expected 3 live nodes, got %d", len(nodes))
+	}
+
+	// One pinned clock per node. base is a fixed instant so nothing below depends
+	// on what time.Now happened to return.
+	const base int64 = 1_700_000_000_000
+	const keyTTLMs int64 = 50_000
+	const deadline = base + keyTTLMs
+	clocks := make([]*atomic.Int64, len(nodes))
+	for i, n := range nodes {
+		clk := &atomic.Int64{}
+		clk.Store(base)
+		clocks[i] = clk
+		setNodeVectorClock(t, n, func() int64 { return clk.Load() })
+	}
+	// Re-pin after the collection exists so a store that built it lazily still
+	// inherits the override (SetNowFunc propagates to resident indexes).
+	pinAll := func(ms int64) {
+		for i, n := range nodes {
+			clocks[i].Store(ms)
+			setNodeVectorClock(t, n, func() int64 { return clocks[i].Load() })
+		}
+	}
+	pinAll(base)
+
+	const id = uint64(7)
+	if _, err := tc.client.Call(ctx, "vector_upsert",
+		ops.EncodeVectorUpsertArgs(physCol, id, []float32{1, 0, 0, 0}, "", 0, nil, vector.SparseVector{})); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	addRC := &wire.OperateArgs{
+		Create: wire.OperateCreateDynamic,
+		Ops:    []wire.OperateOp{{Opcode: wire.OperateOpADD, Type: wire.OperateTypeU64, Path: operateFieldPath("rc"), A: 1}},
+	}
+	operate := func(t *testing.T) {
+		t.Helper()
+		args, err := wire.EncodeVectorOperateArgs(physCol, id, "session", addRC, 0, false)
+		if err != nil {
+			t.Fatalf("EncodeVectorOperateArgs: %v", err)
+		}
+		body, err := tc.client.Call(ctx, "vector_operate", args)
+		if err != nil {
+			t.Fatalf("vector_operate: %v", err)
+		}
+		found, res, err := wire.DecodeVectorOperateResult(body)
+		if err != nil {
+			t.Fatalf("DecodeVectorOperateResult: %v", err)
+		}
+		if !found || res == nil || res.Status != wire.OperateStatusOK {
+			t.Fatalf("vector_operate: found=%v res=%+v", found, res)
+		}
+	}
+
+	// waitForVersion gates on the DATA reaching every replica: raft's applied_index
+	// advances at ENQUEUE, so it is only a proxy for the apply having run. The
+	// version is read rather than the record because a replica whose clock is past
+	// the deadline hides the key from its own read.
+	waitForVersion := func(t *testing.T, want uint64) {
+		t.Helper()
+		deadlineAt := time.Now().Add(20 * time.Second)
+		for {
+			ready := true
+			for _, n := range nodes {
+				if _, v := readRecordFromNode(t, n, physCol, id, "session"); v != want {
+					ready = false
+					break
+				}
+			}
+			if ready {
+				return
+			}
+			if time.Now().After(deadlineAt) {
+				t.Fatalf("timed out waiting for every replica to reach version %d", want)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+
+	// 1. Create the record (rc=1). No deadline yet, so this step is clock-free.
+	operate(t)
+	waitForVersion(t, 2) // upsert=1, operate=2
+
+	// 2. Put a per-key deadline on the record key. An EMPTY patch with a keyTTL
+	//    only re-deadlines a key already in the payload (setPayloadBody), and with
+	//    every clock still at base every replica computes the SAME deadline.
+	if _, err := tc.client.Call(ctx, "vector_set_payload",
+		wire.EncodeSetPayloadArgsOpts(physCol, id, nil, map[string]int64{"session": keyTTLMs})); err != nil {
+		t.Fatalf("vector_set_payload: %v", err)
+	}
+	waitForVersion(t, 3)
+
+	// 3. Skew the replicas' clocks ACROSS the deadline: two past it, one short of
+	//    it. This is the state the divergence needs.
+	clocks[0].Store(deadline + 10_000)
+	clocks[1].Store(base + 10_000)
+	clocks[2].Store(deadline + 30_000)
+
+	// 4. The operate every replica now applies with its own clock.
+	operate(t)
+	waitForVersion(t, 4)
+
+	// 5. Read every replica at ONE common clock, short of the deadline, so the key
+	//    is visible everywhere and the comparison is of real stored bytes.
+	pinAll(base)
+	recs := make([][]byte, 0, len(nodes))
+	for _, n := range nodes {
+		rec, _ := readRecordFromNode(t, n, physCol, id, "session")
+		if len(rec) == 0 {
+			t.Fatalf("a replica holds no record under the payload key at the common probe clock — "+
+				"the mutation dropped the key or its deadline (node %p)", n)
+		}
+		recs = append(recs, rec)
+	}
+	for i := 1; i < len(recs); i++ {
+		if !bytes.Equal(recs[i], recs[0]) {
+			t.Fatalf("replica %d stored DIFFERENT record bytes than replica 0 — an unstamped apply judged the "+
+				"payload key's deadline against its OWN wall clock, so one replica recreated the record while "+
+				"another incremented it\n replica0=%x\n replica%d=%x", i, recs[0], i, recs[i])
+		}
+	}
+
+	// Positive control: the agreed bytes are the INCREMENTED record (rc=2), not a
+	// fresh rc=1 that every replica recreated identically because every clock
+	// happened to be past the deadline.
+	rec, err := wire.DecodeRecord(recs[0])
+	if err != nil {
+		t.Fatalf("DecodeRecord: %v", err)
+	}
+	var rc *wire.Cell
+	for i := range rec.Fields {
+		if rec.Fields[i].Name == "rc" {
+			rc = &rec.Fields[i].Cell
+		}
+	}
+	if rc == nil {
+		t.Fatalf("record carries no field %q: %+v", "rc", rec.Fields)
+	}
+	if rc.U != 2 {
+		t.Fatalf("rc = %d, want 2 — the second operate did not increment the EXISTING record, so the "+
+			"deadline-passed key was read as absent", rc.U)
 	}
 }

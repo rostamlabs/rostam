@@ -3011,6 +3011,13 @@ func (h *hnsw) overwritePayloadBody(id uint64, meta Metadata, keyTTLMs map[strin
 // means the call was a deliberate no-op (a failed CHECK, or a delete of an
 // absent key): nothing was stored, nothing was logged, the version is the
 // CURRENT one and was not bumped.
+//
+// THE KEY'S DEADLINE IS NOT CONSULTED HERE. Unstamped, `now` is this process's
+// own wall clock, and letting it decide whether the record EXISTS would let two
+// replicas store different bytes. So an unstamped mutation treats a
+// deadline-passed record as PRESENT and passes its deadline through untouched;
+// only the *At variant expires the key. See recordKeyPastDeadline
+// (vector/record_mutate.go).
 func (h *hnsw) MutatePayloadRecord(id uint64, key string, fn RecordMutator, cas CASCond) (Metadata, map[string]uint64, uint64, bool, error) {
 	return h.mutatePayloadRecordBody(id, key, fn, cas, false, 0)
 }
@@ -3020,6 +3027,10 @@ func (h *hnsw) MutatePayloadRecord(id uint64, key string, fn RecordMutator, cas 
 // clock nowMs, so a replicated record mutation sees the same record and produces
 // the same bytes on every replica (#4 vector TTL determinism, mirroring
 // SetPayloadAt).
+//
+// This is the ONLY variant that may expire the payload key: its clock is the
+// leader's stamp, identical on every replica. See recordKeyPastDeadline
+// (vector/record_mutate.go) for why the unstamped twin must not.
 func (h *hnsw) MutatePayloadRecordAt(id uint64, key string, fn RecordMutator, cas CASCond, nowMs int64) (Metadata, map[string]uint64, uint64, bool, error) {
 	return h.mutatePayloadRecordBody(id, key, fn, cas, true, uint64(nowMs)) //nolint:gosec // stamped unix-millis is non-negative
 }
@@ -3043,7 +3054,15 @@ func (h *hnsw) mutatePayloadRecordBody(id uint64, key string, fn RecordMutator, 
 	}
 	oldMeta := h.arena.Metadata(slot)
 	oldKE := h.arena.KeyExpires(slot)
-	old, exists, err := currentRecordValue(oldMeta, key, keyExpired(oldKE[key], now))
+	// Only a STAMPED apply may judge the key's deadline; an unstamped one treats
+	// the record as PRESENT and leaves the deadline alone. recordKeyPastDeadline
+	// (vector/record_mutate.go) carries the reasoning — the short version is that
+	// a per-replica wall clock deciding whether a record EXISTS makes replicas
+	// store different bytes, which is not the bounded-deadline-skew class
+	// setPayloadBody lives with. LOCKSTEP: the same two lines exist in
+	// vector/hnsw.go, vector/ivf.go, vector/named.go and vector/multivector.go.
+	keyPastDeadline := recordKeyPastDeadline(stamped, oldKE[key], now)
+	old, exists, err := currentRecordValue(oldMeta, key, keyPastDeadline)
 	if err != nil {
 		return nil, nil, 0, false, err
 	}
@@ -3094,10 +3113,14 @@ func (h *hnsw) mutatePayloadRecordBody(id uint64, key string, fn RecordMutator, 
 		merged[key] = Value{Kind: ValueRecord, Rec: rec} // ownership hand-off; see RecordMutator
 	}
 	ke := cloneKeyExpires(oldKE)
-	// A logically expired key read as ABSENT above: its stale deadline must go,
-	// or the record this call just created would be invisible the instant it is
-	// written. pruneKeyExpires only drops deadlines for keys no longer present.
-	if ke != nil && keyExpired(ke[key], now) {
+	// A key read as ABSENT above because its deadline had passed — STAMPED
+	// applies only: its stale deadline must go, or the record this call just
+	// created would be invisible the instant it is written. pruneKeyExpires only
+	// drops deadlines for keys no longer present. On an unstamped apply
+	// keyPastDeadline is false by construction, so an expired key's deadline is
+	// passed through UNTOUCHED, exactly as setPayloadBody passes an expired key
+	// through unchanged.
+	if ke != nil && keyPastDeadline {
 		delete(ke, key)
 	}
 	ke = pruneKeyExpires(ke, merged)

@@ -394,6 +394,21 @@ func (s *Store) Close() error {
 	return errors.Join(errs...)
 }
 
+// VectorStore returns the shard's vector collection store, or nil when this
+// shard was built without one (a KV-only store). It is the shard-level twin of
+// Server.VectorStore(): a handle for out-of-band drivers that must reach the
+// collections directly rather than through an op — the per-node backup/restore
+// driver, the cold-tier mover, and the replica-determinism tests, which pin each
+// replica's TTL wall clock through CollectionStore.SetNowFunc.
+//
+// It hands out the LIVE store. A caller that mutates collections through it
+// bypasses Raft entirely and will diverge this replica from its peers; the only
+// supported writes through this handle are the ones the replicated apply path
+// itself makes.
+func (s *Store) VectorStore() *vector.CollectionStore {
+	return s.vectors
+}
+
 // Get reads directly from the local cache (no Raft). Returns cache.ErrNotFound if absent.
 func (s *Store) Get(key []byte) ([]byte, error) {
 	return s.cache.Get(key)

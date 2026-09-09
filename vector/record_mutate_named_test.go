@@ -207,15 +207,15 @@ func namedMutateHarness(t *testing.T) mutateHarness {
 			}
 		},
 		mutate: func(id uint64, key string, fn RecordMutator, cas CASCond) (uint64, bool, error) {
-			_, _, v, changed, err := nc.mutatePayloadRecordLockedAt(id, key, fn, cas, nc.nowMs())
+			_, _, v, changed, err := nc.mutatePayloadRecordLockedAt(id, key, fn, cas, nc.nowMs(), false)
 			return v, changed, err
 		},
 		mutateAt: func(id uint64, key string, fn RecordMutator, cas CASCond, nowMs int64) (uint64, bool, error) {
-			_, _, v, changed, err := nc.mutatePayloadRecordLockedAt(id, key, fn, cas, nowMs)
+			_, _, v, changed, err := nc.mutatePayloadRecordLockedAt(id, key, fn, cas, nowMs, true)
 			return v, changed, err
 		},
 		mutateAtKE: func(id uint64, key string, fn RecordMutator, cas CASCond, nowMs int64) (map[string]int64, uint64, bool, error) {
-			_, ke, v, changed, err := nc.mutatePayloadRecordLockedAt(id, key, fn, cas, nowMs)
+			_, ke, v, changed, err := nc.mutatePayloadRecordLockedAt(id, key, fn, cas, nowMs, true)
 			return ke, v, changed, err
 		},
 		payload: func(id uint64) (Metadata, bool) {
@@ -261,15 +261,15 @@ func mvMutateHarness(t *testing.T) mutateHarness {
 			}
 		},
 		mutate: func(id uint64, key string, fn RecordMutator, cas CASCond) (uint64, bool, error) {
-			_, _, v, changed, err := m.mutatePayloadRecordLockedAt(id, key, fn, cas, m.nowMs())
+			_, _, v, changed, err := m.mutatePayloadRecordLockedAt(id, key, fn, cas, m.nowMs(), false)
 			return v, changed, err
 		},
 		mutateAt: func(id uint64, key string, fn RecordMutator, cas CASCond, nowMs int64) (uint64, bool, error) {
-			_, _, v, changed, err := m.mutatePayloadRecordLockedAt(id, key, fn, cas, nowMs)
+			_, _, v, changed, err := m.mutatePayloadRecordLockedAt(id, key, fn, cas, nowMs, true)
 			return v, changed, err
 		},
 		mutateAtKE: func(id uint64, key string, fn RecordMutator, cas CASCond, nowMs int64) (map[string]int64, uint64, bool, error) {
-			_, ke, v, changed, err := m.mutatePayloadRecordLockedAt(id, key, fn, cas, nowMs)
+			_, ke, v, changed, err := m.mutatePayloadRecordLockedAt(id, key, fn, cas, nowMs, true)
 			return ke, v, changed, err
 		},
 		payload: func(id uint64) (Metadata, bool) {
@@ -525,7 +525,7 @@ func TestMutateRecordNamedPointTTLExpiryGate(t *testing.T) {
 		func(_ []byte, _ bool) ([]byte, RecordMutation, error) {
 			called = true
 			return nil, RecordUnchanged, nil
-		}, CASCond{}, mutateHarnessBase+999); err != nil {
+		}, CASCond{}, mutateHarnessBase+999, true); err != nil {
 		t.Fatalf("mutate at stamp base+999: %v, want nil", err)
 	} else if changed {
 		t.Error("changed=true for RecordUnchanged")
@@ -541,7 +541,7 @@ func TestMutateRecordNamedPointTTLExpiryGate(t *testing.T) {
 			func(_ []byte, _ bool) ([]byte, RecordMutation, error) {
 				called = true
 				return sessionRecordBytesRC(t, 8), RecordStore, nil
-			}, CASCond{}, mutateHarnessBase+1000)
+			}, CASCond{}, mutateHarnessBase+1000, true)
 		return v, ch, e
 	}()
 	if !errors.Is(err, ErrIDNotFound) {

@@ -1501,9 +1501,16 @@ func (m *MultiVectorIndex) setPayloadLockedAt(docID uint64, patch Metadata, keyT
 // key holds a non-record value, ErrRecordTooLarge when the resulting record
 // exceeds the storage cap, and fn's own error verbatim — in every case with the
 // document left exactly as it was.
+//
+// THE KEY'S DEADLINE IS NOT CONSULTED HERE. Unstamped, `now` is this process's
+// own wall clock, and letting it decide whether the record EXISTS would let two
+// replicas store different bytes. So an unstamped mutation treats a
+// deadline-passed record as PRESENT and passes its deadline through untouched;
+// only the *At variant expires the key. See recordKeyPastDeadline
+// (vector/record_mutate.go).
 func (m *MultiVectorIndex) MutatePayloadRecordCAS(docID uint64, key string, fn RecordMutator, cas CASCond) (uint64, error) {
 	return m.logPayloadOpChanged(func() (Metadata, map[string]int64, uint64, bool, error) {
-		return m.mutatePayloadRecordLockedAt(docID, key, fn, cas, m.nowMs())
+		return m.mutatePayloadRecordLockedAt(docID, key, fn, cas, m.nowMs(), false)
 	}, docID)
 }
 
@@ -1511,9 +1518,13 @@ func (m *MultiVectorIndex) MutatePayloadRecordCAS(docID uint64, key string, fn R
 // the per-key deadline check and the stale-deadline drop are judged against
 // nowMs, so every replica reads the same record and stores the same bytes (#4
 // vector TTL determinism, mirroring SetPayloadCASAt).
+//
+// This is the ONLY variant that may expire the payload key: its clock is the
+// leader's stamp, identical on every replica. See recordKeyPastDeadline
+// (vector/record_mutate.go) for why the unstamped twin must not.
 func (m *MultiVectorIndex) MutatePayloadRecordCASAt(docID uint64, key string, fn RecordMutator, cas CASCond, nowMs int64) (uint64, error) {
 	return m.logPayloadOpChanged(func() (Metadata, map[string]int64, uint64, bool, error) {
-		return m.mutatePayloadRecordLockedAt(docID, key, fn, cas, nowMs)
+		return m.mutatePayloadRecordLockedAt(docID, key, fn, cas, nowMs, true)
 	}, docID)
 }
 
@@ -1531,7 +1542,7 @@ func (m *MultiVectorIndex) MutatePayloadRecordCASAt(docID uint64, key string, fn
 // WAL-logs exactly what was applied), the resulting version, and changed.
 // changed=false means the call was a deliberate no-op: nothing was stored,
 // nothing will be logged, and the version is the CURRENT one, unbumped.
-func (m *MultiVectorIndex) mutatePayloadRecordLockedAt(docID uint64, key string, fn RecordMutator, cas CASCond, now int64) (Metadata, map[string]int64, uint64, bool, error) {
+func (m *MultiVectorIndex) mutatePayloadRecordLockedAt(docID uint64, key string, fn RecordMutator, cas CASCond, now int64, stamped bool) (Metadata, map[string]int64, uint64, bool, error) {
 	if fn == nil || key == "" || key == contentField {
 		return nil, nil, 0, false, ErrPayloadKeyNotRecord
 	}
@@ -1544,9 +1555,16 @@ func (m *MultiVectorIndex) mutatePayloadRecordLockedAt(docID uint64, key string,
 		return nil, nil, 0, false, err // CAS mismatch: no mutation, no bump
 	}
 	oldMeta, oldKE := m.docMeta[docID], m.keyTTL[docID]
-	// named/MV have no keyExpired twin: liveMetaMap's rule, inlined.
-	dl := oldKE[key]
-	old, exists, err := currentRecordValue(oldMeta, key, dl != 0 && dl <= now)
+	// Only a STAMPED apply may judge the key's deadline; an unstamped one treats
+	// the record as PRESENT and leaves the deadline alone. recordKeyPastDeadline
+	// (vector/record_mutate.go) carries the reasoning — the short version is that
+	// a per-replica wall clock deciding whether a record EXISTS makes replicas
+	// store different bytes, which is not the bounded-deadline-skew class
+	// setPayloadBody lives with. named/MV have no keyExpired twin, so the Abs
+	// twin inlines liveMetaMap's rule. LOCKSTEP: the same two lines exist in
+	// vector/hnsw.go, vector/ivf.go, vector/named.go and vector/multivector.go.
+	keyPastDeadline := recordKeyPastDeadlineAbs(stamped, oldKE[key], now)
+	old, exists, err := currentRecordValue(oldMeta, key, keyPastDeadline)
 	if err != nil {
 		return nil, nil, 0, false, err
 	}
@@ -1597,10 +1615,14 @@ func (m *MultiVectorIndex) mutatePayloadRecordLockedAt(docID uint64, key string,
 		merged[key] = Value{Kind: ValueRecord, Rec: rec} // ownership hand-off; see RecordMutator
 	}
 	ke := cloneKeyTTL(oldKE)
-	// A logically expired key read as ABSENT above: its stale deadline must go,
-	// or the record this call just created would be invisible the instant it is
-	// written. pruneKeyTTL only drops deadlines for keys no longer present.
-	if d, present := ke[key]; present && d != 0 && d <= now {
+	// A key read as ABSENT above because its deadline had passed — STAMPED
+	// applies only: its stale deadline must go, or the record this call just
+	// created would be invisible the instant it is written. pruneKeyTTL only
+	// drops deadlines for keys no longer present. On an unstamped apply
+	// keyPastDeadline is false by construction, so an expired key's deadline is
+	// passed through UNTOUCHED, exactly as setPayloadBody passes an expired key
+	// through unchanged.
+	if keyPastDeadline {
 		delete(ke, key)
 	}
 	ke = pruneKeyTTL(ke, merged)
