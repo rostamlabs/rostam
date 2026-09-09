@@ -676,6 +676,9 @@ func (m *MultiVectorIndex) addLockedAt(docID uint64, tokens [][]float32, meta Me
 // does NOT WAL-log. A version of 0 falls back to the normal bump (an old record
 // predating the version block defaults a fresh add to 1).
 func (m *MultiVectorIndex) restoreAdd(docID uint64, tokens [][]float32, meta Metadata, keyExpires map[string]uint64, version uint64, sparse *SparseVector) error {
+	if err := checkRecordValues(meta); err != nil {
+		return err
+	}
 	if len(tokens) == 0 {
 		return ErrEmptyDocument
 	}

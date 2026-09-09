@@ -313,6 +313,13 @@ func (c *Collection) InsertCASKeyTTLAt(id uint64, vec []float32, ttl time.Durati
 // insert with that version + keyExpires so a later replay restores them too. Starts
 // the sweeper like Insert.
 func (c *Collection) RestoreInsert(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64) error {
+	// Checked HERE as well as in the engine body, because THIS layer owns the
+	// {apply, then append} ordering below: idx.RestoreInsert mutates the index
+	// before the WAL append runs, so a payload the codec cannot encode has to be
+	// refused before either step, not between them.
+	if err := checkRecordValues(meta); err != nil {
+		return err
+	}
 	c.startSweeper()
 	if c.wal == nil {
 		return c.idx.RestoreInsert(id, vec, ttl, meta, sparse, keyExpires, version)
@@ -342,6 +349,10 @@ func (c *Collection) RestoreInsert(id uint64, vec []float32, ttl time.Duration, 
 // version-preserving insert path (reshard/resplit backfill) under an apply stamp
 // (#4 vector TTL determinism).
 func (c *Collection) RestoreInsertAt(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64, nowMs int64) error {
+	// See RestoreInsert: this layer applies before it appends.
+	if err := checkRecordValues(meta); err != nil {
+		return err
+	}
 	c.startSweeper()
 	if c.wal == nil {
 		return c.idx.RestoreInsertAt(id, vec, ttl, meta, sparse, keyExpires, version, nowMs)

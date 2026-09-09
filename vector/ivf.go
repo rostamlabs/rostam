@@ -547,6 +547,9 @@ func (ix *ivf) RestoreInsertAt(id uint64, vec []float32, ttl time.Duration, meta
 }
 
 func (ix *ivf) restoreInsertBody(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64, stamped bool, nowMs uint64) error {
+	if err := checkRecordValues(meta); err != nil {
+		return err
+	}
 	if len(vec) != ix.cfg.Dim {
 		return ErrDimMismatch
 	}
@@ -3730,6 +3733,9 @@ func (ix *ivf) clearPayloadBody(id uint64, cas CASCond, stamped bool, nowMs uint
 }
 
 func (ix *ivf) RestorePayload(id uint64, meta Metadata, keyExpires map[string]uint64, version uint64) error {
+	if err := checkRecordValues(meta); err != nil {
+		return err
+	}
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	slot, ok := ix.arena.Slot(id)

@@ -2014,6 +2014,9 @@ func (h *hnsw) RestoreInsertAt(id uint64, vec []float32, ttl time.Duration, meta
 }
 
 func (h *hnsw) restoreInsertBody(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64, stamped bool, nowMs uint64) error {
+	if err := checkRecordValues(meta); err != nil {
+		return err
+	}
 	if len(vec) != h.cfg.Dim {
 		return ErrDimMismatch
 	}
@@ -3076,6 +3079,9 @@ func (h *hnsw) clearPayloadBody(id uint64, cas CASCond, stamped bool, nowMs uint
 // section. Returns ErrIDNotFound for a dead/absent point. Both maps are stored by
 // reference (caller hands off ownership); nil clears the respective state.
 func (h *hnsw) RestorePayload(id uint64, meta Metadata, keyExpires map[string]uint64, version uint64) error {
+	if err := checkRecordValues(meta); err != nil {
+		return err
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	slot, ok := h.arena.Slot(id)

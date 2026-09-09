@@ -670,6 +670,9 @@ func (nc *NamedCollection) insertLockedAt(id uint64, vectors map[string][]float3
 // normal bump (an old record predating the version block defaults a fresh insert
 // to 1).
 func (nc *NamedCollection) RestoreInsert(id uint64, vectors map[string][]float32, sparseVectors map[string]*SparseVector, payload Metadata, ttl time.Duration, keyExpires map[string]uint64, version uint64) error {
+	if err := checkRecordValues(payload); err != nil {
+		return err
+	}
 	if err := nc.validateInsertSpaces(vectors, sparseVectors); err != nil {
 		return err
 	}

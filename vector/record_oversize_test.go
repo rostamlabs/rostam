@@ -306,3 +306,121 @@ func TestOversizeRecordLeavesSnapshotWritable(t *testing.T) {
 		t.Fatal("Snapshot wrote no bytes")
 	}
 }
+
+// THE RESTORE FAMILY IS NOT REPLAY-ONLY. ops/builtin.go routes an ordinary WIRE
+// insert to Collection.RestoreInsert/RestoreInsertAt whenever the decoded args
+// carry a non-zero version (the version-preserving reinsert the reshard backfill
+// uses), with the caller's own metadata. So these entries take attacker-supplied
+// payloads and must apply the same bound as the ordinary insert.
+//
+// The ordering makes it worse than a missed check: Collection.RestoreInsert
+// applies to the index and only THEN appends to the WAL, so an oversize record
+// used to be stored in memory and the append then failed — leaving a live point
+// with no log record, and a collection that could no longer snapshot.
+//
+// Rejecting here cannot break replay: no WAL record can carry an oversize record
+// (writeOptMeta refuses to encode one) and no snapshot can either (readValue caps
+// at maxRecordValueBytes), so a rejection on this path can only ever come from a
+// live caller.
+func TestOversizeRecordRejectedRestorePaths(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+	}{{"hnsw", oversizeDenseConfig()}, {"ivf", oversizeIVFConfig()}} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := NewCollection("default/restore", tc.cfg)
+			if err != nil {
+				t.Fatalf("NewCollection: %v", err)
+			}
+			vec := []float32{1, 0, 0, 0}
+			good := Metadata{"rc": NewInt(1)}
+			if err := c.Insert(1, vec, 0, good, nil); err != nil {
+				t.Fatalf("baseline Insert: %v", err)
+			}
+
+			// The wire-reachable pair: a version-preserving reinsert.
+			wantTooLarge(t, "RestoreInsert", c.RestoreInsert(2, vec, 0, oversizeRecord(), nil, nil, 5))
+			if _, _, _, _, _, ok := c.Get(2); ok {
+				t.Fatal("rejected RestoreInsert still created point 2")
+			}
+			wantTooLarge(t, "RestoreInsertAt", c.RestoreInsertAt(3, vec, 0, oversizeRecord(), nil, nil, 5, 1_000))
+			if _, _, _, _, _, ok := c.Get(3); ok {
+				t.Fatal("rejected RestoreInsertAt still created point 3")
+			}
+
+			// The engine bodies are the authority (other callers exist), so drive
+			// them directly too — including RestorePayload, which has no Collection
+			// wrapper of its own.
+			wantTooLarge(t, "idx.RestoreInsert", c.idx.RestoreInsert(4, vec, 0, oversizeRecord(), nil, nil, 5))
+			wantTooLarge(t, "idx.RestoreInsertAt", c.idx.RestoreInsertAt(5, vec, 0, oversizeRecord(), nil, nil, 5, 1_000))
+			wantTooLarge(t, "idx.RestorePayload", c.idx.RestorePayload(1, oversizeRecord(), nil, 5))
+
+			// Point 1's payload must be untouched by the rejected RestorePayload.
+			_, meta, _, _, _, ok := c.Get(1)
+			if !ok {
+				t.Fatal("point 1 disappeared")
+			}
+			if got, gok := meta["rc"]; !gok || !got.Equal(NewInt(1)) {
+				t.Fatalf("point 1 payload changed after a rejected RestorePayload: %v", meta)
+			}
+			if _, gok := meta["session"]; gok {
+				t.Fatal("rejected RestorePayload still stored the oversize record")
+			}
+
+			// The whole point of the bound: the collection can still be written down.
+			var snap bytes.Buffer
+			if err := c.Snapshot(&snap); err != nil {
+				t.Fatalf("Snapshot after rejected restores: %v, want nil", err)
+			}
+		})
+	}
+}
+
+// TestOversizeRecordRejectedRestoreNamedMV covers the named and multi-vector
+// restore siblings, which the reshard/resplit backfill reaches the same way.
+func TestOversizeRecordRejectedRestoreNamedMV(t *testing.T) {
+	t.Run("named", func(t *testing.T) {
+		nc, err := NewNamedCollection("default/named-restore", namedTestConfig())
+		if err != nil {
+			t.Fatalf("NewNamedCollection: %v", err)
+		}
+		vecs := map[string][]float32{"title": {1, 0, 0, 0}, "image": {1, 0, 0}}
+		wantTooLarge(t, "NamedRestoreInsert",
+			nc.RestoreInsert(1, vecs, nil, oversizeRecord(), 0, nil, 5))
+		if _, _, _, _, ok := nc.Get(1); ok {
+			t.Fatal("rejected named RestoreInsert still created point 1")
+		}
+	})
+
+	t.Run("multivector", func(t *testing.T) {
+		m, err := NewMultiVectorIndex(MultiVectorConfig{Dim: 4, M: 16, EfConstruction: 200, EfSearch: 64, Seed: 1})
+		if err != nil {
+			t.Fatalf("NewMultiVectorIndex: %v", err)
+		}
+		tokens := [][]float32{{1, 0, 0, 0}}
+		wantTooLarge(t, "MultiRestoreAdd", m.MultiRestoreAdd(1, tokens, oversizeRecord(), nil, 5))
+		if _, _, _, ok := m.Get(1); ok {
+			t.Fatal("rejected MultiRestoreAdd still created doc 1")
+		}
+		wantTooLarge(t, "MultiRestoreAddSparse", m.MultiRestoreAddSparse(2, tokens, oversizeRecord(), nil, 5, nil))
+		if _, _, _, ok := m.Get(2); ok {
+			t.Fatal("rejected MultiRestoreAddSparse still created doc 2")
+		}
+	})
+}
+
+// TestRestoreAtCapAccepted pins that the restore paths reject only what the
+// codec rejects — the bound must not be tighter here than on the insert path,
+// or a legitimate reshard backfill would start failing.
+func TestRestoreAtCapAccepted(t *testing.T) {
+	c, err := NewCollection("default/restore-cap", oversizeDenseConfig())
+	if err != nil {
+		t.Fatalf("NewCollection: %v", err)
+	}
+	if err := c.RestoreInsert(1, []float32{1, 0, 0, 0}, 0, atCapRecord(), nil, nil, 5); err != nil {
+		t.Fatalf("RestoreInsert at exactly the cap: %v, want nil", err)
+	}
+	if _, _, _, _, version, ok := c.Get(1); !ok || version != 5 {
+		t.Fatalf("restored point: ok=%v version=%d, want true/5", ok, version)
+	}
+}

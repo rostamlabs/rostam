@@ -419,11 +419,11 @@ func elementKeysOf(v Value) []scalarKey {
 // tokenizes the field value (which is unavoidable without an index). An empty
 // query matches any present string/strings field. Missing/wrong-kind → false.
 func compileMatch(field string, want Value) (Predicate, error) {
-	look := newFieldLookup(field)
 	if want.Kind != ValueString {
 		return nil, fmt.Errorf("vector: filter op 'match' requires a string value, got kind %d", want.Kind)
 	}
 	queryTokens := tokenize(want.Str)
+	look := newFieldLookup(field)
 	return func(m Metadata) bool {
 		got, ok := look.get(m)
 		if !ok {
@@ -564,7 +564,6 @@ func tokenize(s string) []string {
 // closure. Matches a string field; for a strings field, ANY element matching
 // satisfies. Missing/wrong-kind → false.
 func compileRegex(field string, want Value) (Predicate, error) {
-	look := newFieldLookup(field)
 	if want.Kind != ValueString {
 		return nil, fmt.Errorf("vector: filter op 'regex' requires a string value, got kind %d", want.Kind)
 	}
@@ -572,6 +571,7 @@ func compileRegex(field string, want Value) (Predicate, error) {
 	if err != nil {
 		return nil, fmt.Errorf("vector: filter op 'regex' has invalid pattern %q: %w", want.Str, err)
 	}
+	look := newFieldLookup(field)
 	return func(m Metadata) bool {
 		got, ok := look.get(m)
 		if !ok {
