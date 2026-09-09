@@ -676,14 +676,26 @@ func TestResetKeepsReadyAndClearsPostings(t *testing.T) {
 	s := readySet(d)
 	s.Reindex([]byte("k"), intRec("rc", 1))
 
+	// A definition that has never been walked is installed alongside it: after
+	// the flush BOTH are exact, because the keyspace they cover is empty.
+	fresh := mustDef(t, "fresh", "", "sc", wire.KVIndexKindScalar)
+	s.Install([]Def{d, fresh})
+	if s.IsReady("fresh") {
+		t.Fatal("setup: an unwalked definition must not be ready")
+	}
+
 	s.Reset()
 
 	// Flush emptied the cache, so an EMPTY posting set is the EXACT answer for
-	// the (now empty) keyspace. Clearing ready would strand the definition in
-	// `building` until an unrelated meta write moved the observer, turning
-	// every kv_query into ErrIndexBuilding for no reason.
+	// the (now empty) keyspace — for every definition, walked or not. Leaving
+	// one not-ready would strand it in `building` until an unrelated meta write
+	// moved the observer, turning every kv_query into ErrIndexBuilding for no
+	// reason.
 	if !s.IsReady("by-rc") {
 		t.Fatal("Reset cleared readiness")
+	}
+	if !s.IsReady("fresh") {
+		t.Fatal("Reset left an unwalked definition building over an empty cache")
 	}
 	if keys, distinct := s.Stats("by-rc"); keys != 0 || distinct != 0 {
 		t.Fatalf("Reset left (%d keys, %d distinct)", keys, distinct)
@@ -697,6 +709,79 @@ func TestResetKeepsReadyAndClearsPostings(t *testing.T) {
 	s.Reindex([]byte("k2"), intRec("rc", 1))
 	if got := mustCandidates(t, s, sel, nil, bigBudget); !equalStrings(got, []string{"k2"}) {
 		t.Fatalf("post-Reset reindex: got %v", got)
+	}
+}
+
+// TestResetDuringWalkPublishesTheEmptyIndex pins the one way a flush could
+// strand a definition in `building` forever.
+//
+// Reset bumps every posting's generation, which invalidates any walk in
+// flight. A definition that was mid-BACKFILL when the flush landed therefore
+// never publishes through its own walk — the grant is refused — and nothing
+// re-drives it: it would sit failing every kv_query with ErrIndexBuilding
+// until an unrelated meta write happened to move the observer. So Reset
+// publishes readiness itself, which is also the truth: the keyspace the
+// backfill was being built over no longer exists, and an empty posting set
+// over an empty cache is exact.
+func TestResetDuringWalkPublishesTheEmptyIndex(t *testing.T) {
+	d := mustDef(t, "ix", "", "rc", wire.KVIndexKindScalar)
+	s := New(1024)
+	s.Install([]Def{d})
+	if s.IsReady("ix") {
+		t.Fatal("setup: a freshly installed definition must not be ready")
+	}
+
+	ks := keyspace{keys: []string{"k1", "k2", "k3", "k4"}, vals: map[string][]byte{
+		"k1": intRec("rc", 1), "k2": intRec("rc", 2),
+		"k3": intRec("rc", 3), "k4": intRec("rc", 4),
+	}}
+	var flushed bool
+	s.Backfill("ix", func(fn func(key, value []byte) bool) {
+		for i, k := range ks.keys {
+			if i == 2 {
+				s.Reset() // the flush lands mid-backfill
+				flushed = true
+			}
+			if !fn([]byte(k), ks.vals[k]) {
+				return
+			}
+		}
+	})
+	if !flushed {
+		t.Fatal("the flush did not run")
+	}
+
+	// The definition is ready over an empty index: exact, because the cache it
+	// was being built over was emptied.
+	if !s.IsReady("ix") {
+		t.Fatal("a flush mid-backfill left the definition building forever")
+	}
+	// The stale walk published nothing and resurrected nothing: the keys it had
+	// already read from the pre-flush cache must not be posted back.
+	if keys, distinct := s.Stats("ix"); keys != 0 || distinct != 0 {
+		t.Fatalf("a stale walk wrote (%d keys, %d distinct) into the flushed index", keys, distinct)
+	}
+	sel := Selector{Def: d, Op: vtypes.FilterEq, Values: []vtypes.Value{vtypes.NewInt(1)}}
+	if got := mustCandidates(t, s, sel, nil, bigBudget); len(got) != 0 {
+		t.Fatalf("flushed index answered %v", got)
+	}
+
+	// And it is a normal, usable index afterwards.
+	s.Reindex([]byte("k9"), intRec("rc", 1))
+	if got := mustCandidates(t, s, sel, nil, bigBudget); !equalStrings(got, []string{"k9"}) {
+		t.Fatalf("post-flush write: got %v, want [k9]", got)
+	}
+
+	// Readiness returns to false only at the start of a NEW walk, which will
+	// publish its own result.
+	s.Backfill("ix", func(fn func(key, value []byte) bool) {
+		if s.IsReady("ix") {
+			t.Error("the index reported ready DURING its backfill")
+		}
+		walkOf(ks)(fn)
+	})
+	if !s.IsReady("ix") || func() int { k, _ := s.Stats("ix"); return k }() != 4 {
+		t.Fatal("the definition did not come back from its own backfill")
 	}
 }
 

@@ -319,18 +319,34 @@ func (s *Set) Drop(key []byte) {
 	}
 }
 
-// Reset drops every posting and KEEPS readiness.
+// Reset drops every posting and marks every definition READY.
 //
-// Reset is what a flush calls, and a flush empties the cache: an empty
-// posting set over an empty keyspace is EXACT, not partial. Clearing
-// readiness here would strand every definition in `building` until an
-// unrelated meta write happened to move the observer, turning every kv_query
-// into ErrIndexBuilding for as long as that took.
+// Reset is what a flush calls, and a flush empties the cache: an empty posting
+// set over an empty keyspace is EXACT for every definition, so after a flush
+// every definition is complete by construction and there is nothing left for
+// any walk to discover.
+//
+// It PUBLISHES readiness rather than merely preserving it, and the difference
+// is not cosmetic. Reset bumps each posting's generation, which invalidates
+// any walk in flight — so a definition that was mid-backfill when the flush
+// landed would otherwise never publish (its walk's grant is refused) and
+// nothing would re-drive it: it would sit in `building`, failing every
+// kv_query with ErrIndexBuilding, until an unrelated meta write happened to
+// move the observer. Marking it ready is both the fix and the truth, because
+// the keyspace it was being built over no longer exists.
+//
+// The invalidated walk cannot undo this. grantReadyLocked only ever SETS
+// readiness, and reindexFor refuses to write into a generation it does not
+// own, so the stale walk publishes nothing and resurrects nothing — a key it
+// had already read from the pre-flush cache cannot be posted back into the
+// flushed index. Readiness only ever returns to false at the START of a new
+// Rebuild or Backfill, which is a walk that will publish its own result.
 func (s *Set) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, p := range s.posts {
 		p.reset()
+		p.ready = true
 	}
 }
 
