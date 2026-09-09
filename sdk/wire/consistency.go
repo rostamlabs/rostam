@@ -475,6 +475,19 @@ func ReadConsistencyOf(op string, args []byte) (rc uint8, ok bool) {
 			return 0, false
 		}
 		return rc, true
+	case "kv_query":
+		// kv_query carries its read_consistency byte inline, not behind a
+		// trailer marker (see DecodeKVQueryArgs's layout), so a full decode
+		// is the only way to reach it — the same cost the handler pays
+		// moments later, matching every other case here. A kv_query can
+		// never be ConsistencyBoundedStaleness (DecodeKVQueryArgs rejects
+		// it outright, no bound trailer in this frame), so there is no
+		// corresponding ReadStalenessOf case to add.
+		a, err := DecodeKVQueryArgs(args)
+		if err != nil {
+			return 0, false
+		}
+		return a.Consistency, true
 	default:
 		return 0, false
 	}

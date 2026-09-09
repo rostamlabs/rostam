@@ -72,6 +72,19 @@ var BuiltinOps = []BuiltinOp{
 	// merely the O(1) form of "delete every key" — so it is deliberately NOT added to
 	// the admin allowlist.
 	{"flush", OpReadWrite, nil, RouteLayoutNone, false},
+	// kv_query is a cluster-wide indexed/scanned KV read: it names a KVIndexDef
+	// (or asks for an unindexed scan) rather than a single key, so it is KEYLESS
+	// (nil KeyExtractor) exactly like flush — the cluster path fans it out to
+	// EVERY shard group (cluster.Node.broadcastKVQuery), merges each group's
+	// page, and re-applies the row/byte budgets to the merged result; Direct/
+	// embedded dispatches it once against its single cache.Cache. It is the
+	// ONLY kv_query-family op with a BuiltinOps row: the index CRUD ops
+	// (__kv_index_set__/__kv_index_list__) are admin ops dispatched by exact
+	// name before routing, exactly like __set_catalog__, so they never go
+	// through this table (see the phase-3 plan's decisions §2). Registered
+	// OpReadOnly (unlike flush) because a kv_query never writes — every
+	// candidate is re-verified against the live cache value, never applied.
+	{"kv_query", OpReadOnly, nil, RouteLayoutNone, false},
 	// __ping__/__ready__/__metrics__/__repl_metrics__/__collections__ are shardless (nil KeyExtractor).
 	{"__ping__", OpReadOnly, nil, RouteLayoutNone, false},
 	{ReadyOp, OpReadOnly, nil, RouteLayoutNone, false},
