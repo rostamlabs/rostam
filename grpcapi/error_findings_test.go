@@ -4,6 +4,7 @@ package grpcapi
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -58,5 +59,38 @@ func TestGrpcErrorLeaderlessIsRetryable(t *testing.T) {
 		if got := status.Code(grpcError(tc.err)); got != codes.Unavailable {
 			t.Errorf("%s: grpcError = %v, want Unavailable (retryable)", tc.name, got)
 		}
+	}
+}
+
+// TestGrpcErrorRecordTooLarge pins vector.ErrRecordTooLarge as a CLIENT error on
+// the gRPC front end. It was classified by neither errIs list, so an oversize
+// record payload came back as codes.Internal — a server fault, which standard
+// gRPC retry policies retry and which tells the caller nothing about the one
+// thing they can fix.
+//
+// Three arms, because the sentinel does not survive every path it can take:
+// the sentinel itself, a wrapped one (%w through the op layer), and the
+// stringified one a clustered apply produces, where shard.decodePBResult
+// rebuilds the error with errors.New(string(payload)) and errors.Is stops
+// matching. The stringified arm is built from the sentinel's own .Error() so it
+// cannot drift from the classifier's substring.
+func TestGrpcErrorRecordTooLarge(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", vector.ErrRecordTooLarge},
+		{"wrapped", fmt.Errorf("vector_insert: %w: payload key %q holds a 20000000-byte record, the cap is 16777216 bytes", vector.ErrRecordTooLarge, "session")},
+		{"stringified", errors.New(vector.ErrRecordTooLarge.Error() + ": payload key \"session\" holds a 20000000-byte record, the cap is 16777216 bytes")},
+	}
+	for _, tc := range cases {
+		if got := status.Code(grpcError(tc.err)); got != codes.InvalidArgument {
+			t.Errorf("%s: grpcError = %v, want InvalidArgument", tc.name, got)
+		}
+	}
+	// The negative control: an unrelated internal fault must still be Internal,
+	// so the new arm is not classifying by accident.
+	if got := status.Code(grpcError(errors.New("open /var/lib/rostam/shard-7: no such file"))); got != codes.Internal {
+		t.Errorf("unrelated fault = %v, want Internal", got)
 	}
 }

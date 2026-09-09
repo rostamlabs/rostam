@@ -4,6 +4,7 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -144,5 +145,45 @@ func TestMapResultKeepsWASMUpdateRefusalVisible(t *testing.T) {
 	}
 	if !strings.Contains(msg, "NEW op name") {
 		t.Errorf("payload = %q, want the remedy to survive", msg)
+	}
+}
+
+// TestMapResultKeepsRecordTooLargeVisible pins vector.ErrRecordTooLarge as a
+// client-facing signal on the binary transport, in all three shapes it can
+// arrive in. The sentinel arm was already classified; the STRINGIFIED arm is
+// the one that was not, and it is the shape a clustered write produces —
+// shard.decodePBResult rebuilds an op error with errors.New(string(payload))
+// across replication, so errors.Is stops matching and the caller got the
+// redacted "internal error" for a mistake they could have fixed.
+//
+// The message is safe to disclose: it names the payload key the caller chose
+// and the two sizes, and nothing about the server.
+func TestMapResultKeepsRecordTooLargeVisible(t *testing.T) {
+	disp := &fakeDispatcher{}
+	const detail = ": payload key \"session\" holds a 20000000-byte record, the cap is 16777216 bytes"
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", vector.ErrRecordTooLarge},
+		{"wrapped", fmt.Errorf("vector_insert: %w"+detail, vector.ErrRecordTooLarge)},
+		{"stringified", errors.New(vector.ErrRecordTooLarge.Error() + detail)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, payload := mapResult(disp, nil, tc.err, "")
+			msg, err := DecodeErrorPayload(payload)
+			if err != nil {
+				t.Fatalf("DecodeErrorPayload: %v", err)
+			}
+			if msg == "internal error" || !strings.Contains(msg, "exceeds the storage cap") {
+				t.Errorf("record-too-large redacted: got %q", msg)
+			}
+		})
+	}
+	// Negative control: an unrelated fault is still redacted, so the new string
+	// arm did not widen the bucket.
+	_, payload := mapResult(disp, nil, errors.New("open /var/lib/rostam/shard-7: no such file"), "")
+	if msg, _ := DecodeErrorPayload(payload); msg != "internal error" {
+		t.Errorf("unrelated fault = %q, want the redacted message", msg)
 	}
 }

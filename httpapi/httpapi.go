@@ -496,7 +496,14 @@ func statusForError(err error) int {
 		// acking something that can never be made durable; refusing it is a
 		// client-fixable mistake and the message is the caller's own data.
 		// Keeps this classifier in sync with server.clientFacingErr.
+		//
+		// Matched by sentinel AND by string: a clustered apply rebuilds the op
+		// error with errors.New across the replication boundary
+		// (shard.decodePBResult), so errors.Is alone loses it there and the error
+		// would fall through to the redacted 500 bucket. Comparing against the
+		// sentinel's own .Error() text cannot drift from it.
 		errors.Is(err, vector.ErrRecordTooLarge),
+		strings.Contains(err.Error(), vector.ErrRecordTooLarge.Error()),
 		errors.Is(err, vector.ErrEmptyFilter),
 		errors.Is(err, vector.ErrEmptyGroupBy),
 		errors.Is(err, vector.ErrSparseMismatch),

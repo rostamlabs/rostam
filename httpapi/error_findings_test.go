@@ -4,6 +4,7 @@ package httpapi
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -270,5 +271,42 @@ func TestStatusForErrorAlreadyPartitioned(t *testing.T) {
 	if got := statusForError(err); got != http.StatusConflict {
 		t.Fatalf("statusForError(already partitioned) = %d, want %d (409 Conflict)",
 			got, http.StatusConflict)
+	}
+}
+
+// TestStatusForErrorRecordTooLarge pins the HTTP status for an oversize record
+// payload at 400 in all three shapes the sentinel can arrive in. The sentinel
+// and wrapped arms were already classified; the STRINGIFIED arm is the shape a
+// clustered write produces (shard.decodePBResult rebuilds an op error with
+// errors.New across replication, so errors.Is stops matching), and unclassified
+// it fell through to the redacted 500 bucket — a server fault for a mistake the
+// caller can fix by sending a smaller record.
+func TestStatusForErrorRecordTooLarge(t *testing.T) {
+	const detail = ": payload key \"session\" holds a 20000000-byte record, the cap is 16777216 bytes"
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", vector.ErrRecordTooLarge},
+		{"wrapped", fmt.Errorf("vector_insert: %w"+detail, vector.ErrRecordTooLarge)},
+		{"stringified", errors.New(vector.ErrRecordTooLarge.Error() + detail)},
+	}
+	for _, tc := range cases {
+		if got := statusForError(tc.err); got != http.StatusBadRequest {
+			t.Errorf("%s: statusForError = %d, want 400", tc.name, got)
+		}
+		// A 4xx must keep its descriptive message: it names only the caller's own
+		// payload key and the two sizes.
+		status, msg := clientError("vector_insert", tc.err)
+		if status == http.StatusInternalServerError || msg == "internal error" {
+			t.Errorf("%s: clientError redacted a client-facing error: status=%d msg=%q", tc.name, status, msg)
+		}
+		if !strings.Contains(msg, "exceeds the storage cap") {
+			t.Errorf("%s: message lost the cap text: %q", tc.name, msg)
+		}
+	}
+	// Negative control: an unrelated fault is still a redacted 500.
+	if got := statusForError(errors.New("open /var/lib/rostam/shard-7: no such file")); got != http.StatusInternalServerError {
+		t.Errorf("unrelated fault = %d, want 500", got)
 	}
 }
