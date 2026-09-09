@@ -129,7 +129,7 @@ like a path, e.g. `"a/b"` — always wins over this splitting). The path is
 
 | Segment | Form | Names |
 |---|---|---|
-| field | `name` or `#N` | a top-level record field, by name or position (`N` ≤ 65535) |
+| field | `name` or `#N` | a top-level record field, by name or position (`N` ≤ 65535, written canonically: at most 5 digits, no leading zeros except `#0`) |
 | row key | decimal digits, or `"…"` | a table row: decimal for an integer key type, quoted (`\"`/`\\` escapes) for a `FIXED` key type |
 | column | `name` or `#N` | one column of the row named by the previous segment |
 

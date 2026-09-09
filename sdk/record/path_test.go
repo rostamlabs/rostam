@@ -87,6 +87,24 @@ func TestParsePathAccepted(t *testing.T) {
 			}},
 		},
 		{
+			// "#0" is the one position that legally starts with '0': a
+			// single digit is canonical by definition.
+			name: "zero position",
+			in:   "#0",
+			want: Path{Segs: []Segment{
+				{Kind: SegField, ByPos: true, Pos: 0},
+			}},
+		},
+		{
+			name: "canonical positional column",
+			in:   "a/1/#12345",
+			want: Path{Segs: []Segment{
+				{Kind: SegField, Name: "a"},
+				{Kind: SegRow, KeyText: "1"},
+				{Kind: SegCol, ByPos: true, Pos: 12345},
+			}},
+		},
+		{
 			name: "max-length decimal row key (20 digits, fits uint64)",
 			in:   "a/18446744073709551615/c",
 			want: Path{Segs: []Segment{
@@ -123,10 +141,19 @@ func TestParsePathRejected(t *testing.T) {
 		"row key neither decimal nor quoted": "a/x/y",
 		"position used as row key":           "a/#3",
 		"position out of range":              "#70000",
-		"256-byte name":                      longName,
-		"21-digit row key":                   "a/123456789012345678901/c",
-		"row key overflows uint64":           "a/18446744073709551616/c",
-		"name containing a quote":            `a"b`,
+		// Non-canonical spellings of positions that are in range. The value
+		// they denote is legal; the SPELLING is not, so that ParsePath's
+		// pre-split length bound and the "#N" grammar cannot disagree about
+		// the same string (a long enough run of leading zeros exceeded
+		// maxPathBytes while parseNameOrPos still accepted the digits).
+		"position with a leading zero":      "#01",
+		"position padded with zeros":        "#000001",
+		"position with six digits":          "#123456",
+		"positional column with a zero pad": "a/1/#01",
+		"256-byte name":                     longName,
+		"21-digit row key":                  "a/123456789012345678901/c",
+		"row key overflows uint64":          "a/18446744073709551616/c",
+		"name containing a quote":           `a"b`,
 	}
 
 	for name, in := range cases {

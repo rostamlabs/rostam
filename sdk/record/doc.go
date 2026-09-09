@@ -16,13 +16,16 @@
 // payload key must hold a record. ParsePath then parses the record path
 // into 1-3 "/"-separated segments:
 //
-//	seg1        a field: a name, or "#N" for a position (N <= 65535)
+//	seg1        a field: a name, or "#N" for a position (N <= 65535,
+//	            written canonically: at most 5 digits, no leading zeros
+//	            except "#0" itself)
 //	seg2        a row key: decimal digits ([0-9]+, <= 20 digits, must fit
 //	            uint64) for an integer key type, or a quoted string "..."
 //	            (with \" and \\ escapes) for a FIXED key type, whose
 //	            UNESCAPED length must be <= 255 bytes (wire.OperateMaxKeyLen,
 //	            the widest row key any record can encode)
-//	seg3        a column: a name, or "#N" for a position
+//	seg3        a column: a name, or "#N" for a position, in the same
+//	            canonical form as seg1
 //
 // A field segment may end with "#count" (e.g. "b#count"), in which case it
 // must be the only segment in the path — "#count" reports a table field's
@@ -55,8 +58,9 @@
 // SplitField only ever see the path string (never record bytes) and are
 // therefore straightforward to keep panic-free: every length is checked
 // before slicing, every numeric parse is bounds-checked before the value is
-// trusted (position <= 65535, row-key digit count <= 20 and must fit
-// uint64), and no segment is treated as well-formed until it has been fully
+// trusted (position <= 65535 and canonically spelled, row-key digit count
+// <= 20 and must fit uint64), and no segment is treated as well-formed
+// until it has been fully
 // validated. The quoted row key is bounded before it is unescaped, not
 // after, so a hostile path cannot drive a large allocation on a parse that
 // is going to be rejected anyway. Resolver.Resolve extends the same

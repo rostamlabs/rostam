@@ -64,8 +64,21 @@ type Path struct {
 	Segs []Segment
 }
 
-// maxPos is the largest position a "#N" segment may name.
-const maxPos = 65535
+// maxPos is the largest position a "#N" segment may name. It is
+// wire.OperateMaxFields, the cap on a schema's field count and a table's
+// column count alike, so no legal position needs more digits than it has.
+const maxPos = wire.OperateMaxFields
+
+// maxPosDigits is the number of decimal digits maxPos takes, and therefore
+// the longest digit string a canonical "#N" segment may carry. The grammar
+// is CANONICAL: no leading zeros (except "#0" itself) and no more digits
+// than this. Without that rule "#N" would accept arbitrarily long digit
+// strings that merely happen to denote a small number ("#0000…01"), which
+// maxPathBytes then rejects for its length — two stages disagreeing about
+// the same path. Bounding the spelling here is what keeps them agreed, and
+// it costs nothing: a canonical position is at most 6 bytes, far inside the
+// 255-byte name bound maxPathBytes is derived from.
+const maxPosDigits = 5
 
 // maxRowKeyDigits is the longest decimal row key ParsePath accepts (a
 // uint64's maximum decimal representation is 20 digits).
@@ -226,6 +239,12 @@ func parseNameOrPos(s string) (name string, pos uint32, byPos bool, err error) {
 		rest := s[1:]
 		if rest == "" || !isAllDigits(rest) {
 			return "", 0, false, fmt.Errorf("%w: malformed position %q", ErrPath, s)
+		}
+		// Canonical spelling only — see maxPosDigits. "#0" is the one
+		// leading-zero form there is, because it is the only digit string
+		// that starts with '0' and is a single digit.
+		if len(rest) > maxPosDigits || (len(rest) > 1 && rest[0] == '0') {
+			return "", 0, false, fmt.Errorf("%w: non-canonical position %q (no leading zeros, at most %d digits)", ErrPath, s, maxPosDigits)
 		}
 		v, perr := strconv.ParseUint(rest, 10, 32)
 		if perr != nil || v > maxPos {
