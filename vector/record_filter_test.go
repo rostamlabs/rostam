@@ -5,6 +5,7 @@ package vector
 import (
 	"encoding/binary"
 	"math/rand"
+	"strings"
 	"testing"
 
 	"github.com/rostamlabs/rostam/sdk/wire"
@@ -215,6 +216,52 @@ func TestCompileFilterRowPresenceCompileErrors(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestRowPresenceCompileErrorIsBounded pins the SIZE of a row-presence compile
+// error. The field string is caller-supplied and bounded only by the 32 MiB
+// route body cap, and both rejection branches used to quote it whole — with %q
+// that is up to four bytes of escapes per input byte, so refusing a hostile
+// filter cost another large copy of it, the very cost record.ParsePath's
+// pre-split length bound was added to avoid.
+//
+// The message now carries a 64-byte prefix and the length, so it stays a couple
+// of hundred bytes whatever the input, and rejecting stays flat in the size of
+// the field.
+func TestRowPresenceCompileErrorIsBounded(t *testing.T) {
+	const big = 1 << 20
+	huge := strings.Repeat("x", big)
+
+	for _, c := range []struct {
+		name  string
+		field string
+	}{
+		// No '/' at all: rejected by SplitField, quoting f.Field.
+		{"no slash", huge},
+		// A path that parses to the wrong shape: rejected after ParsePath,
+		// quoting the path.
+		{"path too long", "session/" + huge},
+		// A row-and-column path built from an over-long column name: parses far
+		// enough to reach the shape check.
+		{"wrong shape", "session/b/42/" + huge},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := CompileFilter(Filter{Op: FilterRowExists, Field: c.field})
+			if err == nil {
+				t.Fatal("CompileFilter succeeded, want a compile error")
+			}
+			if n := len(err.Error()); n >= 256 {
+				t.Errorf("error message is %d bytes, want < 256", n)
+			}
+			if strings.Contains(err.Error(), strings.Repeat("x", 128)) {
+				t.Error("error message echoed a long run of the field")
+			}
+			f := Filter{Op: FilterRowExists, Field: c.field}
+			if n := testing.AllocsPerRun(20, func() { _, _ = CompileFilter(f) }); n > 20 {
+				t.Errorf("rejecting a %d-byte field allocated %.1f times, want a small constant", big, n)
+			}
+		})
 	}
 }
 

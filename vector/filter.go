@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -844,14 +845,14 @@ func validateLatLon(lat, lon float64) error {
 func compileRowPresence(f Filter) (Predicate, error) {
 	payloadKey, pathStr, ok := record.SplitField(f.Field)
 	if !ok {
-		return nil, fmt.Errorf("vector: filter op %q requires a payloadKey/path field, got %q", mustOpName(f.Op), f.Field)
+		return nil, fmt.Errorf("vector: filter op %q requires a payloadKey/path field, got %s", mustOpName(f.Op), clipField(f.Field))
 	}
 	p, err := record.ParsePath(pathStr)
 	if err != nil {
-		return nil, fmt.Errorf("vector: filter op %q has an invalid record path %q: %w", mustOpName(f.Op), pathStr, err)
+		return nil, fmt.Errorf("vector: filter op %q has an invalid record path %s: %w", mustOpName(f.Op), clipField(pathStr), err)
 	}
 	if len(p.Segs) != 2 || p.Segs[1].Kind != record.SegRow {
-		return nil, fmt.Errorf("vector: filter op %q requires a path naming exactly a table row (field/row), got %q", mustOpName(f.Op), pathStr)
+		return nil, fmt.Errorf("vector: filter op %q requires a path naming exactly a table row (field/row), got %s", mustOpName(f.Op), clipField(pathStr))
 	}
 	exists := f.Op == FilterRowExists
 	field := f.Field
@@ -920,6 +921,29 @@ func compileRowPresence(f Filter) (Predicate, error) {
 		}
 		return fres.Kind == record.Table
 	}, nil
+}
+
+// clipField renders a caller-supplied field or record path for an error
+// message: the whole thing when it is short, otherwise a 64-byte prefix and
+// the full length.
+//
+// The field string is attacker-controlled and bounded only by the route body
+// cap (httpapi's maxJSONBody, 32 MiB), so quoting it whole made REJECTING a
+// hostile filter allocate another copy of it — with %q, up to four bytes of
+// escapes per input byte — which is the cost the bound in record.ParsePath was
+// added to avoid. The length is what a caller actually needs to see when the
+// path is too long; the prefix is what they need when it is merely wrong, and
+// 64 bytes shows a real path in full (the grammar's own cap is 1024).
+//
+// This is compile-time only, once per filter leaf per request, so the cost of
+// the branch is irrelevant — but so is the cost of quoting the whole input,
+// which is exactly why there is no reason to pay it.
+func clipField(s string) string {
+	const maxShown = 64
+	if len(s) <= maxShown {
+		return strconv.Quote(s)
+	}
+	return fmt.Sprintf("%s… (%d bytes)", strconv.Quote(s[:maxShown]), len(s))
 }
 
 func mustOpName(op FilterOp) string {
