@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"math/rand"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -280,35 +281,53 @@ func TestRowPresenceRefusesUnorderedTable(t *testing.T) {
 	}
 }
 
-// TestRowPresenceCompileErrorIsBounded pins the SIZE of a row-presence compile
-// error. The field string is caller-supplied and bounded only by the 32 MiB
-// route body cap, and both rejection branches used to quote it whole — with %q
-// that is up to four bytes of escapes per input byte, so refusing a hostile
-// filter cost another large copy of it, the very cost record.ParsePath's
-// pre-split length bound was added to avoid.
+// TestRowPresenceCompileErrorIsBounded pins the cost of REJECTING a
+// row-presence filter. The field string is caller-supplied and bounded only by
+// the 32 MiB route body cap, and every rejection branch used to quote it whole
+// — with %q that is up to four bytes of escapes per input byte, so refusing a
+// hostile filter cost another large copy of it, the very cost
+// record.ParsePath's pre-split length bound was added to avoid.
 //
-// The message now carries a 64-byte prefix and the length, so it stays a couple
-// of hundred bytes whatever the input, and rejecting stays flat in the size of
-// the field.
+// The property is SIZE INDEPENDENCE, measured against a small field that takes
+// the SAME rejection branch, and measured in BYTES. An absolute allocation
+// COUNT measures the race detector rather than this code — 4 without -race, 24
+// with it — and the count difference between two sizes is too noisy under
+// -race to assert on (observed swinging by 3 either way run to run, in both
+// directions). Bytes are the cost the fix is actually about: quoting the field
+// whole allocates in proportion to it, clipping allocates a message, and the
+// two differ by three orders of magnitude, so the comparison is not close.
+// This mirrors record.TestParsePathLengthBoundBeforeSplit, which measures the
+// same property the same way for the same reason. The count survives only as a
+// loose ceiling, for a rewrite that starts allocating per segment again.
+//
+// The message-length assertion is the one that actually fails when the fix is
+// reverted, and it is the one the finding was about.
 func TestRowPresenceCompileErrorIsBounded(t *testing.T) {
 	const big = 1 << 20
 	huge := strings.Repeat("x", big)
+	// Comfortably past record.ParsePath's 1024-byte path cap, so the two
+	// over-long cases below take the same rejection branch as their 1 MiB
+	// twins at 1/512th the size. A small field that took a DIFFERENT branch,
+	// or a different formatting path inside clipField, would compare two
+	// unrelated allocation profiles.
+	overCap := strings.Repeat("x", 2048)
 
 	for _, c := range []struct {
-		name  string
-		field string
+		name       string
+		small, big string
 	}{
-		// No '/' at all: rejected by SplitField, quoting f.Field.
-		{"no slash", huge},
-		// A path that parses to the wrong shape: rejected after ParsePath,
-		// quoting the path.
-		{"path too long", "session/" + huge},
-		// A row-and-column path built from an over-long column name: parses far
-		// enough to reach the shape check.
-		{"wrong shape", "session/b/42/" + huge},
+		// No '/' at all: rejected by SplitField, which formats f.Field. The
+		// small one is 256 bytes so it is past clipField's 64-byte threshold
+		// too: below it the whole string is quoted instead of clipped, which
+		// is a different formatting path and not the one being compared.
+		{"no slash", strings.Repeat("x", 256), huge},
+		// Rejected by ParsePath's length bound, which formats the path.
+		{"path too long", "session/" + overCap, "session/" + huge},
+		// Same branch, reached through a row-and-column shape.
+		{"wrong shape", "session/b/42/" + overCap, "session/b/42/" + huge},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			_, err := CompileFilter(Filter{Op: FilterRowExists, Field: c.field})
+			_, err := CompileFilter(Filter{Op: FilterRowExists, Field: c.big})
 			if err == nil {
 				t.Fatal("CompileFilter succeeded, want a compile error")
 			}
@@ -318,13 +337,54 @@ func TestRowPresenceCompileErrorIsBounded(t *testing.T) {
 			if strings.Contains(err.Error(), strings.Repeat("x", 128)) {
 				t.Error("error message echoed a long run of the field")
 			}
-			f := Filter{Op: FilterRowExists, Field: c.field}
-			if n := testing.AllocsPerRun(20, func() { _, _ = CompileFilter(f) }); n > 20 {
-				t.Errorf("rejecting a %d-byte field allocated %.1f times, want a small constant", big, n)
+			if _, serr := CompileFilter(Filter{Op: FilterRowExists, Field: c.small}); serr == nil {
+				t.Fatal("the small field compiled; it must take the same rejection branch as the big one")
+			}
+
+			bigF := Filter{Op: FilterRowExists, Field: c.big}
+			smallF := Filter{Op: FilterRowExists, Field: c.small}
+			smallBytes := bytesPerCompile(smallF)
+			bigBytes := bytesPerCompile(bigF)
+			bigN := testing.AllocsPerRun(20, func() { _, _ = CompileFilter(bigF) })
+			t.Logf("per rejection: %d bytes for a %d-byte field, %d bytes for a %d-byte field (%.0f allocs)",
+				smallBytes, len(c.small), bigBytes, len(c.big), bigN)
+			// The property: a 512x larger field costs the same. The slack
+			// covers the message itself and fmt's buffer sizing, and is two
+			// orders of magnitude below what quoting the field whole costs.
+			const byteSlack = 4 << 10
+			if bigBytes > smallBytes+byteSlack {
+				t.Errorf("rejection allocates in proportion to the field: %d bytes for %d vs %d bytes for %d",
+					smallBytes, len(c.small), bigBytes, len(c.big))
+			}
+			// Backstop on the COUNT, loose enough to survive the race
+			// runtime's own allocations (which roughly double it) and still
+			// catch a rewrite that allocates per segment.
+			if bigN > 64 {
+				t.Errorf("rejecting a %d-byte field allocated %.0f times, want a small constant", big, bigN)
 			}
 		})
 	}
 }
+
+// bytesPerCompile reports the average heap bytes one REJECTED CompileFilter
+// call allocates. runtime.MemStats rather than AllocsPerRun because the cost
+// this test is about is bytes — quoting a 1 MiB field is one big allocation,
+// which barely moves the count — and because the count carries the race
+// runtime's own allocations, which the byte delta between two calls cancels.
+func bytesPerCompile(f Filter) uint64 {
+	const runs = 20
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	for i := 0; i < runs; i++ {
+		_, compileSink = CompileFilter(f)
+	}
+	runtime.ReadMemStats(&after)
+	return (after.TotalAlloc - before.TotalAlloc) / runs
+}
+
+// compileSink keeps the compiler from optimising the rejected calls away.
+var compileSink error
 
 // TestRecordPathFilterFirstMatchesBruteForce is the fix-round-1 regression
 // test: the payload-index planner must NEVER claim a record path is
