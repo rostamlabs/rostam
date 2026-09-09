@@ -357,6 +357,31 @@ the new field values immediately — there is no separate reindex step to wait
 on. The record is still bound by the same 16 MiB storage cap every other
 record-writing entry point enforces.
 
+### Clocks and per-key deadlines
+
+The **only** clock any op consults is the applying transaction's stamp, exactly
+as for a KV [`operate`](../kv/overview.md#atomic-multi-field-updates-operate):
+never a wall clock. On an unreplicated or otherwise unstamped apply that stamp
+is `0`, so an unstamped `STAMP` writes `0` — the same caveat the KV page
+records, and with the same consequence for a `MIN_COL`/`MAX_COL` "LRU" column
+built on it.
+
+The payload key's own **per-key deadline** (set by `set_payload`'s `keyTTLMs`)
+is judged on the same terms. On a **stamped** apply a key whose deadline has
+passed reads as absent: the op-list starts a fresh record and the stale
+deadline is dropped. On an **unstamped** apply the deadline is not consulted at
+all — the record is mutated in place and its deadline is passed through
+unchanged.
+
+That asymmetry is deliberate. Every replica runs the op-list itself, so if an
+unstamped apply judged the deadline against its own wall clock, a replica past
+the deadline would create a fresh record while a replica short of it
+incremented the stored one, and the two would hold different bytes forever. A
+wall-clock read is only safe where it can move a deadline *value* (as
+`set_payload` does, at a bounded millisecond skew), not where it decides
+whether a record exists. The key remains invisible to reads until its deadline
+is refreshed either way.
+
 `vector_operate` is **refused while the collection is resharding** (a
 partitioned collection whose shard count is changing dual-writes every op to
 both the old and new shard generation; `set_payload`-style dual-writing is
