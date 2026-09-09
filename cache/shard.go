@@ -978,13 +978,24 @@ func (s *shard) delH(key []byte, h uint64) (bool, error) {
 			}
 		}
 		if !ok {
-			// Eviction removed the key from the index while making room for the
-			// tombstone. Nothing is left to strip, the appended record is harmless (the
-			// rebuild finds a delete for a key with no live copy), and the entry DID
-			// exist when the caller asked — so report the delete as having happened.
+			// The key is no longer index-current. Nothing is left to strip, the appended
+			// record is harmless (the rebuild finds a delete for a key with no live
+			// copy), and the entry DID exist when the caller asked — so report the
+			// delete as having happened.
 			//
-			// No onRemove call here: the eviction that dropped the slot already fired
-			// the hook for this key from inside its own cur == ref guard.
+			// NO onRemove CALL HERE, and only ONE of the three routes to this branch
+			// has already notified:
+			//   (a) eviction dropped this key's slot while making room for the tombstone
+			//       record — that eviction fired the hook from inside its own
+			//       cur == ref guard, so the key is already reported;
+			//   (b) the re-read of the re-resolved entry FAILED — a keyless corrupt
+			//       slot, which nothing anywhere reports (see sweepIndex);
+			//   (c) the re-resolved slot holds a DIFFERENT key that took the hash over,
+			//       so this key's slot is simply gone, unreported.
+			// (b) and (c) therefore leave a STALE posting behind. That is within the
+			// hook's contract: a stale posting costs one wasted candidate that
+			// verify-on-read discards, and the reconcile pass clears it. The thing that
+			// must never happen — dropping a LIVE key's posting — cannot happen here.
 			s.dels.Add(1)
 			return true, nil
 		}

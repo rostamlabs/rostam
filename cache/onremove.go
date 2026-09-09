@@ -37,8 +37,19 @@ package cache
 //
 // WHERE IT DELIBERATELY DOES NOT FIRE:
 //
-//   - An OVERWRITE. A Put repoints the index slot at the new physical copy; the
-//     write path reindexes instead, so firing here would drop a live posting.
+//   - AN OVERWRITE ITSELF. Repointing a slot is not a removal: a Put stores the
+//     new physical copy and upserts, and the write path reindexes.
+//
+// BUT A Put CAN STILL FIRE THE HOOK FOR THE VERY KEY IT IS WRITING, so ORDER
+// YOUR REINDEX AFTER THE Put RETURNS. On a ringbuf shard, Put →
+// findOrMakePageLocked → evictUntilFitsLocked can choose as its victim the page
+// that holds K's CURRENT copy. That copy matches `cur == ref`, so the eviction
+// notifies onRemove(K) — from inside K's own Put, under the same lock, BEFORE
+// the new copy is written. An index consumer that reindexed K first and then
+// called Put would see the notification land after its own posting and drop it,
+// leaving a live key with no posting: the one failure mode verify-on-read cannot
+// repair. Reindex only once Put has returned, and the ordering is always safe.
+// (TestOnRemoveEvictingPutFiresForItsOwnKey pins this.)
 //   - A DEAD DUPLICATE. The eviction and page-reclaim walks visit every framed
 //     entry on a page, including copies a later Put superseded. Those entries'
 //     index slots already point at a newer live copy elsewhere, so the hook fires
@@ -152,10 +163,12 @@ func (s *shard) iterateChunked(batch int, fn func(key, value []byte) bool) bool 
 // fn stopped the iteration, and whether the pass was abandoned because the index
 // table was swapped underneath it.
 //
-// The body mirrors shard.iterate exactly — same expiry filter against the shard's
+// The body matches shard.iterate's filters — same expiry test against the shard's
 // wall clock, same tombstone guard — so the visited set matches Iterate's for a
-// quiescent cache. Only the locking differs: one RLock per chunk instead of one
-// for the whole shard, following sweepIndex's batching.
+// quiescent cache. Two things differ, both because the lock is released between
+// chunks: one RLock per chunk instead of one for the whole shard (following
+// sweepIndex's batching), and page resolution through the generation-gated
+// pageSlots rather than s.pages (see the gate below).
 func (s *shard) iterateChunkedPass(batch int, fn func(key, value []byte) bool) (stopped, rehashed bool) {
 	now := s.now()
 	t := s.tab.Load()
@@ -178,7 +191,18 @@ func (s *shard) iterateChunkedPass(batch int, fn func(key, value []byte) bool) (
 				continue
 			}
 			ref := slabRef(t.refs[i].Load())
-			page := s.pages[ref.pageIdx()]
+			// Resolve through pageSlots WITH THE GENERATION GATE, exactly as
+			// indexTable.get does — not through s.pages, which Iterate can get away
+			// with because it never lets go of the shard. This walk DOES let go
+			// between chunks, so a page can be retired and replaced by a fresh object
+			// mid-walk (ringbuf eviction, expired-page reclaim, online recycle). A
+			// slot still pointing into the old content would then decode against the
+			// NEW page's bytes and yield a bogus key/value pair. A generation mismatch
+			// says that physical entry is gone: skip it.
+			page := s.pageSlots[ref.pageIdx()].Load()
+			if page == nil || page.gen != ref.gen() {
+				continue
+			}
 			k, v, exp, err := page.Read(ref.offset())
 			if err != nil {
 				continue

@@ -284,6 +284,68 @@ func TestOnRemoveSkipsSupersededDuplicates(t *testing.T) {
 	}
 }
 
+// TestOnRemoveEvictingPutFiresForItsOwnKey pins the ORDERING RULE an index
+// consumer must follow. A Put on a ringbuf shard can evict the page holding the
+// key's CURRENT copy while making room for the new one, so the hook fires for K
+// from inside K's own Put, before the new copy is written. A consumer that
+// reindexed K and then called Put would have its fresh posting dropped by the
+// notification that follows — so it must reindex only AFTER Put returns.
+func TestOnRemoveEvictingPutFiresForItsOwnKey(t *testing.T) {
+	c, rec := newOnRemoveCache(t, evictionConfig())
+	s := c.shards[0]
+	val := make([]byte, 64<<10)
+	newVal := bytes.Repeat([]byte{0xCD}, 64<<10)
+	// Same-length keys, so every entry needs exactly the same number of bytes and
+	// "is there room for one more" is one question rather than two.
+	key := []byte("KKKKK")
+	need := entrySize(len(key), len(val))
+
+	// K's only copy lands on page 0.
+	if err := c.Put(key, val, 0); err != nil {
+		t.Fatalf("Put K: %v", err)
+	}
+	// Fill until no page can take another entry and no page can be added. The next
+	// Put must evict, and the rotation cursor still points at page 0 — K's page.
+	for i := 0; ; i++ {
+		s.mu.RLock()
+		room := s.firstPageWithRoomLocked(need) >= 0
+		grow := len(s.pages) < s.cfg.MaxPagesPerShard()
+		s.mu.RUnlock()
+		if !room && !grow {
+			break
+		}
+		if err := c.Put(fmt.Appendf(nil, "f%04d", i), val, 0); err != nil {
+			t.Fatalf("filler Put: %v", err)
+		}
+		if i > 2000 {
+			t.Fatal("the shard never filled up")
+		}
+	}
+	if s.evictions.Load() != 0 {
+		t.Fatal("eviction happened while filling; the fixture did not stop in time")
+	}
+	if n := rec.count(string(key)); n != 0 {
+		t.Fatalf("hook fired %d times for K before its evicting Put", n)
+	}
+
+	// THE EVICTING PUT: it drains page 0, which still holds K's current copy.
+	if err := c.Put(key, newVal, 0); err != nil {
+		t.Fatalf("evicting Put K: %v", err)
+	}
+
+	if n := rec.count(string(key)); n != 1 {
+		t.Fatalf("hook fired %d times for K during K's own evicting Put, want 1 — "+
+			"an index consumer's reindex must therefore happen AFTER Put returns", n)
+	}
+	got, err := c.Get(key)
+	if err != nil {
+		t.Fatalf("K must be live after its own Put: %v", err)
+	}
+	if !bytes.Equal(got, newVal) {
+		t.Fatal("K did not resolve to the value its evicting Put wrote")
+	}
+}
+
 func TestOnRemoveNotFiredOnOverwrite(t *testing.T) {
 	c, rec := newOnRemoveCache(t, onRemoveTestConfig())
 	for i := range 5 {
@@ -663,16 +725,30 @@ func TestIterateChunkedLetsWritesThrough(t *testing.T) {
 		}
 	}()
 
-	const batch = 256
+	// PACE THE WALK TO A FIXED FLOOR rather than hoping it runs long enough. The
+	// callback sleeps only to catch up to a linear schedule, so the walk always
+	// takes at least walkFloor (a slow machine or -race overshoots the schedule and
+	// sleeps not at all) and the sample count is guaranteed, never assumed. Each
+	// individual sleep is walkFloor/pacePoints ≈ 800 µs — the worst stall a writer
+	// can see is one of those, never the whole walk.
+	const (
+		walkFloor  = 400 * time.Millisecond
+		pacePoints = 500
+		batch      = 256
+	)
+	stride := n / pacePoints
+	if stride < 1 {
+		stride = 1
+	}
 	visited := 0
 	start := time.Now()
 	c.IterateChunked(batch, func(_, _ []byte) bool {
 		visited++
-		if visited%batch == 0 {
-			// Make the walk long enough to span many samples. The sleep happens
-			// under the chunk's read lock, so it is also the worst-case stall a
-			// writer can see — bounded by one chunk, never by the whole walk.
-			time.Sleep(300 * time.Microsecond)
+		if visited%stride == 0 {
+			want := time.Duration(int64(walkFloor) * int64(visited) / int64(n))
+			if d := want - time.Since(start); d > 0 {
+				time.Sleep(d)
+			}
 		}
 		return true
 	})
@@ -685,11 +761,15 @@ func TestIterateChunkedLetsWritesThrough(t *testing.T) {
 	if visited < n {
 		t.Fatalf("walk visited %d of %d keys", visited, n)
 	}
+	// The floor is enforced, so falling short means the pacing itself is broken.
+	if minWalk := walkFloor - walkFloor/pacePoints; elapsed < minWalk {
+		t.Fatalf("walk took %v, below its %v floor; the pacing did not hold", elapsed, minWalk)
+	}
 	sampleMu.Lock()
 	got := append([]int64(nil), samples...)
 	sampleMu.Unlock()
-	if len(got) < 3 {
-		t.Fatalf("walk finished in %v with only %d samples; too short to prove anything", elapsed, len(got))
+	if want := int(walkFloor/(10*time.Millisecond)) / 2; len(got) < want {
+		t.Fatalf("walk ran %v but the sampler took only %d samples, want >= %d", elapsed, len(got), want)
 	}
 	for i, d := range got {
 		if d <= 0 {
