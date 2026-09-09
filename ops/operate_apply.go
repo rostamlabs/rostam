@@ -240,6 +240,12 @@ func openMode(es engines, buf []byte, existed bool) (modeEngine, error) {
 // the bytes. A stored value that big cannot be a valid operate record, so it
 // is wire.ErrOperateRecord — a malformed stored record — rather than
 // wire.ErrOperateCap, which means "this call would grow the record too far".
+//
+// FRESHNESS IS LOAD-BEARING FOR A CALLER OUTSIDE THIS PACKAGE. vector's
+// RecordMutator contract hands ownership of the returned bytes to the engine,
+// which stores them by reference in the arena. That is sound only because this
+// function allocates a new buffer per call (and createRecord allocates fresh).
+// Do not turn this into a pooled or reused buffer without changing that contract.
 func copyRecord(cur []byte) ([]byte, error) {
 	if len(cur) > maxOperateRecordBytes {
 		return nil, wire.ErrOperateRecord

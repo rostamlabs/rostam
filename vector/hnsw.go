@@ -2995,6 +2995,109 @@ func (h *hnsw) overwritePayloadBody(id uint64, meta Metadata, keyTTLMs map[strin
 	return newMeta, ke, h.arena.BumpVersion(slot), nil
 }
 
+// MutatePayloadRecord applies fn to the operate record stored under key in id's
+// payload and stores what fn returns, all inside ONE write-lock critical
+// section: read the current bytes, transform, bound, store/delete, prune the
+// key's deadline, reindex, bump. It is the store-agnostic seam ops.handleVector-
+// Operate drives with applyRecordBytes — vector never imports ops, so the
+// transform arrives as a function.
+//
+// Returns the RESULTING payload and per-key deadlines (so Collection WAL-logs
+// exactly what was applied), the resulting version, and changed. changed=false
+// means the call was a deliberate no-op (a failed CHECK, or a delete of an
+// absent key): nothing was stored, nothing was logged, the version is the
+// CURRENT one and was not bumped.
+func (h *hnsw) MutatePayloadRecord(id uint64, key string, fn RecordMutator, cas CASCond) (Metadata, map[string]uint64, uint64, bool, error) {
+	return h.mutatePayloadRecordBody(id, key, fn, cas, false, 0)
+}
+
+// MutatePayloadRecordAt judges the dead-point liveness gate, the per-key
+// deadline check and the stale-deadline drop against the EXPLICIT leader-stamped
+// clock nowMs, so a replicated record mutation sees the same record and produces
+// the same bytes on every replica (#4 vector TTL determinism, mirroring
+// SetPayloadAt).
+func (h *hnsw) MutatePayloadRecordAt(id uint64, key string, fn RecordMutator, cas CASCond, nowMs int64) (Metadata, map[string]uint64, uint64, bool, error) {
+	return h.mutatePayloadRecordBody(id, key, fn, cas, true, uint64(nowMs)) //nolint:gosec // stamped unix-millis is non-negative
+}
+
+func (h *hnsw) mutatePayloadRecordBody(id uint64, key string, fn RecordMutator, cas CASCond, stamped bool, nowMs uint64) (Metadata, map[string]uint64, uint64, bool, error) {
+	if fn == nil || key == "" || key == contentField {
+		return nil, nil, 0, false, ErrPayloadKeyNotRecord
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	now := nowMs
+	if !stamped {
+		now = uint64(h.now())
+	}
+	slot, ok := h.arena.Slot(id)
+	if !ok || h.tombstoned[slot] || h.isExpiredAt(slot, now) {
+		return nil, nil, 0, false, ErrIDNotFound
+	}
+	if err := cas.check(h.arena.Version(slot)); err != nil {
+		return nil, nil, 0, false, err // CAS mismatch: no mutation, no bump
+	}
+	oldMeta := h.arena.Metadata(slot)
+	oldKE := h.arena.KeyExpires(slot)
+	old, exists, err := currentRecordValue(oldMeta, key, keyExpired(oldKE[key], now))
+	if err != nil {
+		return nil, nil, 0, false, err
+	}
+	rec, act, err := fn(old, exists)
+	if err != nil {
+		return nil, nil, 0, false, err
+	}
+	switch act {
+	case RecordUnchanged:
+		return nil, nil, h.arena.Version(slot), false, nil
+	case RecordDelete:
+		if !exists {
+			return nil, nil, h.arena.Version(slot), false, nil
+		}
+	case RecordStore:
+		// The POST-mutation bound. checkRecordValues (vector/metadata.go) is the
+		// same cap on the ingest side, but it only ever sees a caller's patch —
+		// it cannot reach bytes the operate engine just produced, which is what
+		// this site exists for. Keep the two in step.
+		if len(rec) > maxRecordValueBytes {
+			return nil, nil, 0, false, fmt.Errorf("%w: payload key %q would hold a %d-byte record, the cap is %d bytes",
+				ErrRecordTooLarge, key, len(rec), maxRecordValueBytes)
+		}
+	default:
+		return nil, nil, 0, false, ErrRecordMutation
+	}
+	merged := cloneMeta(oldMeta)
+	if act == RecordDelete {
+		delete(merged, key)
+		if len(merged) == 0 {
+			// An emptied payload stores nil, exactly as deletePayloadKeysBody
+			// normalizes it. Storing an empty non-nil map instead would make the
+			// live state differ from the same state after a WAL replay (the log
+			// encodes an empty payload as absent and restores nil), for no gain.
+			merged = nil
+		}
+	} else {
+		if merged == nil {
+			merged = make(Metadata, 1)
+		}
+		merged[key] = Value{Kind: ValueRecord, Rec: rec} // ownership hand-off; see RecordMutator
+	}
+	ke := cloneKeyExpires(oldKE)
+	// A logically expired key read as ABSENT above: its stale deadline must go,
+	// or the record this call just created would be invisible the instant it is
+	// written. pruneKeyExpires only drops deadlines for keys no longer present.
+	if ke != nil && keyExpired(ke[key], now) {
+		delete(ke, key)
+	}
+	ke = pruneKeyExpires(ke, merged)
+	h.maintainBM25OnPayloadChange(slot, oldMeta, merged)
+	h.arena.SetMetadata(slot, merged)
+	h.arena.SetKeyExpires(slot, ke)
+	h.payloadIdx.reindex(slot, merged)
+	h.bumpData() // payload-value change: invalidate the order_by snapshot (NOT idSetVersion)
+	return merged, ke, h.arena.BumpVersion(slot), true, nil
+}
+
 // DeletePayloadKeys removes the listed keys from id's payload (absent keys are a
 // no-op) AND drops their per-key deadlines. Read-compute-set-reindex run in one
 // write-lock critical section. Returns the resulting payload AND the resulting

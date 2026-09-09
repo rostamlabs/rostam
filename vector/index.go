@@ -616,6 +616,25 @@ type VectorIndex interface {
 	OverwritePayloadAt(id uint64, meta Metadata, keyTTLMs map[string]int64, cas CASCond, nowMs int64) (Metadata, map[string]uint64, uint64, error)
 	DeletePayloadKeysAt(id uint64, keys []string, cas CASCond, nowMs int64) (Metadata, map[string]uint64, uint64, error)
 	ClearPayloadAt(id uint64, cas CASCond, nowMs int64) (Metadata, map[string]uint64, uint64, error)
+	// MutatePayloadRecord applies fn to the operate record stored under key in
+	// id's payload and stores what fn returns, in ONE write-lock critical
+	// section (read, transform, bound, store/delete, reindex, bump). It is the
+	// store-agnostic seam the ops vector_operate handler drives: vector never
+	// imports ops, so the transform arrives as a function.
+	//
+	// Returns the resulting payload, the resulting absolute per-key deadlines,
+	// the resulting version, changed, and an error. changed=false means the
+	// call was a deliberate no-op (a failed CHECK, or a delete of an absent
+	// key): nothing was written and the returned version is the CURRENT,
+	// UNBUMPED one, so a no-op costs neither a WAL record nor a version move a
+	// CAS loop is watching.
+	MutatePayloadRecord(id uint64, key string, fn RecordMutator, cas CASCond) (Metadata, map[string]uint64, uint64, bool, error)
+	// MutatePayloadRecordAt judges the dead-point liveness gate, the per-key
+	// deadline check and the stale-deadline drop against the EXPLICIT
+	// leader-stamped clock nowMs, so a replicated record mutation reads the
+	// same record and produces the same bytes on every replica (#4 vector TTL
+	// determinism, mirroring SetPayloadAt).
+	MutatePayloadRecordAt(id uint64, key string, fn RecordMutator, cas CASCond, nowMs int64) (Metadata, map[string]uint64, uint64, bool, error)
 	// RestorePayload restores a logged payload + per-key deadlines AND the exact
 	// version verbatim (NOT bumped) — the WAL-replay primitive.
 	RestorePayload(id uint64, meta Metadata, keyExpires map[string]uint64, version uint64) error

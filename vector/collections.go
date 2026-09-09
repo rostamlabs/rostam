@@ -1136,6 +1136,30 @@ func (s *CollectionStore) ClearPayloadCASAt(name string, id uint64, cas CASCond,
 	return payloadAppliedV(c.ClearPayloadCASAt(id, cas, nowMs))
 }
 
+// MutatePayloadRecordCAS applies fn to the operate record under key in the named
+// collection's point id. See Collection.MutatePayloadRecordCAS. An absent point
+// is the not-found FLAG (applied=false, err=nil), like every other payload
+// dispatcher here.
+func (s *CollectionStore) MutatePayloadRecordCAS(name string, id uint64, key string, fn RecordMutator, cas CASCond) (applied bool, version uint64, err error) {
+	c, ok := s.Acquire(name)
+	if !ok {
+		return false, 0, fmt.Errorf("vector: no collection %q", name)
+	}
+	defer c.Release()
+	return payloadAppliedV(c.MutatePayloadRecordCAS(id, key, fn, cas))
+}
+
+// MutatePayloadRecordCASAt is MutatePayloadRecordCAS under the leader apply
+// stamp nowMs. See Collection.MutatePayloadRecordCASAt.
+func (s *CollectionStore) MutatePayloadRecordCASAt(name string, id uint64, key string, fn RecordMutator, cas CASCond, nowMs int64) (applied bool, version uint64, err error) {
+	c, ok := s.Acquire(name)
+	if !ok {
+		return false, 0, fmt.Errorf("vector: no collection %q", name)
+	}
+	defer c.Release()
+	return payloadAppliedV(c.MutatePayloadRecordCASAt(id, key, fn, cas, nowMs))
+}
+
 // payloadAppliedV is payloadApplied for the CAS variants that also return the
 // resulting version: ErrIDNotFound → (false, 0, nil) (absent point is a FLAG);
 // any other error (incl. ErrVersionConflict) → (false, 0, err); nil → (true,
