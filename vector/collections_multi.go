@@ -479,6 +479,30 @@ func (s *CollectionStore) MVSetPayloadCASAt(name string, docID uint64, patch Met
 	return payloadAppliedV(idx.SetPayloadCASAt(docID, patch, keyTTLMs, cas, nowMs))
 }
 
+// MVMutatePayloadRecordCAS applies fn to the operate record under key in the
+// multi-vector collection's document docID. See
+// MultiVectorIndex.MutatePayloadRecordCAS. An absent document is the not-found
+// FLAG (applied=false, err=nil), like every other payload dispatcher here.
+func (s *CollectionStore) MVMutatePayloadRecordCAS(name string, docID uint64, key string, fn RecordMutator, cas CASCond) (applied bool, version uint64, err error) {
+	idx, ok := s.AcquireMulti(name)
+	if !ok {
+		return false, 0, fmt.Errorf("vector: no multi-vector collection %q", name)
+	}
+	defer idx.Release()
+	return payloadAppliedV(idx.MutatePayloadRecordCAS(docID, key, fn, cas))
+}
+
+// MVMutatePayloadRecordCASAt is MVMutatePayloadRecordCAS under the leader apply
+// stamp nowMs. See MultiVectorIndex.MutatePayloadRecordCASAt.
+func (s *CollectionStore) MVMutatePayloadRecordCASAt(name string, docID uint64, key string, fn RecordMutator, cas CASCond, nowMs int64) (applied bool, version uint64, err error) {
+	idx, ok := s.AcquireMulti(name)
+	if !ok {
+		return false, 0, fmt.Errorf("vector: no multi-vector collection %q", name)
+	}
+	defer idx.Release()
+	return payloadAppliedV(idx.MutatePayloadRecordCASAt(docID, key, fn, cas, nowMs))
+}
+
 // MVOverwritePayload replaces docID's entire payload with meta. keyTTLMs sets the
 // per-key relative TTLs on the new payload. applied=false for an absent document
 // (not an error). See MultiVectorIndex.OverwritePayload.

@@ -401,6 +401,30 @@ func (s *CollectionStore) NamedSetPayloadCASAt(name string, id uint64, patch Met
 	return payloadAppliedV(nc.SetPayloadCASAt(id, patch, keyTTLMs, cas, nowMs))
 }
 
+// NamedMutatePayloadRecordCAS applies fn to the operate record under key in the
+// named collection's point id. See NamedCollection.MutatePayloadRecordCAS. An
+// absent point is the not-found FLAG (applied=false, err=nil), like every other
+// payload dispatcher here.
+func (s *CollectionStore) NamedMutatePayloadRecordCAS(name string, id uint64, key string, fn RecordMutator, cas CASCond) (applied bool, version uint64, err error) {
+	nc, ok := s.AcquireNamed(name)
+	if !ok {
+		return false, 0, fmt.Errorf("%w %q", ErrNoNamed, name)
+	}
+	defer nc.Release()
+	return payloadAppliedV(nc.MutatePayloadRecordCAS(id, key, fn, cas))
+}
+
+// NamedMutatePayloadRecordCASAt is NamedMutatePayloadRecordCAS under the leader
+// apply stamp nowMs. See NamedCollection.MutatePayloadRecordCASAt.
+func (s *CollectionStore) NamedMutatePayloadRecordCASAt(name string, id uint64, key string, fn RecordMutator, cas CASCond, nowMs int64) (applied bool, version uint64, err error) {
+	nc, ok := s.AcquireNamed(name)
+	if !ok {
+		return false, 0, fmt.Errorf("%w %q", ErrNoNamed, name)
+	}
+	defer nc.Release()
+	return payloadAppliedV(nc.MutatePayloadRecordCASAt(id, key, fn, cas, nowMs))
+}
+
 // NamedOverwritePayload replaces id's entire shared payload with meta. keyTTLMs sets
 // the per-key relative TTLs on the new payload. applied=false for an absent/expired
 // point (not an error). See NamedCollection.OverwritePayload.

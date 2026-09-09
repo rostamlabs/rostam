@@ -176,6 +176,12 @@ var ErrRecordTooLarge = errors.New("vector: record payload value exceeds the sto
 // mutation entry calls it BEFORE it touches any state or stages a WAL write;
 // the inner helpers those entries share deliberately do NOT repeat it, so each
 // op pays exactly one pass over its own payload.
+//
+// It is one of TWO sites for this bound, and the divergence is deliberate: this
+// one sees a CALLER's patch, while mutatePayloadRecordBody (vector/hnsw.go, with
+// twins in vector/ivf.go and in the named/MV mutatePayloadRecordLockedAt) bounds
+// the POST-mutation bytes the operate engine just produced, which no patch check
+// can reach. Keep the two in step.
 func checkRecordValues(m Metadata) error {
 	for k, v := range m {
 		if v.Kind == ValueRecord && len(v.Rec) > maxRecordValueBytes {

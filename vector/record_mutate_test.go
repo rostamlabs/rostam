@@ -68,15 +68,33 @@ func stampedRecordBytes(t *testing.T, stamp int64) []byte {
 // storedMeta returns the metadata the arena actually holds for id — the state
 // Get normalizes away (it reports nil for any empty payload) and the state a WAL
 // replay has to reproduce.
-func storedMeta(t *testing.T, h *hnsw, id uint64) Metadata {
+//
+// It takes the INTERFACE and switches on the concrete engine so the shared table
+// can assert the empty-payload-stores-nil normalisation on the IVF copy too, not
+// only on the dense one it was first written against.
+func storedMeta(t *testing.T, ix VectorIndex, id uint64) Metadata {
 	t.Helper()
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	slot, ok := h.arena.Slot(id)
-	if !ok {
-		t.Fatalf("id %d has no slot", id)
+	switch e := ix.(type) {
+	case *hnsw:
+		e.mu.RLock()
+		defer e.mu.RUnlock()
+		slot, ok := e.arena.Slot(id)
+		if !ok {
+			t.Fatalf("id %d has no slot", id)
+		}
+		return e.arena.Metadata(slot)
+	case *ivf:
+		e.mu.RLock()
+		defer e.mu.RUnlock()
+		slot, ok := e.arena.Slot(id)
+		if !ok {
+			t.Fatalf("id %d has no slot", id)
+		}
+		return e.arena.Metadata(slot)
+	default:
+		t.Fatalf("storedMeta: unhandled engine %T — add it, or the nil normalisation goes unchecked", ix)
+		return nil
 	}
-	return h.arena.Metadata(slot)
 }
 
 // pointVersion reads id's current version through the public read path.
@@ -739,11 +757,130 @@ func TestMutateRecordSurvivesReopen(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// IVF parity
+// cross-engine parity (dense, IVF, named, multi-vector)
 // ---------------------------------------------------------------------------
 
-// mutateCase is one engine-level scenario, run against both engines so the IVF
-// copy cannot drift from the dense one.
+// mutateHarness is ONE engine behind the shared record-mutation table: a seeded
+// point 1 holding a "session" record, plus the four accessors every case needs.
+// The dense, IVF, named and multi-vector implementations are four copies of the
+// same body, so they are held to ONE table (TestMutateRecordNamedAndMVMatchDense
+// runs all four) and a divergence in any of them fails loudly.
+//
+// mutate targets the ENGINE-level entry (which reports changed), not the
+// collection wrapper, so the table sees the no-op flag directly on every family.
+type mutateHarness struct {
+	name string
+	// insert seeds an ADDITIONAL point carrying meta (point 1 is already seeded
+	// with an rc=7 "session" record when the harness is built).
+	insert func(t *testing.T, id uint64, meta Metadata)
+	// setNow pins the engine's wall clock, so the non-At entries and every read
+	// below are judged against an explicit, deterministic time.
+	setNow func(ms int64)
+	// setPayload is the family's set_payload, used only to seed a per-key TTL.
+	setPayload func(t *testing.T, id uint64, meta Metadata, keyTTLMs map[string]int64)
+	mutate     func(id uint64, key string, fn RecordMutator, cas CASCond) (version uint64, changed bool, err error)
+	mutateAt   func(id uint64, key string, fn RecordMutator, cas CASCond, nowMs int64) (version uint64, changed bool, err error)
+	// payload is the live payload as a reader sees it at the pinned clock
+	// (per-key-expired keys already dropped); ok=false for a dead/absent point.
+	payload func(id uint64) (Metadata, bool)
+	// version is the point's current version, 0 for a dead/absent point.
+	version func(id uint64) uint64
+	// stored is the RAW stored payload, before the nil normalisation Get hides.
+	stored func(t *testing.T, id uint64) Metadata
+}
+
+// record reads the record bytes under key from the harness's live payload.
+func (h mutateHarness) record(t *testing.T, id uint64, key string) ([]byte, bool) {
+	t.Helper()
+	meta, ok := h.payload(id)
+	if !ok {
+		t.Fatalf("%s: point %d is not live", h.name, id)
+	}
+	v, present := meta[key]
+	if !present {
+		return nil, false
+	}
+	if v.Kind != ValueRecord {
+		t.Fatalf("%s: payload key %q holds kind %d, want a record", h.name, key, v.Kind)
+	}
+	return v.Rec, true
+}
+
+// mutateHarnessBase is the clock every harness is pinned to before a case runs,
+// so "now" is explicit rather than whatever time.Now happened to return.
+const mutateHarnessBase int64 = 1_000_000_000_000
+
+// denseMutateHarness seeds a dense engine holding point 1 with an rc=7 record.
+func denseMutateHarness(t *testing.T) mutateHarness {
+	t.Helper()
+	h, err := newHNSW(mutateRecordCfg())
+	if err != nil {
+		t.Fatalf("newHNSW: %v", err)
+	}
+	h.now = func() int64 { return mutateHarnessBase }
+	seedMutatePoint(t, h, 1)
+	return vectorIndexHarness("hnsw", h, func(ms int64) { h.now = func() int64 { return ms } })
+}
+
+// ivfMutateHarness seeds an IVF engine with the identical point.
+func ivfMutateHarness(t *testing.T) mutateHarness {
+	t.Helper()
+	ix, err := newIVF(ivfTestConfig(4))
+	if err != nil {
+		t.Fatalf("newIVF: %v", err)
+	}
+	ix.now = func() int64 { return mutateHarnessBase }
+	seedMutatePoint(t, ix, 1)
+	return vectorIndexHarness("ivf", ix, func(ms int64) { ix.now = func() int64 { return ms } })
+}
+
+// vectorIndexHarness adapts either slot-keyed engine to the shared table.
+func vectorIndexHarness(name string, ix VectorIndex, setNow func(int64)) mutateHarness {
+	return mutateHarness{
+		name:   name,
+		setNow: setNow,
+		insert: func(t *testing.T, id uint64, meta Metadata) {
+			t.Helper()
+			vec := make([]float32, ix.Dim())
+			vec[0] = float32(id)
+			if _, _, err := ix.Insert(id, vec, 0, meta, nil, nil, CASCond{}); err != nil {
+				t.Fatalf("%s: Insert(%d): %v", name, id, err)
+			}
+		},
+		setPayload: func(t *testing.T, id uint64, meta Metadata, keyTTLMs map[string]int64) {
+			t.Helper()
+			if _, _, _, err := ix.SetPayload(id, meta, keyTTLMs, CASCond{}); err != nil {
+				t.Fatalf("%s: SetPayload(%d): %v", name, id, err)
+			}
+		},
+		mutate: func(id uint64, key string, fn RecordMutator, cas CASCond) (uint64, bool, error) {
+			_, _, version, changed, err := ix.MutatePayloadRecord(id, key, fn, cas)
+			return version, changed, err
+		},
+		mutateAt: func(id uint64, key string, fn RecordMutator, cas CASCond, nowMs int64) (uint64, bool, error) {
+			_, _, version, changed, err := ix.MutatePayloadRecordAt(id, key, fn, cas, nowMs)
+			return version, changed, err
+		},
+		payload: func(id uint64) (Metadata, bool) {
+			_, meta, _, _, _, ok := ix.Get(id)
+			return meta, ok
+		},
+		version: func(id uint64) uint64 {
+			_, _, _, _, v, ok := ix.Get(id)
+			if !ok {
+				return 0
+			}
+			return v
+		},
+		stored: func(t *testing.T, id uint64) Metadata {
+			t.Helper()
+			return storedMeta(t, ix, id)
+		},
+	}
+}
+
+// mutateCase is one engine-level scenario, run against every engine so no copy
+// of the body can drift from the others.
 type mutateCase struct {
 	name        string
 	key         string
@@ -753,6 +890,10 @@ type mutateCase struct {
 	wantChanged bool
 	wantBump    bool
 	wantRec     func(t *testing.T) ([]byte, bool) // resulting bytes under "session"
+	// wantStoredNil asserts the RAW stored payload is nil afterwards — the
+	// empty-payload normalisation Get hides (it reports nil for any empty
+	// payload) and a WAL replay has to reproduce.
+	wantStoredNil bool
 }
 
 func mutateCases(t *testing.T) []mutateCase {
@@ -773,6 +914,10 @@ func mutateCases(t *testing.T) []mutateCase {
 			fn:          func(_ []byte, _ bool) ([]byte, RecordMutation, error) { return nil, RecordDelete, nil },
 			wantChanged: true, wantBump: true,
 			wantRec: func(*testing.T) ([]byte, bool) { return nil, false },
+			// "session" is the point's ONLY key, so deleting it empties the payload
+			// — which every engine must store as nil, or the live state differs
+			// from the state the same WAL record rebuilds on replay.
+			wantStoredNil: true,
 		},
 		{
 			name: "cas conflict", key: "session", fn: storeFn(sessionRecordBytesRC(t, 8)),
@@ -803,15 +948,29 @@ func mutateCases(t *testing.T) []mutateCase {
 			wantErr: ErrPayloadKeyNotRecord,
 			wantRec: func(t *testing.T) ([]byte, bool) { return sessionRecordBytes(t), true },
 		},
+		{
+			// The reserved document-content key never holds a record: rejected on
+			// the same guard as the empty key, before the point is even read.
+			name: "content field", key: contentField, fn: storeFn(sessionRecordBytesRC(t, 8)),
+			wantErr: ErrPayloadKeyNotRecord,
+			wantRec: func(t *testing.T) ([]byte, bool) { return sessionRecordBytes(t), true },
+		},
+		{
+			// A nil mutator is a caller bug, caught by the same guard rather than
+			// panicking inside the write-lock critical section.
+			name: "nil mutator", key: "session", fn: nil,
+			wantErr: ErrPayloadKeyNotRecord,
+			wantRec: func(t *testing.T) ([]byte, bool) { return sessionRecordBytes(t), true },
+		},
 	}
 }
 
 // runMutateCase applies one case to a freshly seeded engine and asserts the
-// outcome, so the two engines are held to the same table.
-func runMutateCase(t *testing.T, ix VectorIndex, tc mutateCase) {
+// outcome, so every engine is held to the same table.
+func runMutateCase(t *testing.T, h mutateHarness, tc mutateCase) {
 	t.Helper()
-	before := pointVersion(t, ix, 1)
-	_, _, version, changed, err := ix.MutatePayloadRecord(1, tc.key, tc.fn, tc.cas)
+	before := h.version(1)
+	version, changed, err := h.mutate(1, tc.key, tc.fn, tc.cas)
 	if tc.wantErr != nil {
 		if !errors.Is(err, tc.wantErr) {
 			t.Fatalf("%s: err = %v, want %v", tc.name, err, tc.wantErr)
@@ -832,14 +991,19 @@ func runMutateCase(t *testing.T, ix VectorIndex, tc mutateCase) {
 		}
 	}
 	wantBytes, wantPresent := tc.wantRec(t)
-	got, present := recordUnder(t, ix, 1, "session")
+	got, present := h.record(t, 1, "session")
 	if present != wantPresent {
 		t.Fatalf("%s: session present = %v, want %v", tc.name, present, wantPresent)
 	}
 	if present && !bytes.Equal(got, wantBytes) {
 		t.Errorf("%s: stored bytes differ from the expected result", tc.name)
 	}
-	live := pointVersion(t, ix, 1)
+	if tc.wantStoredNil {
+		if stored := h.stored(t, 1); stored != nil {
+			t.Errorf("%s: raw stored payload = %v, want nil (an emptied payload stores nil)", tc.name, stored)
+		}
+	}
+	live := h.version(1)
 	wantLive := before
 	if tc.wantBump {
 		wantLive = before + 1
@@ -852,19 +1016,8 @@ func runMutateCase(t *testing.T, ix VectorIndex, tc mutateCase) {
 func TestMutateRecordIVFMatchesHNSW(t *testing.T) {
 	for _, tc := range mutateCases(t) {
 		t.Run(tc.name, func(t *testing.T) {
-			h, err := newHNSW(mutateRecordCfg())
-			if err != nil {
-				t.Fatal(err)
-			}
-			seedMutatePoint(t, h, 1)
-			cfg := ivfTestConfig(4)
-			ix, err := newIVF(cfg)
-			if err != nil {
-				t.Fatal(err)
-			}
-			seedMutatePoint(t, ix, 1)
-			t.Run("hnsw", func(t *testing.T) { runMutateCase(t, h, tc) })
-			t.Run("ivf", func(t *testing.T) { runMutateCase(t, ix, tc) })
+			t.Run("hnsw", func(t *testing.T) { runMutateCase(t, denseMutateHarness(t), tc) })
+			t.Run("ivf", func(t *testing.T) { runMutateCase(t, ivfMutateHarness(t), tc) })
 		})
 	}
 }

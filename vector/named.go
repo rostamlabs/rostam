@@ -1294,30 +1294,163 @@ func (nc *NamedCollection) setPayloadLockedAt(id uint64, patch Metadata, keyTTLM
 	return merged, ke, v, nil
 }
 
-// logPayloadOp runs a payload mutator (apply, which captures the RESULTING full
-// payload + absolute per-key deadlines under nc.mu) and, on a WAL-mode
+// MutatePayloadRecordCAS applies fn to the operate record stored under key in
+// id's shared payload, atomically with the CAS check and the version bump, and
+// WAL-logs the RESULTING payload (a replace, not a merge) exactly as every other
+// named payload mutation does. A deliberate no-op — fn reporting RecordUnchanged
+// (a failed CHECK), or a delete of an already-absent key — writes no WAL record
+// and returns the current, unbumped version. Returns ErrIDNotFound for a
+// dead/expired point, ErrVersionConflict on a CAS mismatch,
+// ErrPayloadKeyNotRecord when the key holds a non-record value,
+// ErrRecordTooLarge when the resulting record exceeds the storage cap, and fn's
+// own error verbatim — in every case with the point left exactly as it was.
+func (nc *NamedCollection) MutatePayloadRecordCAS(id uint64, key string, fn RecordMutator, cas CASCond) (uint64, error) {
+	return nc.logPayloadOpChanged(func() (Metadata, map[string]int64, uint64, bool, error) {
+		return nc.mutatePayloadRecordLockedAt(id, key, fn, cas, nc.nowMs())
+	}, id)
+}
+
+// MutatePayloadRecordCASAt is MutatePayloadRecordCAS under a leader apply stamp:
+// the dead-point liveness gate, the per-key deadline check and the stale-deadline
+// drop are all judged against nowMs, so every replica reads the same record and
+// stores the same bytes (#4 vector TTL determinism, mirroring SetPayloadCASAt).
+func (nc *NamedCollection) MutatePayloadRecordCASAt(id uint64, key string, fn RecordMutator, cas CASCond, nowMs int64) (uint64, error) {
+	return nc.logPayloadOpChanged(func() (Metadata, map[string]int64, uint64, bool, error) {
+		return nc.mutatePayloadRecordLockedAt(id, key, fn, cas, nowMs)
+	}, id)
+}
+
+// mutatePayloadRecordLockedAt is the named twin of the dense
+// mutatePayloadRecordBody: read the current record bytes, transform, bound,
+// store/delete, prune the key's deadline, reindex, bump — all inside ONE write-
+// lock critical section. It differs from dense in exactly three ways, and in
+// nothing else: deadlines are absolute unix-ms int64 (so the expiry rule is
+// liveMetaMap's, inlined — named has no keyExpired twin), the payload index is
+// keyed by ID not by slot, and there is no BM25 maintenance (the named family
+// carries no dense text index).
+//
+// Returns the RESULTING payload and per-key deadlines (so logPayloadOpChanged
+// WAL-logs exactly what was applied), the resulting version, and changed.
+// changed=false means the call was a deliberate no-op: nothing was stored,
+// nothing will be logged, and the version is the CURRENT one, unbumped.
+func (nc *NamedCollection) mutatePayloadRecordLockedAt(id uint64, key string, fn RecordMutator, cas CASCond, now int64) (Metadata, map[string]int64, uint64, bool, error) {
+	if fn == nil || key == "" || key == contentField {
+		return nil, nil, 0, false, ErrPayloadKeyNotRecord
+	}
+	nc.mu.Lock()
+	defer nc.mu.Unlock()
+	if !nc.liveLockedAt(id, now) {
+		return nil, nil, 0, false, ErrIDNotFound
+	}
+	if err := cas.check(nc.version[id]); err != nil {
+		return nil, nil, 0, false, err // CAS mismatch: no mutation, no bump
+	}
+	oldMeta, oldKE := nc.meta[id], nc.keyTTL[id]
+	// named/MV have no keyExpired twin: liveMetaMap's rule, inlined.
+	dl := oldKE[key]
+	old, exists, err := currentRecordValue(oldMeta, key, dl != 0 && dl <= now)
+	if err != nil {
+		return nil, nil, 0, false, err
+	}
+	rec, act, err := fn(old, exists)
+	if err != nil {
+		return nil, nil, 0, false, err
+	}
+	switch act {
+	case RecordUnchanged:
+		return nil, nil, nc.version[id], false, nil
+	case RecordDelete:
+		if !exists {
+			return nil, nil, nc.version[id], false, nil
+		}
+	case RecordStore:
+		// The POST-mutation bound. checkRecordValues (vector/metadata.go) is the
+		// same cap on the ingest side, but it only ever sees a caller's patch —
+		// it cannot reach bytes the operate engine just produced, which is what
+		// this site exists for. Keep the two in step.
+		if len(rec) > maxRecordValueBytes {
+			return nil, nil, 0, false, fmt.Errorf("%w: payload key %q would hold a %d-byte record, the cap is %d bytes",
+				ErrRecordTooLarge, key, len(rec), maxRecordValueBytes)
+		}
+	default:
+		return nil, nil, 0, false, ErrRecordMutation
+	}
+	merged := cloneMeta(oldMeta)
+	if act == RecordDelete {
+		delete(merged, key)
+		if len(merged) == 0 {
+			// An emptied payload stores nil, exactly as deletePayloadKeysLockedAt
+			// normalizes it. Storing an empty non-nil map instead would make the
+			// live state differ from the same state after a WAL replay (the log
+			// encodes an empty payload as absent and restores nil), for no gain.
+			merged = nil
+		}
+	} else {
+		if merged == nil {
+			merged = make(Metadata, 1)
+		}
+		merged[key] = Value{Kind: ValueRecord, Rec: rec} // ownership hand-off; see RecordMutator
+	}
+	ke := cloneKeyTTL(oldKE)
+	// A logically expired key read as ABSENT above: its stale deadline must go,
+	// or the record this call just created would be invisible the instant it is
+	// written. pruneKeyTTL only drops deadlines for keys no longer present.
+	if d, present := ke[key]; present && d != 0 && d <= now {
+		delete(ke, key)
+	}
+	ke = pruneKeyTTL(ke, merged)
+	nc.meta[id] = merged
+	nc.payloadIdx.reindex(id, merged) // resulting payload may add/remove indexed fields
+	if ke == nil {
+		delete(nc.keyTTL, id)
+	} else {
+		nc.keyTTL[id] = ke
+	}
+	v := nc.version[id] + 1
+	nc.version[id] = v
+	nc.bumpData() // payload-value change: invalidate the order_by snapshot
+	return merged, ke, v, true, nil
+}
+
+// logPayloadOpChanged runs a payload mutator (apply, which captures the RESULTING
+// full payload + absolute per-key deadlines under nc.mu) and, on a WAL-mode
 // collection, appends ONE op-agnostic namedSetPayload record with that resulting
 // state — the dense resulting-payload collapse (set/overwrite/delete-keys/clear
 // all reduce to "this is the new payload"). The whole apply+append runs under
 // opMu so a concurrent Flush can't interleave. The deadlines are logged VERBATIM
 // (absolute unix-ms) so replay is time-stable.
-func (nc *NamedCollection) logPayloadOp(apply func() (Metadata, map[string]int64, uint64, error), id uint64) (uint64, error) {
+//
+// It is logPayloadOp generalized to an apply that may legitimately do NOTHING (a
+// record mutation whose CHECK failed): changed=false stages no WAL record and
+// returns the current, unbumped version — a no-op must not cost a log entry or
+// move a version a CAS loop is watching.
+//
+// The two error returns below are NAMED's, not the dense payloadOpCASChanged's,
+// and must stay that way: the applied version rides along even when only the WAL
+// write failed (the pre-split contract), and a commitWaitStaged failure returns
+// that version too rather than 0. Pinned by
+// TestNamedSetPayloadReturnsVersionOnWALAppendError.
+func (nc *NamedCollection) logPayloadOpChanged(apply func() (Metadata, map[string]int64, uint64, bool, error), id uint64) (uint64, error) {
 	if nc.wal == nil {
-		_, _, version, err := apply()
+		_, _, version, _, err := apply()
 		return version, err
 	}
 	// {apply + WAL WRITE} under opMu in a panic-safe closure; the durability wait
 	// runs outside so concurrent payload writers group-commit instead of each
 	// paying a serialized fsync under the collection's op lock.
 	var seq, version uint64
+	var changed bool
 	err := func() error {
 		nc.opMu.Lock()
 		defer nc.opMu.Unlock()
-		meta, ke, v, err := apply()
+		meta, ke, v, ch, err := apply()
 		if err != nil {
 			return err
 		}
-		version = v
+		version, changed = v, ch
+		if !ch {
+			return nil // a no-op stages nothing
+		}
 		seq, err = nc.wal.appendNamedSetPayloadStaged(id, meta, keyTTLToU64(ke), v)
 		return err
 	}()
@@ -1327,7 +1460,21 @@ func (nc *NamedCollection) logPayloadOp(apply func() (Metadata, map[string]int64
 		// the append error, so keep returning it.
 		return version, err
 	}
+	if !changed {
+		return version, nil
+	}
 	return version, nc.wal.commitWaitStaged(seq)
+}
+
+// logPayloadOp is the always-changed form the four existing payload mutations
+// (set/overwrite/delete-keys/clear) take. Behaviour-preserving:
+// logPayloadOpChanged tests apply's error before it reads changed, so the
+// hard-coded true is never consulted on an error path.
+func (nc *NamedCollection) logPayloadOp(apply func() (Metadata, map[string]int64, uint64, error), id uint64) (uint64, error) {
+	return nc.logPayloadOpChanged(func() (Metadata, map[string]int64, uint64, bool, error) {
+		m, ke, v, err := apply()
+		return m, ke, v, true, err
+	}, id)
 }
 
 // keyTTLToU64 converts named's absolute int64 unix-ms deadlines to the uint64
