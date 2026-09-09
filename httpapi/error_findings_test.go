@@ -341,13 +341,24 @@ func TestStatusForErrorRecordTooLarge(t *testing.T) {
 // caller's own bad bytes as an opaque 500 with the message redacted, so this
 // keeps it in the same bucket as ErrRecordTooLarge and in sync with
 // server.clientFacingErr.
+//
+// Three arms, like TestStatusForErrorVectorRecordAbsent: sentinel, wrapped, and
+// stringified across the Raft boundary, where errors.Is stops matching and the
+// substring fallback is what keeps this a 400 instead of a redacted 500.
 func TestStatusForErrorMalformedRecord(t *testing.T) {
-	err := fmt.Errorf("%w: payload key %q: bad", vector.ErrRecordMalformed, "session")
-	if got := statusForError(err); got != http.StatusBadRequest {
-		t.Errorf("statusForError(ErrRecordMalformed) = %d, want 400", got)
-	}
-	if got := statusForError(vector.ErrRecordTooLarge); got != http.StatusBadRequest {
-		t.Errorf("statusForError(ErrRecordTooLarge) = %d, want 400 (the sibling bound)", got)
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", vector.ErrRecordMalformed},
+		{"wrapped", fmt.Errorf("%w: payload key %q: bad", vector.ErrRecordMalformed, "session")},
+		{"stringified across Raft", errors.New("apply: " + vector.ErrRecordMalformed.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := statusForError(tc.err); got != http.StatusBadRequest {
+				t.Errorf("statusForError(ErrRecordMalformed) = %d, want 400", got)
+			}
+		})
 	}
 }
 
@@ -356,10 +367,23 @@ func TestStatusForErrorMalformedRecord(t *testing.T) {
 // overwriting a plain value with a record, so the caller has a key to fix; an
 // unmatched sentinel here would have surfaced that as an opaque, redacted 500.
 // Kept in sync with server.clientFacingErr.
+//
+// Three arms, like TestStatusForErrorVectorRecordAbsent: sentinel, wrapped, and
+// stringified across the Raft boundary.
 func TestStatusForErrorPayloadKeyNotRecord(t *testing.T) {
-	err := fmt.Errorf("%w: payload key %q holds a value of kind %d", vector.ErrPayloadKeyNotRecord, "country", 2)
-	if got := statusForError(err); got != http.StatusBadRequest {
-		t.Errorf("statusForError(ErrPayloadKeyNotRecord) = %d, want 400", got)
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", vector.ErrPayloadKeyNotRecord},
+		{"wrapped", fmt.Errorf("%w: payload key %q holds a value of kind %d", vector.ErrPayloadKeyNotRecord, "country", 2)},
+		{"stringified across Raft", errors.New("apply: " + vector.ErrPayloadKeyNotRecord.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := statusForError(tc.err); got != http.StatusBadRequest {
+				t.Errorf("statusForError(ErrPayloadKeyNotRecord) = %d, want 400", got)
+			}
+		})
 	}
 }
 

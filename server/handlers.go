@@ -222,14 +222,18 @@ func clientFacingErr(err error) bool {
 		// vector.ErrRecordMalformed: a payload carrying record bytes no operate
 		// engine can open. Same bucket and same reasoning as the cap above — the
 		// caller sent those bytes, the remedy is to send a well-formed record,
-		// and the message names only the payload key the caller chose.
+		// and the message names only the payload key the caller chose. Same
+		// sentinel-plus-string matching, for the same clustered-apply reason.
 		errors.Is(err, vector.ErrRecordMalformed),
+		strings.Contains(err.Error(), vector.ErrRecordMalformed.Error()),
 		// vector.ErrPayloadKeyNotRecord: a vector_operate aimed at a payload key
 		// that holds a plain value (or the reserved content key) rather than a
 		// record. Same bucket and same reasoning as the two above — the caller
 		// chose the key, the remedy is to name a record key, and the message
-		// discloses only that key and the kind stored under it.
+		// discloses only that key and the kind stored under it. Same
+		// sentinel-plus-string matching, for the same clustered-apply reason.
 		errors.Is(err, vector.ErrPayloadKeyNotRecord),
+		strings.Contains(err.Error(), vector.ErrPayloadKeyNotRecord.Error()),
 		errors.Is(err, vector.ErrEmptyFilter),
 		errors.Is(err, vector.ErrEmptyGroupBy),
 		errors.Is(err, vector.ErrSparseMismatch),

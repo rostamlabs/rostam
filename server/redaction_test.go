@@ -214,13 +214,44 @@ func TestMapResultKeepsRecordTooLargeVisible(t *testing.T) {
 // operate engine can open — so its message must reach the client verbatim rather
 // than being redacted to "internal error", which would leave a client unable to
 // tell a bad payload from a server fault.
+//
+// Three arms, like TestMapResultVectorRecordAbsentIsNotFound: sentinel, wrapped,
+// and stringified across the Raft boundary (a clustered apply loses errors.Is
+// identity, which is exactly why clientFacingErr also matches by substring).
 func TestClientFacingErrMalformedRecord(t *testing.T) {
-	err := fmt.Errorf("%w: payload key %q: bad", vector.ErrRecordMalformed, "session")
-	if !clientFacingErr(err) {
-		t.Error("clientFacingErr(ErrRecordMalformed) = false, want true")
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", vector.ErrRecordMalformed},
+		{"wrapped", fmt.Errorf("%w: payload key %q: bad", vector.ErrRecordMalformed, "session")},
+		{"stringified across Raft", errors.New("apply: " + vector.ErrRecordMalformed.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !clientFacingErr(tc.err) {
+				t.Error("clientFacingErr(ErrRecordMalformed) = false, want true")
+			}
+		})
 	}
-	if !clientFacingErr(vector.ErrRecordTooLarge) {
-		t.Error("clientFacingErr(ErrRecordTooLarge) = false, want true (the sibling bound)")
+}
+
+// TestClientFacingErrRecordTooLarge is ErrRecordMalformed's sibling bound: a
+// record value above the storage cap is the same caller-fixable-mistake bucket,
+// with the same three-arm (sentinel / wrapped / stringified) coverage.
+func TestClientFacingErrRecordTooLarge(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", vector.ErrRecordTooLarge},
+		{"wrapped", fmt.Errorf("%w: payload key %q: 17000000 > 16777216", vector.ErrRecordTooLarge, "session")},
+		{"stringified across Raft", errors.New("apply: " + vector.ErrRecordTooLarge.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !clientFacingErr(tc.err) {
+				t.Error("clientFacingErr(ErrRecordTooLarge) = false, want true")
+			}
+		})
 	}
 }
 
@@ -230,10 +261,23 @@ func TestClientFacingErrMalformedRecord(t *testing.T) {
 // destroy data the caller can still read — and that refusal names the caller's
 // own key, so it must reach the client verbatim instead of being redacted to
 // "internal error", which would read as a server fault for a caller mistake.
+//
+// Three arms, like TestMapResultVectorRecordAbsentIsNotFound: sentinel, wrapped,
+// and stringified across the Raft boundary.
 func TestClientFacingErrPayloadKeyNotRecord(t *testing.T) {
-	err := fmt.Errorf("%w: payload key %q holds a value of kind %d", vector.ErrPayloadKeyNotRecord, "country", 2)
-	if !clientFacingErr(err) {
-		t.Error("clientFacingErr(ErrPayloadKeyNotRecord) = false, want true")
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", vector.ErrPayloadKeyNotRecord},
+		{"wrapped", fmt.Errorf("%w: payload key %q holds a value of kind %d", vector.ErrPayloadKeyNotRecord, "country", 2)},
+		{"stringified across Raft", errors.New("apply: " + vector.ErrPayloadKeyNotRecord.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !clientFacingErr(tc.err) {
+				t.Error("clientFacingErr(ErrPayloadKeyNotRecord) = false, want true")
+			}
+		})
 	}
 }
 
