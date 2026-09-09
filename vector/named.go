@@ -1396,9 +1396,12 @@ func (nc *NamedCollection) mutatePayloadRecordLockedAt(id uint64, key string, fn
 		// counter increment would double the op's cost for a case that cannot
 		// arise. The shape check belongs where bytes arrive from a CALLER, which
 		// is checkRecordValues.
+		//
+		// The MESSAGE comes from recordTooLargeErr (vector/metadata.go), the one
+		// producer of this error's detailed form: one canonical shape for the
+		// matcher to anchor on across replication, with the caller's key bounded.
 		if len(rec) > maxRecordValueBytes {
-			return nil, nil, 0, false, fmt.Errorf("%w: payload key %q would hold a %d-byte record, the cap is %d bytes",
-				ErrRecordTooLarge, key, len(rec), maxRecordValueBytes)
+			return nil, nil, 0, false, recordTooLargeErr(key, len(rec))
 		}
 	default:
 		return nil, nil, 0, false, ErrRecordMutation

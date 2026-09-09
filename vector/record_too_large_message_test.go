@@ -37,11 +37,39 @@ func TestIsRecordTooLargeMessage(t *testing.T) {
 		{"session": NewRecord(make([]byte, maxRecordValueBytes+1))},
 	}).Error()
 
+	// The POST-MUTATION form: not an ingest gate at all, but the bound the four
+	// mutatePayloadRecord bodies apply to the bytes the operate engine just
+	// produced. It used to be a SECOND shape ("payload key %q would hold a ...")
+	// that this matcher declined, which redacted a fixable client mistake to
+	// "internal error" on every clustered apply — see recordTooLargeErr. Built by
+	// driving a real mutation so a re-divergence fails here rather than in
+	// production.
+	mutated := func(key string) string {
+		t.Helper()
+		h, err := newHNSW(mutateRecordCfg())
+		if err != nil {
+			t.Fatalf("newHNSW: %v", err)
+		}
+		seedMutatePoint(t, h, 1)
+		_, _, _, _, merr := h.MutatePayloadRecord(1, key, func(_ []byte, _ bool) ([]byte, RecordMutation, error) {
+			return make([]byte, maxRecordValueBytes+1), RecordStore, nil
+		}, CASCond{})
+		if !errors.Is(merr, ErrRecordTooLarge) {
+			t.Fatalf("post-mutation fixture: err = %v, want ErrRecordTooLarge", merr)
+		}
+		return merr.Error()
+	}
+	postMutation := mutated("session")
+	postMutationLongKey := mutated(longKey)
+
 	accept := []struct {
 		name string
 		msg  string
 	}{
 		{"bare sentinel text", ErrRecordTooLarge.Error()},
+		{"post-mutation form, short key", postMutation},
+		{"post-mutation form, long/clipped key", postMutationLongKey},
+		{"post-mutation form re-stringified (simulates decodePBResult)", errors.New(postMutation).Error()},
 		{"single-payload form, short key", single},
 		{"single-payload form, long/clipped key", singleLongKey},
 		{"bulk form, row 0", bulkRow0},

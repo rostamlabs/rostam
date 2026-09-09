@@ -172,6 +172,35 @@ func (fl fieldLookup) get(m Metadata) (Value, bool) {
 // transports like ErrDimMismatch.
 var ErrRecordTooLarge = errors.New("vector: record payload value exceeds the storage cap")
 
+// recordTooLargeErr is the ONE producer of ErrRecordTooLarge's detailed form.
+// Every site that reports the record cap — the ingest gates checkRecordValues /
+// checkRecordValuesSize and the post-mutation bound in the four
+// mutatePayloadRecord bodies (vector/hnsw.go, vector/ivf.go, vector/named.go,
+// vector/multivector.go) — goes through it, so there is exactly one message
+// shape for IsRecordTooLargeMessage to anchor on.
+//
+// IT EXISTS BECAUSE THE COPIES DRIFTED. The four mutate bodies formatted their
+// own variant ("payload key %q would hold a %d-byte record"), and the two
+// differences were each a real defect: "would hold a" is not the " holds a "
+// the matcher anchors on, so a clustered apply — where shard.decodePBResult
+// rebuilds the error with errors.New and errors.Is identity is gone — declined
+// to classify it and redacted a fixable client mistake to "internal error";
+// and %q quoted an unbounded caller-supplied key, echoing up to ~65 KB of it
+// (DecodeVectorOperateArgs' payloadKey cap) straight back in the message.
+//
+// clipField (vector/filter.go) bounds the key at 64 source bytes for the second
+// reason, exactly as currentRecordValue and the two check helpers do: the key is
+// caller-supplied, and this message is returned VERBATIM to the caller on every
+// transport (a client error, classified 400 / InvalidArgument) and carried
+// across replication as a string.
+//
+// n is the size that was refused. Callers keep their own tense in surrounding
+// prose; the MESSAGE is fixed here and must not be re-phrased per site.
+func recordTooLargeErr(key string, n int) error {
+	return fmt.Errorf("%w: payload key %s holds a %d-byte record, the cap is %d bytes",
+		ErrRecordTooLarge, clipField(key), n, maxRecordValueBytes)
+}
+
 // checkRecordValues is the INGEST gate for every payload a caller supplies. It
 // rejects a ValueRecord that is oversize (ErrRecordTooLarge) or that no operate
 // engine could open (ErrRecordMalformed). Every wire-reachable mutation entry
@@ -232,8 +261,7 @@ func checkRecordValues(m Metadata) error {
 		// string. A short key renders exactly as %q did. Keep in step with
 		// checkRecordValuesSize.
 		if len(v.Rec) > maxRecordValueBytes {
-			return fmt.Errorf("%w: payload key %s holds a %d-byte record, the cap is %d bytes",
-				ErrRecordTooLarge, clipField(k), len(v.Rec), maxRecordValueBytes)
+			return recordTooLargeErr(k, len(v.Rec))
 		}
 		if err := validateRecord(v.Rec); err != nil {
 			return fmt.Errorf("%w: payload key %s: %w", ErrRecordMalformed, clipField(k), err)
@@ -287,8 +315,7 @@ func checkRecordValuesSize(m Metadata) error {
 			// returned VERBATIM to the caller on every transport (it is a
 			// client error, classified 400 / InvalidArgument) and carried across
 			// replication as a string. A short key renders exactly as %q did.
-			return fmt.Errorf("%w: payload key %s holds a %d-byte record, the cap is %d bytes",
-				ErrRecordTooLarge, clipField(k), len(v.Rec), maxRecordValueBytes)
+			return recordTooLargeErr(k, len(v.Rec))
 		}
 	}
 	return nil
