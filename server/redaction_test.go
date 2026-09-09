@@ -208,6 +208,20 @@ func TestMapResultKeepsRecordTooLargeVisible(t *testing.T) {
 	}
 }
 
+// errRealMalformedSingle, errRealMalformedBulk and errRealNotRecordDetailed reproduce
+// the EXACT shapes checkRecordValues / checkRecordValuesAll (ErrRecordMalformed)
+// and currentRecordValue (ErrPayloadKeyNotRecord) actually produce in
+// production — see vector.IsRecordMalformedMessage / IsPayloadKeyNotRecordMessage
+// for the format strings these mirror. server cannot call those unexported
+// vector-package producers directly, so the shapes are reproduced by hand;
+// vector's own TestIsRecordMalformedMessage / TestIsPayloadKeyNotRecordMessage
+// pin them against the real producers.
+var (
+	errRealMalformedSingle   = fmt.Errorf("%w: payload key %q: %s", vector.ErrRecordMalformed, "session", "record: malformed record: wire: args too short")
+	errRealMalformedBulk     = fmt.Errorf("payload %d: %w", 7, errRealMalformedSingle)
+	errRealNotRecordDetailed = fmt.Errorf("%w: payload key %q holds a value of kind %d", vector.ErrPayloadKeyNotRecord, "country", 2)
+)
+
 // TestClientFacingErrMalformedRecord pins the TCP transport's half of the same
 // classification the HTTP edge makes (httpapi.TestStatusForErrorMalformedRecord).
 // vector.ErrRecordMalformed is a caller mistake — bytes the caller sent that no
@@ -215,17 +229,23 @@ func TestMapResultKeepsRecordTooLargeVisible(t *testing.T) {
 // than being redacted to "internal error", which would leave a client unable to
 // tell a bad payload from a server fault.
 //
-// Three arms, like TestMapResultVectorRecordAbsentIsNotFound: sentinel, wrapped,
-// and stringified across the Raft boundary (a clustered apply loses errors.Is
-// identity, which is exactly why clientFacingErr also matches by substring).
+// Per shape: the bare sentinel, the real %w-wrapped single/bulk shapes (matched
+// by errors.Is regardless of exact text), and those shapes stringified across
+// the Raft boundary (matched only by vector.IsRecordMalformedMessage — a
+// clustered apply loses errors.Is identity, which is why clientFacingErr also
+// carries a message-shape fallback). A negative control asserts an unrelated
+// error that merely wraps the sentinel with a foreign prefix stays redacted —
+// the exact bug a bare strings.Contains classifier would reintroduce.
 func TestClientFacingErrMalformedRecord(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		err  error
 	}{
 		{"sentinel", vector.ErrRecordMalformed},
-		{"wrapped", fmt.Errorf("%w: payload key %q: bad", vector.ErrRecordMalformed, "session")},
-		{"stringified across Raft", errors.New("apply: " + vector.ErrRecordMalformed.Error())},
+		{"wrapped, real single-payload shape", errRealMalformedSingle},
+		{"wrapped, real bulk shape", errRealMalformedBulk},
+		{"stringified across Raft, real single-payload shape", errors.New(errRealMalformedSingle.Error())},
+		{"stringified across Raft, real bulk shape", errors.New(errRealMalformedBulk.Error())},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if !clientFacingErr(tc.err) {
@@ -233,19 +253,26 @@ func TestClientFacingErrMalformedRecord(t *testing.T) {
 			}
 		})
 	}
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix (%v, no %w identity)", func(t *testing.T) {
+		if clientFacingErr(fmt.Errorf("wal append failed at /var/lib/rostam/x: %v", vector.ErrRecordMalformed)) {
+			t.Error("clientFacingErr(wrapped ErrRecordMalformed) = true, want false (redacted)")
+		}
+	})
 }
 
 // TestClientFacingErrRecordTooLarge is ErrRecordMalformed's sibling bound: a
-// record value above the storage cap is the same caller-fixable-mistake bucket,
-// with the same three-arm (sentinel / wrapped / stringified) coverage.
+// record value above the storage cap is the same caller-fixable-mistake bucket.
+// Per shape: bare sentinel, real %w-wrapped shape, and that shape stringified
+// across the Raft boundary, plus a negative control for an unrelated wrap.
 func TestClientFacingErrRecordTooLarge(t *testing.T) {
+	wrapped := fmt.Errorf("%w: payload key %q holds a 17000000-byte record, the cap is 16777216 bytes", vector.ErrRecordTooLarge, "session")
 	for _, tc := range []struct {
 		name string
 		err  error
 	}{
 		{"sentinel", vector.ErrRecordTooLarge},
-		{"wrapped", fmt.Errorf("%w: payload key %q: 17000000 > 16777216", vector.ErrRecordTooLarge, "session")},
-		{"stringified across Raft", errors.New("apply: " + vector.ErrRecordTooLarge.Error())},
+		{"wrapped, real shape", wrapped},
+		{"stringified across Raft, real shape", errors.New(wrapped.Error())},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if !clientFacingErr(tc.err) {
@@ -253,6 +280,11 @@ func TestClientFacingErrRecordTooLarge(t *testing.T) {
 			}
 		})
 	}
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix (%v, no %w identity)", func(t *testing.T) {
+		if clientFacingErr(fmt.Errorf("wal append failed at /var/lib/rostam/x: %v", vector.ErrRecordTooLarge)) {
+			t.Error("clientFacingErr(wrapped ErrRecordTooLarge) = true, want false (redacted)")
+		}
+	})
 }
 
 // TestClientFacingErrPayloadKeyNotRecord pins the TCP transport's half of
@@ -262,16 +294,18 @@ func TestClientFacingErrRecordTooLarge(t *testing.T) {
 // own key, so it must reach the client verbatim instead of being redacted to
 // "internal error", which would read as a server fault for a caller mistake.
 //
-// Three arms, like TestMapResultVectorRecordAbsentIsNotFound: sentinel, wrapped,
-// and stringified across the Raft boundary.
+// Per shape: bare sentinel, real %w-wrapped detailed shape, and that shape
+// stringified across the Raft boundary, plus a negative control for an
+// unrelated wrap.
 func TestClientFacingErrPayloadKeyNotRecord(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		err  error
 	}{
 		{"sentinel", vector.ErrPayloadKeyNotRecord},
-		{"wrapped", fmt.Errorf("%w: payload key %q holds a value of kind %d", vector.ErrPayloadKeyNotRecord, "country", 2)},
-		{"stringified across Raft", errors.New("apply: " + vector.ErrPayloadKeyNotRecord.Error())},
+		{"wrapped, real detailed shape", errRealNotRecordDetailed},
+		{"stringified across Raft, real detailed shape", errors.New(errRealNotRecordDetailed.Error())},
+		{"stringified across Raft, bare shape", errors.New(vector.ErrPayloadKeyNotRecord.Error())},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if !clientFacingErr(tc.err) {
@@ -279,6 +313,11 @@ func TestClientFacingErrPayloadKeyNotRecord(t *testing.T) {
 			}
 		})
 	}
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix (%v, no %w identity)", func(t *testing.T) {
+		if clientFacingErr(fmt.Errorf("wal append failed at /var/lib/rostam/x: %v", vector.ErrPayloadKeyNotRecord)) {
+			t.Error("clientFacingErr(wrapped ErrPayloadKeyNotRecord) = true, want false (redacted)")
+		}
+	})
 }
 
 // TestMapResultVectorRecordAbsentIsNotFound pins vector_operate's create=NONE
@@ -290,9 +329,14 @@ func TestClientFacingErrPayloadKeyNotRecord(t *testing.T) {
 // unclassified it fell through to the redacted StatusError bucket, telling a
 // caller "internal error" for a record that simply is not there.
 //
-// The substring arm covers the clustered path, where the sentinel is stringified
-// across the Raft boundary and errors.Is stops matching — the same reason
-// clientFacingErr carries string fallbacks.
+// ErrVectorRecordAbsent has exactly ONE production shape — bare, never wrapped
+// (see ops.IsVectorRecordAbsentMessage's doc). "wrapped" here is a synthetic
+// %w wrap exercising errors.Is identity, not a real production shape;
+// "stringified" is the bare form re-created with errors.New, the real
+// clustered-apply shape. A negative control asserts an unrelated error that
+// wraps the sentinel with a foreign prefix (the message-shape matcher's whole
+// reason to exist — a bare strings.Contains classifier used to accept this)
+// stays redacted.
 func TestMapResultVectorRecordAbsentIsNotFound(t *testing.T) {
 	disp := &fakeDispatcher{}
 	for _, tc := range []struct {
@@ -300,8 +344,9 @@ func TestMapResultVectorRecordAbsentIsNotFound(t *testing.T) {
 		err  error
 	}{
 		{"sentinel", ops.ErrVectorRecordAbsent},
-		{"wrapped", fmt.Errorf("shard 3: %w", ops.ErrVectorRecordAbsent)},
-		{"stringified across Raft", errors.New("apply: " + ops.ErrVectorRecordAbsent.Error())},
+		{"wrapped (synthetic %w, exercises errors.Is identity — production never wraps this sentinel)",
+			fmt.Errorf("shard 3: %w", ops.ErrVectorRecordAbsent)},
+		{"stringified across Raft, real bare shape", errors.New(ops.ErrVectorRecordAbsent.Error())},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			status, payload := mapResult(disp, nil, tc.err, "")
@@ -313,4 +358,13 @@ func TestMapResultVectorRecordAbsentIsNotFound(t *testing.T) {
 			}
 		})
 	}
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix", func(t *testing.T) {
+		status, payload := mapResult(disp, nil, errors.New("apply: "+ops.ErrVectorRecordAbsent.Error()), "")
+		if status != StatusError {
+			t.Fatalf("status = %d, want StatusError (%d), i.e. redacted, not StatusNotFound", status, StatusError)
+		}
+		if msg, _ := DecodeErrorPayload(payload); msg != "internal error" {
+			t.Fatalf("payload = %q, want the redacted message", msg)
+		}
+	})
 }

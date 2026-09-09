@@ -155,9 +155,11 @@ func mapResult(disp Dispatcher, result []byte, err error, reqID string) (uint8, 
 		// client-facing error message.
 		errors.Is(err, ops.ErrVectorRecordAbsent),
 		// The clustered path stringifies the sentinel across the Raft boundary, so
-		// errors.Is stops matching — the same reason clientFacingErr carries string
-		// fallbacks. Comparing against the sentinel's own text cannot drift from it.
-		strings.Contains(err.Error(), ops.ErrVectorRecordAbsent.Error()):
+		// errors.Is stops matching — the same reason clientFacingErr carries a
+		// message-shape fallback. ops.IsVectorRecordAbsentMessage, not
+		// strings.Contains: a bare substring check would also match an unrelated
+		// internal error that merely wraps the sentinel, leaking it unredacted.
+		ops.IsVectorRecordAbsentMessage(err.Error()):
 		return StatusNotFound, nil
 	case errors.Is(err, shard.ErrNotLeader):
 		var nle *shard.NotLeaderError
@@ -212,8 +214,8 @@ func clientFacingErr(err error) bool {
 		// Matched by sentinel AND by exact message shape: shard.decodePBResult
 		// rebuilds an op error with errors.New across replication, so a
 		// clustered apply loses errors.Is identity and the error would fall
-		// through to the redacted internal-fault bucket. The message-shape arm
-		// uses vector.IsRecordTooLargeMessage, NOT strings.Contains — a bare
+		// through to the redacted internal-fault bucket. The message-shape arms
+		// use vector.IsRecordTooLargeMessage, NOT strings.Contains — a bare
 		// substring check would also match an unrelated internal error that
 		// merely wraps the sentinel (e.g. a WAL/path error), leaking it to the
 		// caller unredacted.
@@ -223,17 +225,19 @@ func clientFacingErr(err error) bool {
 		// engine can open. Same bucket and same reasoning as the cap above — the
 		// caller sent those bytes, the remedy is to send a well-formed record,
 		// and the message names only the payload key the caller chose. Same
-		// sentinel-plus-string matching, for the same clustered-apply reason.
+		// sentinel-plus-message-shape matching, for the same clustered-apply
+		// reason.
 		errors.Is(err, vector.ErrRecordMalformed),
-		strings.Contains(err.Error(), vector.ErrRecordMalformed.Error()),
+		vector.IsRecordMalformedMessage(err.Error()),
 		// vector.ErrPayloadKeyNotRecord: a vector_operate aimed at a payload key
 		// that holds a plain value (or the reserved content key) rather than a
 		// record. Same bucket and same reasoning as the two above — the caller
 		// chose the key, the remedy is to name a record key, and the message
 		// discloses only that key and the kind stored under it. Same
-		// sentinel-plus-string matching, for the same clustered-apply reason.
+		// sentinel-plus-message-shape matching, for the same clustered-apply
+		// reason.
 		errors.Is(err, vector.ErrPayloadKeyNotRecord),
-		strings.Contains(err.Error(), vector.ErrPayloadKeyNotRecord.Error()),
+		vector.IsPayloadKeyNotRecordMessage(err.Error()),
 		errors.Is(err, vector.ErrEmptyFilter),
 		errors.Is(err, vector.ErrEmptyGroupBy),
 		errors.Is(err, vector.ErrSparseMismatch),

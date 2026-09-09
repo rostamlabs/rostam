@@ -334,6 +334,20 @@ func TestStatusForErrorRecordTooLarge(t *testing.T) {
 	}
 }
 
+// errRealMalformedSingle, errRealMalformedBulk and errRealNotRecordDetailed reproduce
+// the EXACT shapes checkRecordValues / checkRecordValuesAll (ErrRecordMalformed)
+// and currentRecordValue (ErrPayloadKeyNotRecord) actually produce in
+// production — see vector.IsRecordMalformedMessage / IsPayloadKeyNotRecordMessage
+// for the format strings these mirror. httpapi cannot call those unexported
+// vector-package producers directly, so the shapes are reproduced by hand;
+// vector's own TestIsRecordMalformedMessage / TestIsPayloadKeyNotRecordMessage
+// pin them against the real producers.
+var (
+	errRealMalformedSingle   = fmt.Errorf("%w: payload key %q: %s", vector.ErrRecordMalformed, "session", "record: malformed record: wire: args too short")
+	errRealMalformedBulk     = fmt.Errorf("payload %d: %w", 7, errRealMalformedSingle)
+	errRealNotRecordDetailed = fmt.Errorf("%w: payload key %q holds a value of kind %d", vector.ErrPayloadKeyNotRecord, "country", 2)
+)
+
 // TestStatusForErrorMalformedRecord pins the ingest gate's shape rejection as a
 // 400. vector.ErrRecordMalformed is what every wire-reachable entry returns for
 // record bytes no operate engine can open, and it arrived with the phase-2
@@ -342,17 +356,23 @@ func TestStatusForErrorRecordTooLarge(t *testing.T) {
 // keeps it in the same bucket as ErrRecordTooLarge and in sync with
 // server.clientFacingErr.
 //
-// Three arms, like TestStatusForErrorVectorRecordAbsent: sentinel, wrapped, and
-// stringified across the Raft boundary, where errors.Is stops matching and the
-// substring fallback is what keeps this a 400 instead of a redacted 500.
+// Per shape: the bare sentinel, the real %w-wrapped single/bulk shapes (matched
+// by errors.Is regardless of exact text), and those shapes stringified across
+// the Raft boundary (matched only by vector.IsRecordMalformedMessage, since
+// shard.decodePBResult rebuilds a replicated op error with errors.New and
+// errors.Is stops matching there). A negative control asserts an unrelated
+// error that merely wraps the sentinel with a foreign prefix stays a redacted
+// 500 — the exact bug a bare strings.Contains classifier would reintroduce.
 func TestStatusForErrorMalformedRecord(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		err  error
 	}{
 		{"sentinel", vector.ErrRecordMalformed},
-		{"wrapped", fmt.Errorf("%w: payload key %q: bad", vector.ErrRecordMalformed, "session")},
-		{"stringified across Raft", errors.New("apply: " + vector.ErrRecordMalformed.Error())},
+		{"wrapped, real single-payload shape", errRealMalformedSingle},
+		{"wrapped, real bulk shape", errRealMalformedBulk},
+		{"stringified across Raft, real single-payload shape", errors.New(errRealMalformedSingle.Error())},
+		{"stringified across Raft, real bulk shape", errors.New(errRealMalformedBulk.Error())},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := statusForError(tc.err); got != http.StatusBadRequest {
@@ -360,6 +380,12 @@ func TestStatusForErrorMalformedRecord(t *testing.T) {
 			}
 		})
 	}
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix (%v, no %w identity)", func(t *testing.T) {
+		err := fmt.Errorf("wal append failed at /var/lib/rostam/x: %v", vector.ErrRecordMalformed)
+		if got := statusForError(err); got != http.StatusInternalServerError {
+			t.Errorf("statusForError(%v) = %d, want 500", err, got)
+		}
+	})
 }
 
 // TestStatusForErrorPayloadKeyNotRecord pins vector_operate's "that key does not
@@ -368,16 +394,19 @@ func TestStatusForErrorMalformedRecord(t *testing.T) {
 // unmatched sentinel here would have surfaced that as an opaque, redacted 500.
 // Kept in sync with server.clientFacingErr.
 //
-// Three arms, like TestStatusForErrorVectorRecordAbsent: sentinel, wrapped, and
-// stringified across the Raft boundary.
+// Per shape: the bare sentinel, the real %w-wrapped detailed shape, and that
+// shape stringified across the Raft boundary. A negative control asserts an
+// unrelated error that merely wraps the sentinel with a foreign prefix stays a
+// redacted 500.
 func TestStatusForErrorPayloadKeyNotRecord(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		err  error
 	}{
 		{"sentinel", vector.ErrPayloadKeyNotRecord},
-		{"wrapped", fmt.Errorf("%w: payload key %q holds a value of kind %d", vector.ErrPayloadKeyNotRecord, "country", 2)},
-		{"stringified across Raft", errors.New("apply: " + vector.ErrPayloadKeyNotRecord.Error())},
+		{"wrapped, real detailed shape", errRealNotRecordDetailed},
+		{"stringified across Raft, real detailed shape", errors.New(errRealNotRecordDetailed.Error())},
+		{"stringified across Raft, bare shape", errors.New(vector.ErrPayloadKeyNotRecord.Error())},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := statusForError(tc.err); got != http.StatusBadRequest {
@@ -385,6 +414,12 @@ func TestStatusForErrorPayloadKeyNotRecord(t *testing.T) {
 			}
 		})
 	}
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix (%v, no %w identity)", func(t *testing.T) {
+		err := fmt.Errorf("wal append failed at /var/lib/rostam/x: %v", vector.ErrPayloadKeyNotRecord)
+		if got := statusForError(err); got != http.StatusInternalServerError {
+			t.Errorf("statusForError(%v) = %d, want 500", err, got)
+		}
+	})
 }
 
 // TestStatusForErrorVectorRecordAbsent pins vector_operate's create=NONE refusal
@@ -394,16 +429,22 @@ func TestStatusForErrorPayloadKeyNotRecord(t *testing.T) {
 // named does not exist, which is what 404 means — not the redacted 500 an
 // unclassified sentinel would have produced.
 //
-// The substring arm covers the clustered path, where the sentinel is stringified
-// across the Raft boundary and errors.Is stops matching.
+// ErrVectorRecordAbsent has exactly ONE production shape — bare, never wrapped
+// (see ops.IsVectorRecordAbsentMessage's doc). "wrapped" here is a synthetic
+// %w wrap exercising errors.Is identity, not a real production shape;
+// "stringified" is the bare form re-created with errors.New, the real
+// clustered-apply shape. A negative control asserts an unrelated error that
+// wraps the sentinel with a foreign prefix (the OLD test's "stringified" case,
+// which a bare strings.Contains classifier used to accept) stays a redacted 500.
 func TestStatusForErrorVectorRecordAbsent(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		err  error
 	}{
 		{"sentinel", ops.ErrVectorRecordAbsent},
-		{"wrapped", fmt.Errorf("shard 3: %w", ops.ErrVectorRecordAbsent)},
-		{"stringified across Raft", errors.New("apply: " + ops.ErrVectorRecordAbsent.Error())},
+		{"wrapped (synthetic %w, exercises errors.Is identity — production never wraps this sentinel)",
+			fmt.Errorf("shard 3: %w", ops.ErrVectorRecordAbsent)},
+		{"stringified across Raft, real bare shape", errors.New(ops.ErrVectorRecordAbsent.Error())},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := statusForError(tc.err); got != http.StatusNotFound {
@@ -411,4 +452,10 @@ func TestStatusForErrorVectorRecordAbsent(t *testing.T) {
 			}
 		})
 	}
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix", func(t *testing.T) {
+		err := errors.New("apply: " + ops.ErrVectorRecordAbsent.Error())
+		if got := statusForError(err); got != http.StatusInternalServerError {
+			t.Errorf("statusForError(%v) = %d, want 500", err, got)
+		}
+	})
 }

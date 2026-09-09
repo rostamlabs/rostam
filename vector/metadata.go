@@ -338,8 +338,10 @@ func checkRecordValuesAll(metas []Metadata) error {
 // Error())) is not silently redacted; the equality check cannot mis-fire on
 // anything else, so it costs nothing to include.
 //
-// Phase 2 adds the same treatment for ErrRecordMalformed, ErrPayloadKeyNotRecord,
-// and ErrVectorRecordAbsent; this helper does not attempt those.
+// IsRecordMalformedMessage, in this file, gives ErrRecordMalformed the same
+// treatment. ErrPayloadKeyNotRecord (vector.IsPayloadKeyNotRecordMessage, in
+// record_mutate.go) and ErrVectorRecordAbsent (ops.IsVectorRecordAbsentMessage,
+// in ops/vector_operate.go) get their own matchers next to their sentinels.
 func IsRecordTooLargeMessage(s string) bool {
 	if len(s) == 0 || len(s) > maxRecordTooLargeMessageLen {
 		return false
@@ -416,6 +418,105 @@ func hasRecordTooLargeSuffix(s string) bool {
 		return false
 	}
 	return strings.HasSuffix(rest[:i], recordTooLargeSuffixMid)
+}
+
+// IsRecordMalformedMessage reports whether s is the EXACT serialised form of
+// an ErrRecordMalformed error produced by checkRecordValues (single-payload)
+// or checkRecordValuesAll (bulk) — anchored on the fixed prefix/marker text
+// those two produce, exactly as IsRecordTooLargeMessage is for its sentinel,
+// and for the same reason: shard.decodePBResult rebuilds a replicated op
+// error with errors.New, losing errors.Is identity, and a bare
+// strings.Contains fallback would make any error whose message happens to
+// mention the sentinel text client-facing — including an internal error that
+// merely wraps it.
+//
+// The three recognized shapes (<key> is clipField's bounded rendering of the
+// caller's payload key; <detail> is validateRecord's — i.e. record.Validate's
+// — own message for what DecodeRecord rejected, e.g. "unexpected EOF"):
+//
+//	vector: record payload value is not a decodable operate record
+//	vector: record payload value is not a decodable operate record: payload key <key>: record: malformed record: <detail>
+//	payload I: vector: record payload value is not a decodable operate record: payload key <key>: record: malformed record: <detail>
+//
+// UNLIKE IsRecordTooLargeMessage, the tail after the fixed "record: malformed
+// record: " marker has no fixed closing suffix to anchor on — record.Validate
+// wraps whatever wire.DecodeRecord's own error says, which is not one fixed
+// shape. This matcher therefore requires only that the marker appear
+// somewhere after the fixed prefix and that SOME non-empty text follow it; it
+// does not attempt to bound or validate the detail itself. That is still safe
+// against the redaction-bypass this exists to close: an unrelated error (a
+// WAL/path/IO failure, say) would have to independently reproduce the exact,
+// highly specific opening text before falling through to an arbitrary tail,
+// which an accidental wrap around the sentinel cannot do — a wrap always adds
+// its OWN text as a prefix, which fails the exact-prefix check below.
+func IsRecordMalformedMessage(s string) bool {
+	if len(s) == 0 || len(s) > maxRecordMalformedMessageLen {
+		return false
+	}
+	if s == ErrRecordMalformed.Error() {
+		return true
+	}
+	rest, ok := cutRecordMalformedPrefix(s)
+	if !ok {
+		return false
+	}
+	return hasRecordMalformedSuffix(rest)
+}
+
+// maxRecordMalformedMessageLen bounds the input IsRecordMalformedMessage
+// scans, so classification cost cannot scale with an attacker-chosen string's
+// length. Mirrors maxRecordTooLargeMessageLen's reasoning; sized a little
+// larger to leave headroom for record.Validate's detail text.
+const maxRecordMalformedMessageLen = 2048
+
+// recordMalformedPrefix is the fixed text that opens the single-payload form,
+// ending right before the caller-controlled clipField(k) rendering.
+var recordMalformedPrefix = ErrRecordMalformed.Error() + ": payload key "
+
+// recordMalformedMidMarker is the fixed text that separates the
+// caller-controlled key rendering from record.Validate's own detail: the
+// wrapped record.ErrRecord sentinel, colon-space delimited on both sides.
+var recordMalformedMidMarker = ": " + record.ErrRecord.Error() + ": "
+
+// cutRecordMalformedPrefix strips either the single-payload prefix or the
+// bulk "payload <digits>: " wrapper followed by the single-payload prefix,
+// and returns what follows (the clipField rendering, the mid marker, and
+// record.Validate's detail). Structurally identical to
+// cutRecordTooLargePrefix, duplicated rather than shared because the two
+// prefixes differ.
+func cutRecordMalformedPrefix(s string) (string, bool) {
+	if rest, ok := strings.CutPrefix(s, recordMalformedPrefix); ok {
+		return rest, true
+	}
+	rest, ok := strings.CutPrefix(s, "payload ")
+	if !ok {
+		return "", false
+	}
+	i := 0
+	for i < len(rest) && rest[i] >= '0' && rest[i] <= '9' {
+		i++
+	}
+	if i == 0 {
+		return "", false
+	}
+	rest, ok = strings.CutPrefix(rest[i:], ": ")
+	if !ok {
+		return "", false
+	}
+	return strings.CutPrefix(rest, recordMalformedPrefix)
+}
+
+// hasRecordMalformedSuffix reports whether s contains the fixed mid marker
+// somewhere after the caller-controlled key rendering, followed by at least
+// one byte of record.Validate's detail. Unlike hasRecordTooLargeSuffix there
+// is no fixed tail to anchor the far end on (see IsRecordMalformedMessage's
+// doc for why that is still safe).
+func hasRecordMalformedSuffix(s string) bool {
+	i := strings.Index(s, recordMalformedMidMarker)
+	if i < 0 {
+		return false
+	}
+	return i+len(recordMalformedMidMarker) < len(s)
 }
 
 // recordPoison is the READ side of the payload index's per-payload-key

@@ -5,6 +5,7 @@ package vector
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // RecordMutation is what a RecordMutator asks the engine to do with the record
@@ -71,4 +72,74 @@ func currentRecordValue(meta Metadata, key string, expired bool) (rec []byte, ex
 		return nil, false, fmt.Errorf("%w: payload key %q holds a value of kind %d", ErrPayloadKeyNotRecord, key, v.Kind)
 	}
 	return v.Rec, true, nil
+}
+
+// IsPayloadKeyNotRecordMessage reports whether s is the EXACT serialised form
+// of an ErrPayloadKeyNotRecord error — anchored the same way
+// IsRecordTooLargeMessage (vector/metadata.go) is for its sentinel, and for
+// the same reason: shard.decodePBResult rebuilds a replicated op error with
+// errors.New, losing errors.Is identity, and a bare strings.Contains fallback
+// would make any error that merely mentions the sentinel text client-facing.
+//
+// The two recognized shapes (<key> is the RAW payload key rendered by %q —
+// unlike ErrRecordMalformed/ErrRecordTooLarge this producer does not run it
+// through clipField, so a caller-chosen key of any length can appear here;
+// <N> is the decimal vtypes.ValueKind of whatever the key actually holds):
+//
+//	vector: payload key does not hold a record
+//	vector: payload key does not hold a record: payload key <key> holds a value of kind <N>
+//
+// The bare form comes from mutatePayloadRecordLockedAt / mutatePayloadRecordBody's
+// own guard clause (fn == nil, key == "", or key == contentField); the detailed
+// form comes from currentRecordValue, for a key that resolves to a non-record
+// value. Neither ever passes through a bulk "payload N: " wrapper — a
+// vector_operate always targets exactly one payload key on exactly one point,
+// unlike the ingest paths ErrRecordMalformed/ErrRecordTooLarge share.
+//
+// Like IsRecordTooLargeMessage's numeric tail, the kind digits sit at the very
+// end of the string with nothing after them, so — unlike
+// IsRecordMalformedMessage — the far end IS fully anchored: this reports false
+// for anything that does not end in "... holds a value of kind " followed by
+// one or more digits and nothing else.
+func IsPayloadKeyNotRecordMessage(s string) bool {
+	if len(s) == 0 || len(s) > maxPayloadKeyNotRecordMessageLen {
+		return false
+	}
+	if s == ErrPayloadKeyNotRecord.Error() {
+		return true
+	}
+	rest, ok := strings.CutPrefix(s, payloadKeyNotRecordPrefix)
+	if !ok {
+		return false
+	}
+	return hasPayloadKeyNotRecordSuffix(rest)
+}
+
+// maxPayloadKeyNotRecordMessageLen bounds the input IsPayloadKeyNotRecordMessage
+// scans, so classification cost cannot scale with an attacker-chosen key's
+// length (the key here is unbounded — see IsPayloadKeyNotRecordMessage's doc).
+// A key longer than this cap simply fails to match and falls through to the
+// redacted internal-error bucket, which is the safe direction to fail in.
+const maxPayloadKeyNotRecordMessageLen = 4096
+
+// payloadKeyNotRecordPrefix is the fixed text that opens the detailed form,
+// ending right before the caller-controlled %q(key) rendering.
+var payloadKeyNotRecordPrefix = ErrPayloadKeyNotRecord.Error() + ": payload key "
+
+// payloadKeyNotRecordSuffixMid is the fixed text between the caller-controlled
+// key rendering and the trailing kind digits.
+const payloadKeyNotRecordSuffixMid = " holds a value of kind "
+
+// hasPayloadKeyNotRecordSuffix reports whether s ends with the fixed marker
+// text followed by one or more decimal digits and nothing else — the same
+// digit-stripping-then-anchor approach hasRecordTooLargeSuffix uses.
+func hasPayloadKeyNotRecordSuffix(s string) bool {
+	i := len(s)
+	for i > 0 && s[i-1] >= '0' && s[i-1] <= '9' {
+		i--
+	}
+	if i == len(s) {
+		return false
+	}
+	return strings.HasSuffix(s[:i], payloadKeyNotRecordSuffixMid)
 }

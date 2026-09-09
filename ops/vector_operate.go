@@ -16,6 +16,24 @@ import (
 // nothing.
 var ErrVectorRecordAbsent = errors.New("ops: vector_operate: create=NONE and no record under the payload key")
 
+// IsVectorRecordAbsentMessage reports whether s is the EXACT serialised form
+// of ErrVectorRecordAbsent — anchored the same way vector.IsRecordTooLargeMessage
+// and its Phase 2 twins are for their own sentinels, and for the same reason:
+// shard.decodePBResult rebuilds a replicated op error with errors.New, losing
+// errors.Is identity, and a bare strings.Contains fallback would make any
+// error that merely mentions the sentinel text client-facing.
+//
+// Unlike the vector-package sentinels this one has exactly ONE shape: bare
+// equality, no detail suffix and no bulk wrapper. vectorOperateMutator returns
+// it verbatim (return nil, vector.RecordUnchanged, ErrVectorRecordAbsent), and
+// every one of its three callers — handleVectorOperate, handleNamedVectorOperate,
+// handleMVVectorOperate — propagates whatever the engine returned unwrapped
+// ("return nil, err"), so no call site ever attaches a key, a kind, or a bulk
+// index to it.
+func IsVectorRecordAbsentMessage(s string) bool {
+	return s == ErrVectorRecordAbsent.Error()
+}
+
 // vectorOperateMutator builds the RecordMutator the three handlers hand to the
 // engine, plus the pointer the decoded result lands in.
 //

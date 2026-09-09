@@ -500,8 +500,8 @@ func statusForError(err error) int {
 		// Matched by sentinel AND by exact message shape: a clustered apply
 		// rebuilds the op error with errors.New across the replication boundary
 		// (shard.decodePBResult), so errors.Is alone loses it there and the error
-		// would fall through to the redacted 500 bucket. The message-shape arm
-		// uses vector.IsRecordTooLargeMessage, NOT strings.Contains — a bare
+		// would fall through to the redacted 500 bucket. The message-shape arms
+		// use vector.IsRecordTooLargeMessage, NOT strings.Contains — a bare
 		// substring check would also match an unrelated internal error that
 		// merely wraps the sentinel, leaking it to the caller unredacted.
 		errors.Is(err, vector.ErrRecordTooLarge),
@@ -510,16 +510,18 @@ func statusForError(err error) int {
 		// would poison every accelerated filter under that payload key for the
 		// whole collection, so refusing at the door is the client-fixable
 		// mistake. Keeps this classifier in sync with server.clientFacingErr.
-		// Same sentinel-plus-string matching, for the same clustered-apply reason.
+		// Same sentinel-plus-message-shape matching, for the same
+		// clustered-apply reason.
 		errors.Is(err, vector.ErrRecordMalformed),
-		strings.Contains(err.Error(), vector.ErrRecordMalformed.Error()),
+		vector.IsRecordMalformedMessage(err.Error()),
 		// A vector_operate against a payload key holding a non-record value: 400,
 		// not 500. Silently replacing that value would destroy data the caller can
 		// still read, so the op refuses — a client-fixable mistake. Keeps this
 		// classifier in sync with server.clientFacingErr.
-		// Same sentinel-plus-string matching, for the same clustered-apply reason.
+		// Same sentinel-plus-message-shape matching, for the same
+		// clustered-apply reason.
 		errors.Is(err, vector.ErrPayloadKeyNotRecord),
-		strings.Contains(err.Error(), vector.ErrPayloadKeyNotRecord.Error()),
+		vector.IsPayloadKeyNotRecordMessage(err.Error()),
 		errors.Is(err, vector.ErrEmptyFilter),
 		errors.Is(err, vector.ErrEmptyGroupBy),
 		errors.Is(err, vector.ErrSparseMismatch),
@@ -574,8 +576,10 @@ func statusForError(err error) int {
 		return http.StatusBadRequest
 	case errors.Is(err, ops.ErrVectorRecordAbsent),
 		// The clustered path stringifies the sentinel across the Raft boundary, so
-		// errors.Is stops matching there; the sentinel's own text cannot drift.
-		strings.Contains(err.Error(), ops.ErrVectorRecordAbsent.Error()):
+		// errors.Is stops matching there. ops.IsVectorRecordAbsentMessage, not
+		// strings.Contains: a bare substring check would also match an unrelated
+		// internal error that merely wraps the sentinel, leaking it unredacted.
+		ops.IsVectorRecordAbsentMessage(err.Error()):
 		// vector_operate with create = NONE against a payload key that holds no
 		// record: the caller declined to create one and there was none, so the
 		// thing they named does not exist → 404. This is the HTTP rendering of the
