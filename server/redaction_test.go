@@ -452,6 +452,10 @@ func TestMapResultMalformedOperateFrameIsClientFacing(t *testing.T) {
 		{"sentinel", wire.ErrOperateArgs},
 		{"wrapped (%w, exercises errors.Is identity)", fmt.Errorf("vector_operate: %w", wire.ErrOperateArgs)},
 		{"as the decoder actually returns it", decErr},
+		// The clustered shape, and the one the sentinel arm cannot reach: an
+		// operate handler decodes inside the FSM apply, so shard.decodePBResult
+		// hands the error back rebuilt with errors.New and identity is gone.
+		{"stringified across Raft, real bare shape", errors.New(wire.ErrOperateArgs.Error())},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			status, payload := mapResult(disp, nil, tc.err, "")
@@ -467,4 +471,17 @@ func TestMapResultMalformedOperateFrameIsClientFacing(t *testing.T) {
 			}
 		})
 	}
+	// Negative control: an unrelated internal fault that merely mentions the
+	// sentinel text must STAY redacted. This is what an exact-equality matcher
+	// buys over a strings.Contains arm.
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix", func(t *testing.T) {
+		err := errors.New("apply: " + wire.ErrOperateArgs.Error())
+		status, payload := mapResult(disp, nil, err, "")
+		if status != StatusError {
+			t.Fatalf("status = %d, want StatusError (%d)", status, StatusError)
+		}
+		if msg, _ := DecodeErrorPayload(payload); msg != "internal error" {
+			t.Fatalf("payload = %q, want the redacted message", msg)
+		}
+	})
 }

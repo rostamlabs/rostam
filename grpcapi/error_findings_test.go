@@ -277,6 +277,10 @@ func TestGrpcErrorMalformedOperateFrameIsInvalidArgument(t *testing.T) {
 	}{
 		{"sentinel", wire.ErrOperateArgs},
 		{"wrapped (%w, exercises errIs identity)", fmt.Errorf("vector_operate: %w", wire.ErrOperateArgs)},
+		// The clustered shape, and the one the sentinel arm cannot reach: an
+		// operate handler decodes inside the FSM apply, so shard.decodePBResult
+		// hands the error back rebuilt with errors.New and identity is gone.
+		{"stringified across replication, real bare shape", errors.New(wire.ErrOperateArgs.Error())},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := status.Code(grpcError(tc.err)); got != codes.InvalidArgument {
@@ -284,4 +288,13 @@ func TestGrpcErrorMalformedOperateFrameIsInvalidArgument(t *testing.T) {
 			}
 		})
 	}
+	// Negative control: an unrelated internal fault that merely mentions the
+	// sentinel text must stay Internal — what exact equality buys over a
+	// strings.Contains arm.
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix", func(t *testing.T) {
+		err := errors.New("apply: " + wire.ErrOperateArgs.Error())
+		if got := status.Code(grpcError(err)); got != codes.Internal {
+			t.Errorf("grpcError(%v) = %v, want Internal", err, got)
+		}
+	})
 }

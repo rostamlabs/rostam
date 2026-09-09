@@ -195,7 +195,16 @@ func grpcError(err error) error {
 		// TextSearch/HybridTextSearch on a collection without FullText: a usage error.
 		vector.ErrFullTextDisabled):
 		return status.Error(codes.InvalidArgument, err.Error())
-	case errIs(err, wire.ErrOperateArgs):
+	case errIs(err, wire.ErrOperateArgs),
+		// The clustered path stringifies the sentinel across the Raft boundary:
+		// an operate handler decodes its frame INSIDE the FSM apply, so
+		// shard.decodePBResult rebuilds the error with errors.New and errors.Is
+		// stops matching — which left a malformed frame from a clustered caller
+		// redacted as a server fault, the one case the sentinel arm above cannot
+		// reach. wire.IsOperateArgsMessage, not strings.Contains: a bare
+		// substring check would also match an unrelated internal error that
+		// merely wraps the sentinel, leaking it unredacted.
+		wire.IsOperateArgsMessage(err.Error()):
 		// wire.ErrOperateArgs: a malformed operate frame — a vector_operate or a KV
 		// operate whose args do not decode, or which names a second target or a
 		// TTL the op does not carry (DecodeVectorOperateArgs /

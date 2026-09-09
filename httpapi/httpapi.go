@@ -585,6 +585,15 @@ func statusForError(err error) int {
 		// Sentinel only, no message-shape arm: this error is raised by the
 		// decoder the handler itself calls, so it reaches the classifier with its
 		// identity intact.
+		// The clustered path stringifies the sentinel across the Raft boundary:
+		// an operate handler decodes its frame INSIDE the FSM apply, so
+		// shard.decodePBResult rebuilds the error with errors.New and errors.Is
+		// stops matching — which left a malformed frame from a clustered caller
+		// redacted as a server fault, the one case the sentinel arm above cannot
+		// reach. wire.IsOperateArgsMessage, not strings.Contains: a bare
+		// substring check would also match an unrelated internal error that
+		// merely wraps the sentinel, leaking it unredacted.
+		wire.IsOperateArgsMessage(err.Error()),
 		errors.Is(err, wire.ErrOperateArgs):
 		return http.StatusBadRequest
 	case errors.Is(err, ops.ErrVectorRecordAbsent),

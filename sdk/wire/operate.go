@@ -16,6 +16,32 @@ import (
 // DecodeOperateArgs (a wire frame carrying one) — see design doc §3.5.
 var ErrOperateArgs = errors.New("wire: operate call arguments invalid")
 
+// IsOperateArgsMessage reports whether s is the EXACT serialised form of an
+// ErrOperateArgs error — the same exact-form matching ops.IsVectorRecordAbsent-
+// Message and vector.IsRecordTooLargeMessage do for their sentinels, and for the
+// same reason: an operate handler decodes its frame INSIDE the FSM apply, so on
+// a cluster the error comes back through shard.decodePBResult rebuilt with
+// errors.New, errors.Is identity is gone, and a sentinel-only classifier
+// redacts a client protocol mistake to "internal error".
+//
+// This sentinel has exactly ONE serialised shape: bare, no detail suffix and no
+// wrapper. Every server-side producer returns it unadorned — the wire decoders
+// and encoders in this package (DecodeOperateArgs, DecodeVectorOperateArgs and
+// their encoders) and ops (operate_apply.go's three guards,
+// checkVectorOperateArgs) all `return ..., ErrOperateArgs`. So exact equality is
+// the whole matcher, and it is deliberately not a strings.Contains: a bare
+// substring check would make any internal fault that merely mentions the
+// sentinel text client-facing.
+//
+// The ONE %w wrap in the tree, client.DecodeOperateValue's "N bytes left after
+// the tagged cell", is raised in the CLIENT process on a reply it is decoding.
+// It never reaches a server classifier, so it is correctly not matched here; if
+// a future server-side site does wrap the sentinel with context, add that exact
+// shape here, anchored, rather than loosening this to a substring.
+func IsOperateArgsMessage(s string) bool {
+	return s == ErrOperateArgs.Error()
+}
+
 // OperateSeg addresses one hop of an OperatePath (design doc §2.4/§3.5): a
 // field or column identified by its schema position, or, for a record that
 // stores names, by name.
