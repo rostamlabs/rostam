@@ -126,6 +126,12 @@ func (s *shard) flush() error {
 		}
 	}
 
+	// NO onRemove NOTIFICATIONS HERE, deliberately. The wipe is an O(1) table swap
+	// with no per-entry walk, so there are no keys to report even in principle —
+	// and a derived secondary index does not need them: the flush handler resets
+	// the whole index instead, because an empty cache IS an exact empty index.
+	// See cache/onremove.go.
+	//
 	// Durable now (or heap): perform the O(1) logical wipe. Swap in a fresh empty
 	// table — lock-free readers see it on their next load, and the old table (with
 	// its live/tomb counts) is dropped whole. The in-memory floor mirrors the

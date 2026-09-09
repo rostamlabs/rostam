@@ -251,6 +251,20 @@ type shard struct {
 	// pin a fixed instant for a canonical fingerprint) without racing the
 	// lock-free read path that consults it. nil ⇒ the real clock (nowMs).
 	nowFn atomic.Pointer[func() uint64]
+
+	// onRemove points at the OWNING CACHE's removal hook (Cache.onRemove), so a
+	// SetOnRemove is one store seen by every shard. It is assigned once in
+	// Cache.New, before the cache is published, and never mutated afterwards — the
+	// hook VALUE behind it is what changes, atomically. nil for a shard built
+	// directly by newShard (tests, benchmarks): fireOnRemove short-circuits on it.
+	// See cache/onremove.go for the callback contract.
+	onRemove *atomic.Pointer[func([]byte)]
+
+	// chunkedRestarts counts how many times IterateChunked abandoned a shard pass
+	// because a concurrent rehash swapped the index table. Diagnostics only —
+	// nothing depends on it — but it is what proves the restart path (and its
+	// bounded fallback) actually executes.
+	chunkedRestarts atomic.Uint64
 }
 
 // newShard constructs a shard. dataDir="" selects heap mode (heap-only behavior).
@@ -619,7 +633,7 @@ func (s *shard) getCore(key []byte, h, now uint64, allowPhysicalRemove bool) ([]
 		}
 		if isExpired(exp, now) {
 			if allowPhysicalRemove {
-				s.dropExpiredLocked(h, ref)
+				s.dropExpiredLocked(key, h, ref)
 			}
 			s.misses.Add(1)
 			return nil, 0, ErrNotFound
@@ -644,7 +658,7 @@ func (s *shard) getCore(key []byte, h, now uint64, allowPhysicalRemove bool) ([]
 	}
 	if isExpired(exp, now) {
 		if allowPhysicalRemove {
-			s.dropExpiredLocked(h, ref)
+			s.dropExpiredLocked(key, h, ref)
 		}
 		s.misses.Add(1)
 		return nil, 0, ErrNotFound
@@ -715,7 +729,7 @@ func (s *shard) getIntoCore(dst, key []byte, h, now uint64, allowPhysicalRemove 
 		}
 		if isExpired(exp, now) {
 			if allowPhysicalRemove {
-				s.dropExpiredLocked(h, ref)
+				s.dropExpiredLocked(key, h, ref)
 			}
 			s.misses.Add(1)
 			return dst, 0, ErrNotFound
@@ -738,7 +752,7 @@ func (s *shard) getIntoCore(dst, key []byte, h, now uint64, allowPhysicalRemove 
 	}
 	if isExpired(exp, now) {
 		if allowPhysicalRemove {
-			s.dropExpiredLocked(h, ref)
+			s.dropExpiredLocked(key, h, ref)
 		}
 		s.misses.Add(1)
 		return dst, 0, ErrNotFound
@@ -749,12 +763,18 @@ func (s *shard) getIntoCore(dst, key []byte, h, now uint64, allowPhysicalRemove 
 // dropExpiredLocked removes the entry for h if it still points at ref (i.e. the
 // entry a reader just saw expire has not been overwritten by a newer Put).
 // Mirrors the cur == ref guard the map path used.
-func (s *shard) dropExpiredLocked(h uint64, ref slabRef) {
+//
+// `key` is the CALLER'S key — the one it just resolved through the index and
+// found expired — and is used only to notify the derived-index removal hook. It
+// is passed rather than re-read off the page because the caller already holds it
+// and the cur == ref guard has already proved the slot is that key's.
+func (s *shard) dropExpiredLocked(key []byte, h uint64, ref slabRef) {
 	s.mu.Lock()
 	t := s.tab.Load()
 	if slot, cur, ok := t.findSlot(h); ok && cur == ref {
 		t.tombstone(slot)
 		s.expirations.Add(1)
+		s.fireOnRemove(key)
 	}
 	s.mu.Unlock()
 }
@@ -962,12 +982,19 @@ func (s *shard) delH(key []byte, h uint64) (bool, error) {
 			// tombstone. Nothing is left to strip, the appended record is harmless (the
 			// rebuild finds a delete for a key with no live copy), and the entry DID
 			// exist when the caller asked — so report the delete as having happened.
+			//
+			// No onRemove call here: the eviction that dropped the slot already fired
+			// the hook for this key from inside its own cur == ref guard.
 			s.dels.Add(1)
 			return true, nil
 		}
 	}
 	t.tombstone(slot)
 	s.dels.Add(1)
+	// The slot just removed is this key's — findSlot plus the bytes.Equal guard
+	// above (and, on the durable path, the re-resolve) proved it — so a derived
+	// index may drop the key's postings.
+	s.fireOnRemove(key)
 	return true, nil
 }
 
@@ -1218,13 +1245,20 @@ func (s *shard) stripDeadSlots(now uint64) {
 		}
 		ref := slabRef(t.refs[i].Load())
 		p := s.pages[ref.pageIdx()]
+		// Both branches below remove a slot that IS the winning copy of its key (the
+		// max-seq contest already ran), so each notifies the derived-index hook. In
+		// practice the hook is always nil here: this runs inside newShard, before the
+		// cache exists to install one. It fires anyway so the rule "every live-slot
+		// removal notifies" holds without a caller-ordering caveat.
 		if meta, ok := p.MetaAt(ref.offset()); ok && metaIsTombstone(meta) {
 			t.tombstone(uint64(i)) //nolint:gosec // i is a valid slot index
+			s.fireOnRemoveAt(p, ref.offset())
 			continue
 		}
 		if dropExpired {
-			if _, _, exp, err := p.Read(ref.offset()); err == nil && isExpired(exp, now) {
+			if k, _, exp, err := p.Read(ref.offset()); err == nil && isExpired(exp, now) {
 				t.tombstone(uint64(i)) //nolint:gosec // i is a valid slot index
+				s.fireOnRemove(k)
 			}
 		}
 	}
@@ -1428,6 +1462,11 @@ func (s *shard) retirePageLocked(idx int) {
 			if !isExpired(expiryMs, now) {
 				s.evictionsLive.Add(1)
 			}
+			// INSIDE the cur == ref guard, never outside it. This walk visits every
+			// framed entry on the page, DEAD DUPLICATES INCLUDED — copies a later Put
+			// superseded, whose index slot points at a live copy on another page.
+			// Notifying for one of those would drop a live key's postings.
+			s.fireOnRemove(key)
 		}
 		s.evictions.Add(1)
 		cursor += entrySize(len(key), len(value))
@@ -1487,6 +1526,12 @@ func (s *shard) drainPageLocked(victim int) error {
 			if !isExpired(headExpiryMs, now) {
 				s.evictionsLive.Add(1)
 			}
+			// INSIDE the cur == ref guard, exactly as in retirePageLocked: this drain
+			// walks every framed entry including dead duplicates whose slot points at a
+			// newer live copy elsewhere. evictedKey still aliases the page (head only
+			// moved past it; nothing has been written over it inside this loop), and the
+			// hook contract requires the callback to copy before retaining.
+			s.fireOnRemove(evictedKey)
 		}
 		s.evictions.Add(1)
 	}
@@ -1655,11 +1700,16 @@ func (s *shard) sweepIndex(now uint64) {
 				continue
 			}
 			ref := slabRef(t.refs[i].Load())
-			_, _, exp, err := s.pages[ref.pageIdx()].Read(ref.offset())
+			key, _, exp, err := s.pages[ref.pageIdx()].Read(ref.offset())
 			if err != nil || isExpired(exp, now) {
 				t.tombstone(uint64(i)) //nolint:gosec // i is a valid slot index in [0,n)
 				if err == nil {
 					s.expirations.Add(1)
+					// EXPIRY BRANCH ONLY. A slot dropped because its page.Read FAILED has
+					// no key to report — the bytes are unreadable — so it notifies nothing
+					// and the derived index's reconcile pass is the backstop for that one
+					// posting. Notifying with a nil key would be worse than silence.
+					s.fireOnRemove(key)
 				}
 			}
 		}
@@ -1745,8 +1795,15 @@ func (s *shard) tryRetireExpiredPageLocked(idx int, stamp uint64) {
 	tail := p.tail()
 	// Current-and-expired slots to drop once we confirm the WHOLE page is dead. We
 	// cannot tombstone as we go: a live entry found later must leave the page (and
-	// all its slots) untouched.
-	var expiredSlots []uint64
+	// all its slots) untouched. Each carries the entry OFFSET as well, so the
+	// derived-index removal hook can be given the key when the drop actually
+	// happens (the page bytes are still intact then — the fresh page is swapped in
+	// only afterwards).
+	type expiredSlot struct {
+		slot uint64
+		off  uint32
+	}
+	var expiredSlots []expiredSlot
 	for cursor := p.head(); cursor < tail; {
 		key, value, exp, err := decodeEntryFast(entries[cursor:tail])
 		if err != nil {
@@ -1762,14 +1819,17 @@ func (s *shard) tryRetireExpiredPageLocked(idx int, stamp uint64) {
 			if !isExpired(exp, stamp) {
 				return // a live, index-current entry pins the whole page.
 			}
-			expiredSlots = append(expiredSlots, slot)
+			expiredSlots = append(expiredSlots, expiredSlot{slot: slot, off: uint32(cursor)}) //nolint:gosec // cursor < PageSize ≤ MaxInt32
 		}
 		cursor += entrySize(len(key), len(value))
 	}
 	// No live current entry: drop every expired current slot and retire the page.
-	for _, slot := range expiredSlots {
-		t.tombstone(slot)
+	for _, es := range expiredSlots {
+		t.tombstone(es.slot)
 		s.expirations.Add(1)
+		// Collected inside the cur == ref guard above, so each of these IS the live
+		// copy of its key — dead duplicates never reach the slice.
+		s.fireOnRemoveAt(p, es.off)
 	}
 	fresh := newHeapPage(s.cfg.PageSize)
 	fresh.gen = s.nextGen()
