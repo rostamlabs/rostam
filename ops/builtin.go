@@ -338,12 +338,13 @@ func handleFlush(tx *TxContext, _ []byte) ([]byte, error) {
 	return nil, nil
 }
 
-// handleExpire replaces the key's deadline and nothing else. The record index
-// posts what the VALUE resolves to, and expire rewrites the same bytes (see
-// TxContext.Expire), so there is no posting to change — and the handler does
-// not even have the value in scope. Deliberately no reindexKV. The same is
-// true of caex (a compare-guarded expire) and persist (the same bytes with the
-// deadline cleared); the eventual expiry itself fires onRemove → Set.Drop.
+// handleExpire replaces the key's deadline and nothing else, so the posting's
+// CONTENT does not change. It still has to be re-posted, because the rewrite
+// goes through the cache's put body and can evict the page framing the key's
+// own copy — dropping every posting for a key that stays live. That re-post
+// lives in TxContext.Expire, the seam this handler and caex both go through,
+// so neither calls reindexKV itself. persist does its own (it writes through
+// PutAbs). The eventual expiry fires onRemove → Set.Drop as always.
 func handleExpire(tx *TxContext, args []byte) ([]byte, error) {
 	key, ttl, err := wire.DecodeExpireArgs(args)
 	if err != nil {
@@ -560,6 +561,11 @@ func handlePersist(tx *TxContext, args []byte) ([]byte, error) {
 	if err := tx.PutAbs(key, buf, 0); err != nil {
 		return nil, err
 	}
+	// The SAME bytes, but still a write through the cache's put body — which
+	// can evict the page framing this key's own current copy and drop every
+	// posting for it mid-write, leaving a live key unfindable. Re-post after
+	// the write returns. See TxContext.Expire for the full argument.
+	tx.reindexKV(key, buf)
 	return []byte{1}, nil
 }
 

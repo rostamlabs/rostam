@@ -10,6 +10,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/rostamlabs/rostam/ops"
 	"github.com/rostamlabs/rostam/raft"
 )
 
@@ -140,6 +141,19 @@ func (s *Store) RestoreSnapshot(ctx context.Context, data []byte, appliedIndex u
 				wasmRestore = s.fsm.wasmRestore
 			}
 			_, rErr = restoreSnapshot(s.cache, s.vectors, wasmRestore, rc)
+			if rErr == nil {
+				// The KV record index is derived state — in no snapshot, no WAL
+				// and no log — so this install has just replaced the keyspace it
+				// describes, leaving it with postings for keys that are gone and
+				// NONE for the keys that arrived. Rebuild it against the same Set
+				// (restoreSnapshot refills the EXISTING cache, so the Set already
+				// wired to that cache's onRemove hook is the one to refill),
+				// inside the exclusive section so no write lands between the
+				// refill and the rebuild. It walks nothing when no definition is
+				// installed. The raft branch below reaches fsm.Restore, which
+				// does the same thing.
+				ops.RebuildKVIndex(s.kvIdx, s.cache)
+			}
 		})
 		if rErr != nil {
 			return fmt.Errorf("shard: RestoreSnapshot (pb): %w", rErr)

@@ -312,6 +312,20 @@ func (tx *TxContext) Del(key []byte) (bool, error) {
 // TTL — so under a replicated apply stamp both halves use the stamped clock
 // (GetAt to test liveness, PutAt to stamp the new absolute expiry), keeping the
 // re-stamped expiry identical on every replica.
+//
+// IT REINDEXES, even though it stores the SAME BYTES, and that is not
+// redundant — it is the case the obvious rule gets wrong. Expire goes through
+// the cache's PUT body, so it can evict the page framing this key's own current
+// copy and fire onRemove(key) → Set.Drop from inside the write; every posting
+// for the key is dropped mid-write while the key itself stays live. Nothing
+// about an unchanged value looks like a change, so without the re-post expire
+// would silently turn a findable key into an unfindable one — the missing-row
+// class. Hence the rule: EVERY path that writes through the cache's put body
+// reindexes after it returns, whether or not the bytes moved. The re-post is
+// idempotent in (key, value), so it costs a resolve and changes nothing else.
+//
+// This is also the seam for expire, caex and the WASM cache_expire host
+// function, all of which route here and so need no reindex of their own.
 func (tx *TxContext) Expire(key []byte, ttl time.Duration) error {
 	v, err := tx.Get(key)
 	if err != nil {
@@ -321,5 +335,26 @@ func (tx *TxContext) Expire(key []byte, ttl time.Duration) error {
 	// overwrite that page region during the Put call itself.
 	buf := make([]byte, len(v))
 	copy(buf, v)
-	return tx.Put(key, buf, ttl)
+	if err := tx.Put(key, buf, ttl); err != nil {
+		return err
+	}
+	tx.reindexKV(key, buf)
+	return nil
+}
+
+// PutIndexed is Put followed by the index maintenance every KV write owes. It
+// is the exported seam for writers OUTSIDE this package that store bytes under
+// a key; the WASM cache_put host function is the one such writer today.
+//
+// Prefer it to Put plus a hand-written reindex, because the ordering is a
+// correctness requirement rather than a style choice: an evicting Put can fire
+// onRemove for the very key being written, so a posting made first is dropped
+// by the write that follows. Callers inside this package use the unexported
+// seam directly.
+func (tx *TxContext) PutIndexed(key, value []byte, ttl time.Duration) error {
+	if err := tx.Put(key, value, ttl); err != nil {
+		return err
+	}
+	tx.reindexKV(key, value)
+	return nil
 }

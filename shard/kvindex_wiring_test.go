@@ -9,6 +9,7 @@ package shard
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"testing"
@@ -283,5 +284,117 @@ func TestStoreCacheWalkerVisitsEveryKey(t *testing.T) {
 		if !seen[k] {
 			t.Fatalf("CacheWalker never visited %q", k)
 		}
+	}
+}
+
+// --- the other two restore paths -----------------------------------------
+//
+// restoreSnapshot has three callers, and all three replace the whole keyspace
+// the index describes: fsm.Restore (raft), pbSnapshotStore.InstallFSM (a PB
+// catch-up transfer) and Store.RestoreSnapshot's PB branch (disaster recovery).
+// A caller that refills the cache without rebuilding leaves the index holding
+// postings for keys that are gone and NONE for the keys that arrived — the
+// second half being the missing-row class. The raft path is covered by
+// TestRestoreRebuildsIndex above; these two cover the rest.
+
+// installIndexOn installs the fixture definition on a store's index and marks
+// it ready, then returns the index.
+func installIndexOn(t *testing.T, s *Store) *kvindex.Set {
+	t.Helper()
+	idx := s.KVIndex()
+	if idx == nil {
+		t.Fatal("the store has no KV index")
+	}
+	idx.Install([]kvindex.Def{kvWiringDef(t)})
+	idx.MarkReady(kvWiringIndexName)
+	return idx
+}
+
+// seedIndexedKeys writes n record keys under the definition's prefix.
+func seedIndexedKeys(t *testing.T, s *Store, n int, rc int64) []string {
+	t.Helper()
+	out := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		k := fmt.Appendf(nil, "u:%02d", i)
+		if err := s.Put(k, kvWiringRec(rc), 0); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+		out = append(out, string(k))
+	}
+	return out
+}
+
+func TestPBSnapshotInstallRebuildsKVIndex(t *testing.T) {
+	srcDir, dstDir := t.TempDir(), t.TempDir()
+	src, _ := pbFrontierStore(t, srcDir, 0)
+	defer func() { _ = src.Close() }()
+	dst, _ := pbFrontierStore(t, dstDir, 0)
+	defer func() { _ = dst.Close() }()
+
+	want := seedIndexedKeys(t, src, 20, 7)
+
+	// The target is diverged AND indexed: its postings describe keys the source
+	// has never heard of.
+	dstIdx := installIndexOn(t, dst)
+	seedIndexedKeys(t, dst, 3, 9)
+	if got := kvWiringCandidates(t, dstIdx, 9); len(got) != 3 {
+		t.Fatalf("pre-install postings = %v, want 3 ghosts", got)
+	}
+
+	blob, err := pbSnapStoreFor(src).SnapshotFSM(20)
+	if err != nil {
+		t.Fatalf("SnapshotFSM: %v", err)
+	}
+	target := pbSnapStoreFor(dst)
+	if err := target.BeginInstall(20, 1); err != nil {
+		t.Fatalf("BeginInstall: %v", err)
+	}
+	if err := target.InstallFSM(blob); err != nil {
+		t.Fatalf("InstallFSM: %v", err)
+	}
+	if err := target.CommitInstall(20, 1); err != nil {
+		t.Fatalf("CommitInstall: %v", err)
+	}
+
+	if got := kvWiringCandidates(t, dstIdx, 9); len(got) != 0 {
+		t.Fatalf("after the install, the pre-install postings survive: %v", got)
+	}
+	got := kvWiringCandidates(t, dstIdx, 7)
+	if len(got) != len(want) {
+		t.Fatalf("after the install, rc == 7 finds %d keys, want %d — InstallFSM must "+
+			"rebuild the index over the keyspace it just installed", len(got), len(want))
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("post-install postings = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestPBRestoreSnapshotRebuildsKVIndex(t *testing.T) {
+	srcDir, dstDir := t.TempDir(), t.TempDir()
+	src, _ := pbFrontierStore(t, srcDir, 0)
+	defer func() { _ = src.Close() }()
+	dst, _ := pbFrontierStore(t, dstDir, 0)
+	defer func() { _ = dst.Close() }()
+
+	want := seedIndexedKeys(t, src, 20, 7)
+	dstIdx := installIndexOn(t, dst)
+	seedIndexedKeys(t, dst, 3, 9)
+
+	blob, appliedIndex, err := src.BackupSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("BackupSnapshot: %v", err)
+	}
+	if err := dst.RestoreSnapshot(context.Background(), blob, appliedIndex); err != nil {
+		t.Fatalf("RestoreSnapshot: %v", err)
+	}
+
+	if got := kvWiringCandidates(t, dstIdx, 9); len(got) != 0 {
+		t.Fatalf("after the DR restore, the pre-restore postings survive: %v", got)
+	}
+	if got := kvWiringCandidates(t, dstIdx, 7); len(got) != len(want) {
+		t.Fatalf("after the DR restore, rc == 7 finds %d keys, want %d — the PB branch of "+
+			"RestoreSnapshot must rebuild the index", len(got), len(want))
 	}
 }

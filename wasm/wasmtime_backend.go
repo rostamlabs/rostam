@@ -654,7 +654,15 @@ func defineHostFunctions(linker *wasmtime.Linker, store *wasmtime.Store, holder 
 			if ttlMs > 0 {
 				ttl = time.Duration(ttlMs) * time.Millisecond
 			}
-			if err := holder.tx.Put(key, val, ttl); err != nil {
+			// PutIndexed, not Put: a guest write is a KV write like any other, so
+			// it owes the record index the same maintenance a builtin handler
+			// does — store first, post second. A bare Put would leave the posting
+			// describing whatever the key held BEFORE the guest wrote it, and a
+			// query for the new value would miss a live key. cache_del below
+			// needs no counterpart (it removes a live slot, so the cache's
+			// onRemove hook unposts), and cache_expire routes through
+			// TxContext.Expire, which re-posts for the same reason.
+			if err := holder.tx.PutIndexed(key, val, ttl); err != nil {
 				// -1 is the guest's signal; recordHostErr is what carries the reason
 				// out through Invoke so the replicated apply path can classify it.
 				holder.recordHostErr(err)

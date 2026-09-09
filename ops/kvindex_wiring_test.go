@@ -434,6 +434,72 @@ func TestExpireAndPersistDoNotDisturbPostings(t *testing.T) {
 		t.Fatalf("TTL-only ops changed the postings: (%d, %d) → (%d, %d)",
 			before, distinctBefore, after, distinctAfter)
 	}
+
+	// ###################### AND THEY MUST NOT LOSE THEM #####################
+	//
+	// "Leaves the posting alone" is only half the requirement, and the easy
+	// half: everything above runs on a DefaultConfig cache, which never evicts,
+	// so it would pass even if these handlers did nothing at all about the
+	// index. The half that bites is that expire, caex and persist all reach the
+	// cache's PUT body — expire and caex through TxContext.Expire (get, copy,
+	// put the same bytes with a new deadline), persist through PutAbs — and a
+	// put on a ringbuf shard can evict the page framing the key's own current
+	// copy, firing onRemove for the key mid-write. The bytes being UNCHANGED is
+	// exactly why that is dangerous: nothing about the value looks like a
+	// change, so nothing re-posts, and the key is left LIVE WITH NO POSTING.
+	//
+	// So the rule is not "reindex when the bytes change", it is: every path
+	// that writes through the cache's put body reindexes after it returns.
+	t.Run("under self-eviction", func(t *testing.T) {
+		seedWithTTL := func(t *testing.T, tx *TxContext) {
+			if _, err := handlePut(tx, wire.EncodePutArgs(evictionKey, padRec(1), time.Hour)); err != nil {
+				t.Fatalf("seed put: %v", err)
+			}
+		}
+		// The stored bytes never change, so the key must still be findable
+		// under the value it was posted with before the write.
+		stillPosted := func(op string) func(*testing.T, *cache.Cache, *kvindex.Set) {
+			return func(t *testing.T, c *cache.Cache, idx *kvindex.Set) {
+				live := true
+				if v, err := c.Get(evictionKey); err != nil || !bytes.Equal(v, padRec(1)) {
+					live = false
+				}
+				got := posted(t, idx, 1)
+				if len(got) != 1 || got[0] != string(evictionKey) {
+					t.Fatalf("after an evicting %s, rc == 1 finds %v, want [%s] — key live: %v. "+
+						"%s rewrites the key through the cache's put body, so it must reindex "+
+						"after that write returns even though the bytes are unchanged",
+						op, got, evictionKey, live, op)
+				}
+			}
+		}
+
+		t.Run("expire", func(t *testing.T) {
+			runUnderSelfEviction(t, seedWithTTL, func(t *testing.T, tx *TxContext) {
+				if _, err := handleExpire(tx, wire.EncodeExpireArgs(evictionKey, 2*time.Hour)); err != nil {
+					t.Fatalf("expire: %v", err)
+				}
+			}, stillPosted("expire"))
+		})
+
+		t.Run("caex", func(t *testing.T) {
+			runUnderSelfEviction(t, seedWithTTL, func(t *testing.T, tx *TxContext) {
+				out, err := handleCAEX(tx, wire.EncodeCAEXArgs(evictionKey, padRec(1), 2*time.Hour))
+				if err != nil || len(out) != 1 || out[0] != 1 {
+					t.Fatalf("caex = (%v, %v), want refreshed", out, err)
+				}
+			}, stillPosted("caex"))
+		})
+
+		t.Run("persist", func(t *testing.T) {
+			runUnderSelfEviction(t, seedWithTTL, func(t *testing.T, tx *TxContext) {
+				out, err := handlePersist(tx, wire.EncodeKeyArgs(evictionKey))
+				if err != nil || len(out) != 1 || out[0] != 1 {
+					t.Fatalf("persist = (%v, %v), want cleared", out, err)
+				}
+			}, stillPosted("persist"))
+		})
+	})
 }
 
 // TestFlushResetsIndexButKeepsReady — Flush is O(shards) and fires no per-key
@@ -494,21 +560,35 @@ func TestFlushWithoutIndexIsUnchanged(t *testing.T) {
 
 // --- ordering, failure isolation and cost --------------------------------
 
-// TestReindexHappensAfterPut is the regression test for the ORDER a handler
-// must use, and it is a real defect, not a style rule: on a ringbuf shard a Put
-// can evict the page that still frames the key's CURRENT copy, and the cache
-// fires onRemove for THAT KEY from inside the Put. A handler that posted first
-// would have its fresh posting dropped by the notification that follows, and
-// the new value would be unfindable.
+// evictionKey is the key every eviction fixture in this file writes. It is the
+// same length as the fillers' keys so that "is there room for one more" is one
+// question rather than a size-dependent one.
+var evictionKey = []byte("u:KKKK")
+
+// runUnderSelfEviction is the fixture behind every ordering test here, and it
+// exists because the defect it hunts is invisible on an ordinary cache: a
+// DefaultConfig cache never evicts, so a test written against one passes
+// whatever the handler does.
 //
-// The fixture searches for the exact fill level at which the key's own Put is
-// the evicting one, since that is the only arrangement in which the hook fires
-// for the key being written. Every key and every value is the same length, so
-// "is there room for one more" is one question rather than a size-dependent
-// one — otherwise the small overwrite always slots into the slack a filler
-// could not use and never evicts anything.
-func TestReindexHappensAfterPut(t *testing.T) {
-	key := []byte("u:KKKK")
+// On a two-page ringbuf shard a write can evict the page that still frames the
+// key's CURRENT copy, and the cache fires onRemove for THAT KEY from inside the
+// write. Every posting for the key is dropped mid-write. Any handler that does
+// not (re)post AFTER the write returns therefore leaves a LIVE key with NO
+// posting — the missing-row class, the one failure this index may never have.
+//
+// The harness sweeps fill levels until `write` is itself the evicting write,
+// since that is the only arrangement in which the hook fires for the key being
+// written. seed lays down the key's first copy and any TTL the case needs;
+// check runs once, at that fill level, with the eviction confirmed to have
+// happened. It fails loudly rather than passing vacuously if no fill level
+// produces the case.
+func runUnderSelfEviction(
+	t *testing.T,
+	seed func(t *testing.T, tx *TxContext),
+	write func(t *testing.T, tx *TxContext),
+	check func(t *testing.T, c *cache.Cache, idx *kvindex.Set),
+) {
+	t.Helper()
 	filler := padRec(0)
 
 	for fill := 0; fill < 400; fill++ {
@@ -522,11 +602,11 @@ func TestReindexHappensAfterPut(t *testing.T) {
 			t.Fatal(err)
 		}
 		idx := NewKVIndexFor(c)
-		// Wrap the hook so the test can see it fire for the key being written.
-		// The index's Drop is still what runs — the recorder only observes.
+		// Wrap the hook so the fixture can see it fire for the key being
+		// written. The index's Drop is still what runs — this only observes.
 		var droppedKey int
 		c.SetOnRemove(func(k []byte) {
-			if bytes.Equal(k, key) {
+			if bytes.Equal(k, evictionKey) {
 				droppedKey++
 			}
 			idx.Drop(k)
@@ -536,9 +616,7 @@ func TestReindexHappensAfterPut(t *testing.T) {
 		tx := NewTxContextWithIndex(c, nil, idx)
 
 		// The key's only copy lands on the first page.
-		if _, err := handlePut(tx, wire.EncodePutArgs(key, padRec(1), 0)); err != nil {
-			t.Fatalf("put key: %v", err)
-		}
+		seed(t, tx)
 		for i := 0; i < fill; i++ {
 			if err := c.Put(fmt.Appendf(nil, "f:%04d", i), filler, 0); err != nil {
 				t.Fatalf("filler put: %v", err)
@@ -551,31 +629,45 @@ func TestReindexHappensAfterPut(t *testing.T) {
 			break
 		}
 
-		// THE PUT UNDER TEST. At exactly one fill level it is the write that
+		// THE WRITE UNDER TEST. At exactly one fill level it is the write that
 		// must evict, and the page it drains is the one holding the key.
-		if _, err := handlePut(tx, wire.EncodePutArgs(key, padRec(2), 0)); err != nil {
-			t.Fatalf("overwriting put: %v", err)
-		}
+		write(t, tx)
 		if droppedKey == 0 {
 			_ = c.Close()
 			continue // not the evicting fill level yet
 		}
-
-		// The hook fired for the key from inside its own Put. The fresh posting
-		// must have survived, which is only true if the handler reindexed AFTER
-		// the Put returned.
-		got := posted(t, idx, 2)
-		if len(got) != 1 || got[0] != string(key) {
-			t.Fatalf("after an evicting Put of the key itself, rc == 2 finds %v, want [%s] — "+
-				"the handler must call reindexKV AFTER Put returns, never before", got, key)
-		}
-		if v, err := c.Get(key); err != nil || !bytes.Equal(v, padRec(2)) {
-			t.Fatalf("the key itself did not survive its evicting Put: (%q, %v)", v, err)
-		}
+		check(t, c, idx)
 		_ = c.Close()
 		return
 	}
-	t.Fatal("no fill level made the key's own Put the evicting one; the fixture needs adjusting")
+	t.Fatal("no fill level made the write under test the evicting one; the fixture needs adjusting")
+}
+
+// TestReindexHappensAfterPut is the regression test for the ORDER a handler
+// must use. A handler that posted BEFORE its Put would have the fresh posting
+// dropped by the eviction that follows, and the new value would be unfindable.
+func TestReindexHappensAfterPut(t *testing.T) {
+	runUnderSelfEviction(t,
+		func(t *testing.T, tx *TxContext) {
+			if _, err := handlePut(tx, wire.EncodePutArgs(evictionKey, padRec(1), 0)); err != nil {
+				t.Fatalf("seed put: %v", err)
+			}
+		},
+		func(t *testing.T, tx *TxContext) {
+			if _, err := handlePut(tx, wire.EncodePutArgs(evictionKey, padRec(2), 0)); err != nil {
+				t.Fatalf("overwriting put: %v", err)
+			}
+		},
+		func(t *testing.T, c *cache.Cache, idx *kvindex.Set) {
+			got := posted(t, idx, 2)
+			if len(got) != 1 || got[0] != string(evictionKey) {
+				t.Fatalf("after an evicting Put of the key itself, rc == 2 finds %v, want [%s] — "+
+					"the handler must call reindexKV AFTER Put returns, never before", got, evictionKey)
+			}
+			if v, err := c.Get(evictionKey); err != nil || !bytes.Equal(v, padRec(2)) {
+				t.Fatalf("the key itself did not survive its evicting Put: (%q, %v)", v, err)
+			}
+		})
 }
 
 // TestIndexFailureNeverFailsApply — a definition whose path never resolves is
