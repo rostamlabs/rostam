@@ -424,3 +424,34 @@ func TestRestoreAtCapAccepted(t *testing.T) {
 		t.Fatalf("restored point: ok=%v version=%d, want true/5", ok, version)
 	}
 }
+
+// TestOversizeRecordErrorBoundsThePayloadKey pins the SIZE of the rejection
+// message. The payload key is caller-supplied and bounded only by the route
+// body cap, and this error is a classified CLIENT error on every transport, so
+// its text is returned to the caller verbatim and carried across replication as
+// a string — quoting an unbounded key whole would hand a hostile caller a
+// megabyte-scale message to allocate, format, log and ship, on the path whose
+// whole point is to refuse cheaply.
+//
+// clipField (the same helper the row-presence compile errors use) keeps a short
+// key rendering exactly as %q did, which is what the transport tests' fixtures
+// assume.
+func TestOversizeRecordErrorBoundsThePayloadKey(t *testing.T) {
+	const big = 1 << 20
+	huge := string(bytes.Repeat([]byte("k"), big))
+	err := checkRecordValues(Metadata{huge: NewRecord(make([]byte, maxRecordValueBytes+1))})
+	wantTooLarge(t, "oversize record under a 1 MiB payload key", err)
+	if n := len(err.Error()); n >= 256 {
+		t.Errorf("error message is %d bytes, want < 256", n)
+	}
+	if bytes.Contains([]byte(err.Error()), bytes.Repeat([]byte("k"), 128)) {
+		t.Error("error message echoed a long run of the payload key")
+	}
+	// A short key is unchanged, so nothing that reads this message has to
+	// change with it.
+	short := checkRecordValues(oversizeRecord())
+	wantTooLarge(t, "oversize record under a short payload key", short)
+	if !bytes.Contains([]byte(short.Error()), []byte(`payload key "session" holds a`)) {
+		t.Errorf("short-key message changed shape: %q", short.Error())
+	}
+}

@@ -178,8 +178,13 @@ var ErrRecordTooLarge = errors.New("vector: record payload value exceeds the sto
 func checkRecordValues(m Metadata) error {
 	for k, v := range m {
 		if v.Kind == ValueRecord && len(v.Rec) > maxRecordValueBytes {
-			return fmt.Errorf("%w: payload key %q holds a %d-byte record, the cap is %d bytes",
-				ErrRecordTooLarge, k, len(v.Rec), maxRecordValueBytes)
+			// The key goes through clipField, not %q: it is caller-supplied and
+			// bounded only by the route body cap, and this message is now
+			// returned VERBATIM to the caller on every transport (it is a
+			// client error, classified 400 / InvalidArgument) and carried across
+			// replication as a string. A short key renders exactly as %q did.
+			return fmt.Errorf("%w: payload key %s holds a %d-byte record, the cap is %d bytes",
+				ErrRecordTooLarge, clipField(k), len(v.Rec), maxRecordValueBytes)
 		}
 	}
 	return nil
