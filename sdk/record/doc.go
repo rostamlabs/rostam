@@ -31,6 +31,12 @@
 // Names are 1-255 bytes and may not contain '/', '#', or '"'. Any path that
 // does not fit this grammar is rejected with an error wrapping ErrPath.
 //
+// The grammar bounds the whole string as well as its segments: three
+// segments of at most 255 bytes each, with a quoted row key of at most
+// 2+2*wire.OperateMaxKeyLen raw bytes, is 1024 bytes. ParsePath checks that
+// total FIRST, before it splits, so a hostile field costs one length
+// comparison rather than one allocation per '/'.
+//
 // # Determinism
 //
 // ParsePath and SplitField are pure functions of their input string: same

@@ -5,6 +5,7 @@ package record
 import (
 	"errors"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -227,4 +228,86 @@ func TestParsePathQuotedRowKeyLengthBound(t *testing.T) {
 			t.Fatalf("256 escaped pairs: err = %v, want an ErrPath", err)
 		}
 	})
+}
+
+// parsePathSink keeps the ParsePath results below from being optimized away.
+var parsePathSink error
+
+// TestParsePathLengthBoundBeforeSplit pins the bound ParsePath applies AHEAD of
+// strings.Split.
+//
+// Split allocates one []string header per segment and only then can the
+// segment-count check reject the input, so before this bound an input carrying
+// N slashes cost roughly 16N bytes of transient headers before rejection — once
+// per filter leaf per request, under a 32 MiB route body cap. The segment-level
+// bounds (validateName's 255, parseRowSeg's quoted-key cap) cannot help: both
+// live in helpers that run after the split.
+func TestParsePathLengthBoundBeforeSplit(t *testing.T) {
+	// The longest path the grammar allows, spelled out exactly: a 255-byte
+	// field name, a quoted row key at its raw cap (255 escaped pairs, 510 bytes
+	// inside the quotes, unescaping to a legal 255-byte key), and a 255-byte
+	// column name. This is the input a bound set one byte too low would break.
+	longest := strings.Repeat("f", maxNameLen) + `/"` + strings.Repeat(`\"`, 255) + `"/` + strings.Repeat("c", maxNameLen)
+	if len(longest) != maxPathBytes {
+		t.Fatalf("the longest legal path is %d bytes but maxPathBytes is %d — the derivation and the constant disagree",
+			len(longest), maxPathBytes)
+	}
+	p, err := ParsePath(longest)
+	if err != nil {
+		t.Fatalf("the longest legal path was rejected: %v", err)
+	}
+	if len(p.Segs) != 3 || len(p.Segs[1].Key) != 255 {
+		t.Fatalf("unexpected parse of the longest legal path: %+v", p)
+	}
+
+	// One byte over is rejected, and with an ErrPath like every other rejection.
+	if _, err := ParsePath(longest + "x"); err == nil || !errors.Is(err, ErrPath) {
+		t.Fatalf("maxPathBytes+1: err = %v, want an ErrPath", err)
+	}
+
+	// The hostile input: a 1 MiB field that is almost entirely '/'.
+	hostile := strings.Repeat("a/", 512<<10)
+	if _, err := ParsePath(hostile); err == nil || !errors.Is(err, ErrPath) {
+		t.Fatalf("a 1 MiB field of slashes: err = %v, want an ErrPath", err)
+	}
+
+	// The point of the fix, measured in BYTES rather than allocation count:
+	// strings.Split makes one big allocation for the whole []string, so the
+	// count barely moves while the bytes move by 16x the slash count. A 1 MiB
+	// field of slashes carries 512Ki segments, which is 8 MiB of headers.
+	small := strings.Repeat("a/", 32<<10) // 64 KiB, 32Ki slashes
+	smallBytes := bytesPerParse(small)
+	bigBytes := bytesPerParse(hostile)
+	const byteCeiling = 4 << 10 // the error value and its formatting; nothing per segment
+	if bigBytes > byteCeiling {
+		t.Errorf("rejecting a 1 MiB field allocated %d bytes, want at most %d — the split still runs first",
+			bigBytes, byteCeiling)
+	}
+	// And it does not scale: a 16x larger input must not cost 16x the bytes.
+	if bigBytes > smallBytes+byteCeiling {
+		t.Errorf("rejection bytes scale with input: %d for 64 KiB vs %d for 1 MiB", smallBytes, bigBytes)
+	}
+
+	// Allocation COUNT is asserted too, since a future rewrite could split into
+	// many small allocations instead of one big one.
+	const allocCeiling = 8 // the error value and its formatting
+	if got := testing.AllocsPerRun(50, func() { _, parsePathSink = ParsePath(hostile) }); got > allocCeiling {
+		t.Errorf("rejecting a 1 MiB field allocated %.0f times, want at most %d", got, allocCeiling)
+	}
+}
+
+// bytesPerParse reports the average heap bytes one rejected ParsePath call
+// allocates. runtime.MemStats rather than AllocsPerRun because the cost this
+// test is about is BYTES: strings.Split allocates the whole []string at once,
+// so a per-segment cost is invisible in the allocation count.
+func bytesPerParse(s string) uint64 {
+	const runs = 20
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	for i := 0; i < runs; i++ {
+		_, parsePathSink = ParsePath(s)
+	}
+	runtime.ReadMemStats(&after)
+	return (after.TotalAlloc - before.TotalAlloc) / runs
 }

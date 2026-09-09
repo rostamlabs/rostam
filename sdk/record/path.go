@@ -75,6 +75,37 @@ const maxRowKeyDigits = 20
 // SegCount path.
 const countSuffix = "#count"
 
+// maxNameLen is the longest field, column, or unquoted row-key name
+// validateName accepts.
+const maxNameLen = 255
+
+// maxPathBytes is the longest path string ParsePath can possibly accept, and
+// the bound it applies BEFORE strings.Split.
+//
+// WHY THE BOUND IS AHEAD OF THE SPLIT. strings.Split allocates one []string
+// header per segment (about 16 bytes each) and only then can the segment-count
+// check reject the input, so an unbounded field of '/' costs ~16x its own
+// length in transient headers before the rejection fires. The only outer limit
+// is the route body cap (httpapi's maxJSONBody, 32 MiB), which makes a
+// worst-case field cost roughly 512 MiB of headers — once per filter leaf per
+// request, multiplied by request concurrency. Segment-level bounds cannot help:
+// validateName's 255 and parseRowSeg's quoted-key cap both live in helpers that
+// run AFTER the split.
+//
+// DERIVATION. A path is at most three segments joined by two '/':
+//
+//	field:  a name of at most maxNameLen bytes (validateName), or "#65535";
+//	        the "#count" form is a name plus 6 bytes but must be the ONLY
+//	        segment, so 261 bytes total — well under the three-segment sum.
+//	row:    a quoted key of at most 2+2*wire.OperateMaxKeyLen RAW bytes (the
+//	        pre-unescape bound in parseRowSeg: every escape is two bytes
+//	        producing one), or at most maxRowKeyDigits decimal digits.
+//	column: a name of at most maxNameLen bytes.
+//
+// Nothing legal can exceed the sum, so the check rejects only inputs a later
+// stage would reject anyway — just without paying for the split first.
+const maxPathBytes = maxNameLen + 1 + (2 + 2*wire.OperateMaxKeyLen) + 1 + maxNameLen
+
 // ParsePath parses a record path — the part of a filter or index "field"
 // string that names a location inside a record's decoded fields, as
 // documented in the package comment. It never panics: every rejection
@@ -82,6 +113,13 @@ const countSuffix = "#count"
 func ParsePath(s string) (Path, error) {
 	if s == "" {
 		return Path{}, fmt.Errorf("%w: empty path", ErrPath)
+	}
+	// Ahead of the split, so a pathological field costs one length comparison
+	// instead of one []string header per '/'. See maxPathBytes. The message
+	// carries the length, never the input, so rejecting stays allocation-flat
+	// in the size of s.
+	if len(s) > maxPathBytes {
+		return Path{}, fmt.Errorf("%w: path too long (%d bytes, cap is %d)", ErrPath, len(s), maxPathBytes)
 	}
 
 	parts := strings.Split(s, "/")
@@ -253,8 +291,8 @@ func parseRowSeg(s string) (Segment, error) {
 // validateName reports whether s is a valid field, row(-quoted excluded),
 // or column name: 1-255 bytes, containing none of '/', '#', '"'.
 func validateName(s string) error {
-	if len(s) < 1 || len(s) > 255 {
-		return fmt.Errorf("%w: name length out of range (1-255 bytes) %q", ErrPath, s)
+	if len(s) < 1 || len(s) > maxNameLen {
+		return fmt.Errorf("%w: name length out of range (1-%d bytes) %q", ErrPath, maxNameLen, s)
 	}
 	for i := 0; i < len(s); i++ {
 		switch s[i] {
