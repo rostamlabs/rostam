@@ -118,6 +118,13 @@ verbatim as a payload value of kind `record`:
 never hand-built. A record value is never `is_empty`/`is_null` unless it is
 literally absent or zero-length; a present, non-empty record is neither.
 
+Over HTTP, gRPC or the binary protocol the record you read back is a copy the
+codec wrote, and it is yours. In the **in-process Go API** it is not: a payload
+returned by a read shares its bytes with the stored record, exactly as a
+list-valued payload shares its slice. Read it, never write through it — mutating
+it changes the live record while the index still describes the old bytes. Copy
+the slice if you need to keep or edit it.
+
 ### Path grammar
 
 A filter's `field` string is tried as an exact payload key first. Only when

@@ -1202,11 +1202,13 @@ func (m *MultiVectorIndex) applyDocSparseLocked(docID uint64, sparse *SparseVect
 }
 
 // Get retrieves a live document by id: its token matrix (each row a DEEP-COPIED
-// normalized token vector) and its metadata (deep-copied), plus ok. ok is false
+// normalized token vector) and its metadata (a map-level copy — see cloneMeta
+// and vtypes.Metadata for the slice-ownership contract), plus ok. ok is false
 // when docID is absent — the MV index has no tombstones or TTL, so a docID is live
 // iff it has a token-set entry (mirror Exists/ScanDocuments). The returned
-// tokens/payload are owned by the caller (mutating them never corrupts the inner
-// arena or docMeta). Lock order: m.mu (read) outer, then the inner index's own mu
+// tokens are owned by the caller, and so is the payload MAP (adding or removing
+// keys never corrupts docMeta); a slice-backed Value inside it still points at
+// stored bytes and must not be written through. Lock order: m.mu (read) outer, then the inner index's own mu
 // (taken internally by vecsForIDs) — the same outer→inner order Search/ScanDocuments use.
 func (m *MultiVectorIndex) Get(docID uint64) (tokens [][]float32, payload Metadata, version uint64, ok bool) {
 	m.mu.RLock()
@@ -1228,8 +1230,9 @@ func (m *MultiVectorIndex) Get(docID uint64) (tokens [][]float32, payload Metada
 			tokens = append(tokens, v) // already a fresh copy owned by us
 		}
 	}
-	// Drop per-key-TTL-expired keys, then deep-copy so the caller owns the payload
-	// (liveMetaMap may alias m.docMeta on the no-expiry fast path).
+	// Drop per-key-TTL-expired keys, then copy the map so the caller owns it
+	// (liveMetaMap may alias m.docMeta on the no-expiry fast path). Slice-backed
+	// Values inside still point at stored bytes — vtypes.Metadata's contract.
 	payload = cloneMeta(liveMetaMap(m.docMeta[docID], m.keyTTL[docID], m.nowMs()))
 	return tokens, payload, version, true
 }

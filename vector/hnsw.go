@@ -2522,11 +2522,16 @@ func (h *hnsw) linkRead(t *linkTask) {
 	h.linkNode(s, t.nd, t.stored, t.level, t.now)
 }
 
-// Get retrieves the live record for id: a DEEP COPY of its vector, metadata, and
+// Get retrieves the live record for id: a copy of its vector, metadata map, and
 // sparse vector, plus the remaining TTL. ok is false when id is absent,
 // tombstoned (deleted), or TTL-expired — the exact liveness gate the search path
-// uses (mirror admits). The returned vec/meta/sparse are owned by the caller
-// (mutating them never corrupts the arena). For a cosine-metric index the stored
+// uses (mirror admits). The returned vec/sparse are owned by the caller, and so
+// is the meta MAP — inserting or deleting keys in it never reaches the arena.
+// The Values inside it are copied as structs, so a slice-backed one
+// (strings/ints/floats/record) still points at the arena's own bytes: read it,
+// never write through it. That is vtypes.Metadata's documented slice-ownership
+// contract, identical for all four kinds; a caller that needs to own the bytes
+// copies them, and every network client already gets a codec-written copy. For a cosine-metric index the stored
 // (and therefore returned) vector is the NORMALIZED vector, not the original
 // caller-supplied one — Insert normalizes on the way in. ttl is the remaining
 // duration to the deadline (0 = no expiry).
@@ -2682,10 +2687,17 @@ func keyExpired(deadline, now uint64) bool {
 	return deadline != 0 && deadline <= now
 }
 
-// cloneMeta returns a deep copy of m, or nil when m is empty. Callers that read
-// m from arena.Metadata(slot) MUST hold h.mu (read or write) while doing so; the
-// copy then lets the four payload mutators build newMeta without aliasing arena
-// storage.
+// cloneMeta returns a MAP-level copy of m, or nil when m is empty: a fresh map
+// holding the same Values, so adding, replacing or deleting a key in the copy
+// never touches the arena's map. The Values themselves are copied as structs,
+// which means a slice-backed Value (strings/ints/floats/record) still points at
+// the same backing bytes — the payload mutators only ever replace whole Values,
+// never write through one, and vtypes.Metadata documents that contract for
+// callers too.
+//
+// Callers that read m from arena.Metadata(slot) MUST hold h.mu (read or write)
+// while doing so; the copy then lets the four payload mutators build newMeta
+// without aliasing the arena's MAP.
 func cloneMeta(m Metadata) Metadata {
 	if len(m) == 0 {
 		return nil
