@@ -3696,6 +3696,22 @@ func (ix *ivf) MutatePayloadRecordAt(id uint64, key string, fn RecordMutator, ca
 	return ix.mutatePayloadRecordBody(id, key, fn, cas, true, uint64(nowMs)) //nolint:gosec // stamped unix-millis is non-negative
 }
 
+// LOCKSTEP with vector/hnsw.go mutatePayloadRecordBody and the named/multi-vector
+// mutatePayloadRecordLockedAt in vector/named.go and vector/multivector.go.
+// These four bodies are ~110 near-identical lines each and are deliberately NOT
+// factored into one: that matches the house style of their set_payload /
+// overwrite_payload siblings, whose engine differences (slot- vs id-keyed
+// indexes, uint64 vs int64 deadlines, BM25 on dense only) are real and are what
+// a shared body would have to branch on.
+//
+// The cost is real too, and it has already been paid once: a single formatting
+// difference in the size-bound message landed as a defect in all four at the
+// same time, and the deadline rule below had to be corrected in all four at the
+// same time. So both of those now live in SHARED helpers — recordTooLargeErr
+// (vector/metadata.go) and recordKeyPastDeadline[Abs] (vector/record_mutate.go)
+// — and any further change to the RULES, as opposed to the plumbing, belongs in
+// a helper rather than in a fifth copy. A change here that is not mirrored in
+// the other three is a bug, not a variation.
 func (ix *ivf) mutatePayloadRecordBody(id uint64, key string, fn RecordMutator, cas CASCond, stamped bool, nowMs uint64) (Metadata, map[string]uint64, uint64, bool, error) {
 	if fn == nil || key == "" || key == contentField {
 		return nil, nil, 0, false, ErrPayloadKeyNotRecord

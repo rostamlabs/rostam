@@ -1347,6 +1347,23 @@ func (nc *NamedCollection) MutatePayloadRecordCASAt(id uint64, key string, fn Re
 // WAL-logs exactly what was applied), the resulting version, and changed.
 // changed=false means the call was a deliberate no-op: nothing was stored,
 // nothing will be logged, and the version is the CURRENT one, unbumped.
+//
+// LOCKSTEP with the dense mutatePayloadRecordBody in vector/hnsw.go and vector/ivf.go,
+// and vector/multivector.go mutatePayloadRecordLockedAt.
+// These four bodies are ~110 near-identical lines each and are deliberately NOT
+// factored into one: that matches the house style of their set_payload /
+// overwrite_payload siblings, whose engine differences (slot- vs id-keyed
+// indexes, uint64 vs int64 deadlines, BM25 on dense only) are real and are what
+// a shared body would have to branch on.
+//
+// The cost is real too, and it has already been paid once: a single formatting
+// difference in the size-bound message landed as a defect in all four at the
+// same time, and the deadline rule below had to be corrected in all four at the
+// same time. So both of those now live in SHARED helpers — recordTooLargeErr
+// (vector/metadata.go) and recordKeyPastDeadline[Abs] (vector/record_mutate.go)
+// — and any further change to the RULES, as opposed to the plumbing, belongs in
+// a helper rather than in a fifth copy. A change here that is not mirrored in
+// the other three is a bug, not a variation.
 func (nc *NamedCollection) mutatePayloadRecordLockedAt(id uint64, key string, fn RecordMutator, cas CASCond, now int64, stamped bool) (Metadata, map[string]int64, uint64, bool, error) {
 	if fn == nil || key == "" || key == contentField {
 		return nil, nil, 0, false, ErrPayloadKeyNotRecord
