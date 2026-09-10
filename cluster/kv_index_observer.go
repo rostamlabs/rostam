@@ -381,6 +381,11 @@ func (n *Node) kvIndexStats() KVIndexStats {
 			continue
 		}
 		hosted++
+		// The query leaf counts a verify miss on the Set it read, because it
+		// runs in ops with no way to reach this Node. The node total is
+		// therefore the sum over the hosted groups' indexes, added to the node
+		// counter that the reconcile path (which does have a Node) uses.
+		st.VerifyMisses += idx.VerifyMisses()
 		for _, d := range idx.Defs() {
 			if _, seen := readyOn[d.Name]; !seen {
 				readyOn[d.Name] = 0

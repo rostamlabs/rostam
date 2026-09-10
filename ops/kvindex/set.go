@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/rostamlabs/rostam/sdk/record"
 	"github.com/rostamlabs/rostam/sdk/vtypes"
@@ -143,6 +144,15 @@ type Set struct {
 	defs  []Def
 	posts map[string]*posting
 	res   *record.Resolver
+
+	// verifyMisses counts candidates whose live re-read MISSED — a posting for
+	// a key the cache no longer holds. It is the health signal for posting
+	// staleness: postings are hints, so a miss is harmless per query (one
+	// wasted lookup, no wrong row), but a rising rate means keys are leaving
+	// the cache by a path that does not reach Drop and the reconciler has work
+	// to do. Written by the query leaf, which holds no lock here, so it is an
+	// atomic rather than a field under s.mu.
+	verifyMisses atomic.Uint64
 }
 
 // New returns an empty Set whose resolver caches at most resolverCache
@@ -528,6 +538,24 @@ func (s *Set) reindexFor(name string, tok walkToken, key, value []byte) {
 
 // Stats reports how many keys the named index posts and how many distinct
 // values they are spread over. Both are 0 for an index that is not installed.
+// NoteVerifyMisses records n candidates whose live re-read missed. The query
+// leaf calls it once per page rather than once per miss, so a page of stale
+// postings costs one atomic add.
+//
+// It takes NO lock: the verify loop that counts these deliberately holds
+// nothing (the re-read can re-enter this Set through the cache's onRemove
+// hook), so this counter must be reachable from there.
+func (s *Set) NoteVerifyMisses(n int) {
+	if n <= 0 {
+		return
+	}
+	s.verifyMisses.Add(uint64(n)) //nolint:gosec // n > 0 checked above
+}
+
+// VerifyMisses reports how many candidates have missed their live re-read
+// since this Set was created. Monotonic.
+func (s *Set) VerifyMisses() uint64 { return s.verifyMisses.Load() }
+
 func (s *Set) Stats(name string) (keys, distinct int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
