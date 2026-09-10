@@ -278,6 +278,13 @@ zero value, so `KVQuery` reads a zero `Consistency` as "the caller did not
 choose" and promotes it to leader-only. To issue an any-replica read from Go,
 encode the args and call `Call("kv_query", …)` directly.
 
+There is a join window that makes `"any"` sharper than "slightly stale": a
+replica that has just joined a group publishes its store before the snapshot
+lands, so its backfill walks an empty cache and grants the definition *ready*
+over nothing — and an `"any"` read routed there can come back as an exhausted
+empty page rather than as a page that is merely behind. The leader-only default
+avoids it, which is the second reason it is the default.
+
 **A partial answer is a hard error.** If one group's leg fails, the whole query
 fails with that group named. An under-complete page is a *wrong* answer, not a
 partial effect: the caller cannot tell it from a complete one.
@@ -436,6 +443,19 @@ retry rather than a hard failure.
 **`no KV index on this dispatcher`** means this deployment has no KV index layer
 wired at all — every embedder predating the feature. It is permanent, but it is a
 fact about the deployment, not about your query.
+
+**A definition counted in `RejectedDefs`** is in the catalog but unbuildable on
+this node, so its postings do not exist here. Creating one is refused before the
+commit, so the only way to reach this state is build skew: a node whose payload-
+path grammar is wider wrote a definition an older node cannot parse. Querying it
+on a node that rejected it is a **permanent** error naming the definition
+(`invalid kv index definition`), not the retryable "still building" — an index
+that cannot be built here will never finish building, and a client told to retry
+would retry forever at one full fan-out per attempt. The coordinator answers for
+*itself*: if a remote group's older binary is the one that rejected it while the
+coordinator can build it, the query is still reported as retryable, because a
+peer's reject state is not carried back in the leaf reply. Upgrade the lagging
+node, or drop the definition.
 
 ## Operating it
 
