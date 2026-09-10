@@ -30,6 +30,7 @@ import (
 	"container/heap"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"sync"
 
@@ -288,6 +289,10 @@ func contFor(conts []wire.KVQueryCont, group uint32) []byte {
 //
 // truncated says the CALLER already dropped keys it could not carry (the scan
 // chunk overflowed), so the page is incomplete however few rows match.
+//
+// A row whose value is too large for any page is emitted WITHOUT the value
+// rather than dropped (see the oversize branch): a kv_query page caps at 8 MiB
+// while a cache value may be up to the 16 MiB page size.
 func verifyPage(tx *TxContext, idx *kvindex.Set, keys [][]byte, after []byte, pred vector.Predicate, a wire.KVQueryArgs, group uint32, truncated bool) ([]byte, error) {
 	// DecodeKVQueryArgs already refuses a limit outside 1..KVQueryMaxLimit, so
 	// this clamp is defence in depth against a future caller that builds args
@@ -300,7 +305,7 @@ func verifyPage(tx *TxContext, idx *kvindex.Set, keys [][]byte, after []byte, pr
 	byteBudget := wire.KVQueryMaxPageBytes - kvQueryPageOverhead
 
 	res := wire.KVQueryResult{}
-	used, misses := 0, 0
+	used, misses, oversize := 0, 0, 0
 	// The continuation starts at the incoming cursor: a page that examines
 	// nothing has made no progress and must not claim any.
 	cont := append([]byte(nil), after...)
@@ -368,11 +373,32 @@ func verifyPage(tx *TxContext, idx *kvindex.Set, keys [][]byte, after []byte, pr
 		withValue := a.Return != wire.KVQueryReturnKeys
 		if withValue {
 			cost += 4 + len(v)
+			if cost > byteBudget {
+				// OVERSIZE: this row cannot fit a page even alone. A cache value
+				// may be up to the 16 MiB page size while a kv_query page caps
+				// at 8 MiB, so this is reachable with ordinary data.
+				//
+				// The row is emitted WITHOUT its value rather than dropped or
+				// refused, because both alternatives are worse than useless:
+				// dropping it loses a true match silently, and refusing the page
+				// wedges the query — EncodeKVQueryResult would reject the frame,
+				// the handler would return an error with NO continuation, and
+				// every retry would re-examine the same key, so every key
+				// sorting after it becomes unreachable forever.
+				//
+				// hasVal = false is unambiguous here: in values/records mode
+				// every ordinary row carries a non-nil value (a zero-length
+				// stored value encodes as a present, empty one), so a row with
+				// no value means exactly "omitted, larger than the page cap;
+				// fetch it with get". See EncodeKVQueryResult's doc.
+				withValue = false
+				cost = 2 + len(k) + 1
+				oversize++
+			}
 		}
-		// The FIRST row is emitted whatever it costs. Refusing it would leave
-		// the page empty with a continuation that never advances — an infinite
-		// paging loop. A single row too large for a frame is instead refused
-		// once, with a typed error, by EncodeKVQueryResult's own cap.
+		// Any OTHER row that does not fit is deferred to the next page, where it
+		// will be first and will fit. The first row of a page is therefore always
+		// emitted, so a page always advances and paging always terminates.
 		if len(res.Rows) > 0 && used+cost > byteBudget {
 			break
 		}
@@ -392,6 +418,10 @@ func verifyPage(tx *TxContext, idx *kvindex.Set, keys [][]byte, after []byte, pr
 
 	if idx != nil {
 		idx.NoteVerifyMisses(misses)
+	}
+	if oversize > 0 {
+		slog.Warn("kv_query omitted values larger than the page cap; fetch those keys with get",
+			"component", "ops", "op", "kv_query", "shard", group, "rows", oversize, "cap", byteBudget)
 	}
 	// More when the caller already dropped keys, or when this loop stopped
 	// early. i == len(keys) with truncated false is the only complete answer.

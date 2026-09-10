@@ -963,3 +963,107 @@ func TestKVQueryScanHeapKeepsOneOversizeKey(t *testing.T) {
 		t.Fatalf("an oversize lone key must be kept, got %d keys", h.Len())
 	}
 }
+
+// --- an oversize value ----------------------------------------------------
+
+// pageAllRows is pageAll keeping whole rows, for the tests that care what a row
+// carries rather than only which keys came back.
+func pageAllRows(t *testing.T, tx *TxContext, a wire.KVQueryArgs, maxPages int) []wire.KVQueryRow {
+	t.Helper()
+	var rows []wire.KVQueryRow
+	for pages := 0; ; {
+		res := runKVQuery(t, tx, a)
+		pages++
+		rows = append(rows, res.Rows...)
+		if len(res.Cursor) == 0 {
+			return rows
+		}
+		if pages >= maxPages {
+			t.Fatalf("paging did not terminate: %d pages, %d rows", pages, len(rows))
+		}
+		a.Cursor = res.Cursor
+	}
+}
+
+func TestKVQueryOversizeValueDoesNotWedgePaging(t *testing.T) {
+	// THE REGRESSION. A cache value may be up to the 16 MiB cache page size,
+	// while a kv_query page caps at 8 MiB. Emitting such a row with its value
+	// made EncodeKVQueryResult reject the whole frame, so the handler returned
+	// an error with NO continuation — and every retry re-examined the same key,
+	// making every key that sorts after it unreachable forever.
+	tx, _, _ := newIndexedTx(t, "rc")
+	big := kvBigRec(7, 164) // ~9.6 MiB, comfortably over the 8 MiB page cap
+	if len(big) <= wire.KVQueryMaxPageBytes {
+		t.Fatalf("fixture: the record is %d bytes, which does not exceed the %d page cap",
+			len(big), wire.KVQueryMaxPageBytes)
+	}
+	seedKV(t, tx, "u:big", big)
+	seedKV(t, tx, "u:zsmall", kvRec(7, "gold")) // sorts AFTER the oversize key
+
+	for _, tc := range []struct {
+		name string
+		ret  uint8
+	}{
+		{"keys", wire.KVQueryReturnKeys},
+		{"values", wire.KVQueryReturnValues},
+		{"records", wire.KVQueryReturnRecords},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, mode := range []struct {
+				name string
+				args wire.KVQueryArgs
+			}{
+				{"indexed", wire.KVQueryArgs{Index: wiringIndexName, Filter: eqFilter("rc", vtypes.NewInt(7)), Return: tc.ret, Limit: 10}},
+				{"scan", wire.KVQueryArgs{Scan: true, Filter: eqFilter("rc", vtypes.NewInt(7)), Return: tc.ret, Limit: 10}},
+			} {
+				t.Run(mode.name, func(t *testing.T) {
+					rows := pageAllRows(t, tx, mode.args, 20)
+					got := make([]string, 0, len(rows))
+					byKey := map[string][]byte{}
+					for _, r := range rows {
+						got = append(got, string(r.Key))
+						byKey[string(r.Key)] = r.Value
+					}
+					// BOTH keys, and the one after the oversize value above all.
+					if strings.Join(got, ",") != "u:big,u:zsmall" {
+						t.Fatalf("got %v, want [u:big u:zsmall]", got)
+					}
+					if _, ok := byKey["u:big"]; !ok {
+						t.Fatal("the oversize row must still be a result")
+					}
+					if tc.ret == wire.KVQueryReturnKeys {
+						return
+					}
+					// In values/records mode the oversize row comes back with no
+					// value (fetch it with get), while its neighbour keeps one.
+					if byKey["u:big"] != nil {
+						t.Fatalf("the oversize value must be OMITTED, got %d bytes", len(byKey["u:big"]))
+					}
+					if byKey["u:zsmall"] == nil {
+						t.Fatal("an ordinary row must still carry its value")
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestKVQueryEmptyValueIsPresentNotOmitted(t *testing.T) {
+	// What makes hasVal = 0 readable as "omitted" in values mode: a zero-length
+	// STORED value encodes as present-and-empty, never as absent. If this ever
+	// changed, an empty value would be indistinguishable from a dropped one.
+	tx, _, _ := newIndexedTx(t, "rc")
+	if err := tx.PutIndexed([]byte("u:empty"), []byte{}, 0); err != nil {
+		t.Fatal(err)
+	}
+	res := runKVQuery(t, tx, wire.KVQueryArgs{Scan: true, Return: wire.KVQueryReturnValues})
+	if len(res.Rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(res.Rows))
+	}
+	if res.Rows[0].Value == nil {
+		t.Fatal("a zero-length stored value must round-trip as PRESENT and empty, not absent")
+	}
+	if len(res.Rows[0].Value) != 0 {
+		t.Fatalf("value = %d bytes, want 0", len(res.Rows[0].Value))
+	}
+}

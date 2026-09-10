@@ -90,8 +90,11 @@ type KVQueryCont struct {
 // KVQueryRow is one matching key (plus its value, when the query asked for
 // one) in a kv_query result.
 type KVQueryRow struct {
-	Key   []byte
-	Value []byte // nil when the query's Return == KVQueryReturnKeys
+	Key []byte
+	// Value is nil when the query's Return == KVQueryReturnKeys, and also when
+	// Return asked for a value that was too large to fit the page — see
+	// EncodeKVQueryResult for the full reading of an absent value.
+	Value []byte
 }
 
 // KVQueryArgs is the decoded form of a kv_query call.
@@ -442,6 +445,22 @@ func DecodeKVQueryArgs(args []byte) (KVQueryArgs, error) {
 // frame to know whether a value follows the key, and Row.Value's nil-ness
 // round-trips exactly (nil in, nil out; a legitimate zero-length value in,
 // a non-nil empty slice out).
+//
+// WHAT hasVal = 0 MEANS TO A CLIENT depends on the query's Return, and the
+// two readings do not overlap:
+//
+//   - Return == keys: no row carries a value. Nothing is being said.
+//   - Return == values/records: the value was OMITTED because encoding it
+//     would push the page past KVQueryMaxPageBytes — a cache value may be up
+//     to the 16 MiB cache page size, while a page caps at 8 MiB. The key
+//     matched the filter and the row is a true result; fetch the value with
+//     get. This reading is unambiguous because an ordinary row in these modes
+//     always carries a non-nil value: a zero-length STORED value encodes as
+//     present-and-empty (hasVal = 1, len 0), never as absent.
+//
+// A per-row reason byte was considered and rejected: the distinction above is
+// already carried by Return, which the caller always has, and adding a field
+// would change the frame for every row to describe a case that is rare.
 func EncodeKVQueryResult(r KVQueryResult) ([]byte, error) {
 	if err := checkKVQueryCursorShape(r.Cursor); err != nil {
 		return nil, err
