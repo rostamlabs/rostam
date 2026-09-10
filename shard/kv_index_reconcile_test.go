@@ -15,6 +15,7 @@ package shard
 import (
 	"fmt"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -304,4 +305,118 @@ func settledGoroutines() int {
 		prev = n
 	}
 	return runtime.NumGoroutine()
+}
+
+// TestReconcileTickBlocksCloseUntilItReturns is the UNMAP FENCE, and it is what
+// TestReconcileStopsOnClose above cannot show: that one would pass with a
+// signal-only stop, because a signalled-but-still-running tick eventually exits
+// too. The property that matters is that Close WAITS.
+//
+// The tick is parked INSIDE the probe: every sampled key is expired on a
+// non-replicated shard, so cache.Get runs dropExpiredLocked → the shard write
+// lock → onRemove, and the hook installed here blocks there. While it is parked
+// the store's cache must still be mapped — a live key still reads back — and
+// Close must not have returned. Release the hook and Close completes.
+//
+// Without the join in Store.Close, Close returns while that Get is in flight and
+// cache.Close unmaps the pages it is reading.
+func TestReconcileTickBlocksCloseUntilItReturns(t *testing.T) {
+	reg := ops.NewRegistry()
+	if err := ops.RegisterBuiltins(reg); err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultConfig(t.TempDir(), "fence", reg)
+	cfg.Bootstrap = true
+	cfg.RaftHeartbeatMs = 50
+	cfg.RaftElectionMs = 100
+	cfg.NoSync = true
+	cfg.Cache.TTLSweepIntervalMs = 0 // the probe's own Get must be what expires a key
+	cfg.KVIndexReconcileIntervalMs = 5
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatalf("shard.New: %v", err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = s.Close()
+		}
+	}()
+
+	s.kvIdx.Install([]kvindex.Def{recStoreDef(t, "by-rc", "u:", "rc")})
+	// One live key, and expiring ones for the probe to trip over.
+	live := []byte("u:live")
+	liveVal := recStoreRec("rc", 7)
+	if err := s.cache.Put(live, liveVal, 0); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	s.kvIdx.Reindex(live, liveVal)
+	for i := 0; i < 20; i++ {
+		k := []byte(fmt.Sprintf("u:%03d", i))
+		val := recStoreRec("rc", 7)
+		if err := s.cache.Put(k, val, 20*time.Millisecond); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+		s.kvIdx.Reindex(k, val)
+	}
+	s.kvIdx.MarkReady("by-rc")
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	s.cache.SetOnRemove(func(key []byte) {
+		// Park the FIRST expiring probe only; later ones must not block, or the
+		// tick would never drain after the release.
+		once.Do(func() {
+			close(entered)
+			<-release
+		})
+		s.kvIdx.Drop(key)
+	})
+
+	time.Sleep(30 * time.Millisecond) // let the keys expire
+	select {
+	case <-entered:
+	case <-time.After(20 * time.Second):
+		t.Fatal("no reconcile tick reached the probe")
+	}
+
+	// The tick is inside cache.Get. The mapping must still be live.
+	readBack := make(chan error, 1)
+	go func() {
+		_, err := s.cache.Get(live)
+		readBack <- err
+	}()
+	select {
+	case err := <-readBack:
+		if err != nil {
+			t.Fatalf("a live key failed to read while a tick was parked: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		close(release)
+		t.Fatal("reading a live key blocked while a tick was parked")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- s.Close() }()
+
+	select {
+	case err := <-closeDone:
+		close(release)
+		t.Fatalf("Close returned (%v) while a reconcile tick was still inside the probe; "+
+			"cache.Close would unmap pages that Get is reading", err)
+	case <-time.After(300 * time.Millisecond):
+		// Correct: Close is parked in stopKVIndexReconciler's join.
+	}
+
+	close(release)
+	select {
+	case err := <-closeDone:
+		closed = true
+		if err != nil {
+			t.Fatalf("Close after the tick released: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("Close did not return after the reconcile tick was released")
+	}
 }
