@@ -225,7 +225,12 @@ func grpcError(err error) error {
 		wire.ErrKVFilterBudget,
 		wire.ErrKVQueryArgs,
 		wire.ErrKVQueryResult,
-		wire.ErrKVQueryArgsTruncated):
+		wire.ErrKVQueryArgsTruncated,
+		// wire.ErrKVIndexDef: the index-admin op refused the definition (shape or
+		// payload path). InvalidArgument for the same reason the rest of this
+		// bucket is: only a different request changes it, and unclassified it
+		// would be the Internal that retry policies hammer.
+		wire.ErrKVIndexDef):
 		return status.Error(codes.InvalidArgument, err.Error())
 	// Unavailable: RETRYABLE. The index exists but this group has not finished
 	// installing or backfilling it (including the coordinator's rewrite of a

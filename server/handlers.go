@@ -380,7 +380,15 @@ func clientFacingErr(err error) bool {
 		// Found missing by the shared-family parity test — httpapi and grpcapi
 		// classified it while this edge redacted it, which is the exact drift
 		// that test exists to catch.
-		errors.Is(err, wire.ErrKVFilterBudget):
+		errors.Is(err, wire.ErrKVFilterBudget),
+		// wire.ErrKVIndexDef: the index-ADMIN op refused a definition that fails
+		// the full admission check (shape + path parse). Not a kv_query refusal,
+		// but classified here because redaction would turn "your payload path is
+		// not a legal path" into "internal error" — and because admitting such a
+		// definition is what makes a kv_query retry forever. See
+		// cluster.validateKVIndexDef. Its message names only the definition the
+		// caller just sent.
+		errors.Is(err, wire.ErrKVIndexDef):
 		return true
 	// shard.ErrStoreClosed: a Call refused because this store is draining for
 	// close. It is a REFUSAL, not a fault — the op never ran, and in a cluster

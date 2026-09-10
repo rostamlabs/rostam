@@ -52,6 +52,17 @@ func (d *kvIndexDispatcher) Call(name string, args []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+		// The real node refuses an UNINSTALLABLE definition before the meta
+		// commit — the wire shape check plus the path parse
+		// (cluster.validateKVIndexDef) — and this fake must refuse it in the
+		// same shape, or this file would be exercising an endpoint the cluster
+		// does not actually have. A drop is exempt from the parse there and
+		// here: its path is a placeholder nothing reads.
+		if def.Enabled {
+			if _, derr := kvindex.DefFrom(def, 0); derr != nil {
+				return nil, fmt.Errorf("cluster: SetKVIndex: %w", derr)
+			}
+		}
 		for i := range d.defs {
 			if d.defs[i].Name != def.Name {
 				continue
@@ -613,5 +624,47 @@ func TestHTTPKVQueryCursorAtTheCapIsNotRefusedOnLength(t *testing.T) {
 	}
 	if strings.Contains(rec.Body.String(), "cursor is too large") {
 		t.Fatalf("a cursor AT the cap was refused on length: %s", rec.Body)
+	}
+}
+
+// TestHTTPKVIndexCreateUninstallablePathIs400 pins the status a definition gets
+// when it passes this edge's local shape check and the CLUSTER's admission check
+// then refuses its payload path.
+//
+// 400 is the whole point. wire.ErrKVIndexDef unclassified falls to 500, which
+// says "the server broke, try again" about a definition that will never be
+// accepted — and the index it would have created is exactly the one that makes
+// kv_query retry forever. The paths here are the ones this edge's Validate lets
+// through: it cannot parse a path (sdk/record imports sdk/wire), so it checks
+// the "#count" spelling and the '/' ban and no more.
+func TestHTTPKVIndexCreateUninstallablePathIs400(t *testing.T) {
+	h, _, cleanup := newKVQueryTestAPI(t, 0)
+	defer cleanup()
+
+	for _, tc := range []struct{ name, path, kind string }{
+		{"count_of_no_field", "#count", "count"},
+		{"non_canonical_position", "#00001", "scalar"},
+		{"invalid_character", `\"x\"`, "scalar"},
+		{"count_twice", "a#count#count", "count"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"name":"` + tc.name + `","payload_path":"` + tc.path + `","kind":"` + tc.kind + `"}`
+			rr := do(t, h, http.MethodPost, "/v1/kv/indexes", body, nil)
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("POST /v1/kv/indexes with path %s = %d, want 400: %s", tc.path, rr.Code, rr.Body.String())
+			}
+			// And it must be the CLUSTER's refusal that produced it, not this
+			// edge's local shape check — only the path parser says "bad path",
+			// and the parse is the check this test exists for.
+			if !strings.Contains(rr.Body.String(), "bad path") {
+				t.Fatalf("400 body %s does not carry the path parser's refusal", rr.Body.String())
+			}
+		})
+	}
+
+	// The control: a definition that parses is still created.
+	rr := do(t, h, http.MethodPost, "/v1/kv/indexes", `{"name":"by_age","payload_path":"`+kvIndexTestField+`","kind":"scalar"}`, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("a valid definition = %d, want 200: %s", rr.Code, rr.Body.String())
 	}
 }

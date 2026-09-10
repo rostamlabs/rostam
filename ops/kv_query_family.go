@@ -49,8 +49,9 @@ type KVQueryErrorSpec struct {
 	Class KVQueryErrorClass
 }
 
-// KVQueryErrorFamily is THE canonical list of the kv_query refusals every
-// transport must classify, and the class each one gets.
+// KVQueryErrorFamily is THE canonical list of the kv_query refusals — plus the
+// one index-admin refusal that rides the same classifiers — that every transport
+// must classify, and the class each one gets.
 //
 // WHY IT LIVES IN PRODUCTION CODE. The three classifiers —
 // server.clientFacingErr, httpapi.statusForError and grpcapi.grpcError — are
@@ -91,6 +92,20 @@ func KVQueryErrorFamily() []KVQueryErrorSpec {
 		{"wire.ErrKVQueryArgs", wire.ErrKVQueryArgs, KVQueryErrPermanent},
 		{"wire.ErrKVQueryArgsTruncated", wire.ErrKVQueryArgsTruncated, KVQueryErrPermanent},
 		{"wire.ErrKVQueryResult", wire.ErrKVQueryResult, KVQueryErrPermanent},
+
+		// THE ONE MEMBER THAT IS NOT A kv_query REFUSAL. wire.ErrKVIndexDef is
+		// raised by the index-ADMIN op (__kv_index_set__) when a definition fails
+		// the full admission check — the shape check plus the path parse
+		// cluster.validateKVIndexDef performs before the meta commit.
+		//
+		// It belongs in THIS table because it is classified by exactly the same
+		// three functions, and because getting it wrong reopens the kv_query
+		// failure this whole family exists to prevent. Unclassified it falls to
+		// the redaction/500/Internal bucket, which tells a client nothing and
+		// invites the retry a permanent 400 stops. It is PERMANENT: a definition
+		// this build cannot parse is a fact about the definition the caller sent,
+		// and no amount of waiting makes it parse.
+		{"wire.ErrKVIndexDef", wire.ErrKVIndexDef, KVQueryErrPermanent},
 
 		// The caller named a definition that does not exist.
 		{"kvindex.ErrNoSuchIndex", kvindex.ErrNoSuchIndex, KVQueryErrNotFound},

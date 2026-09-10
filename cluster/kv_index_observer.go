@@ -261,10 +261,12 @@ func (n *Node) kvIndexDefsFromCatalog() []kvindex.Def {
 	cat := n.meta.FSM.KVIndexes()
 	defs := make([]kvindex.Def, 0, len(cat))
 	var rejects uint64
+	rejected := make(map[string]struct{})
 	for name, e := range cat {
 		d, err := kvindex.DefFrom(e.Def, e.MetaIndex)
 		if err != nil {
 			rejects++
+			rejected[name] = struct{}{}
 			slog.Warn("kv index definition is in the meta catalog but this node cannot build it; it is NOT installed here and queries naming it will report no such index",
 				"component", "cluster", "node", n.cfg.NodeID, "index", name, "path", e.Def.PayloadPath, "err", err)
 			continue
@@ -273,8 +275,41 @@ func (n *Node) kvIndexDefsFromCatalog() []kvindex.Def {
 	}
 	n.kvIndexRejects.Add(rejects)
 	n.kvIndexRejectedDefs.Store(rejects)
+	// Published whole and never mutated afterwards, so a reader needs no lock:
+	// the map a reader holds is a consistent snapshot of one pass, and the next
+	// pass swaps in a new one.
+	n.kvIndexRejectedNames.Store(&rejected)
 	sort.Slice(defs, func(i, j int) bool { return defs[i].Name < defs[j].Name })
 	return defs
+}
+
+// kvIndexDefRejected reports whether THIS node's last observer pass refused to
+// build the named definition — it is in the meta catalog, but kvindex.DefFrom
+// cannot parse it here, so this node will never install it.
+//
+// It exists for classifyKVQueryErr. Admission (validateKVIndexDef) stops a
+// definition this build cannot parse from committing at all, so the only way a
+// rejected name reaches the catalog now is VERSION SKEW: a newer node admits a
+// path grammar this one does not have. Left unasked, that is the retry-forever
+// loop again — the name is in the catalog, so the group's permanent "no such
+// index" would be rewritten as "still building" for an index that will never
+// finish building here.
+//
+// IT ANSWERS FOR THIS NODE ONLY, which is a partial but sound answer. If the
+// COORDINATOR cannot build the definition, no query it serves can ever be
+// complete, so permanent is right regardless of what the other nodes think. The
+// converse — this node builds it, a remote group's older binary does not — is
+// still reported as retryable, because the coordinator has no channel to learn a
+// peer's reject state; a query against such a cluster retries until the old node
+// is upgraded. Closing that would mean carrying the reject bit back in the leaf
+// reply, which is a wire change and is left as a follow-up.
+func (n *Node) kvIndexDefRejected(name string) bool {
+	m := n.kvIndexRejectedNames.Load()
+	if m == nil {
+		return false
+	}
+	_, bad := (*m)[name]
+	return bad
 }
 
 // backfillKVIndex walks one group's whole keyspace through one definition and

@@ -559,7 +559,13 @@ func statusForError(err error) int {
 		errors.Is(err, wire.ErrKVFilterBudget),
 		errors.Is(err, wire.ErrKVQueryArgs),
 		errors.Is(err, wire.ErrKVQueryResult),
-		errors.Is(err, wire.ErrKVQueryArgsTruncated):
+		errors.Is(err, wire.ErrKVQueryArgsTruncated),
+		// wire.ErrKVIndexDef: POST/DELETE /v1/kv/indexes refused the definition.
+		// This edge validates the SHAPE locally before dispatch, so what arrives
+		// here is the deeper refusal the cluster's admission check makes — a
+		// payload path this build cannot parse. Still a 400: only a different
+		// definition can change it.
+		errors.Is(err, wire.ErrKVIndexDef):
 		return http.StatusBadRequest
 	// RETRYABLE ones are 503, the bucket this transport already uses for every
 	// other "come back in a moment": the index exists but this group has not

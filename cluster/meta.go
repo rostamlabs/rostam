@@ -394,8 +394,15 @@ func (m *MetaRaft) ApplySetCatalogEntry(collection string, partitions, generatio
 //
 // d.Enabled == false is a DELETE of the named definition, not a stored "off"
 // flag; the FSM apply is where that is decided.
+//
+// THE ADMISSION CHECK IS THE FULL ONE, not wire.KVIndexDef.Validate. This is the
+// last place a definition can be refused while refusing it still costs the caller
+// only an error: past the Apply it is committed cluster-wide, and a definition
+// that parses nowhere then fails at install on every node while making every
+// query naming it look retryable. See validateKVIndexDef, which states why the
+// parse cannot live in the FSM instead.
 func (m *MetaRaft) ApplySetKVIndex(d wire.KVIndexDef, timeout time.Duration) error {
-	if err := d.Validate(); err != nil {
+	if err := validateKVIndexDef(d); err != nil {
 		return fmt.Errorf("cluster: SetKVIndex: %w", err)
 	}
 	if m.Raft.State() != hraft.Leader {

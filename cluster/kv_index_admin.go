@@ -51,6 +51,49 @@ const kvIndexSetTimeout = 5 * time.Second
 // answers makes its bit false instead of hanging the call.
 const kvIndexReadyGroupTimeout = 10 * time.Second
 
+// validateKVIndexDef is the FULL admission check a definition must pass before
+// it reaches the meta log: the wire shape check AND the path parse the observer
+// performs after the commit.
+//
+// THE TWO MUST RUN TOGETHER, HERE, because they disagree about what is legal.
+// wire.KVIndexDef.Validate is a shallow string check — sdk/record imports
+// sdk/wire, so the path grammar cannot live there — and it accepts paths
+// kvindex.DefFrom later refuses: "#count" (a count of no field), "#00001" (a
+// non-canonical position), a name carrying a character the grammar forbids,
+// "a#count#count". Checked only shallowly, such a definition COMMITS; every
+// node then rejects it at install time (Stats().KVIndex.RejectedDefs = 1 on all
+// of them); and a query naming it is worse than a hard failure, because the
+// name IS in the meta catalog, so classifyKVQueryErr rewrites each group's
+// PERMANENT "no such index" into the RETRYABLE ErrIndexBuilding — and a
+// well-behaved client then retries forever, at one full cluster fan-out per
+// attempt, for an index that can never install anywhere.
+//
+// ONLY AN ENABLED DEFINITION IS PARSED. Enabled=false is a DELETE keyed on Name
+// alone: its PayloadPath is a placeholder ("-") nothing ever reads, and the FSM
+// removes the entry instead of storing it, so no observer will ever build it.
+// Parsing it would fail a drop over a field that does not matter — and would
+// make a definition written by a NEWER build undroppable by this one.
+//
+// IT DOES NOT MOVE INTO THE META FSM. An FSM check must decide identically on
+// every node at every version or the state machines diverge, and the path
+// grammar is precisely the part that may widen between builds. So the FSM keeps
+// the version-stable shape check and admission does the parse: a definition this
+// build cannot build is refused at the door, and one a newer build admits is
+// still applied identically everywhere.
+func validateKVIndexDef(d wire.KVIndexDef) error {
+	if err := d.Validate(); err != nil {
+		return err
+	}
+	if !d.Enabled {
+		return nil
+	}
+	// The error wraps wire.ErrKVIndexDef, which every transport classifies as
+	// PERMANENT (ops.KVQueryErrorFamily) — the one classification that stops the
+	// retry loop described above.
+	_, err := kvindex.DefFrom(d, 0)
+	return err
+}
+
 // handleSetKVIndex applies a FORWARDED index-definition write. Like
 // handleSetCatalog it runs on the meta-Raft leader — the sender selected this
 // node as the leader — so it proposes the entry LOCALLY and never re-enters the
@@ -93,7 +136,7 @@ func (n *Node) SetKVIndex(d wire.KVIndexDef, timeout time.Duration) error {
 	if n.meta == nil {
 		return errNoMeta
 	}
-	if err := d.Validate(); err != nil {
+	if err := validateKVIndexDef(d); err != nil {
 		return fmt.Errorf("cluster: SetKVIndex: %w", err)
 	}
 	if n.meta.Raft.State() != hraft.Leader {

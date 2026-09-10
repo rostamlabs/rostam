@@ -173,10 +173,17 @@ type Node struct {
 	// kvindex.Set — the query leaf runs in ops, and the reconcile pass runs on a
 	// goroutine the store owns — so these node counters are only ever the
 	// residue of groups that have left.
-	kvBackfills           atomic.Uint64
-	kvBackfillKeys        atomic.Uint64
-	kvIndexRejects        atomic.Uint64
-	kvIndexRejectedDefs   atomic.Uint64
+	kvBackfills         atomic.Uint64
+	kvBackfillKeys      atomic.Uint64
+	kvIndexRejects      atomic.Uint64
+	kvIndexRejectedDefs atomic.Uint64
+	// kvIndexRejectedNames is the same rejection as kvIndexRejectedDefs, BY NAME
+	// rather than by count, published as a whole immutable map on every observer
+	// pass. classifyKVQueryErr reads it to keep a definition this node can never
+	// build out of the retryable bucket; see kvIndexDefRejected. A count cannot
+	// answer "is THIS index the broken one", which is the only question that
+	// decides whether a client should retry.
+	kvIndexRejectedNames  atomic.Pointer[map[string]struct{}]
 	kvIndexVerifyMisses   atomic.Uint64
 	kvIndexReconcileDrops atomic.Uint64
 

@@ -232,7 +232,10 @@ func (n *Node) callKVQueryGroup(ctx context.Context, group int, consistency uint
 }
 
 // classifyKVQueryErr turns a group's PERMANENT "no such index" into the
-// RETRYABLE ErrIndexBuilding when the name IS in this node's meta catalog.
+// RETRYABLE ErrIndexBuilding when the name IS in this node's meta catalog — and,
+// when this node has REJECTED that definition, into the permanent
+// wire.ErrKVIndexDef instead, because an index that cannot be built here will
+// never stop "building".
 //
 // The two facts live in different places on purpose. A shard group knows only
 // its own installed definitions, so a name it has never seen is, to it,
@@ -257,6 +260,19 @@ func (n *Node) classifyKVQueryErr(index string, group int, err error) error {
 	}
 	if _, inCatalog := n.meta.FSM.KVIndexLookup(index); !inCatalog {
 		return err
+	}
+	// IN THE CATALOG IS NOT THE SAME AS BUILDABLE. A definition this node's own
+	// observer refused (kvindex.DefFrom cannot parse its path here) will never
+	// install, so "still building" would be a promise nothing can keep and the
+	// client would retry forever at one full fan-out per attempt. Since
+	// validateKVIndexDef refuses such a definition at admission, the only way one
+	// reaches the catalog is version skew — a newer node admitting a grammar this
+	// build lacks — and the honest answer is the PERMANENT wire.ErrKVIndexDef,
+	// which all three transports render as a client error. See kvIndexDefRejected
+	// for what this does and does not cover.
+	if n.kvIndexDefRejected(index) {
+		return fmt.Errorf("%w: %q is in the meta catalog but this node cannot build it, so it will never install here; the definition needs a build that understands its payload path",
+			wire.ErrKVIndexDef, index)
 	}
 	return fmt.Errorf("%w: %q is in the meta catalog but not yet installed on shard group %d (retry)",
 		kvindex.ErrIndexBuilding, index, group)
