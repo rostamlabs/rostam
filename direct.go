@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rostamlabs/rostam/cache"
@@ -37,6 +38,17 @@ type DirectConfig struct {
 
 	// Cache configures the cache layer (mmap knobs).
 	Cache CacheConfig
+
+	// KVIndexReconcileIntervalMs is how often this store reconciles ONE of its
+	// KV index definitions against the live cache. It follows the same
+	// convention as Cache.TTLSweepIntervalMs above: 0 keeps the default (60 s),
+	// negative disables the pass, positive sets the interval in milliseconds.
+	//
+	// Disabling it is safe and never changes an answer: every candidate is
+	// re-read and re-checked against the live value, so a posting the pass
+	// would have removed costs one wasted lookup and can never produce a wrong
+	// row. What it bounds is MEMORY. See ops/kvindex/reconcile.go.
+	KVIndexReconcileIntervalMs int
 
 	// Authenticator, when non-nil, gates every request on all transports. It is
 	// the unified RBAC authorizer (authz.Authenticator): it receives an
@@ -110,13 +122,18 @@ func NewDirect(cfg DirectConfig) (Store, error) {
 	// The error cannot fire here: the cache is not reachable by anything that
 	// could close it until this constructor returns.
 	_ = ops.RebuildKVIndex(kvIdx, c)
-	return &directStore{
+	d := &directStore{
 		cache:    c,
 		registry: cfg.Ops,
 		vectors:  vectorStore,
 		tx:       ops.NewTxContextWithIndex(c, vectorStore, kvIdx),
 		opMu:     make([]sync.Mutex, c.NumShards()),
-	}, nil
+	}
+	// The bounded reconcile pass. A Direct store builds no shard.Store, so it
+	// hosts its own copy of the ticker; Close stops and joins it before the
+	// cache is unmapped. See direct_kv_index_reconcile.go.
+	d.startKVIndexReconciler(directReconcileInterval(cfg.KVIndexReconcileIntervalMs))
+	return d, nil
 }
 
 // directStore implements Store on top of a bare cache.Cache. It does
@@ -132,6 +149,16 @@ type directStore struct {
 	//                         to different shards run concurrently — matching Embedded's
 	//                         independent per-shard Raft groups. Shardless ops lock all shards.
 	wasmRT *wasm.Runtime // lazily created on first RegisterWASM
+
+	// The KV index reconcile ticker's state. kvReconcileStop signals it,
+	// kvReconcileWg is how Close WAITS for it (the probe reads the cache, so it
+	// must be out before anything is unmapped), kvReconcileOnce makes the stop
+	// idempotent, and kvReconcileNext is the rotation cursor over the
+	// definitions. All nil/zero when the interval disables the pass.
+	kvReconcileStop chan struct{}
+	kvReconcileWg   sync.WaitGroup
+	kvReconcileOnce sync.Once
+	kvReconcileNext atomic.Uint64
 }
 
 func (d *directStore) Get(_ context.Context, key []byte) ([]byte, error) {
@@ -296,6 +323,10 @@ func (d *directStore) LeaderAddr(_ []byte) string { return "" }
 
 func (d *directStore) Close() error {
 	var errs []error
+	// The KV index reconcile ticker probes the cache, so it has to be out before
+	// d.cache.Close unmaps anything. Stopped FIRST, and joined: a signal alone
+	// would leave a tick already inside cache.Get racing the unmap.
+	d.stopKVIndexReconciler()
 	if d.wasmRT != nil {
 		if err := d.wasmRT.Close(); err != nil {
 			errs = append(errs, err)
