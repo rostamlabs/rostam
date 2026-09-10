@@ -124,7 +124,10 @@ func (n *Node) broadcastKVQuery(args []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	ask := kvQueryTargets(a.Cursor, n.cfg.NumShards)
+	ask, err := kvQueryTargets(a.Cursor, n.cfg.NumShards)
+	if err != nil {
+		return nil, err
+	}
 
 	// Only the groups that can still contribute get a leg: a finished group is
 	// skipped BEFORE a goroutine, a context and a timer are spent on it, which on
@@ -169,23 +172,35 @@ func (n *Node) broadcastKVQuery(args []byte) ([]byte, error) {
 // it again would cost a round trip per group per page for the life of the query
 // (and, on a leader-pinned read, a leader resolution with it).
 //
-// A cursor naming a group outside this node's shard count is ignored rather than
-// rejected: the cursor is attacker-controlled bytes, and the codec has already
-// bounded its size and shape.
-func kvQueryTargets(conts []wire.KVQueryCont, numShards int) []bool {
+// A cursor naming a group this cluster does not have is REFUSED, permanently.
+// It used to be silently ignored, which is the worst of the three options: a
+// cursor naming only out-of-range groups asks nobody, so the caller gets an
+// exhausted empty page and reads it as "no more rows" for a query that never
+// ran. Silence is indistinguishable from an answer here, and the cursor is
+// opaque to the caller, so an edited or cross-cluster one has exactly one honest
+// reply — this cursor does not belong to this cluster, stop resending it.
+//
+// wire.ErrKVQueryArgs is the class the args codec already uses for a
+// structurally decodable cursor that is semantically wrong (continuations not
+// increasing by group, over the continuation cap), and every transport carries
+// it as PERMANENT in ops.KVQueryErrorFamily. A retryable class would be a lie:
+// no amount of waiting gives this cluster the group.
+func kvQueryTargets(conts []wire.KVQueryCont, numShards int) ([]bool, error) {
 	ask := make([]bool, numShards)
 	if len(conts) == 0 {
 		for g := range ask {
 			ask[g] = true
 		}
-		return ask
+		return ask, nil
 	}
 	for _, c := range conts {
-		if c.Group < uint32(numShards) { //nolint:gosec // numShards is a small positive config value
-			ask[c.Group] = true
+		if c.Group >= uint32(numShards) { //nolint:gosec // numShards is a small positive config value
+			return nil, fmt.Errorf("%w: cursor names shard group %d, but this cluster has %d groups",
+				wire.ErrKVQueryArgs, c.Group, numShards)
 		}
+		ask[c.Group] = true
 	}
-	return ask
+	return ask, nil
 }
 
 // callKVQueryGroup answers ONE group, routed by the query's read consistency.

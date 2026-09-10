@@ -746,9 +746,15 @@ func TestKVQueryValuePresenceThroughTheCoordinator(t *testing.T) {
 // --- cursor hardening -----------------------------------------------------
 
 // The cursor is attacker-controlled bytes on the way back in. A group it names
-// that this cluster does not have is ignored, not a panic and not a query that
-// answers from nowhere.
-func TestKVQueryCursorNamingAnUnknownGroupIsIgnored(t *testing.T) {
+// that this cluster does not have is REFUSED — permanently, and by the class the
+// args codec already uses for a semantically wrong cursor.
+//
+// It used to be ignored, and ignoring it is the one option that cannot be told
+// apart from an answer: a cursor naming only out-of-range groups asks nobody, so
+// the caller gets an exhausted empty page and reads it as "no more rows" for a
+// query that never ran. An edited cursor, or one carried over from another
+// cluster, has exactly one honest reply.
+func TestKVQueryCursorNamingAnUnknownGroupIsRefused(t *testing.T) {
 	tc := newTestCluster(t, 1, 2)
 	n := tc.nodes[0]
 
@@ -762,10 +768,21 @@ func TestKVQueryCursorNamingAnUnknownGroupIsIgnored(t *testing.T) {
 		Index: "by_age", Filter: kvQueryAll(), Limit: 100,
 		Cursor: []wire.KVQueryCont{{Group: 0, More: true}, {Group: 4_000_000_000, More: true}},
 	})
-	if err != nil {
-		t.Fatalf("a cursor naming an unknown group failed the query: %v", err)
+	if err == nil {
+		t.Fatalf("a cursor naming an unknown group was accepted: %d rows", len(res.Rows))
 	}
-	// Only group 0 was asked, so only its keys come back.
+	if !errors.Is(err, wire.ErrKVQueryArgs) {
+		t.Fatalf("err = %v, want a wire.ErrKVQueryArgs — the permanent class every transport carries", err)
+	}
+	// The control: a cursor naming only groups this cluster HAS still pages, so
+	// the refusal is about the group number and nothing else.
+	res, err = kvQueryCall(t, n, wire.KVQueryArgs{
+		Index: "by_age", Filter: kvQueryAll(), Limit: 100,
+		Cursor: []wire.KVQueryCont{{Group: 0, More: true}},
+	})
+	if err != nil {
+		t.Fatalf("a cursor naming only group 0: %v", err)
+	}
 	for _, row := range res.Rows {
 		if g := shardOf(row.Key, 2); g != 0 {
 			t.Fatalf("key %q from group %d answered a cursor that named only group 0", row.Key, g)
@@ -776,22 +793,39 @@ func TestKVQueryCursorNamingAnUnknownGroupIsIgnored(t *testing.T) {
 // kvQueryTargets is what "stop sending exhausted groups" means in code: a first
 // page asks everyone, and a later page asks exactly the groups its cursor names.
 func TestKVQueryTargetsFollowTheCursor(t *testing.T) {
-	all := kvQueryTargets(nil, 4)
+	all, err := kvQueryTargets(nil, 4)
+	if err != nil {
+		t.Fatalf("a first page: %v", err)
+	}
 	for g, ask := range all {
 		if !ask {
 			t.Fatalf("a first page did not ask group %d", g)
 		}
 	}
-	some := kvQueryTargets([]wire.KVQueryCont{{Group: 1}, {Group: 3}}, 4)
+	some, err := kvQueryTargets([]wire.KVQueryCont{{Group: 1}, {Group: 3}}, 4)
+	if err != nil {
+		t.Fatalf("a later page: %v", err)
+	}
 	want := []bool{false, true, false, true}
 	for g := range want {
 		if some[g] != want[g] {
 			t.Fatalf("targets = %v, want %v — an exhausted group must never be sent again", some, want)
 		}
 	}
-	// Out of range is ignored rather than panicking.
-	if got := kvQueryTargets([]wire.KVQueryCont{{Group: 99}}, 4); len(got) != 4 || got[0] || got[1] || got[2] || got[3] {
-		t.Fatalf("targets for an out-of-range cursor = %v, want none asked", got)
+	// A group this cluster does not have is REFUSED, not ignored. Ignored, a
+	// cursor naming only out-of-range groups asks nobody and the caller reads the
+	// resulting empty page as "no more rows" for a query that never ran.
+	got, err := kvQueryTargets([]wire.KVQueryCont{{Group: 99}}, 4)
+	if err == nil {
+		t.Fatalf("an out-of-range cursor was accepted, targets = %v", got)
+	}
+	if !errors.Is(err, wire.ErrKVQueryArgs) {
+		t.Fatalf("err = %v, want a wire.ErrKVQueryArgs (the permanent bad-cursor class)", err)
+	}
+	// Including when it is mixed in with legal groups: a page that quietly
+	// dropped the bad one would answer a different question than it was asked.
+	if _, err := kvQueryTargets([]wire.KVQueryCont{{Group: 1}, {Group: 99}}, 4); !errors.Is(err, wire.ErrKVQueryArgs) {
+		t.Fatalf("a cursor mixing a legal and an out-of-range group = %v, want a wire.ErrKVQueryArgs", err)
 	}
 }
 
