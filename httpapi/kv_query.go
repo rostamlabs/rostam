@@ -4,7 +4,6 @@ package httpapi
 
 import (
 	"encoding/base64"
-	"encoding/json"
 	"net/http"
 	"strconv"
 	"unicode/utf8"
@@ -51,19 +50,29 @@ type kvQueryReq struct {
 	Cursor      string        `json:"cursor"`
 }
 
-// kvQueryRow is one row of the answer. Key is always present. ValueB64 carries
-// the raw value bytes when the query asked for a value AND that value fit the
-// page; a row whose value was omitted for size comes back key-only, which is the
-// leaf's documented convention and NOT an error — fetch those keys with
-// GET /v1/kv/{key}. ValueUTF8 appears only when the bytes really are text, so a
-// client never mistakes lossy bytes for a string. Record is the decoded record,
-// present only for return:"records".
+// kvQueryRow is one row of the answer. KeyB64 is always present, with KeyUTF8
+// beside it only when the key really is text, so a client never mistakes lossy
+// bytes for a string.
+//
+// ValueB64 carries the raw value bytes when the query asked for a value AND that
+// value fit the page. A row whose value was omitted for size comes back
+// key-only, which is the leaf's documented convention and NOT an error — fetch
+// those keys with GET /v1/kv/{key}.
+//
+// THERE IS NO DECODED-RECORD FIELD, and its absence is a decision. return:
+// "records" means the SERVER validated that each value decodes as a record and
+// skipped the ones that do not; the bytes still arrive in value_b64 and decoding
+// them is the caller's job (the same split the native client makes — it is the
+// client that calls wire.DecodeRecord). Rendering the record here would mean
+// committing this REST surface to a record-to-JSON shape, and the only one
+// available today is Go's default marshalling of wire.Record, whose field names
+// are internal and carry no compatibility promise. A deliberate rendering is
+// worth having; inheriting one by accident is not.
 type kvQueryRow struct {
-	KeyB64    string          `json:"key_b64"`
-	KeyUTF8   *string         `json:"key_utf8,omitempty"`
-	ValueB64  *string         `json:"value_b64,omitempty"`
-	ValueUTF8 *string         `json:"value_utf8,omitempty"`
-	Record    json.RawMessage `json:"record,omitempty"`
+	KeyB64    string  `json:"key_b64"`
+	KeyUTF8   *string `json:"key_utf8,omitempty"`
+	ValueB64  *string `json:"value_b64,omitempty"`
+	ValueUTF8 *string `json:"value_utf8,omitempty"`
 }
 
 // kvQueryResponse is the POST /v1/kv/query body. Cursor is an OPAQUE base64
@@ -138,7 +147,7 @@ func (a *api) kvQuery(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, opKVQuery+" decode", derr)
 		return
 	}
-	resp, rerr := kvQueryResponseFrom(res, args.Return)
+	resp, rerr := kvQueryResponseFrom(res)
 	if rerr != nil {
 		writeInternalError(w, opKVQuery+" render", rerr)
 		return
@@ -200,7 +209,7 @@ func (req *kvQueryReq) toWire(w http.ResponseWriter) (wire.KVQueryArgs, bool) {
 // Rows is always a non-nil slice so an exhausted query marshals as "rows":[]
 // rather than "rows":null — a client iterating the field should not have to
 // special-case an empty page.
-func kvQueryResponseFrom(res wire.KVQueryResult, ret uint8) (kvQueryResponse, error) {
+func kvQueryResponseFrom(res wire.KVQueryResult) (kvQueryResponse, error) {
 	resp := kvQueryResponse{Rows: make([]kvQueryRow, 0, len(res.Rows))}
 	for _, row := range res.Rows {
 		out := kvQueryRow{KeyB64: base64.StdEncoding.EncodeToString(row.Key)}
@@ -214,20 +223,6 @@ func kvQueryResponseFrom(res wire.KVQueryResult, ret uint8) (kvQueryResponse, er
 			if utf8.Valid(row.Value) {
 				s := string(row.Value)
 				out.ValueUTF8 = &s
-			}
-			if ret == wire.KVQueryReturnRecords {
-				// The leaf already validated that these bytes decode as a record,
-				// so a failure here is a frame this process built wrong, not a
-				// client mistake — hence the error return rather than a 400.
-				rec, err := wire.DecodeRecord(row.Value)
-				if err != nil {
-					return kvQueryResponse{}, err
-				}
-				j, jerr := json.Marshal(rec)
-				if jerr != nil {
-					return kvQueryResponse{}, jerr
-				}
-				out.Record = j
 			}
 		}
 		resp.Rows = append(resp.Rows, out)

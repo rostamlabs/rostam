@@ -169,37 +169,48 @@ func TestHTTPKVQuery(t *testing.T) {
 	}
 }
 
-// TestHTTPKVQueryValuesAndRecords covers the two non-key projections: values
-// come back base64 (and value_utf8 only when the bytes really are text), and
-// records come back as decoded JSON alongside the raw bytes.
-func TestHTTPKVQueryValuesAndRecords(t *testing.T) {
+// TestHTTPKVQueryProjections covers all three: keys carries no value at all,
+// values carries the raw bytes base64, and records carries the same bytes — the
+// difference being that the SERVER has validated each one decodes as a record.
+// Decoding stays the caller's job at this transport too, so there is no
+// decoded-record field to assert on; see kvQueryRow for why.
+func TestHTTPKVQueryProjections(t *testing.T) {
 	h, _, cleanup := newKVQueryTestAPI(t, 2)
 	defer cleanup()
 
-	var out kvQueryResponse
-	body := `{"index":"by_age","return":"values","filter":{"op":"eq","field":"age","value":{"kind":"int","int":1}}}`
-	rec := do(t, h, "POST", "/v1/kv/query", body, &out)
-	if rec.Code != http.StatusOK || len(out.Rows) != 1 {
-		t.Fatalf("values query = %d rows=%d (%s)", rec.Code, len(out.Rows), rec.Body)
-	}
-	if out.Rows[0].ValueB64 == nil {
-		t.Fatal("a values projection must carry value_b64")
-	}
-	if out.Rows[0].Record != nil {
-		t.Fatal("a values projection must NOT carry a decoded record")
-	}
-
-	var recs kvQueryResponse
-	body = `{"index":"by_age","return":"records","filter":{"op":"eq","field":"age","value":{"kind":"int","int":1}}}`
-	rec = do(t, h, "POST", "/v1/kv/query", body, &recs)
-	if rec.Code != http.StatusOK || len(recs.Rows) != 1 {
-		t.Fatalf("records query = %d rows=%d (%s)", rec.Code, len(recs.Rows), rec.Body)
-	}
-	if recs.Rows[0].Record == nil {
-		t.Fatalf("a records projection must carry the decoded record (%s)", rec.Body)
-	}
-	if !strings.Contains(string(recs.Rows[0].Record), kvIndexTestField) {
-		t.Fatalf("decoded record %s does not mention %q", recs.Rows[0].Record, kvIndexTestField)
+	const filter = `"filter":{"op":"eq","field":"age","value":{"kind":"int","int":1}}`
+	for _, tc := range []struct {
+		name     string
+		ret      string
+		wantVal  bool
+		wantUTF8 bool
+	}{
+		// value_utf8 rides along whenever the bytes pass utf8.Valid, exactly as
+		// GET /v1/kv/{key} already behaves. A dynamic-mode record of small
+		// integers happens to be all-ASCII, so it qualifies — accidentally, but
+		// consistently with the rule the rest of the KV surface follows.
+		{"keys", `"return":"keys",`, false, false},
+		{"values", `"return":"values",`, true, true},
+		{"records", `"return":"records",`, true, true},
+		{"absent return defaults to keys", "", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out kvQueryResponse
+			rec := do(t, h, "POST", "/v1/kv/query", `{"index":"by_age",`+tc.ret+filter+`}`, &out)
+			if rec.Code != http.StatusOK || len(out.Rows) != 1 {
+				t.Fatalf("status=%d rows=%d (%s)", rec.Code, len(out.Rows), rec.Body)
+			}
+			if got := out.Rows[0].ValueB64 != nil; got != tc.wantVal {
+				t.Fatalf("value_b64 present = %v, want %v (%s)", got, tc.wantVal, rec.Body)
+			}
+			if got := out.Rows[0].ValueUTF8 != nil; got != tc.wantUTF8 {
+				t.Fatalf("value_utf8 present = %v, want %v (%s)", got, tc.wantUTF8, rec.Body)
+			}
+			// The key IS text, so its UTF-8 twin must be there.
+			if out.Rows[0].KeyUTF8 == nil || *out.Rows[0].KeyUTF8 != "u:001" {
+				t.Fatalf("key_utf8 = %v, want u:001", out.Rows[0].KeyUTF8)
+			}
+		})
 	}
 }
 
