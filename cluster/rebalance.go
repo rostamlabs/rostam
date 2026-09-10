@@ -156,6 +156,23 @@ func (n *Node) RemoveShardOwner(shardID int) error {
 	n.shardMu.Lock()
 	s := n.shards[shardID]
 	n.shards[shardID] = nil
+	// FOLD THE GROUP'S VERIFY MISSES INTO THE NODE TOTAL BEFORE ITS INDEX GOES
+	// AWAY. Stats().KVIndex.VerifyMisses is the node counter plus the sum over
+	// HOSTED groups (kvIndexStats), because the query leaf runs in ops and can
+	// only reach the Set it read. Dropping a group without folding would make
+	// that contracted uint64 DECREASE, which every scraper reads as a process
+	// restart and a reset of every other counter alongside it.
+	//
+	// Inside the lock, in the same critical section that takes the store out of
+	// n.shards, so no observer can see the group counted by neither. A query
+	// still in flight on this store can add a miss after the fold and lose it;
+	// that is bounded by the in-flight queries and never makes the total go
+	// backwards, which is the property being protected.
+	if s != nil {
+		if idx := s.KVIndex(); idx != nil {
+			n.kvIndexVerifyMisses.Add(idx.VerifyMisses())
+		}
+	}
 	n.shardMu.Unlock()
 	// Drain any in-flight KV index backfill on this group BEFORE the store closes.
 	// The walk aliases the store's live mmap, which Close unmaps; draining first

@@ -1236,3 +1236,45 @@ func TestKVIndexInstallWithoutBackfill(t *testing.T) {
 		t.Fatalf("the full pass walked %d keys, want at least 2000", st.BackfillKeys)
 	}
 }
+
+func TestKVIndexVerifyMissesSurviveShardRemoval(t *testing.T) {
+	// Stats().KVIndex.VerifyMisses is a contracted monotonic uint64, but the
+	// query leaf can only count on the Set it read, so the node total is a SUM
+	// over hosted groups. Dropping a group without folding its count in made
+	// that total DECREASE — which a scraper reads as a process restart, and
+	// which resets every rate built on it.
+	tc := newTestCluster(t, 1, 2)
+	n := tc.nodes[0]
+
+	const perShard = 3
+	hosted := 0
+	for _, s := range n.snapshotShards() {
+		if s == nil {
+			continue
+		}
+		idx := s.KVIndex()
+		if idx == nil {
+			continue
+		}
+		hosted++
+		idx.NoteVerifyMisses(perShard)
+	}
+	if hosted < 2 {
+		t.Fatalf("fixture: %d hosted groups with an index, want 2", hosted)
+	}
+
+	before := n.Stats().KVIndex.VerifyMisses
+	if want := uint64(hosted * perShard); before != want {
+		t.Fatalf("VerifyMisses = %d before removal, want %d", before, want)
+	}
+
+	if err := n.RemoveShardOwner(0); err != nil {
+		t.Fatalf("RemoveShardOwner: %v", err)
+	}
+
+	if after := n.Stats().KVIndex.VerifyMisses; after < before {
+		t.Fatalf("VerifyMisses went BACKWARDS across a shard removal: %d -> %d", before, after)
+	} else if after != before {
+		t.Fatalf("VerifyMisses = %d after removal, want %d unchanged", after, before)
+	}
+}

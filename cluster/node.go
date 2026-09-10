@@ -165,9 +165,12 @@ type Node struct {
 	// what the observer's walks have cost; kvIndexRejects COUNTS reject events and
 	// kvIndexRejectedDefs GAUGES how many are broken right now (see
 	// kvIndexDefsFromCatalog for why both).
-	// kvIndexVerifyMisses and kvIndexReconcileDrops belong to the query and
-	// reconcile paths and stay zero until those land; they live here so the whole
-	// KVIndexStats block has one owner.
+	// kvIndexVerifyMisses holds verify misses that no longer have a hosted group
+	// to be read from: RemoveShardOwner folds a departing group's count in here
+	// before dropping its index, so Stats().KVIndex.VerifyMisses (this plus the
+	// sum over hosted groups) never decreases. kvIndexReconcileDrops belongs to
+	// the reconcile path and stays zero until Task 9 lands; both live here so the
+	// whole KVIndexStats block has one owner.
 	kvBackfills           atomic.Uint64
 	kvBackfillKeys        atomic.Uint64
 	kvIndexRejects        atomic.Uint64

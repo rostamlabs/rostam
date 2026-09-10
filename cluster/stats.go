@@ -153,9 +153,20 @@ type KVIndexStats struct {
 	// fixed or removed, which is the signal an operator acts on.
 	RejectedDefs int
 
-	// VerifyMisses counts candidates whose live re-read did not match — i.e.
-	// stale postings the query path paid a lookup for and discarded. Postings are
-	// hints, so this is a cost, never a wrong answer.
+	// VerifyMisses counts candidates whose live re-read MISSED — a posting for a
+	// key the cache no longer holds. Postings are hints, so this is a cost (one
+	// wasted lookup) and never a wrong answer; a rising rate means keys are
+	// leaving the cache by a path that does not reach kvindex.Set.Drop.
+	//
+	// IT IS KEY STALENESS ONLY, not value staleness. A candidate whose key is
+	// still live but whose VALUE no longer satisfies the filter is discarded by
+	// the predicate and counted nowhere — so a write path that stopped
+	// reindexing is invisible here, and this counter staying at zero is not
+	// evidence that the postings agree with the data. A separate counter for
+	// that is a follow-up.
+	//
+	// Monotonic across shard removal: RemoveShardOwner folds a departing group's
+	// count into the node total before its index is dropped.
 	VerifyMisses uint64
 
 	// ReconcileDrops counts postings the reconciler removed because their key is
