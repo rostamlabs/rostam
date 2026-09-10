@@ -189,6 +189,62 @@ func wcOf(r wcArgs) (uint32, bool) { return r.GetWriteConsistencyFactor(), !r.Ge
 // HTTP front end's 400/404/503/500 mapping.
 func grpcError(err error) error {
 	switch {
+	// THE kv_query FAMILY IS CLASSIFIED FIRST, and the position is load-bearing.
+	// Several arms below match by SUBSTRING ("rate limited", "unknown
+	// collection", "already exists", "version conflict"), and a kv_query filter
+	// refusal quotes the caller's own FIELD NAME verbatim into its message — so
+	// with these arms further down, a client naming a filter field "rate limited"
+	// turned its own permanent 400 into ResourceExhausted, a code standard retry
+	// policies retry. Reproduced before this move; pinned by
+	// TestGRPCKVQueryFilterTextCannotSteerTheCode. Matching by IDENTITY first is
+	// strictly more precise than any heuristic below it, so nothing else loses.
+	// The kv_query family, kept in sync with server.clientFacingErr (which lets
+	// these cross the wire unredacted) and httpapi.statusForError (which maps the
+	// same set onto 400/404/503). Three transports, one classification: a caller
+	// that switches from REST to gRPC must not discover that its retry loop has
+	// become a hard failure.
+	//
+	// NotFound: the caller named a definition that does not exist. Distinct from
+	// the InvalidArgument bucket on purpose — the remedy is to CREATE the index,
+	// not to fix the query — and it mirrors httpapi's 404 for the same sentinel.
+	case errIs(err, kvindex.ErrNoSuchIndex):
+		return status.Error(codes.NotFound, err.Error())
+	// InvalidArgument: PERMANENT facts about the query or the deployment. The
+	// filter, the missing scan consent, the scan/candidate/filter budgets, a
+	// continuation too large to represent, and a malformed frame are all things
+	// only a different request can change; each message names only what the
+	// caller already sent. ops.ErrKVIndexUnavailable is the odd one out (this
+	// deployment has no KV index at all) but is equally not something to retry.
+	case errIs(err, ops.ErrKVQueryFilter,
+		ops.ErrKVQueryScanRequired,
+		ops.ErrKVQueryScanBudget,
+		ops.ErrKVIndexUnavailable,
+		ops.ErrKVQueryCursorCap,
+		kvindex.ErrCandidateBudget,
+		wire.ErrKVFilterBudget,
+		wire.ErrKVQueryArgs,
+		wire.ErrKVQueryResult,
+		wire.ErrKVQueryArgsTruncated):
+		return status.Error(codes.InvalidArgument, err.Error())
+	// Unavailable: RETRYABLE. The index exists but this group has not finished
+	// installing or backfilling it (including the coordinator's rewrite of a
+	// group-level no-such-index into ErrIndexBuilding when the name IS in the
+	// meta catalog), the definition moved under the query, the shard is being
+	// removed from the node mid-scan, or the store is draining for close.
+	// Unavailable is the gRPC rendering of HTTP's 503 and the code standard
+	// retry policies actually retry — unlike the Internal an unclassified
+	// sentinel falls to, which they hammer or hard-fail.
+	case errIs(err, kvindex.ErrIndexBuilding,
+		kvindex.ErrIndexChanged,
+		ops.ErrKVQueryUnavailable),
+		// shard.ErrStoreClosed reaches this package as TEXT — grpcapi cannot
+		// import shard — so it is matched by ops.IsStoreClosedMessage: an
+		// anchored suffix over the spelling shard.ErrStoreClosed is DECLARED
+		// from, vetoed by the permanent filter sentinel so a caller-chosen
+		// filter field quoting the refusal cannot make its own error retryable.
+		// NOT strings.Contains, for the reason every matcher above records.
+		ops.IsStoreClosedMessage(err.Error()):
+		return status.Error(codes.Unavailable, err.Error())
 	case errIs(err, vector.ErrDimMismatch, vector.ErrEmptyFilter, vector.ErrEmptyGroupBy,
 		vector.ErrSparseMismatch, vector.ErrSparseUnsorted, vector.ErrSpaceModalityMismatch,
 		vector.ErrUnknownVectorName, vector.ErrEmptyNamedVectors,
@@ -345,53 +401,6 @@ func grpcError(err error) error {
 		// ops.IsOperateDuringReshardMessage, not strings.Contains, so an internal
 		// fault that merely mentions the refusal is not leaked.
 		ops.IsOperateDuringReshardMessage(err.Error()):
-		return status.Error(codes.Unavailable, err.Error())
-	// The kv_query family, kept in sync with server.clientFacingErr (which lets
-	// these cross the wire unredacted) and httpapi.statusForError (which maps the
-	// same set onto 400/404/503). Three transports, one classification: a caller
-	// that switches from REST to gRPC must not discover that its retry loop has
-	// become a hard failure.
-	//
-	// NotFound: the caller named a definition that does not exist. Distinct from
-	// the InvalidArgument bucket on purpose — the remedy is to CREATE the index,
-	// not to fix the query — and it mirrors httpapi's 404 for the same sentinel.
-	case errIs(err, kvindex.ErrNoSuchIndex):
-		return status.Error(codes.NotFound, err.Error())
-	// InvalidArgument: PERMANENT facts about the query or the deployment. The
-	// filter, the missing scan consent, the scan/candidate/filter budgets, a
-	// continuation too large to represent, and a malformed frame are all things
-	// only a different request can change; each message names only what the
-	// caller already sent. ops.ErrKVIndexUnavailable is the odd one out (this
-	// deployment has no KV index at all) but is equally not something to retry.
-	case errIs(err, ops.ErrKVQueryFilter,
-		ops.ErrKVQueryScanRequired,
-		ops.ErrKVQueryScanBudget,
-		ops.ErrKVIndexUnavailable,
-		ops.ErrKVQueryCursorCap,
-		kvindex.ErrCandidateBudget,
-		wire.ErrKVFilterBudget,
-		wire.ErrKVQueryArgs,
-		wire.ErrKVQueryResult,
-		wire.ErrKVQueryArgsTruncated):
-		return status.Error(codes.InvalidArgument, err.Error())
-	// Unavailable: RETRYABLE. The index exists but this group has not finished
-	// installing or backfilling it (including the coordinator's rewrite of a
-	// group-level no-such-index into ErrIndexBuilding when the name IS in the
-	// meta catalog), the definition moved under the query, the shard is being
-	// removed from the node mid-scan, or the store is draining for close.
-	// Unavailable is the gRPC rendering of HTTP's 503 and the code standard
-	// retry policies actually retry — unlike the Internal an unclassified
-	// sentinel falls to, which they hammer or hard-fail.
-	case errIs(err, kvindex.ErrIndexBuilding,
-		kvindex.ErrIndexChanged,
-		ops.ErrKVQueryUnavailable),
-		// shard.ErrStoreClosed reaches this package as TEXT — grpcapi cannot
-		// import shard — so it is matched by ops.IsStoreClosedMessage: an
-		// anchored suffix over the spelling shard.ErrStoreClosed is DECLARED
-		// from, vetoed by the permanent filter sentinel so a caller-chosen
-		// filter field quoting the refusal cannot make its own error retryable.
-		// NOT strings.Contains, for the reason every matcher above records.
-		ops.IsStoreClosedMessage(err.Error()):
 		return status.Error(codes.Unavailable, err.Error())
 	case strings.Contains(err.Error(), "not leader"),
 		strings.Contains(err.Error(), "no leader"),

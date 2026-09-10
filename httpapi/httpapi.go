@@ -516,6 +516,67 @@ func writeInternalError(w http.ResponseWriter, ctx string, err error) {
 // leader becomes 503; everything else is 500.
 func statusForError(err error) int {
 	switch {
+	// THE kv_query FAMILY IS CLASSIFIED FIRST, and the position is load-bearing.
+	// Several arms below match by SUBSTRING ("rate limited", "collection full",
+	// "not leader"), and a kv_query filter refusal quotes the caller's own FIELD
+	// NAME verbatim into its message — so with these arms further down, a client
+	// naming a filter field "rate limited" turned its own permanent 400 into a
+	// 429 that clients back off and retry. Reproduced before this move; pinned by
+	// TestHTTPKVQueryFilterTextCannotSteerTheStatus. Matching by IDENTITY first
+	// is strictly more precise than any heuristic below it, so nothing else
+	// loses.
+	// The kv_query refusals, kept in sync with server.clientFacingErr, which
+	// classifies the same set for the TCP edge — and, crucially, for the
+	// peer-to-peer __kv_query_shard__ leg, where redaction would leave the
+	// coordinator nothing to classify (see the comment there).
+	//
+	// PERMANENT ones are 400: the filter, the missing scan consent, the scan
+	// budget and a malformed frame are all facts about the query the caller
+	// sent. ops.ErrKVIndexUnavailable is the odd one out — it says this
+	// deployment has no KV index at all — but it is equally not something to
+	// retry, and 400 tells the caller to stop rather than to wait.
+	//
+	// kvindex.ErrNoSuchIndex is the one that is NOT a 400 but a 404: the caller
+	// named a definition that does not exist, which is what 404 says, and it
+	// tells a client library to create the index rather than to fix its filter.
+	// It is matched by SENTINEL only — the leaf's message shape carries a
+	// caller-chosen index name, and rewriting a message into a 404 is not worth
+	// a matcher when a coordinator that finds the name in the meta catalog has
+	// already rewritten it to the retryable ErrIndexBuilding below.
+	case errors.Is(err, kvindex.ErrNoSuchIndex):
+		return http.StatusNotFound
+	case errors.Is(err, ops.ErrKVQueryFilter),
+		errors.Is(err, ops.ErrKVQueryScanRequired),
+		errors.Is(err, ops.ErrKVQueryScanBudget),
+		errors.Is(err, ops.ErrKVIndexUnavailable),
+		// The coordinator built a continuation it cannot represent, and the
+		// candidate/filter budgets. All are facts about what the caller asked
+		// for, and each message carries the arithmetic the caller acts on.
+		errors.Is(err, ops.ErrKVQueryCursorCap),
+		errors.Is(err, kvindex.ErrCandidateBudget),
+		errors.Is(err, wire.ErrKVFilterBudget),
+		errors.Is(err, wire.ErrKVQueryArgs),
+		errors.Is(err, wire.ErrKVQueryResult),
+		errors.Is(err, wire.ErrKVQueryArgsTruncated):
+		return http.StatusBadRequest
+	// RETRYABLE ones are 503, the bucket this transport already uses for every
+	// other "come back in a moment": the index exists but this group has not
+	// finished installing or backfilling it, the definition moved under the
+	// query, or the shard is being removed from the node mid-scan.
+	case errors.Is(err, kvindex.ErrIndexBuilding),
+		errors.Is(err, kvindex.ErrIndexChanged),
+		errors.Is(err, ops.ErrKVQueryUnavailable),
+		// shard.ErrStoreClosed: the store refused the Call because it is
+		// draining for close. A REFUSAL, not a fault — the op never ran, and in
+		// a cluster the group's other replicas can serve it — so it belongs in
+		// the same retryable bucket as the reshard refusal above. This package
+		// cannot import shard (the layering wall server.clientFacingErr
+		// documents), so it is matched by ops.IsStoreClosedMessage: an anchored
+		// suffix over the shared spelling shard.ErrStoreClosed is DECLARED from,
+		// with a veto on the permanent filter sentinel so a caller-chosen filter
+		// field quoting the refusal cannot make its own error retryable.
+		ops.IsStoreClosedMessage(err.Error()):
+		return http.StatusServiceUnavailable
 	case errors.Is(err, vector.ErrDimMismatch),
 		// A payload carrying a record value above the storage cap: 400, not 500.
 		// The cap is the snapshot/WAL codec's, so accepting the write would mean
@@ -756,58 +817,6 @@ func statusForError(err error) int {
 		// ops.IsOperateDuringReshardMessage, not strings.Contains, so an internal
 		// fault that merely mentions the refusal is not leaked.
 		ops.IsOperateDuringReshardMessage(err.Error()):
-		return http.StatusServiceUnavailable
-	// The kv_query refusals, kept in sync with server.clientFacingErr, which
-	// classifies the same set for the TCP edge — and, crucially, for the
-	// peer-to-peer __kv_query_shard__ leg, where redaction would leave the
-	// coordinator nothing to classify (see the comment there).
-	//
-	// PERMANENT ones are 400: the filter, the missing scan consent, the scan
-	// budget and a malformed frame are all facts about the query the caller
-	// sent. ops.ErrKVIndexUnavailable is the odd one out — it says this
-	// deployment has no KV index at all — but it is equally not something to
-	// retry, and 400 tells the caller to stop rather than to wait.
-	//
-	// kvindex.ErrNoSuchIndex is the one that is NOT a 400 but a 404: the caller
-	// named a definition that does not exist, which is what 404 says, and it
-	// tells a client library to create the index rather than to fix its filter.
-	// It is matched by SENTINEL only — the leaf's message shape carries a
-	// caller-chosen index name, and rewriting a message into a 404 is not worth
-	// a matcher when a coordinator that finds the name in the meta catalog has
-	// already rewritten it to the retryable ErrIndexBuilding below.
-	case errors.Is(err, kvindex.ErrNoSuchIndex):
-		return http.StatusNotFound
-	case errors.Is(err, ops.ErrKVQueryFilter),
-		errors.Is(err, ops.ErrKVQueryScanRequired),
-		errors.Is(err, ops.ErrKVQueryScanBudget),
-		errors.Is(err, ops.ErrKVIndexUnavailable),
-		// The coordinator built a continuation it cannot represent, and the
-		// candidate/filter budgets. All are facts about what the caller asked
-		// for, and each message carries the arithmetic the caller acts on.
-		errors.Is(err, ops.ErrKVQueryCursorCap),
-		errors.Is(err, kvindex.ErrCandidateBudget),
-		errors.Is(err, wire.ErrKVFilterBudget),
-		errors.Is(err, wire.ErrKVQueryArgs),
-		errors.Is(err, wire.ErrKVQueryResult),
-		errors.Is(err, wire.ErrKVQueryArgsTruncated):
-		return http.StatusBadRequest
-	// RETRYABLE ones are 503, the bucket this transport already uses for every
-	// other "come back in a moment": the index exists but this group has not
-	// finished installing or backfilling it, the definition moved under the
-	// query, or the shard is being removed from the node mid-scan.
-	case errors.Is(err, kvindex.ErrIndexBuilding),
-		errors.Is(err, kvindex.ErrIndexChanged),
-		errors.Is(err, ops.ErrKVQueryUnavailable),
-		// shard.ErrStoreClosed: the store refused the Call because it is
-		// draining for close. A REFUSAL, not a fault — the op never ran, and in
-		// a cluster the group's other replicas can serve it — so it belongs in
-		// the same retryable bucket as the reshard refusal above. This package
-		// cannot import shard (the layering wall server.clientFacingErr
-		// documents), so it is matched by ops.IsStoreClosedMessage: an anchored
-		// suffix over the shared spelling shard.ErrStoreClosed is DECLARED from,
-		// with a veto on the permanent filter sentinel so a caller-chosen filter
-		// field quoting the refusal cannot make its own error retryable.
-		ops.IsStoreClosedMessage(err.Error()):
 		return http.StatusServiceUnavailable
 	case strings.Contains(err.Error(), "not leader"),
 		strings.Contains(err.Error(), "no leader"),

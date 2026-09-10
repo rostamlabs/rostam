@@ -513,3 +513,58 @@ func TestHTTPKVIndexRoutesShadowOnlyTheGet(t *testing.T) {
 		t.Fatalf("GET /v1/kv/indexes returned %s, want the catalog listing", rec.Body)
 	}
 }
+
+// httpKVQuerySteeringFields are strings that appear in the SUBSTRING arms
+// further down statusForError's switch. Each is a legal filter field name, and
+// a kv_query filter refusal quotes the caller's field verbatim, so each is a
+// string a client can plant inside its own error message.
+var httpKVQuerySteeringFields = []string{
+	"rate limited",
+	"collection full",
+	"not leader",
+	"no leader",
+	"no reachable owner",
+	"cluster: write ",
+}
+
+// TestHTTPKVQueryFilterTextCannotSteerTheStatus is a regression test for a hole
+// that was REAL before the kv_query arms were moved to the front of the switch.
+//
+// A filter refusal renders the caller's field name with %q, and the arms below
+// match by substring, so a client asking for a field named "rate limited" got a
+// 429 for its own permanent mistake — a status clients back off and RETRY,
+// turning a bad query into an unbounded retry loop at one full cluster fan-out
+// per attempt. Every string here used to produce a different status; all must
+// now be 400.
+func TestHTTPKVQueryFilterTextCannotSteerTheStatus(t *testing.T) {
+	for _, field := range httpKVQuerySteeringFields {
+		err := fmt.Errorf("%w: field %q is not a path", ops.ErrKVQueryFilter, field)
+		if got := statusForError(err); got != http.StatusBadRequest {
+			t.Errorf("a filter field named %q classified as %d, want 400", field, got)
+		}
+	}
+}
+
+// TestHTTPNonKVQueryStatusesUnchanged is the control for the reordering: moving
+// the kv_query arms to the front must not capture anything that is not
+// kv_query.
+func TestHTTPNonKVQueryStatusesUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"rate limited", errors.New("collection rate limited"), http.StatusTooManyRequests},
+		{"collection full", errors.New("collection full"), http.StatusTooManyRequests},
+		{"not leader", errors.New("not leader"), http.StatusServiceUnavailable},
+		{"no reachable owner", errors.New("no reachable owner for shard 3"), http.StatusServiceUnavailable},
+		{"write consistency", errors.New("cluster: write consistency not met"), http.StatusGatewayTimeout},
+		{"unrelated fault", errors.New("open /var/lib/rostam/shard-7: no such file"), http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := statusForError(tc.err); got != tc.want {
+				t.Fatalf("statusForError(%v) = %d, want %d", tc.err, got, tc.want)
+			}
+		})
+	}
+}

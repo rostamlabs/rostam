@@ -126,3 +126,81 @@ func TestGRPCStoreClosedIsUnavailable(t *testing.T) {
 		})
 	}
 }
+
+// kvQuerySteeringFields are strings that appear in the SUBSTRING arms further
+// down grpcError's switch. Each is a legal filter field name, and a kv_query
+// filter refusal quotes the caller's field verbatim, so each is a string a
+// client can plant inside its own error message.
+var kvQuerySteeringFields = []string{
+	"rate limited",
+	"collection full",
+	"unknown collection",
+	"no collection",
+	"already exists",
+	"already present",
+	"version conflict",
+	"not leader",
+	"no leader",
+	"no reachable owner",
+	"cluster: write ",
+	"rostam: alias ",
+	"rostam: online key-admin unavailable",
+}
+
+// TestGRPCKVQueryFilterTextCannotSteerTheCode is a regression test for a hole
+// that was REAL before the kv_query arms were moved to the front of the switch.
+//
+// A filter refusal renders the caller's field name with %q, and the arms below
+// match by substring, so a client asking for a field named "rate limited" got
+// ResourceExhausted for its own permanent mistake — a code standard retry
+// policies and service meshes retry, turning a bad query into an unbounded
+// retry loop at one full cluster fan-out per attempt. Every string here used to
+// produce a different code; all must now be InvalidArgument.
+func TestGRPCKVQueryFilterTextCannotSteerTheCode(t *testing.T) {
+	for _, field := range kvQuerySteeringFields {
+		err := fmt.Errorf("%w: field %q is not a path", ops.ErrKVQueryFilter, field)
+		if got := status.Code(grpcError(err)); got != codes.InvalidArgument {
+			t.Errorf("a filter field named %q classified as %v, want InvalidArgument", field, got)
+		}
+	}
+}
+
+// TestGRPCKVQueryIndexNameCannotSteerTheCode is the same hole through the OTHER
+// caller-controlled string in this family: the index name, which the leaf quotes
+// into its no-such-index refusal. The name charset is narrow, but it admits
+// spaces-free forms of several of the substrings above, so the property is
+// asserted rather than assumed.
+func TestGRPCKVQueryIndexNameCannotSteerTheCode(t *testing.T) {
+	for _, name := range []string{"no-leader", "not-leader", "already-exists", "rate-limited"} {
+		err := fmt.Errorf("%w: %q on shard group 3", kvindex.ErrNoSuchIndex, name)
+		if got := status.Code(grpcError(err)); got != codes.NotFound {
+			t.Errorf("an index named %q classified as %v, want NotFound", name, got)
+		}
+	}
+}
+
+// TestGRPCNonKVQueryClassificationUnchanged is the control for the reordering:
+// moving the kv_query arms to the front must not capture anything that is not
+// kv_query. These are the codes the arms below still own.
+func TestGRPCNonKVQueryClassificationUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want codes.Code
+	}{
+		{"rate limited", errors.New("collection rate limited"), codes.ResourceExhausted},
+		{"collection full", errors.New("collection full"), codes.ResourceExhausted},
+		{"unknown collection", errors.New("unknown collection \"docs\""), codes.NotFound},
+		{"already exists", errors.New("collection already exists"), codes.AlreadyExists},
+		{"version conflict", errors.New("version conflict"), codes.FailedPrecondition},
+		{"not leader", errors.New("not leader"), codes.Unavailable},
+		{"write consistency", errors.New("cluster: write consistency not met"), codes.FailedPrecondition},
+		{"unrelated fault", errors.New("open /var/lib/rostam/shard-7: no such file"), codes.Internal},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := status.Code(grpcError(tc.err)); got != tc.want {
+				t.Fatalf("grpcError(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
