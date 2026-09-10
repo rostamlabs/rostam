@@ -360,6 +360,9 @@ func TestReconcileTickBlocksCloseUntilItReturns(t *testing.T) {
 		s.kvIdx.Reindex(k, val)
 	}
 	s.kvIdx.MarkReady("by-rc")
+	if got := recStorePosted(s, "by-rc"); got != 21 {
+		t.Fatalf("fixture posts %d keys, want 21 (1 live + 20 expiring)", got)
+	}
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -381,22 +384,11 @@ func TestReconcileTickBlocksCloseUntilItReturns(t *testing.T) {
 		t.Fatal("no reconcile tick reached the probe")
 	}
 
-	// The tick is inside cache.Get. The mapping must still be live.
-	readBack := make(chan error, 1)
-	go func() {
-		_, err := s.cache.Get(live)
-		readBack <- err
-	}()
-	select {
-	case err := <-readBack:
-		if err != nil {
-			t.Fatalf("a live key failed to read while a tick was parked: %v", err)
-		}
-	case <-time.After(10 * time.Second):
-		close(release)
-		t.Fatal("reading a live key blocked while a tick was parked")
-	}
-
+	// NO READ-BACK PROBE HERE, deliberately. The parked hook holds the cache
+	// SHARD'S WRITE LOCK, so a Get that hashes to that shard blocks — and it
+	// would have proved nothing anyway, running before Close is even called.
+	// What proves the fence is the pair of assertions below: Close does not
+	// return while the tick is parked, and does once it is released.
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- s.Close() }()
 

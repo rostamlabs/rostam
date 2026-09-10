@@ -14,12 +14,14 @@ package rostam
 import (
 	"fmt"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/rostamlabs/rostam/ops"
 	"github.com/rostamlabs/rostam/ops/kvindex"
 	"github.com/rostamlabs/rostam/sdk/wire"
+	"github.com/rostamlabs/rostam/shard"
 )
 
 func directRecDef(t *testing.T) kvindex.Def {
@@ -219,4 +221,113 @@ func directSettledGoroutines() int {
 		prev = n
 	}
 	return runtime.NumGoroutine()
+}
+
+// TestDirectReconcileDefaultMatchesShard pins the two 60 s defaults together.
+// They are separate constants in separate packages — shard's is unexported and
+// a directStore has no shard.Config to read — so nothing but this stops one
+// from drifting and leaving Embedded and Direct deployments reconciling at
+// different cadences for no stated reason.
+func TestDirectReconcileDefaultMatchesShard(t *testing.T) {
+	reg := ops.NewRegistry()
+	if err := ops.RegisterBuiltins(reg); err != nil {
+		t.Fatalf("RegisterBuiltins: %v", err)
+	}
+	shardDefault := time.Duration(shard.DefaultConfig(t.TempDir(), "n", reg).KVIndexReconcileIntervalMs) * time.Millisecond
+	if shardDefault != defaultKVIndexReconcileInterval {
+		t.Fatalf("Direct reconciles every %v but shard.DefaultConfig says %v; the two defaults have drifted",
+			defaultKVIndexReconcileInterval, shardDefault)
+	}
+}
+
+// TestDirectReconcileTickBlocksCloseUntilItReturns is the shard fence test's
+// twin. Direct's reconciler is a SEPARATE COPY of the ticker, so the join in
+// its Close needs its own proof: TestDirectReconcilerStopsOnClose above is the
+// leak shape, which a signal-only stop also passes.
+//
+// The tick is parked INSIDE the probe — every sampled key is expired on a
+// non-replicated cache, so cache.Get runs dropExpiredLocked and fires onRemove,
+// where the hook blocks. Close must not return until it is released, or
+// d.cache.Close unmaps pages that Get is reading.
+func TestDirectReconcileTickBlocksCloseUntilItReturns(t *testing.T) {
+	reg := ops.NewRegistry()
+	if err := ops.RegisterBuiltins(reg); err != nil {
+		t.Fatalf("RegisterBuiltins: %v", err)
+	}
+	s, err := NewDirect(DirectConfig{
+		Ops: reg,
+		Cache: CacheConfig{
+			NumShardsPerNode:   1,
+			TTLSweepIntervalMs: -1, // the probe's own Get must be what expires a key
+		},
+		KVIndexReconcileIntervalMs: 5,
+	})
+	if err != nil {
+		t.Fatalf("NewDirect: %v", err)
+	}
+	d, ok := s.(*directStore)
+	if !ok {
+		t.Fatalf("NewDirect returned %T, want *directStore", s)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = d.Close()
+		}
+	}()
+
+	idx := d.tx.KVIndex()
+	idx.Install([]kvindex.Def{directRecDef(t)})
+	for i := 0; i < 20; i++ {
+		k := []byte(fmt.Sprintf("u:%03d", i))
+		val := directRecRec(7)
+		if err := d.cache.Put(k, val, 20*time.Millisecond); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+		idx.Reindex(k, val)
+	}
+	idx.MarkReady("by-rc")
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	d.cache.SetOnRemove(func(key []byte) {
+		// The FIRST expiring probe only; later ones must not block, or the tick
+		// would never drain after the release.
+		once.Do(func() {
+			close(entered)
+			<-release
+		})
+		idx.Drop(key)
+	})
+
+	time.Sleep(30 * time.Millisecond) // let the keys expire
+	select {
+	case <-entered:
+	case <-time.After(20 * time.Second):
+		t.Fatal("no Direct reconcile tick reached the probe")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- d.Close() }()
+
+	select {
+	case err := <-closeDone:
+		close(release)
+		t.Fatalf("Close returned (%v) while a reconcile tick was still inside the probe; "+
+			"cache.Close would unmap pages that Get is reading", err)
+	case <-time.After(300 * time.Millisecond):
+		// Correct: Close is parked in stopKVIndexReconciler's join.
+	}
+
+	close(release)
+	select {
+	case err := <-closeDone:
+		closed = true
+		if err != nil {
+			t.Fatalf("Close after the tick released: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("Close did not return after the Direct reconcile tick was released")
+	}
 }
