@@ -209,7 +209,7 @@ var builtinHandlers = map[string]Handler{
 //   - "vector_operate" / "vector_named_operate" / "vector_mv_operate" (read-write)
 //     args: see sdk/wire/vector_operate.go — the SAME operate call, wrapped in
 //     [colLen u8][col][id u64][pkLen u16][payloadKey][casPresent u8][?expectedVersion u64][argsLen u32][operateArgs],
-//     applied to the record under a POINT's payload key → [found u8](+[resLen u32][operateResult] if found)
+//     applied to the record under a POINT's payload key → [found u8](+[resLen u32][operateResult][version u64] if found)
 //   - "flush"   (read-write) args: (ignored)                               → empty (wipes the ENTIRE keyspace; broadcast to every shard group in cluster mode)
 //   - "__ping__" (read-only) args: (ignored)                             → empty
 //

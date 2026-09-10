@@ -32,13 +32,21 @@ type OperateRequest struct {
 // version is the point's version AFTER the call: bumped when the op-list
 // applied, and the CURRENT unbumped one when it was a deliberate no-op (a failed
 // CHECK). It is 0 when found is false. Feed it straight into the next call's
-// ExpectedVersion to run a CAS loop without re-reading the point:
+// ExpectedVersion to run a CAS loop without re-reading the point — a re-read is
+// both a round trip and a race, since another writer can land between it and the
+// retry:
 //
 //	found, res, v, err := col.Operate(ctx, OperateRequest{ID: id, PayloadKey: k, Args: a})
-//	// ... on ErrVersionConflict, retry with ExpectedVersion: v, HasExpectedVersion: true
+//	// ... next attempt: ExpectedVersion: v, HasExpectedVersion: true
 //
-// The re-read that would otherwise be needed is both a round trip and a race,
-// since another writer can land between it and the retry.
+// ONLY A CALL THAT RETURNED CARRIES A USABLE VERSION. A call that fails the
+// precondition returns (false, nil, 0, ErrVersionConflict): the server sends no
+// result frame for a refused write, so there is no version in it to report, and
+// 0 is not a placeholder — it is the value that means "expect an ABSENT point",
+// which conflicts again against a live one. After a conflict, retry with the
+// last version this collection handed back if the caller knows no one else
+// writes the point; otherwise re-read it, because the conflict says somebody
+// did.
 //
 // The op is NOT replayable (nonReplayableOp): an ADD applied twice after an
 // ambiguous post-commit transport failure double-counts, so an ambiguous error

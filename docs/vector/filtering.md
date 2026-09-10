@@ -127,9 +127,10 @@ the slice if you need to keep or edit it.
 
 Every write that stores a record value is **validated at ingest** — insert,
 insert-if-absent, upsert, `set_payload`, `overwrite_payload` and the bulk
-paths alike. Bytes no operate engine could open are refused with a 400 before
-anything changes (`vector: record payload value is not a decodable operate
-record`), and so is a record above the 16 MiB storage cap. A mis-encoded `rec`
+paths alike. Bytes no operate engine could open are refused before
+anything changes — HTTP 400, gRPC `InvalidArgument`, or the binary protocol's
+remote error, carrying `vector: record payload value is not a decodable operate
+record` — and so is a record above the 16 MiB storage cap. A mis-encoded `rec`
 is therefore a rejected request, not a stored value that misbehaves later.
 
 ### Path grammar
@@ -359,12 +360,23 @@ record-writing entry point enforces.
 
 ### Clocks and per-key deadlines
 
-The **only** clock any op consults is the applying transaction's stamp, exactly
-as for a KV [`operate`](../kv/overview.md#atomic-multi-field-updates-operate):
-never a wall clock. On an unreplicated or otherwise unstamped apply that stamp
-is `0`, so an unstamped `STAMP` writes `0` — the same caveat the KV page
-records, and with the same consequence for a `MIN_COL`/`MAX_COL` "LRU" column
-built on it.
+The only clock the **op-list** consults is the applying transaction's stamp,
+exactly as for a KV
+[`operate`](../kv/overview.md#atomic-multi-field-updates-operate): `STAMP` and
+everything that reads it never see a wall clock. On an unreplicated or otherwise
+unstamped apply that stamp is `0`, so an unstamped `STAMP` writes `0` — the same
+caveat the KV page records, and with the same consequence for a
+`MIN_COL`/`MAX_COL` "LRU" column built on it.
+
+One gate outside the op-list is **not** covered by that rule, and it is worth
+knowing about: whether the POINT itself is still alive. On an unstamped apply
+that liveness check is judged against the node's wall clock, exactly as
+`set_payload`'s is, so near a point's own TTL expiry two replicas can disagree
+about whether the call applies at all. This is a pre-existing property of every
+unstamped write rather than something specific to `operate` — making record
+mutation disagree with its siblings about whether a point exists would be worse —
+and it goes away when leader apply stamps are enabled. The per-key deadline
+below, which decides the record's own content, IS covered.
 
 The payload key's own **per-key deadline** (set by `set_payload`'s `keyTTLMs`)
 is judged on the same terms. On a **stamped** apply a key whose deadline has
@@ -420,10 +432,16 @@ if err != nil {
 found, res, version, err := posts.Operate(ctx, client.OperateRequest{
     ID: 1, PayloadKey: "session", Args: args,
 })
-// found: false if the point is absent, tombstoned or expired (res is nil then)
+if err != nil {
+    return err
+}
+if !found {
+    return nil // the point is absent, tombstoned or expired; res is nil
+}
 // res.Values[0]: the new "rc", res.Values[1]: the "b" table's row count
 // version: the point's version AFTER the call — feed it to the next call's
-// ExpectedVersion to run a CAS loop without re-reading the point
+// ExpectedVersion to run a CAS loop without re-reading the point. A call that
+// failed with ErrVersionConflict returns 0, not the conflicting version.
 ```
 
 This mirrors `TestVectorOperateAgainstSchemaRecord` (`ops/vector_operate_test.go`):

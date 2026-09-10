@@ -116,17 +116,31 @@ if err != nil { ... }
 found, res, version, err := posts.Operate(ctx, client.OperateRequest{
 	ID: 1, PayloadKey: "session", Args: args,
 })
-// found: false if the point is absent/tombstoned/expired — res is nil then, not an error
-// version: the point's version AFTER the call (0 when found is false)
+if err != nil {
+	return err
+}
+// found: false if the point is absent/tombstoned/expired — res is nil then, not
+// an error. Guard on it before touching res.
+if !found {
+	return nil
+}
 n, err := client.DecodeOperateValue(res.Values[0])
 ```
 
-`version` is what a CAS loop retries with. It is the bumped version when the
-op-list applied and the current, unbumped one when the call was a deliberate
-no-op (a failed `CHECK`), so a caller that hits `ErrVersionConflict` can retry
-with `ExpectedVersion: version, HasExpectedVersion: true` **without re-reading
-the point** — a re-read is both a round trip and a race, since another writer
-can land between it and the retry.
+`version` is the point's version **after** the call, and it is what a CAS loop
+retries with. It is the bumped version when the op-list applied and the current,
+unbumped one when the call was a deliberate no-op (a failed `CHECK`). In both
+cases it can be fed straight into the next call's `ExpectedVersion` **without
+re-reading the point** — a re-read is both a round trip and a race, since another
+writer can land between it and the retry.
+
+Only a call that RETURNED carries a usable version. A call that fails with
+`ErrVersionConflict` returns `version == 0`: the server sends no result frame for
+a refused precondition, and `0` means "expect an absent point", so retrying with
+it conflicts again against a live point. Retry a conflict with the last version
+this collection handed you (from a successful or check-failed call) if you know
+no one else writes the point; otherwise re-read it, because the conflict means
+somebody did.
 
 `Collection.Operate` is **not replayable**: an ambiguous post-commit transport
 failure (the call may or may not have landed) surfaces as an error instead of
