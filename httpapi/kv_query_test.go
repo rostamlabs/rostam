@@ -43,17 +43,11 @@ type kvIndexDispatcher struct {
 	*testDispatcher
 	defs  []wire.KVIndexDef
 	ready []bool
-	// setErr, when non-nil, is returned instead of applying a set — the seam
-	// the error-classification cases use.
-	setErr error
 }
 
 func (d *kvIndexDispatcher) Call(name string, args []byte) ([]byte, error) {
 	switch name {
 	case opKVIndexSet:
-		if d.setErr != nil {
-			return nil, d.setErr
-		}
 		def, err := wire.DecodeKVIndexSetArgs(args)
 		if err != nil {
 			return nil, err
