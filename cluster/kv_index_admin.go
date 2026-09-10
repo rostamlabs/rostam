@@ -51,10 +51,20 @@ const kvIndexSetTimeout = 5 * time.Second
 // answers makes its bit false instead of hanging the call.
 const kvIndexReadyGroupTimeout = 10 * time.Second
 
-// handleSetKVIndex commits one index definition to the meta catalog. Mirrors
-// handleSetCatalog: propose here when this node is the meta leader, otherwise
-// forward the SAME admin op to the leader, whose handler applies it locally and
-// never re-enters the forwarding branch (no loop).
+// handleSetKVIndex applies a FORWARDED index-definition write. Like
+// handleSetCatalog it runs on the meta-Raft leader — the sender selected this
+// node as the leader — so it proposes the entry LOCALLY and never re-enters the
+// forwarding path.
+//
+// It must not call Node.SetKVIndex, whose own leadership check would forward
+// AGAIN. Under a leadership flap that is a chain: A forwards to B, B has just
+// lost leadership and forwards to C, and a stale view can point C back at A —
+// each hop a goroutine parked on a 5 s call, for a write that should have failed
+// fast. Proposing directly makes a mis-addressed forward a clean, immediate
+// hraft.ErrNotLeader that the CALLER re-resolves, exactly as __set_catalog__
+// behaves. It also drops the redundant read-your-writes wait: the leader's Raft
+// Apply has already returned, so its own FSM has applied the entry by
+// construction.
 func (n *Node) handleSetKVIndex(args []byte) ([]byte, error) {
 	if n.meta == nil {
 		return nil, errNoMeta
@@ -63,7 +73,7 @@ func (n *Node) handleSetKVIndex(args []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cluster: %s decode: %w", opKVIndexSetName, err)
 	}
-	return nil, n.SetKVIndex(d, kvIndexSetTimeout)
+	return nil, n.meta.ApplySetKVIndex(d, kvIndexSetTimeout)
 }
 
 // SetKVIndex durably records one KV index definition in the meta-Raft catalog.

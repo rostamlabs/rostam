@@ -241,9 +241,10 @@ func TestSetKVIndexForwardsToMetaLeader(t *testing.T) {
 	}
 
 	d := kvIndexDefFixture("by_age", "u:")
-	// Issue the ADMIN OP (not the Go method) so the op name is exercised end to end.
-	if _, err := follower.Call(opKVIndexSetName, wire.EncodeKVIndexSetArgs(d)); err != nil {
-		t.Fatalf("%s at a follower: %v", opKVIndexSetName, err)
+	// The public entry point at a FOLLOWER: it forwards __kv_index_set__ to the
+	// meta leader, whose handler proposes locally.
+	if err := follower.SetKVIndex(d, 5*time.Second); err != nil {
+		t.Fatalf("SetKVIndex at a follower: %v", err)
 	}
 	// Read-your-writes: the call returned only after THIS node's own FSM applied
 	// it, so no polling is allowed here — the assertion is immediate.
@@ -259,16 +260,57 @@ func TestSetKVIndexForwardsToMetaLeader(t *testing.T) {
 	// A disable through the same path drops it everywhere.
 	off := d
 	off.Enabled = false
-	if _, err := follower.Call(opKVIndexSetName, wire.EncodeKVIndexSetArgs(off)); err != nil {
-		t.Fatalf("%s disable: %v", opKVIndexSetName, err)
+	if err := follower.SetKVIndex(off, 5*time.Second); err != nil {
+		t.Fatalf("SetKVIndex disable: %v", err)
 	}
 	if _, ok := follower.meta.FSM.KVIndexes()["by_age"]; ok {
 		t.Fatal("the follower returned before its own FSM reflected the disable")
 	}
 
 	// A malformed definition is refused at the edge, not committed.
-	if _, err := follower.Call(opKVIndexSetName, []byte{0xff}); err == nil {
+	if _, err := leader.Call(opKVIndexSetName, []byte{0xff}); err == nil {
 		t.Fatal("a malformed __kv_index_set__ frame was accepted")
+	}
+}
+
+// The forwarded op must be a LEAF on the node that receives it: it proposes
+// locally or it fails. A handler that re-entered Node.SetKVIndex would forward
+// again, and under a leadership flap that chain can loop between nodes, each hop
+// holding a goroutine on a 5s call. A mis-addressed forward has to fail fast
+// instead, so the caller re-resolves the leader.
+func TestSetKVIndexHandlerDoesNotForward(t *testing.T) {
+	c := newTestCluster(t, 3, 4)
+
+	leader := metaLeaderNode(t, c)
+	var follower *Node
+	for _, n := range c.nodes {
+		if n != leader && n.meta != nil {
+			follower = n
+			break
+		}
+	}
+	if follower == nil {
+		t.Fatal("no non-leader meta node found")
+	}
+
+	d := kvIndexDefFixture("leafcheck", "u:")
+	_, err := follower.Call(opKVIndexSetName, wire.EncodeKVIndexSetArgs(d))
+	if err == nil {
+		t.Fatal("the follower's handler committed the write — it forwarded instead of proposing locally")
+	}
+	if !errors.Is(err, raft.ErrNotLeader) {
+		t.Fatalf("follower handler error = %v, want a wrap of raft.ErrNotLeader", err)
+	}
+	if _, present := follower.meta.FSM.KVIndexes()["leafcheck"]; present {
+		t.Fatal("a refused forward still reached the catalog")
+	}
+
+	// The same op AT the leader proposes and commits.
+	if _, err := leader.Call(opKVIndexSetName, wire.EncodeKVIndexSetArgs(d)); err != nil {
+		t.Fatalf("%s at the meta leader: %v", opKVIndexSetName, err)
+	}
+	if _, ok := leader.meta.FSM.KVIndexLookup("leafcheck"); !ok {
+		t.Fatal("the leader's handler returned before its own FSM applied the entry")
 	}
 }
 
