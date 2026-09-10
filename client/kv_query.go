@@ -159,6 +159,15 @@ func (c *Client) ListKVIndexes(ctx context.Context) ([]wire.KVIndexDef, []bool, 
 // back would quietly rewrite its request; and LeaderOnly is the right default
 // for a read whose whole point is that the page is a complete answer.
 //
+// THE COST OF ZERO-MEANS-DEFAULT: wire.ConsistencyAnyReplica IS zero, so an
+// any-replica read cannot be asked for through this call — it reads as "the
+// caller did not choose" and becomes LeaderOnly. That is the safe direction (a
+// stale replica silently omitting matching rows is the one failure this feature
+// may not have), and the cheaper read stays available by encoding the args and
+// calling Call("kv_query", …) directly. Giving it a first-class spelling means
+// a pointer field or an explicit "unset" sentinel, which is an API change worth
+// making deliberately rather than as a side effect of this defaulting.
+//
 // When a.Return is wire.KVQueryReturnRecords each row's value is decoded HERE,
 // on the client: the server has already validated that the bytes are a record,
 // and decoding them into a tree is work that does not belong on a node serving
