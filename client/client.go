@@ -583,6 +583,16 @@ func nonReplayableCall(op string, args []byte) bool {
 	if !ok {
 		return true
 	}
+	// A NESTED envelope is non-replayable outright. The server's fanout
+	// dispatcher unwraps the envelope and dispatches whatever is inside, so a
+	// frame wrapping a second envelope eventually reaches some real write, and
+	// this guard cannot see which one without decoding an unbounded chain. This
+	// client never builds a nested frame — wcWire wraps exactly once — so
+	// declining is free, while recursing would let a hand-built frame choose how
+	// much work the classification does.
+	if inner == wire.WCEnvelopeOp {
+		return true
+	}
 	return nonReplayableOp(inner)
 }
 

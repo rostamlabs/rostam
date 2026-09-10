@@ -121,6 +121,15 @@ func TestNonReplayableCallThroughEnvelope(t *testing.T) {
 		{"envelope wrapping vector_mv_operate", wire.WCEnvelopeOp, encodeWCEnvelopeFrame(1, 1, "vector_mv_operate", nil), true},
 		{"envelope wrapping operate", wire.WCEnvelopeOp, encodeWCEnvelopeFrame(1, 1, "operate", nil), true},
 		{"envelope wrapping an idempotent op", wire.WCEnvelopeOp, encodeWCEnvelopeFrame(1, 1, "vector_insert", nil), false},
+		// A NESTED envelope: the fanout dispatcher unwraps and dispatches what
+		// is inside, so the frame still reaches a real write. This client never
+		// builds one, so it is declined rather than followed.
+		{"envelope wrapping another envelope around vector_operate", wire.WCEnvelopeOp,
+			encodeWCEnvelopeFrame(1, 1, wire.WCEnvelopeOp,
+				encodeWCEnvelopeFrame(1, 1, "vector_operate", nil)), true},
+		{"envelope wrapping another envelope around an idempotent op", wire.WCEnvelopeOp,
+			encodeWCEnvelopeFrame(1, 1, wire.WCEnvelopeOp,
+				encodeWCEnvelopeFrame(1, 1, "vector_insert", nil)), true},
 		{"envelope too short for a header", wire.WCEnvelopeOp, []byte{1, 1}, true},
 		{"envelope truncated inside the name", wire.WCEnvelopeOp, []byte{1, 1, 8, 'v', 'e', 'c'}, true},
 		{"empty args under the envelope name", wire.WCEnvelopeOp, nil, true},
@@ -131,5 +140,37 @@ func TestNonReplayableCallThroughEnvelope(t *testing.T) {
 				t.Fatalf("nonReplayableCall(%q) = %v, want %v", tc.op, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestNestedWCEnvelopeNotReplayed is the end-to-end half of the nested case: the
+// server's fanout dispatcher unwraps an envelope and dispatches what is inside,
+// so a doubly-wrapped vector_operate still reaches the real write. Server A takes
+// the request and drops the connection; server B must never be contacted.
+func TestNestedWCEnvelopeNotReplayed(t *testing.T) {
+	var callB atomic.Int32
+	addrA, stopA := startDropAfterReadServer(t, nil)
+	defer stopA()
+	addrB, stopB := startFakeServer(t, func(_ []byte) (uint8, []byte) {
+		callB.Add(1)
+		return StatusOK, []byte{0}
+	})
+	defer stopB()
+
+	c, err := New(Config{Servers: []string{addrA, addrB}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	nested := encodeWCEnvelopeFrame(2, 1, wire.WCEnvelopeOp,
+		encodeWCEnvelopeFrame(2, 1, "vector_operate", []byte("inner-args")))
+	if _, err := c.Call(context.Background(), wire.WCEnvelopeOp, nested); err == nil {
+		t.Fatal("a doubly-wrapped vector_operate returned nil; want an ambiguous transport error")
+	} else if !isAmbiguous(err) {
+		t.Fatalf("err = %v; want an ambiguous (post-transmission) error", err)
+	}
+	if n := callB.Load(); n != 0 {
+		t.Fatalf("server B calls = %d, want 0 (a nested envelope must not replay)", n)
 	}
 }
