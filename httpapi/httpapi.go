@@ -166,12 +166,14 @@ func Handler(disp Dispatcher, opts Options) http.Handler {
 	mux.HandleFunc("POST /v1/kv/flush", a.kvFlush)
 	// KV record search. Fixed, keyless routes under /v1/kv/, like flush.
 	//
-	// A NOTE ON SHADOWING: ServeMux prefers the more specific pattern, so
-	// "GET /v1/kv/indexes" and "DELETE /v1/kv/indexes/{name}" win over
-	// "/v1/kv/{key}" — a KV key literally named "indexes" is no longer readable
-	// or deletable through the {key} route (PUT still reaches it, since no PUT is
-	// registered here). The same carve-out /v1/kv/flush already made, and the
-	// remedy is the same: address such a key over the binary or gRPC transport.
+	// A NOTE ON SHADOWING, and it is narrower than it looks. "/v1/kv/{key}"
+	// matches exactly three path segments, so "DELETE /v1/kv/indexes/{name}"
+	// (four) never competes with it at all. Only "GET /v1/kv/indexes" collides,
+	// and ServeMux prefers the literal over the wildcard: a KV key literally
+	// named "indexes" is no longer READABLE over REST, while PUT and DELETE on
+	// it still reach the {key} route. The same carve-out /v1/kv/flush already
+	// made, and the remedy is the same — address such a key over the binary or
+	// gRPC transport.
 	mux.HandleFunc("POST /v1/kv/query", a.kvQuery)
 	mux.HandleFunc("POST /v1/kv/indexes", a.kvIndexCreate)
 	mux.HandleFunc("GET /v1/kv/indexes", a.kvIndexList)

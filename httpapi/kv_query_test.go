@@ -478,3 +478,38 @@ func newKVQueryTestAPIAuth(t *testing.T, allow func(op string) bool) (http.Handl
 	opts := Options{Authenticator: func(r authz.AuthRequest) bool { return allow(r.Op) }}
 	return Handler(disp, opts), disp, cleanup
 }
+
+// TestHTTPKVIndexRoutesShadowOnlyTheGet pins the exact extent of the route
+// collision documented at the registration site, in both directions.
+//
+// "/v1/kv/{key}" matches three segments, so the four-segment drop route never
+// competed with it; only the literal "GET /v1/kv/indexes" shadows the wildcard.
+// Asserting the NEGATIVE half matters more than the positive: a later refactor
+// that registered PUT or DELETE on /v1/kv/indexes would take a KV key away from
+// callers silently, and nothing else would notice.
+func TestHTTPKVIndexRoutesShadowOnlyTheGet(t *testing.T) {
+	h, _, cleanup := newKVQueryTestAPI(t, 0)
+	defer cleanup()
+
+	// PUT and DELETE on the three-segment path still address the KV key.
+	if rec := do(t, h, "PUT", "/v1/kv/indexes", `{"value":"hi"}`, nil); rec.Code != http.StatusOK {
+		t.Fatalf("PUT /v1/kv/indexes = %d, want 200 — the {key} route must still own it (%s)", rec.Code, rec.Body)
+	}
+	var del struct {
+		Deleted bool `json:"deleted"`
+	}
+	rec := do(t, h, "DELETE", "/v1/kv/indexes", "", &del)
+	if rec.Code != http.StatusOK || !del.Deleted {
+		t.Fatalf("DELETE /v1/kv/indexes = %d deleted=%v, want 200/true (%s)", rec.Code, del.Deleted, rec.Body)
+	}
+
+	// GET is the one that moved: it now answers the catalog, not the key.
+	var list kvIndexListResponse
+	rec = do(t, h, "GET", "/v1/kv/indexes", "", &list)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /v1/kv/indexes = %d, want 200 (%s)", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), `"indexes"`) {
+		t.Fatalf("GET /v1/kv/indexes returned %s, want the catalog listing", rec.Body)
+	}
+}
