@@ -30,9 +30,9 @@ import (
 	"container/heap"
 	"errors"
 	"fmt"
-	"log/slog"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/rostamlabs/rostam/cache"
 	"github.com/rostamlabs/rostam/ops/kvindex"
@@ -140,6 +140,25 @@ const kvQueryPageOverhead = 4 + 2 + (4 + 1 + 2 + 0xFFFF)
 // only a memory bound if keys are small: at the default chunk of 10 000 and the
 // 64 KiB the encoder allows a key, a count bound alone permits 625 MiB.
 const kvQueryScanHeapMaxBytes = 32 << 20
+
+// kvQueryOversizeRows counts the rows this process has emitted WITHOUT their
+// value because the value alone exceeded the page cap (see verifyPage's oversize
+// branch).
+//
+// A COUNTER RATHER THAN A LOG LINE, and the difference is who controls the
+// volume. kv_query is a client-driven read: a caller querying a keyspace with
+// large values can produce this condition on every page of every query, from
+// every connection, for as long as it likes — a log line there is a client with
+// a write handle on the operator's disk. The number is the part an operator
+// acts on ("values are being omitted; fetch those keys with get"), and it is
+// exactly as informative when read once a minute as when printed thousands of
+// times a second.
+var kvQueryOversizeRows atomic.Uint64
+
+// KVQueryOversizeRows reports how many kv_query rows this process has returned
+// with the value omitted because it did not fit a page. Monotonic since start;
+// a rising rate means callers are being handed keys they must fetch with get.
+func KVQueryOversizeRows() uint64 { return kvQueryOversizeRows.Load() }
 
 // handleKVQuery answers one shard group's page of a kv_query.
 func handleKVQuery(tx *TxContext, args []byte) ([]byte, error) {
@@ -436,8 +455,7 @@ func verifyPage(tx *TxContext, idx *kvindex.Set, keys [][]byte, after []byte, pr
 		idx.NoteVerifyMisses(misses)
 	}
 	if oversize > 0 {
-		slog.Warn("kv_query omitted values larger than the page cap; fetch those keys with get",
-			"component", "ops", "op", "kv_query", "shard", group, "rows", oversize, "cap", byteBudget)
+		kvQueryOversizeRows.Add(uint64(oversize)) //nolint:gosec // a count of rows within one page, never negative
 	}
 	// More when the caller already dropped keys, or when this loop stopped
 	// early. i == len(keys) with truncated false is the only complete answer.

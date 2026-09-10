@@ -1048,6 +1048,31 @@ func TestKVQueryOversizeValueDoesNotWedgePaging(t *testing.T) {
 	}
 }
 
+// The omission is COUNTED, not logged. kv_query is a client-driven read: a
+// caller querying a keyspace of large values can hit this on every page of every
+// query from every connection, so a log line there hands a client a write handle
+// on the operator's disk. The number is the part an operator acts on.
+func TestKVQueryOversizeValueIsCounted(t *testing.T) {
+	tx, _, _ := newIndexedTx(t, "rc")
+	seedKV(t, tx, "u:big", kvBigRec(7, 164)) // ~9.6 MiB, over the 8 MiB page cap
+
+	before := KVQueryOversizeRows()
+	rows := pageAllRows(t, tx, wire.KVQueryArgs{Scan: true, Return: wire.KVQueryReturnValues}, 4)
+	if len(rows) != 1 || rows[0].Value != nil {
+		t.Fatalf("fixture: got %d rows, want one with an omitted value", len(rows))
+	}
+	if got := KVQueryOversizeRows() - before; got != 1 {
+		t.Fatalf("the counter moved by %d, want 1 per row emitted without its value", got)
+	}
+
+	// A page with nothing oversized leaves it alone.
+	at := KVQueryOversizeRows()
+	runKVQuery(t, tx, wire.KVQueryArgs{Scan: true, Limit: 1, Return: wire.KVQueryReturnKeys})
+	if now := KVQueryOversizeRows(); now != at {
+		t.Fatalf("a keys-only page moved the counter from %d to %d", at, now)
+	}
+}
+
 func TestKVQueryEmptyValueIsPresentNotOmitted(t *testing.T) {
 	// What makes hasVal = 0 readable as "omitted" in values mode: a zero-length
 	// STORED value encodes as present-and-empty, never as absent. If this ever
