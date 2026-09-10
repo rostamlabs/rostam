@@ -47,12 +47,16 @@ func OperateDuringReshardErr(collection string) error {
 // two in step: the bound is what stops a caller-chosen name from setting the
 // size of an error message, and of the classification scan that reads it.
 func clipOperateName(s string) string {
-	const maxShown = 64
-	if len(s) <= maxShown {
+	if len(s) <= maxClippedNameBytes {
 		return strconv.Quote(s)
 	}
-	return fmt.Sprintf("%s… (%d bytes)", strconv.Quote(s[:maxShown]), len(s))
+	return fmt.Sprintf("%s… (%d bytes)", strconv.Quote(s[:maxClippedNameBytes]), len(s))
 }
+
+// maxClippedNameBytes is the number of SOURCE bytes clipOperateName shows
+// before it truncates. It is shared with isClippedName so the matcher enforces
+// the producer's own bound rather than a second copy of the number.
+const maxClippedNameBytes = 64
 
 // IsOperateDuringReshardMessage reports whether s is the EXACT serialised form
 // of an ErrOperateDuringReshard error — anchored the way
@@ -104,10 +108,22 @@ var operateDuringReshardPrefix = ErrOperateDuringReshard.Error() + ": collection
 // truncated form, after the decimal byte count.
 const clippedNameLengthTail = " bytes)"
 
-// isClippedName reports whether s is exactly what clipOperateName renders: a
-// Go-quoted string, or a Go-quoted 64-byte prefix followed by "… (N bytes)".
-// Anything after that — an internal fault's own trailing context — makes it
-// false, which is what keeps the matcher from leaking an unrelated error.
+// isClippedName reports whether s is exactly what clipOperateName renders, and
+// enforces the producer's own INVARIANTS rather than merely its punctuation:
+//
+//   - untruncated form: a canonical Go-quoted string whose DECODED length is at
+//     most maxClippedNameBytes. clipOperateName only takes this branch for a
+//     name that short, so a longer one is a shape it can never emit.
+//   - truncated form: a canonical Go-quoted prefix of EXACTLY
+//     maxClippedNameBytes decoded bytes, then "… (N bytes)" with N strictly
+//     greater than maxClippedNameBytes — the branch is only taken when the full
+//     name is longer than the prefix it shows.
+//
+// Without the two length rules the matcher accepted forms the producer cannot
+// emit (a 65-byte quoted name with no length tail, a truncated form whose prefix
+// is 63 bytes), which is how an unrelated internal error carrying the fixed
+// refusal prefix could be classified as the retryable refusal and cross the
+// wire verbatim instead of being redacted.
 func isClippedName(s string) bool {
 	if rest, ok := strings.CutSuffix(s, clippedNameLengthTail); ok {
 		i := len(rest)
@@ -117,23 +133,45 @@ func isClippedName(s string) bool {
 		if i == len(rest) {
 			return false // no digits where the byte count belongs
 		}
+		// The count is the FULL source length, which the truncated branch is
+		// only reached for when it exceeds the shown prefix. ParseUint (not
+		// Atoi) so the width does not depend on GOARCH; an overflowing run of
+		// digits is a shape clipOperateName cannot produce either.
+		n, perr := strconv.ParseUint(rest[i:], 10, 64)
+		if perr != nil || n <= maxClippedNameBytes {
+			return false
+		}
 		quoted, ok := strings.CutSuffix(rest[:i], "… (")
 		if !ok {
 			return false
 		}
-		return isGoQuoted(quoted)
+		dec, ok := goQuoted(quoted)
+		return ok && len(dec) == maxClippedNameBytes
 	}
-	return isGoQuoted(s)
+	dec, ok := goQuoted(s)
+	return ok && len(dec) <= maxClippedNameBytes
 }
 
-// isGoQuoted reports whether s is a single, complete strconv.Quote rendering.
-// Unquote does the whole job: it rejects an unterminated quote, a stray trailing
-// byte after the closing quote, and an invalid escape, none of which
-// strconv.Quote can produce.
-func isGoQuoted(s string) bool {
+// goQuoted reports whether s is a CANONICAL strconv.Quote rendering, and
+// returns what it decodes to so the caller can bound the decoded length.
+//
+// Unquote alone is not enough. It accepts renderings strconv.Quote never
+// produces — "\x41" for "A", say, or an escaped character Quote would leave
+// literal — and a matcher that accepted those would be accepting text no
+// producer in this tree can emit. Re-quoting the decoded string and requiring
+// byte equality is the whole canonicality check, and it subsumes Unquote's own
+// rejections (an unterminated quote, a stray byte after the closing quote, an
+// invalid escape).
+func goQuoted(s string) (string, bool) {
 	if len(s) < 2 || s[0] != '"' {
-		return false
+		return "", false
 	}
-	_, err := strconv.Unquote(s)
-	return err == nil
+	dec, err := strconv.Unquote(s)
+	if err != nil {
+		return "", false
+	}
+	if strconv.Quote(dec) != s {
+		return "", false
+	}
+	return dec, true
 }

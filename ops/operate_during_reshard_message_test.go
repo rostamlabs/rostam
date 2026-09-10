@@ -5,16 +5,32 @@ package ops
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 )
 
 // TestIsOperateDuringReshardMessage pins IsOperateDuringReshardMessage against
 // the shapes OperateDuringReshardErr actually produces, and against the class it
-// exists to REJECT: an unrelated internal fault whose message merely contains the
-// refusal text. A bare strings.Contains would accept every case in the reject
-// table, which is the redaction bypass the exact-form matchers were introduced to
-// close.
+// exists to REJECT.
+//
+// Two kinds of rejection are in the table, and they are rejected for different
+// reasons. The first kind is the redaction bypass the exact-form matchers were
+// introduced to close: a message that DOES contain the refusal text — an
+// unrelated internal fault that wrapped it, or the refusal with a fault's own
+// trailing context — which a bare strings.Contains would wave through and this
+// matcher declines because the text is not anchored where the producer puts it.
+// The second kind never contains the sentinel text at all (the empty string, a
+// form with a byte cut off the front) and is rejected by the length bound or the
+// prefix anchor; those rows guard the matcher's edges rather than demonstrating
+// anything about Contains.
+//
+// The rows about the clipped rendering pin clipOperateName's INVARIANTS, not
+// just its punctuation: at most 64 decoded bytes when there is no length tail,
+// and exactly 64 with a count greater than 64 when there is. A quoted name is
+// also required to be CANONICAL — the rendering strconv.Quote itself produces —
+// so a message carrying an equivalent-but-different escape is a shape no
+// producer in this tree can emit.
 func TestIsOperateDuringReshardMessage(t *testing.T) {
 	short := OperateDuringReshardErr("docs").Error()
 	if !strings.HasPrefix(short, ErrOperateDuringReshard.Error()+": collection \"docs\"") {
@@ -28,6 +44,12 @@ func TestIsOperateDuringReshardMessage(t *testing.T) {
 	// A name needing escapes, so the quoted rendering is not a plain identifier.
 	quoted := OperateDuringReshardErr("a\"b\nc").Error()
 
+	// The two boundary names: exactly maxClippedNameBytes takes the untruncated
+	// branch, one more takes the truncated one.
+	atBound := OperateDuringReshardErr(strings.Repeat("c", maxClippedNameBytes)).Error()
+	overBound := OperateDuringReshardErr(strings.Repeat("c", maxClippedNameBytes+1)).Error()
+	prefix := ErrOperateDuringReshard.Error() + ": collection "
+
 	accept := []struct {
 		name string
 		msg  string
@@ -38,6 +60,8 @@ func TestIsOperateDuringReshardMessage(t *testing.T) {
 		{"detailed form, name needing escapes", quoted},
 		{"detailed form re-stringified (simulates decodePBResult)", errors.New(short).Error()},
 		{"clipped form re-stringified (simulates decodePBResult)", errors.New(long).Error()},
+		{"name of exactly the shown-byte bound", atBound},
+		{"name one byte over the bound (shortest truncated form)", overBound},
 	}
 	for _, tc := range accept {
 		t.Run("accept/"+tc.name, func(t *testing.T) {
@@ -69,6 +93,21 @@ func TestIsOperateDuringReshardMessage(t *testing.T) {
 			ErrOperateDuringReshard.Error() + ": collection \"docs\"… ( bytes)"},
 		{"oversize input beyond the length bound",
 			strings.Repeat(short+" ", 64)},
+		// clipOperateName quotes a name this long only WITH a length tail, so an
+		// untruncated form carrying one is a shape it cannot produce.
+		{"quoted name one byte over the bound with no length tail",
+			prefix + strconv.Quote(strings.Repeat("c", maxClippedNameBytes+1))},
+		// The truncated branch always shows exactly the bound's worth of bytes.
+		{"clipped form whose shown prefix is one byte short of the bound",
+			prefix + strconv.Quote(strings.Repeat("c", maxClippedNameBytes-1)) + "… (200 bytes)"},
+		// It is only reached when the full name is LONGER than what it shows.
+		{"clipped form whose byte count equals the bound",
+			prefix + strconv.Quote(strings.Repeat("c", maxClippedNameBytes)) +
+				fmt.Sprintf("… (%d bytes)", maxClippedNameBytes)},
+		// strconv.Quote renders "A" as "A", never as an escape.
+		{"noncanonical escape in the quoted name", prefix + `"\x41"`},
+		{"noncanonical escape in a clipped name's prefix",
+			prefix + `"\x41` + strings.Repeat("c", maxClippedNameBytes-1) + `"… (200 bytes)`},
 	}
 	for _, tc := range reject {
 		t.Run("reject/"+tc.name, func(t *testing.T) {
