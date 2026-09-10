@@ -281,6 +281,13 @@ func (n *Node) registerAdminOps() {
 		// Shard-scoped leg of the KV flush broadcast: proposes a flush to the ONE
 		// group named in its payload and never re-broadcasts. See flush_broadcast.go.
 		opFlushShardName: n.handleFlushShard,
+		// KV record search: the index catalog CRUD (set/list) and the per-group
+		// readiness leaf the list handler gathers. Dispatched by exact name before
+		// any routing, exactly like __set_catalog__; the ready leaf answers for the
+		// ONE group in its payload and never re-broadcasts. See kv_index_admin.go.
+		opKVIndexSetName:   n.handleSetKVIndex,
+		opKVIndexListName:  n.handleListKVIndexes,
+		opKVIndexReadyName: n.handleKVIndexReady,
 		// WASM blob transport: how a node that lacks a module's bytes obtains
 		// them. Both are node-local leaves — the put verifies, compiles and
 		// stores; the get reads the content-addressed store and NOTHING ELSE (no

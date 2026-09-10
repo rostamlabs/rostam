@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 
 	"github.com/hashicorp/raft"
+
+	"github.com/rostamlabs/rostam/sdk/wire"
 )
 
 // MetaFSM is the meta-Raft state machine. Holds cluster-structural
@@ -182,7 +184,55 @@ func (m *MetaFSM) State() State {
 			cp.ShardFormer[k] = v
 		}
 	}
+	cp.KVIndexes = copyKVIndexes(m.state.KVIndexes)
 	return cp
+}
+
+// copyKVIndexes deep-copies a KV index catalog, KeyPrefix bytes included. The
+// byte slice matters: a shallow map copy would hand every caller a slice
+// aliasing live FSM state, and one caller mutating it would silently change
+// what every node believes the definition says. nil in, nil out.
+func copyKVIndexes(src map[string]KVIndexEntry) map[string]KVIndexEntry {
+	if src == nil {
+		return nil
+	}
+	out := make(map[string]KVIndexEntry, len(src))
+	for k, v := range src {
+		v.Def.KeyPrefix = append([]byte(nil), v.Def.KeyPrefix...)
+		out[k] = v
+	}
+	return out
+}
+
+// KVIndexes returns a deep copy of the cluster-wide KV index catalog (name →
+// definition + the meta-log index that installed it) under a single read lock.
+// nil/empty yields an empty (non-nil) map, so callers may range over it
+// unconditionally. This is what the node's index observer reads to decide what
+// to install locally.
+func (m *MetaFSM) KVIndexes() map[string]KVIndexEntry {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make(map[string]KVIndexEntry, len(m.state.KVIndexes))
+	for k, v := range m.state.KVIndexes {
+		v.Def.KeyPrefix = append([]byte(nil), v.Def.KeyPrefix...)
+		out[k] = v
+	}
+	return out
+}
+
+// KVIndexLookup returns one definition from the catalog without copying the
+// whole map — the read-your-writes wait and the coordinator's "is this name in
+// the catalog at all?" check both poll it. nil-safe: a missing entry / nil map
+// yields (zero, false).
+func (m *MetaFSM) KVIndexLookup(name string) (KVIndexEntry, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	e, ok := m.state.KVIndexes[name] // nil map read => (zero, false)
+	if !ok {
+		return KVIndexEntry{}, false
+	}
+	e.Def.KeyPrefix = append([]byte(nil), e.Def.KeyPrefix...)
+	return e, true
 }
 
 // CatalogLookup returns one collection's partition count from the catalog
@@ -520,6 +570,35 @@ func (m *MetaFSM) Apply(log *raft.Log) any {
 				}
 			}
 		}
+		return nil
+	case OpSetKVIndex:
+		// The KV index CATALOG. This apply installs nothing and walks nothing: it
+		// only records what indexes exist. Each node derives its own postings from
+		// this map on its own goroutine (see Node.startKVIndexObserver), because an
+		// O(live-keys) backfill must never run under this FSM write lock.
+		//
+		// Validate here rather than trusting the proposer: the entry may have been
+		// written by an older or newer build, and an unvalidated definition in the
+		// catalog is one every node would have to reject individually forever.
+		if err := entry.KVIndex.Validate(); err != nil {
+			return fmt.Errorf("meta-fsm: kv index: %w", err)
+		}
+		if m.state.KVIndexes == nil {
+			m.state.KVIndexes = make(map[string]KVIndexEntry)
+		}
+		if !entry.KVIndex.Enabled {
+			// Disable == drop. The map stays sparse, so a lookup miss has exactly
+			// one meaning and no node has to distinguish "absent" from "present but
+			// off". Deleting a name that was never there is a clean no-op.
+			delete(m.state.KVIndexes, entry.KVIndex.Name)
+			return nil
+		}
+		// The cap counts NAMES, so updating an existing definition is always
+		// allowed — it takes no new slot. Only a new name can hit the ceiling.
+		if _, exists := m.state.KVIndexes[entry.KVIndex.Name]; !exists && len(m.state.KVIndexes) >= wire.KVIndexMaxDefs {
+			return fmt.Errorf("meta-fsm: kv index: at the %d-definition cap", wire.KVIndexMaxDefs)
+		}
+		m.state.KVIndexes[entry.KVIndex.Name] = KVIndexEntry{Def: entry.KVIndex, MetaIndex: log.Index}
 		return nil
 	case OpSetShardFormer:
 		// WRITE-ONCE designation of the single owner that bootstraps this shard's

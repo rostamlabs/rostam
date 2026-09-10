@@ -618,6 +618,18 @@ func equalState(a, b State) bool {
 			return false
 		}
 	}
+	// KVIndexes must be compared too: without this a snapshot/restore that loses
+	// the KV index catalog would silently pass, and every index in the cluster
+	// would quietly stop being installed after a meta snapshot restore.
+	if len(a.KVIndexes) != len(b.KVIndexes) {
+		return false
+	}
+	for k, v := range a.KVIndexes {
+		o, ok := b.KVIndexes[k]
+		if !ok || o.MetaIndex != v.MetaIndex || !kvIndexDefEqual(o.Def, v.Def) {
+			return false
+		}
+	}
 	// ShardEpoch/ShardPrimary/ShardISR (primary-backup/ISR control plane) must be
 	// compared too so a re-applied identical epoch/ISR is detected and a
 	// snapshot/restore that loses shard-replication state cannot silently pass.

@@ -129,6 +129,27 @@ type Node struct {
 	// before tearing down meta-Raft (which the goroutine uses).
 	pbSeedWg sync.WaitGroup
 
+	// kvIndexStop signals the KV index observer goroutine to exit; kvIndexWg
+	// tracks it so Close waits for it before the shard stores it walks are torn
+	// down. kvIndexStopOnce makes stopKVIndexObserver idempotent, so a test may
+	// freeze the observer and Close may still run its own stop. nil in
+	// single-node mode (no meta catalog to derive definitions from).
+	kvIndexStop     chan struct{}
+	kvIndexWg       sync.WaitGroup
+	kvIndexStopOnce sync.Once
+
+	// KV index counters behind Stats().KVIndex. kvBackfills/kvBackfillKeys record
+	// what the observer's walks have cost; kvIndexRejects counts definitions the
+	// meta FSM accepted that this build cannot parse (see kvIndexDefsFromCatalog).
+	// kvIndexVerifyMisses and kvIndexReconcileDrops belong to the query and
+	// reconcile paths and stay zero until those land; they live here so the whole
+	// KVIndexStats block has one owner.
+	kvBackfills           atomic.Uint64
+	kvBackfillKeys        atomic.Uint64
+	kvIndexRejects        atomic.Uint64
+	kvIndexVerifyMisses   atomic.Uint64
+	kvIndexReconcileDrops atomic.Uint64
+
 	// formationStop signals the shard-formation seeder and driver goroutines to
 	// exit (closed in Close). See cluster/shard_formation.go: these form the Raft
 	// groups whose owner set excludes the -bootstrap node, which nothing else does.
@@ -1076,6 +1097,11 @@ func newMultiNode(cfg Config) (*Node, error) {
 	// still being built. A no-op unless cfg.WASMBlobRetention is set.
 	n.startWASMBlobRetirement()
 
+	// Started LAST, after every construction failure path has been passed: the
+	// observer installs into and walks the shard stores, so it must not be running
+	// over stores a late error is about to close. See startKVIndexObserver.
+	n.startKVIndexObserver()
+
 	return n, nil
 }
 
@@ -1755,6 +1781,7 @@ func (n *Node) Stats() Stats {
 			Skips: n.wasmBlobPushSkips.Load(),
 		},
 		WASMBlobRetire: n.wasmBlobRetireStats(),
+		KVIndex:        n.kvIndexStats(),
 	}
 	for i, s := range n.snapshotShards() {
 		if s == nil {
@@ -1862,6 +1889,9 @@ func (n *Node) Close() error {
 			close(n.pbSeedStop)
 			n.pbSeedWg.Wait()
 		}
+		// Stop the KV index observer before the shards close: it installs into and
+		// walks their caches.
+		n.stopKVIndexObserver()
 		// Stop shard formation before the shards close: the driver calls
 		// BootstrapGroup on them.
 		if n.formationStop != nil {

@@ -6,7 +6,22 @@ import (
 	"bytes"
 	"encoding/gob"
 	"errors"
+
+	"github.com/rostamlabs/rostam/sdk/wire"
 )
+
+// KVIndexEntry is one KV index definition in the meta catalog, paired with the
+// meta-log index of the entry that installed it.
+//
+// MetaIndex is what lets a node tell a RE-ISSUED definition from a stale one:
+// the index set is derived state (never snapshotted, never logged, always
+// rebuilt by walking the cache), so a node carries the index its local Def was
+// built from. It is stamped from raft.Log.Index at apply, so every replica
+// records the same number for the same entry.
+type KVIndexEntry struct {
+	Def       wire.KVIndexDef
+	MetaIndex uint64
+}
 
 // ReshardEntry is one collection's online-reshard state in the meta catalog.
 // Status 0 = Stable (steady), 1 = Resharding (a live repartition is dual-writing
@@ -119,6 +134,20 @@ type State struct {
 	// (includes the primary). A nil map or an absent entry reads as nil (no ISR
 	// set). A new epoch resets this to just {primary} until backups catch up.
 	ShardISR map[int][]string
+	// KVIndexes is the cluster-wide KV index CATALOG: definition name → the
+	// definition and the meta-log index that installed it. Kept separate from
+	// Catalog/Aliases/the PB maps so old gob snapshots (written before KV indexes
+	// existed) still decode: the missing field deserializes to nil, i.e. no index
+	// is defined anywhere.
+	//
+	// This map is the ONLY durable record of a KV index. The postings themselves
+	// are node-local derived state — not snapshotted, not in any WAL, not in any
+	// Raft log — which is exactly why the definition has to live here: a node
+	// re-derives its postings by walking its own cache, and this is what tells it
+	// WHAT to derive. A disabled definition is DELETED rather than stored with
+	// Enabled=false, so the map stays sparse and a lookup miss is the single
+	// meaning of "no such index".
+	KVIndexes map[string]KVIndexEntry
 	// MinISR is the STRUCTURAL durability floor for OpSetShardISR: the FSM refuses
 	// to commit an ISR set smaller than this, so a buggy shrink/grow driver can
 	// never drop a shard below the floor at the FSM level (it is a backstop under
@@ -180,6 +209,7 @@ const (
 	OpSetShardISR       Op = 9  // primary-backup/ISR: set one shard's in-sync replica set
 	OpShardLeaseRenew   Op = 10 // primary-backup failover: a node's batched primary-liveness beacon (inert in the FSM)
 	OpSetShardFormer    Op = 11 // cluster formation: designate the one owner that bootstraps a shard's Raft group
+	OpSetKVIndex        Op = 12 // KV record search: upsert (or, when disabled, drop) one KV index definition
 )
 
 // logBody is the gob payload of a LogEntry (everything after the 1-byte op
@@ -206,6 +236,7 @@ type logBody struct {
 	Node              string           // OpShardLeaseRenew: the beaconing node claiming the LeaseRenew primaries
 	LeaseRenew        []ShardEpochPair // OpShardLeaseRenew: (shard,epoch) pairs the node currently primaries
 	MinISR            int              // OpSetMembers: cluster-wide structural ISR floor (seeded at bootstrap)
+	KVIndex           wire.KVIndexDef  // OpSetKVIndex: the KV index definition to upsert (Enabled=false drops it)
 }
 
 // LogEntry is the wire format of a meta-Raft log entry: 1-byte op tag
@@ -242,6 +273,10 @@ type LogEntry struct {
 	LeaseRenew []ShardEpochPair // (shard,epoch) pairs the node currently primaries
 	// OpSetMembers: cluster-wide structural ISR floor seeded into MetaState at bootstrap.
 	MinISR int
+	// OpSetKVIndex: the KV index definition to upsert into State.KVIndexes. An
+	// entry with Enabled=false DELETES the named definition (see the apply case);
+	// the name is the catalog key, so this one field carries both mutations.
+	KVIndex wire.KVIndexDef
 }
 
 func encodeLogEntry(e LogEntry) ([]byte, error) {
@@ -270,6 +305,7 @@ func encodeLogEntry(e LogEntry) ([]byte, error) {
 		Node:              e.Node,
 		LeaseRenew:        e.LeaseRenew,
 		MinISR:            e.MinISR,
+		KVIndex:           e.KVIndex,
 	}); err != nil {
 		return nil, err
 	}
@@ -305,5 +341,6 @@ func decodeLogEntry(b []byte) (LogEntry, error) {
 	e.Node = body.Node
 	e.LeaseRenew = body.LeaseRenew
 	e.MinISR = body.MinISR
+	e.KVIndex = body.KVIndex
 	return e, nil
 }

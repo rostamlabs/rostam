@@ -30,6 +30,10 @@ type Stats struct {
 	// block is a group that cannot APPLY an entry its log already carries.
 	WASMBlock WASMBlockStats
 
+	// KVIndex reports this node's KV record index: what is installed, what is
+	// usable, and what the derivation has cost.
+	KVIndex KVIndexStats
+
 	// WASMBlobRetire reports the blob retirement sweeper (see
 	// WASMBlobRetireStats). Retention == 0 means retirement is OFF, which is the
 	// default and the only configuration in which nothing can ever be removed.
@@ -102,4 +106,47 @@ type WASMGateStats struct {
 	// present here with a group MISSING is a wedged (op, group) pair — that is
 	// the diagnostic. Freshly allocated per call.
 	ProvenGroups map[string][]int
+}
+
+// KVIndexStats makes the KV record index observable.
+//
+// The index is DERIVED state — never snapshotted, never logged, never
+// replicated — installed from the meta catalog by a per-node polling observer
+// and filled by walking the local cache. That makes almost everything about it
+// invisible from the outside: a definition can be committed cluster-wide and
+// still be doing nothing on this node, and the two reasons for that (still
+// backfilling, or rejected at install) look identical to a client, which just
+// sees queries that do not use the index.
+type KVIndexStats struct {
+	// Definitions is how many distinct index definitions are installed on this
+	// node. It can lag the meta catalog by up to one observe interval, and sits
+	// BELOW it whenever Rejects is climbing.
+	Definitions int
+
+	// Ready is how many of those are ready on EVERY shard group this node hosts.
+	// A definition ready on some groups and building on others is not ready:
+	// answering from it would silently return a proper subset of the matches.
+	Ready int
+
+	// Backfills counts completed definition walks since process start, and
+	// BackfillKeys the cache entries they visited. Both climb on a restart (the
+	// index is rebuilt from the cache every time) and on every new definition.
+	Backfills    uint64
+	BackfillKeys uint64
+
+	// Rejects counts definitions the meta FSM ACCEPTED that this node cannot
+	// build — one per offending definition per install pass, so it keeps climbing
+	// while the definition sits in the catalog. A non-zero value is a standing
+	// misconfiguration (or a version skew): the definition exists cluster-wide and
+	// does nothing here.
+	Rejects uint64
+
+	// VerifyMisses counts candidates whose live re-read did not match — i.e.
+	// stale postings the query path paid a lookup for and discarded. Postings are
+	// hints, so this is a cost, never a wrong answer.
+	VerifyMisses uint64
+
+	// ReconcileDrops counts postings the reconciler removed because their key is
+	// no longer live.
+	ReconcileDrops uint64
 }
