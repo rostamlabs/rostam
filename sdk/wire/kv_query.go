@@ -757,5 +757,19 @@ func DecodeKVQueryCursor(b []byte) ([]KVQueryCont, error) {
 	if n != len(b) {
 		return nil, fmt.Errorf("%w: %d bytes left after the cursor block", ErrKVQueryArgs, len(b)-n)
 	}
+	if len(conts) == 0 {
+		// A well-formed block declaring ZERO continuations means exactly what an
+		// empty input means — no group has more rows — so both spellings decode
+		// to the same nil, and "no continuations" has ONE representation on this
+		// side of the codec.
+		//
+		// Without this the exported pair is ASYMMETRIC, and FuzzDecodeKVQueryCursor
+		// found it in under a second: a zero-count block decoded to an empty
+		// non-nil slice, which EncodeKVQueryCursor then rendered as an empty blob,
+		// which decoded back to nil. Nothing in this system emits a zero-count
+		// block, so no caller loses anything; what is gained is that a cursor's
+		// decoded form always re-encodes to something that decodes back to it.
+		return nil, nil
+	}
 	return conts, nil
 }

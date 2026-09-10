@@ -118,3 +118,70 @@ func FuzzDecodeKVQueryCont(f *testing.F) {
 		}
 	})
 }
+
+// FuzzDecodeKVQueryCursor covers the EXPORTED standalone cursor codec — the one
+// the REST surface hands the outside world as an opaque base64 blob, and the
+// only member of this family a caller can hand back byte for byte.
+//
+// It is a separate target from FuzzDecodeKVQueryCont even though both cover the
+// same block, because the exported pair adds two rules the internal one does
+// not have and which are exactly where a hostile cursor would aim: the length
+// is checked against KVQueryMaxCursorBytes BEFORE any decode, and the block must
+// be consumed EXACTLY, so a cursor that decodes from a prefix of its input and
+// leaves bytes unexamined is refused rather than silently accepted.
+//
+// The properties: never panic, never mutate the input, an empty input is an
+// empty cursor rather than an error, and any accepted cursor re-encodes to bytes
+// that decode back to an identical value.
+func FuzzDecodeKVQueryCursor(f *testing.F) {
+	seed := func(conts []KVQueryCont) {
+		if b, err := EncodeKVQueryCursor(conts); err == nil {
+			f.Add(b)
+		}
+	}
+	seed(nil)
+	seed([]KVQueryCont{{Group: 0, After: nil, More: false}})
+	seed([]KVQueryCont{{Group: 1, After: []byte("u:0000001"), More: true}})
+	seed([]KVQueryCont{
+		{Group: 1, After: []byte("u:0000001"), More: true},
+		{Group: 2, After: []byte("u:0000002"), More: true},
+		{Group: 7, After: nil, More: false},
+	})
+	// A shared-prefix block, which is the shape the LCP factoring produces.
+	seed([]KVQueryCont{
+		{Group: 0, After: []byte("prefix/aaaaaaaa"), More: true},
+		{Group: 1, After: []byte("prefix/bbbbbbbb"), More: true},
+	})
+	f.Add([]byte{})
+	f.Add([]byte{0})
+	f.Add([]byte{0, 1})
+	f.Add([]byte{0xff, 0xff, 0xff})
+
+	f.Fuzz(func(t *testing.T, b []byte) {
+		before := append([]byte(nil), b...)
+		conts, err := DecodeKVQueryCursor(b)
+		if !bytes.Equal(b, before) {
+			t.Fatal("DecodeKVQueryCursor mutated its input")
+		}
+		if err != nil {
+			if len(b) == 0 {
+				t.Fatal("an empty cursor must decode to an empty continuation, not an error")
+			}
+			return
+		}
+		if len(b) == 0 && conts != nil {
+			t.Fatal("an empty cursor must decode to a nil continuation")
+		}
+		b2, err := EncodeKVQueryCursor(conts)
+		if err != nil {
+			t.Fatal("an accepted cursor did not re-encode:", err)
+		}
+		conts2, err := DecodeKVQueryCursor(b2)
+		if err != nil {
+			t.Fatal("re-encoded cursor failed to decode:", err)
+		}
+		if !reflect.DeepEqual(conts, conts2) {
+			t.Fatal("not stable")
+		}
+	})
+}
