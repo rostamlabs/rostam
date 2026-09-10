@@ -126,11 +126,11 @@ func waitMetaLogQuiescent(t *testing.T, n *Node) uint64 {
 	last := n.meta.Raft.LastIndex()
 	for time.Now().Before(deadline) {
 		time.Sleep(300 * time.Millisecond)
-		if cur := n.meta.Raft.LastIndex(); cur == last {
+		cur := n.meta.Raft.LastIndex()
+		if cur == last {
 			return last
-		} else {
-			last = cur
 		}
+		last = cur
 	}
 	t.Fatalf("the meta log never went quiet (last index %d)", last)
 	return 0
