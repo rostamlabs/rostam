@@ -666,8 +666,12 @@ type Selector struct {
 // keys. The caller re-reads each one and re-evaluates the full predicate on
 // the live value, which is what turns the superset back into an exact answer.
 //
-// `after` is EXCLUSIVE; an empty `after` means no cursor. The result is
-// sorted by key and free of duplicates, so a caller can page over it.
+// `after` is EXCLUSIVE, and `resumed` — not the LENGTH of `after` — is what
+// says a cursor was supplied at all. The empty key is a storable KV key, so a
+// page can legitimately end on it and hand back an empty continuation;
+// treating "no bytes" as "no cursor" would re-emit that key on every following
+// page and never advance. The result is sorted by key and free of duplicates,
+// so a caller can page over it.
 //
 // Every posting key the selector unions counts against budget, cursor or no
 // cursor: a set too large to examine is refused on every page rather than
@@ -677,14 +681,14 @@ type Selector struct {
 // The keys are copies taken under RLock and returned with the lock released.
 // The caller reads the cache next, and holding s.mu across a cache read
 // self-deadlocks (package doc, lock order).
-func (s *Set) Candidates(sel Selector, after []byte, budget int) ([][]byte, error) {
+func (s *Set) Candidates(sel Selector, after []byte, resumed bool, budget int) ([][]byte, error) {
 	if err := checkSelector(sel); err != nil {
 		return nil, err
 	}
 	if budget < 0 {
 		budget = 0
 	}
-	out, err := s.collectCandidates(sel, after, budget)
+	out, err := s.collectCandidates(sel, after, resumed, budget)
 	if err != nil {
 		return nil, err
 	}
@@ -719,7 +723,7 @@ func checkSelector(sel Selector) error {
 // collectCandidates does the locked half of Candidates: it charges the budget,
 // copies the matching keys, and releases the lock. The copies are fresh, so
 // nothing the caller holds afterwards points into the index.
-func (s *Set) collectCandidates(sel Selector, after []byte, budget int) ([][]byte, error) {
+func (s *Set) collectCandidates(sel Selector, after []byte, resumed bool, budget int) ([][]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -748,7 +752,7 @@ func (s *Set) collectCandidates(sel Selector, after []byte, budget int) ([][]byt
 	afterStr := string(after)
 	for _, st := range sets {
 		for k := range st {
-			if len(after) > 0 && k <= afterStr {
+			if resumed && k <= afterStr {
 				continue
 			}
 			out = append(out, []byte(k))
@@ -844,6 +848,21 @@ func (p *posting) selectSets(sel Selector, budget int) ([]keySet, int, error) {
 			// No field of any kind satisfies an ordering against a bool, a list,
 			// a geo point or a record (compileOrdering rejects every one), so the
 			// answer is empty without examining anything.
+			return nil, 0, nil
+		}
+		if numeric && bf != bf {
+			// A NaN BOUND IS THE SAME ANSWER FOR A DIFFERENT REASON, and it must
+			// be reached the same way: orderingHoldsFloat is false for every
+			// posting against NaN (IEEE-754 leaves the pair unordered), so the
+			// walk below would examine every distinct value only to admit none.
+			// Charged one unit each, that turns a query that matches nothing into
+			// ErrCandidateBudget on any index with more distinct values than the
+			// budget — a refusal where the honest answer is an empty page.
+			//
+			// It short-circuits to EMPTY rather than declining to drive the index:
+			// declining would fall through to ErrKVQueryScanRequired (or, with
+			// scan consent, a full walk), and "a NaN bound narrows to the empty
+			// set" is the contract docs/kv/querying-records.md states.
 			return nil, 0, nil
 		}
 		for sk, st := range p.vals {

@@ -104,7 +104,7 @@ func keyStrings(keys [][]byte) []string {
 
 func mustCandidates(t *testing.T, s *Set, sel Selector, after []byte, budget int) []string {
 	t.Helper()
-	got, err := s.Candidates(sel, after, budget)
+	got, err := s.Candidates(sel, after, len(after) > 0, budget)
 	if err != nil {
 		t.Fatalf("Candidates: unexpected error: %v", err)
 	}
@@ -391,7 +391,7 @@ func TestCandidatesBudget(t *testing.T) {
 	}
 	sel := Selector{Def: d, Op: vtypes.FilterEq, Values: []vtypes.Value{vtypes.NewInt(1)}}
 
-	got, err := s.Candidates(sel, nil, 5)
+	got, err := s.Candidates(sel, nil, false, 5)
 	if !errors.Is(err, ErrCandidateBudget) {
 		t.Fatalf("budget 5 over 10 keys: err = %v, want ErrCandidateBudget", err)
 	}
@@ -409,7 +409,7 @@ func TestCandidatesBudget(t *testing.T) {
 	// The cursor does NOT lower the cost: keys below it were still examined,
 	// so a set too large to examine is refused on every page, not silently on
 	// the first one only.
-	if _, err := s.Candidates(sel, []byte("k8"), 5); !errors.Is(err, ErrCandidateBudget) {
+	if _, err := s.Candidates(sel, []byte("k8"), true, 5); !errors.Is(err, ErrCandidateBudget) {
 		t.Fatalf("budget with a cursor: err = %v, want ErrCandidateBudget", err)
 	}
 
@@ -418,7 +418,7 @@ func TestCandidatesBudget(t *testing.T) {
 		s.Reindex([]byte(fmt.Sprintf("j%d", i)), intRec("rc", int64(i)))
 	}
 	rsel := Selector{Def: d, Op: vtypes.FilterGte, Values: []vtypes.Value{vtypes.NewInt(0)}}
-	if _, err := s.Candidates(rsel, nil, 5); !errors.Is(err, ErrCandidateBudget) {
+	if _, err := s.Candidates(rsel, nil, false, 5); !errors.Is(err, ErrCandidateBudget) {
 		t.Fatalf("range budget: err = %v, want ErrCandidateBudget", err)
 	}
 }
@@ -429,17 +429,17 @@ func TestCandidatesUnknownAndBuildingIndexes(t *testing.T) {
 	s.Install([]Def{d})
 
 	sel := Selector{Def: d, Op: vtypes.FilterEq, Values: []vtypes.Value{vtypes.NewInt(1)}}
-	if _, err := s.Candidates(sel, nil, bigBudget); !errors.Is(err, ErrIndexBuilding) {
+	if _, err := s.Candidates(sel, nil, false, bigBudget); !errors.Is(err, ErrIndexBuilding) {
 		t.Fatalf("not-ready index: err = %v, want ErrIndexBuilding", err)
 	}
 	s.MarkReady("by-rc")
-	if _, err := s.Candidates(sel, nil, bigBudget); err != nil {
+	if _, err := s.Candidates(sel, nil, false, bigBudget); err != nil {
 		t.Fatalf("ready index: %v", err)
 	}
 
 	missing := sel
 	missing.Def.Name = "nope"
-	if _, err := s.Candidates(missing, nil, bigBudget); !errors.Is(err, ErrNoSuchIndex) {
+	if _, err := s.Candidates(missing, nil, false, bigBudget); !errors.Is(err, ErrNoSuchIndex) {
 		t.Fatalf("unknown index: err = %v, want ErrNoSuchIndex", err)
 	}
 	if s.IsReady("nope") {
@@ -454,7 +454,7 @@ func TestCandidatesUnknownAndBuildingIndexes(t *testing.T) {
 	// anything.
 	bad := sel
 	bad.Op = vtypes.FilterNe
-	if _, err := s.Candidates(bad, nil, bigBudget); err == nil {
+	if _, err := s.Candidates(bad, nil, false, bigBudget); err == nil {
 		t.Fatal("a 'ne' selector was accepted")
 	}
 }
@@ -486,7 +486,7 @@ func TestCandidatesMatchesBruteForce(t *testing.T) {
 				after = []byte(ks.keys[rng.Intn(len(ks.keys))])
 			}
 
-			got, err := s.Candidates(sel, after, bigBudget)
+			got, err := s.Candidates(sel, after, len(after) > 0, bigBudget)
 			if err != nil {
 				t.Fatalf("iter %d q %d: Candidates: %v", iter, q, err)
 			}
@@ -1024,7 +1024,7 @@ func TestCandidatesRejectsAStaleDef(t *testing.T) {
 	s.Reindex([]byte("u:k"), intRec("rc", 1))
 
 	sel := Selector{Def: old, Op: vtypes.FilterEq, Values: []vtypes.Value{vtypes.NewInt(1)}}
-	if _, err := s.Candidates(sel, nil, bigBudget); err != nil {
+	if _, err := s.Candidates(sel, nil, false, bigBudget); err != nil {
 		t.Fatalf("current definition: %v", err)
 	}
 
@@ -1033,7 +1033,7 @@ func TestCandidatesRejectsAStaleDef(t *testing.T) {
 	reissued := old
 	reissued.MetaIndex = 77
 	s.Install([]Def{reissued})
-	if _, err := s.Candidates(sel, nil, bigBudget); err != nil {
+	if _, err := s.Candidates(sel, nil, false, bigBudget); err != nil {
 		t.Fatalf("re-issued identical definition: %v", err)
 	}
 
@@ -1043,7 +1043,7 @@ func TestCandidatesRejectsAStaleDef(t *testing.T) {
 	moved := mustDef(t, "ix", "u:", "sc", wire.KVIndexKindScalar)
 	s.Install([]Def{moved})
 	s.MarkReady("ix")
-	if _, err := s.Candidates(sel, nil, bigBudget); !errors.Is(err, ErrIndexChanged) {
+	if _, err := s.Candidates(sel, nil, false, bigBudget); !errors.Is(err, ErrIndexChanged) {
 		t.Fatalf("moved path: err = %v, want ErrIndexChanged", err)
 	}
 
@@ -1051,7 +1051,7 @@ func TestCandidatesRejectsAStaleDef(t *testing.T) {
 	rescoped := mustDef(t, "ix", "o:", "rc", wire.KVIndexKindScalar)
 	s.Install([]Def{rescoped})
 	s.MarkReady("ix")
-	if _, err := s.Candidates(sel, nil, bigBudget); !errors.Is(err, ErrIndexChanged) {
+	if _, err := s.Candidates(sel, nil, false, bigBudget); !errors.Is(err, ErrIndexChanged) {
 		t.Fatalf("moved prefix: err = %v, want ErrIndexChanged", err)
 	}
 }
@@ -1076,7 +1076,7 @@ func TestCandidatesRangeChargesDistinctValues(t *testing.T) {
 	// Matches NOTHING (every value is >= 0), so no key is ever charged — the
 	// examinations are the whole cost, and they must be refused.
 	empty := Selector{Def: d, Op: vtypes.FilterLt, Values: []vtypes.Value{vtypes.NewInt(0)}}
-	if _, err := s.Candidates(empty, nil, distinct/2); !errors.Is(err, ErrCandidateBudget) {
+	if _, err := s.Candidates(empty, nil, false, distinct/2); !errors.Is(err, ErrCandidateBudget) {
 		t.Fatalf("zero-match range over %d distinct values with budget %d: err = %v, want ErrCandidateBudget",
 			distinct, distinct/2, err)
 	}
@@ -1087,7 +1087,7 @@ func TestCandidatesRangeChargesDistinctValues(t *testing.T) {
 	// A budget that covers the examinations but not the keys they admit is
 	// still a refusal.
 	all := Selector{Def: d, Op: vtypes.FilterGte, Values: []vtypes.Value{vtypes.NewInt(0)}}
-	if _, err := s.Candidates(all, nil, distinct+10); !errors.Is(err, ErrCandidateBudget) {
+	if _, err := s.Candidates(all, nil, false, distinct+10); !errors.Is(err, ErrCandidateBudget) {
 		t.Fatalf("full-match range: err = %v, want ErrCandidateBudget", err)
 	}
 	if got := mustCandidates(t, s, all, nil, 2*distinct); len(got) != distinct {
@@ -1145,7 +1145,7 @@ func TestCandidatesSortsOutsideTheLock(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			start := time.Now()
-			got, err := s.Candidates(sel, nil, 4*n)
+			got, err := s.Candidates(sel, nil, false, 4*n)
 			total = time.Since(start)
 			close(done)
 			if err != nil || len(got) != n {
@@ -1216,7 +1216,7 @@ func TestSetNeverCallsBack(t *testing.T) {
 	s.MarkReady("by-rc")
 	_, _ = s.Stats("by-rc")
 	sel := Selector{Def: d, Op: vtypes.FilterEq, Values: []vtypes.Value{vtypes.NewInt(1)}}
-	if _, err := s.Candidates(sel, nil, bigBudget); err != nil {
+	if _, err := s.Candidates(sel, nil, false, bigBudget); err != nil {
 		t.Fatalf("Candidates: %v", err)
 	}
 	s.Install([]Def{d})
@@ -1256,7 +1256,7 @@ func TestReindexIsRaceFree(t *testing.T) {
 					s.Drop(k)
 				default:
 					sel := Selector{Def: a, Op: vtypes.FilterGte, Values: []vtypes.Value{vtypes.NewInt(int64(rng.Intn(8)))}}
-					if _, err := s.Candidates(sel, nil, bigBudget); err != nil {
+					if _, err := s.Candidates(sel, nil, false, bigBudget); err != nil {
 						t.Errorf("Candidates: %v", err)
 						return
 					}
@@ -1362,7 +1362,7 @@ func BenchmarkCandidatesEq100k(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		got, err := s.Candidates(sel, nil, bigBudget)
+		got, err := s.Candidates(sel, nil, false, bigBudget)
 		if err != nil || len(got) != 100 {
 			b.Fatalf("got %d keys, err %v", len(got), err)
 		}

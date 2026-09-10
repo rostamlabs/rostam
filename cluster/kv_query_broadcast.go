@@ -429,9 +429,14 @@ func mergeKVQuery(parts []wire.KVQueryResult, in []wire.KVQueryCont, limit, maxB
 	usable := make([]int, len(parts))
 	all := make([]sourced, 0, kvQueryRowCount(parts))
 	for g := range parts {
-		after := inAfter[uint32(g)] //nolint:gosec // g indexes parts, which is NumShards long
+		after, resumed := inAfter[uint32(g)] //nolint:gosec // g indexes parts, which is NumShards long
 		for _, row := range parts[g].Rows {
-			if len(after) > 0 && bytes.Compare(row.Key, after) <= 0 {
+			// RESUMED, NOT len(after) > 0. The empty key is a storable KV key, so
+			// a group's continuation can legitimately BE the empty key; reading
+			// that as "no cursor" would let the row it names through again on
+			// every page. The entry's presence in the incoming cursor is the bit
+			// that says this group is resuming. Same rule as ops.contFor.
+			if resumed && bytes.Compare(row.Key, after) <= 0 {
 				continue
 			}
 			usable[g]++
@@ -454,14 +459,34 @@ func mergeKVQuery(parts []wire.KVQueryResult, in []wire.KVQueryCont, limit, maxB
 		if len(res.Rows) >= limit {
 			break
 		}
-		cost := kvQueryRowBytes(s.row)
+		row := s.row
+		cost := kvQueryRowBytes(row)
+		if len(res.Rows) == 0 && cost > budget && row.Value != nil {
+			// OVERSIZE FIRST ROW. The first row of a page is always emitted, so
+			// that paging advances — but the merged frame reserves one
+			// continuation per GROUP, and the leaf that sized this row reserved
+			// only one. With enough groups carrying long keys the merge budget is
+			// the smaller of the two, so a row the leaf sized to fit can push the
+			// merged frame over the cap: EncodeKVQueryResult would then reject the
+			// whole query with NO continuation, and every retry would rebuild the
+			// same page. Every key sorting after it becomes unreachable.
+			//
+			// So the coordinator does exactly what the leaf does with a value too
+			// large for any page: emit the row WITHOUT its value. nil already means
+			// "omitted, larger than the page cap; fetch it with get" on this wire,
+			// so the client reads it the same way whichever layer dropped it, and
+			// it is counted in the same place an operator already watches.
+			row.Value = nil
+			cost = kvQueryRowBytes(row)
+			ops.NoteKVQueryOversizeRow()
+		}
 		if len(res.Rows) > 0 && used+cost > budget {
 			break
 		}
-		res.Rows = append(res.Rows, s.row)
+		res.Rows = append(res.Rows, row)
 		used += cost
 		emitted[s.group]++
-		last[s.group] = s.row.Key
+		last[s.group] = row.Key
 	}
 
 	var cursor []wire.KVQueryCont
@@ -494,7 +519,7 @@ func mergeKVQuery(parts []wire.KVQueryResult, in []wire.KVQueryCont, limit, maxB
 		// got, drop every row as already-seen, and rewrite the same cursor —
 		// paging that never terminates and never advances. Clamping to the
 		// incoming bound costs one comparison and makes that unreachable.
-		if a := inAfter[group]; len(a) > 0 && bytes.Compare(after, a) < 0 {
+		if a, resumed := inAfter[group]; resumed && bytes.Compare(after, a) < 0 {
 			after = a
 		}
 		// Rule 4, reading the More rule 3 just wrote.

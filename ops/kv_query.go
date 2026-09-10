@@ -145,10 +145,18 @@ func kvQueryBudget() KVQueryBudget {
 }
 
 // kvQueryPageOverhead is the room reserved inside wire.KVQueryMaxPageBytes for
-// everything a page carries that is not row payload: the row count, the
-// continuation block, and one 64 KiB key inside it (the encoder's own key cap).
-// Reserving it is what makes "the rows fit" imply "the frame encodes".
-const kvQueryPageOverhead = 4 + 2 + (4 + 1 + 2 + 0xFFFF)
+// everything a page carries that is not row payload: the row count (4), the
+// cursor block's entry count (2) and its prefixLen byte (1), and one whole
+// continuation entry — group, flags, suffix length and a 64 KiB key, the
+// encoder's own key cap. The prefix and the suffix together are that one key,
+// however appendKVQueryCursor splits them, so counting the key once plus the
+// prefixLen byte covers every split. Reserving all of it is what makes "the
+// rows fit" imply "the frame encodes"; leaving the prefixLen byte out made that
+// implication false by exactly one byte, and a page filled to the budget with a
+// near-64 KiB continuation would then be rejected by EncodeKVQueryResult with
+// no continuation at all — the wedge the oversize branch below exists to
+// prevent.
+const kvQueryPageOverhead = 4 + 2 + 1 + (4 + 1 + 2 + 0xFFFF)
 
 // kvQueryScanHeapMaxBytes bounds the KEY BYTES one scan page's chunk heap
 // holds, independently of ScanChunk. ScanChunk bounds the key COUNT, which is
@@ -175,6 +183,18 @@ var kvQueryOversizeRows atomic.Uint64
 // a rising rate means callers are being handed keys they must fetch with get.
 func KVQueryOversizeRows() uint64 { return kvQueryOversizeRows.Load() }
 
+// NoteKVQueryOversizeRow records one row emitted without its value because the
+// value did not fit the page being built.
+//
+// Exported for the CLUSTER COORDINATOR, which is the one other place that has
+// to make this decision: its merged frame reserves a continuation per shard
+// group where a leaf reserves one, so a row the leaf sized to fit can still be
+// too large once merged. Both layers drop the value rather than wedge the
+// query, and an operator watching this number must see both — a coordinator
+// with its own private counter would report zero on exactly the deployment
+// (many groups, long keys) where the condition is reachable.
+func NoteKVQueryOversizeRow() { kvQueryOversizeRows.Add(1) }
+
 // handleKVQuery answers one shard group's page of a kv_query.
 func handleKVQuery(tx *TxContext, args []byte) ([]byte, error) {
 	a, err := wire.DecodeKVQueryArgs(args)
@@ -186,7 +206,7 @@ func handleKVQuery(tx *TxContext, args []byte) ([]byte, error) {
 		return nil, ErrKVIndexUnavailable
 	}
 	group := kvQueryGroup(tx)
-	after := contFor(a.Cursor, group)
+	after, resumed := contFor(a.Cursor, group)
 
 	// Compiled BEFORE any candidate work: a filter this leaf will not accept is
 	// a query error, and finding that out after walking the keyspace would be
@@ -200,10 +220,10 @@ func handleKVQuery(tx *TxContext, args []byte) ([]byte, error) {
 	if a.Index == "" {
 		// The decoder already rejected index == "" && !scan, so this is a
 		// consented scan and nothing else.
-		return scanPage(tx, tx.Walker(), after, pred, a, group, b)
+		return scanPage(tx, tx.Walker(), after, resumed, pred, a, group, b)
 	}
 
-	cands, err := kvQueryCandidates(idx, a, after, group, b)
+	cands, err := kvQueryCandidates(idx, a, after, resumed, group, b)
 	switch {
 	case errors.Is(err, errKVQuerySelectorless):
 		// The index exists and is ready, but no leaf of this filter can drive
@@ -212,11 +232,11 @@ func handleKVQuery(tx *TxContext, args []byte) ([]byte, error) {
 		if !a.Scan {
 			return nil, ErrKVQueryScanRequired
 		}
-		return scanPage(tx, tx.Walker(), after, pred, a, group, b)
+		return scanPage(tx, tx.Walker(), after, resumed, pred, a, group, b)
 	case err != nil:
 		return nil, err
 	}
-	return verifyPage(tx, idx, cands, after, pred, a, group, false)
+	return verifyPage(tx, idx, cands, after, resumed, pred, a, group, false)
 }
 
 // errKVQuerySelectorless is internal: it reports "the index is usable but this
@@ -321,7 +341,7 @@ func kvQueryIsShardNumber(s string) bool {
 // never do is fall through to a scan — that would silently turn a cheap query
 // into a full walk the caller never consented to — or leak ErrIndexChanged,
 // which says nothing actionable to a client.
-func kvQueryCandidates(idx *kvindex.Set, a wire.KVQueryArgs, after []byte, group uint32, b KVQueryBudget) ([][]byte, error) {
+func kvQueryCandidates(idx *kvindex.Set, a wire.KVQueryArgs, after []byte, resumed bool, group uint32, b KVQueryBudget) ([][]byte, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		def, ok := idx.Lookup(a.Index)
 		if !ok {
@@ -341,7 +361,7 @@ func kvQueryCandidates(idx *kvindex.Set, a wire.KVQueryArgs, after []byte, group
 		if !ok {
 			return nil, errKVQuerySelectorless
 		}
-		cands, err := idx.Candidates(sel, after, b.Candidates)
+		cands, err := idx.Candidates(sel, after, resumed, b.Candidates)
 		if err == nil {
 			// SORTED HERE, not merely assumed. Candidates already returns a
 			// sorted set, but ascending key order IS this leaf's contract, so it
@@ -374,9 +394,17 @@ func kvQueryGroup(tx *TxContext) uint32 {
 	return uint32(i) //nolint:gosec // non-negative, and bounded by the node's shard count
 }
 
-// contFor returns the exclusive resume key this group's cursor carries, or nil
-// when the cursor does not mention this group (a first page, or a group that
-// finished on an earlier one).
+// contFor returns the exclusive resume key this group's cursor carries, and
+// whether the cursor mentions this group at all — false on a first page, or for
+// a group that finished on an earlier one.
+//
+// RESUMPTION IS THE ENTRY'S PRESENCE, NEVER len(After). The empty key is a
+// storable KV key (cache.Put and wire.DecodePutArgs both accept it), so a page
+// whose last emitted row is the empty key hands back a continuation whose After
+// is legitimately empty. Reading "no bytes" as "no cursor" would make the next
+// page re-examine and re-emit that key, and with a limit of 1 the query would
+// page forever without advancing. The presence of the entry carries the bit, so
+// nothing on the wire has to change.
 //
 // The cursor is in strictly increasing Group order — DecodeKVQueryArgs enforces
 // it — so this is a binary search rather than a scan over up to 4096 entries.
@@ -385,12 +413,12 @@ func kvQueryGroup(tx *TxContext) uint32 {
 // and reading it as "this group is finished" would make the page's contents
 // depend on a flag the caller can set freely. After is the only thing that
 // changes what this page contains.
-func contFor(conts []wire.KVQueryCont, group uint32) []byte {
+func contFor(conts []wire.KVQueryCont, group uint32) (after []byte, resumed bool) {
 	i := sort.Search(len(conts), func(i int) bool { return conts[i].Group >= group })
 	if i < len(conts) && conts[i].Group == group {
-		return conts[i].After
+		return conts[i].After, true
 	}
-	return nil
+	return nil, false
 }
 
 // verifyPage is the shared verify-and-emit step: it re-reads each candidate in
@@ -418,7 +446,7 @@ func contFor(conts []wire.KVQueryCont, group uint32) []byte {
 // A row whose value is too large for any page is emitted WITHOUT the value
 // rather than dropped (see the oversize branch): a kv_query page caps at 8 MiB
 // while a cache value may be up to the 16 MiB page size.
-func verifyPage(tx *TxContext, idx *kvindex.Set, keys [][]byte, after []byte, pred vector.Predicate, a wire.KVQueryArgs, group uint32, truncated bool) ([]byte, error) {
+func verifyPage(tx *TxContext, idx *kvindex.Set, keys [][]byte, after []byte, resumed bool, pred vector.Predicate, a wire.KVQueryArgs, group uint32, truncated bool) ([]byte, error) {
 	// DecodeKVQueryArgs already refuses a limit outside 1..KVQueryMaxLimit, so
 	// this clamp is defence in depth against a future caller that builds args
 	// by hand: a limit of 0 emits no row, so the continuation never advances
@@ -459,7 +487,7 @@ func verifyPage(tx *TxContext, idx *kvindex.Set, keys [][]byte, after []byte, pr
 		// would then re-request a page it has already seen, forever. Skipping it
 		// without touching `cont` leaves the continuation monotonic whatever the
 		// producer did.
-		if len(after) > 0 && bytes.Compare(k, after) <= 0 {
+		if resumed && bytes.Compare(k, after) <= 0 {
 			continue
 		}
 		v, err := tx.Get(k)
@@ -582,7 +610,7 @@ func verifyPage(tx *TxContext, idx *kvindex.Set, keys [][]byte, after []byte, pr
 // there. A keyspace of any size below the scan budget therefore pages to
 // completion in about ceil(n / ScanChunk) pages, each costing one full walk —
 // quadratic, and honestly so. Use an index.
-func scanPage(tx *TxContext, walk kvindex.Walker, after []byte, pred vector.Predicate, a wire.KVQueryArgs, group uint32, b KVQueryBudget) ([]byte, error) {
+func scanPage(tx *TxContext, walk kvindex.Walker, after []byte, resumed bool, pred vector.Predicate, a wire.KVQueryArgs, group uint32, b KVQueryBudget) ([]byte, error) {
 	h := &kvKeyHeap{max: b.ScanChunk, maxBytes: kvQueryScanHeapMaxBytes}
 	visited := 0
 	overBudget := false
@@ -597,7 +625,7 @@ func scanPage(tx *TxContext, walk kvindex.Walker, after []byte, pred vector.Pred
 			overBudget = true
 			return false
 		}
-		if len(after) > 0 && bytes.Compare(key, after) <= 0 {
+		if resumed && bytes.Compare(key, after) <= 0 {
 			return true
 		}
 		if !h.offer(key) {
@@ -616,7 +644,7 @@ func scanPage(tx *TxContext, walk kvindex.Walker, after []byte, pred vector.Pred
 	}
 	// idx is nil: a key that vanished between the walk and the re-read is not a
 	// stale posting, so it is not charged to the index's staleness counter.
-	return verifyPage(tx, nil, h.ascending(), after, pred, a, group, dropped)
+	return verifyPage(tx, nil, h.ascending(), after, resumed, pred, a, group, dropped)
 }
 
 // kvKeyHeap is the bounded MAX-heap scanPage carries a chunk in: it holds the

@@ -90,7 +90,7 @@ func recCandidates(t *testing.T, idx *kvindex.Set, v int64) []string {
 		Def:    d,
 		Op:     vtypes.FilterEq,
 		Values: []vtypes.Value{vtypes.NewInt(v)},
-	}, nil, 1<<20)
+	}, nil, false, 1<<20)
 	if err != nil {
 		t.Fatalf("Candidates: %v", err)
 	}

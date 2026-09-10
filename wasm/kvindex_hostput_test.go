@@ -69,7 +69,7 @@ func TestWASMHostPutMaintainsKVIndex(t *testing.T) {
 
 	keys, err := idx.Candidates(kvindex.Selector{
 		Def: def, Op: vtypes.FilterEq, Values: []vtypes.Value{vtypes.NewInt(5)},
-	}, nil, 1<<20)
+	}, nil, false, 1<<20)
 	if err != nil {
 		t.Fatalf("Candidates: %v", err)
 	}

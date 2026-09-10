@@ -119,7 +119,7 @@ func kvindexCandidates(idx *kvindex.Set, d kvindex.Def, v int64) ([][]byte, erro
 		Def:    d,
 		Op:     vtypes.FilterEq,
 		Values: []vtypes.Value{vtypes.NewInt(v)},
-	}, nil, 1<<20)
+	}, nil, false, 1<<20)
 }
 
 func wantPosted(t *testing.T, idx *kvindex.Set, v int64, want ...string) {

@@ -248,7 +248,7 @@ func kvTwinIsCandidate(t *testing.T, set *kvindex.Set, key string, op vtypes.Fil
 			return false
 		}
 	}
-	cands, err := set.Candidates(kvindex.Selector{Def: def, Op: op, Values: values}, nil, 1<<20)
+	cands, err := set.Candidates(kvindex.Selector{Def: def, Op: op, Values: values}, nil, false, 1<<20)
 	if err != nil {
 		t.Fatalf("Candidates(%s): %v", kvOpName(op), err)
 	}

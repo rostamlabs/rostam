@@ -197,7 +197,7 @@ func TestDropReconciledRechecksReverseMap(t *testing.T) {
 				Def:    d,
 				Op:     vtypes.FilterEq,
 				Values: []vtypes.Value{vtypes.NewInt(tc.reAdd)},
-			}, nil, 100)
+			}, nil, false, 100)
 			if err != nil {
 				t.Fatalf("Candidates: %v", err)
 			}

@@ -366,7 +366,7 @@ func TestKVIndexObserverInstallsAndBackfills(t *testing.T) {
 	}
 	for v := 0; v < 5; v++ {
 		sel := kvindex.Selector{Def: d, Op: vtypes.FilterEq, Values: []vtypes.Value{vtypes.NewInt(int64(v))}}
-		cands, err := idx.Candidates(sel, nil, 1<<20)
+		cands, err := idx.Candidates(sel, nil, false, 1<<20)
 		if err != nil {
 			t.Fatalf("Candidates(%d): %v", v, err)
 		}

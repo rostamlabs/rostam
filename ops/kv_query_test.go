@@ -534,7 +534,7 @@ func TestKVQueryScanWalkErrorIsRetryable(t *testing.T) {
 		fn([]byte("u:a"), kvRec(7, "gold")) // some progress, then the failure
 		return closed
 	})
-	out, err := scanPage(tx, walk, nil, nil, wire.KVQueryArgs{Scan: true, Limit: 10}, 0, kvQueryBudget())
+	out, err := scanPage(tx, walk, nil, false, nil, wire.KVQueryArgs{Scan: true, Limit: 10}, 0, kvQueryBudget())
 	if out != nil {
 		t.Fatalf("a failed walk must yield no page, got %d bytes", len(out))
 	}
@@ -560,7 +560,7 @@ func TestKVQueryScanWalkAbortedIsRetryable(t *testing.T) {
 		fn([]byte("u:a"), kvRec(7, "gold"))
 		return kvindex.ErrWalkAborted
 	})
-	out, err := scanPage(tx, walk, nil, nil, wire.KVQueryArgs{Scan: true, Limit: 10}, 0, kvQueryBudget())
+	out, err := scanPage(tx, walk, nil, false, nil, wire.KVQueryArgs{Scan: true, Limit: 10}, 0, kvQueryBudget())
 	if out != nil {
 		t.Fatalf("an aborted walk must yield no page, got %d bytes", len(out))
 	}
@@ -1145,7 +1145,7 @@ func TestKVQueryVerifyPageIgnoresKeysAtOrBelowTheCursor(t *testing.T) {
 	}
 	keys := [][]byte{[]byte("u:a"), []byte("u:b"), []byte("u:c")}
 
-	out, err := verifyPage(tx, nil, keys, []byte("u:b"), nil, wire.KVQueryArgs{Limit: 10}, 0, false)
+	out, err := verifyPage(tx, nil, keys, []byte("u:b"), true, nil, wire.KVQueryArgs{Limit: 10}, 0, false)
 	if err != nil {
 		t.Fatalf("verifyPage: %v", err)
 	}
@@ -1159,7 +1159,7 @@ func TestKVQueryVerifyPageIgnoresKeysAtOrBelowTheCursor(t *testing.T) {
 
 	// And a page made ENTIRELY of such keys reports no progress rather than a
 	// continuation that walks backwards.
-	out, err = verifyPage(tx, nil, keys[:2], []byte("u:b"), nil, wire.KVQueryArgs{Limit: 10}, 0, false)
+	out, err = verifyPage(tx, nil, keys[:2], []byte("u:b"), true, nil, wire.KVQueryArgs{Limit: 10}, 0, false)
 	if err != nil {
 		t.Fatalf("verifyPage: %v", err)
 	}

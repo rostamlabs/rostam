@@ -208,7 +208,7 @@ func TestReconcileLeavesLiveKeysAlone(t *testing.T) {
 		Def:    d,
 		Op:     vtypes.FilterEq,
 		Values: []vtypes.Value{vtypes.NewInt(7)},
-	}, nil, 1<<20)
+	}, nil, false, 1<<20)
 	if err != nil {
 		t.Fatalf("Candidates: %v", err)
 	}
