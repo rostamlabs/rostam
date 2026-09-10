@@ -126,10 +126,10 @@ func (n *Node) broadcastKVQuery(args []byte) ([]byte, error) {
 	}
 	ask := kvQueryTargets(a.Cursor, n.cfg.NumShards)
 
-	results, errs := n.forEachGroup(kvQueryGroupTimeout, func(ctx context.Context, group int) ([]byte, error) {
-		if !ask[group] {
-			return nil, nil
-		}
+	// Only the groups that can still contribute get a leg: a finished group is
+	// skipped BEFORE a goroutine, a context and a timer are spent on it, which on
+	// a long paging run is most of them.
+	results, errs := n.forEachGroupIn(ask, kvQueryGroupTimeout, func(ctx context.Context, group int) ([]byte, error) {
 		if kvQueryLegHook != nil {
 			kvQueryLegHook(group)
 		}
@@ -373,9 +373,10 @@ func checkKVQueryCursorFits(conts []wire.KVQueryCont) error {
 // the page cap; fetch it with get", a zero-length one means "present and empty".
 // Rows are carried through by value and never rebuilt, so the two stay distinct.
 func mergeKVQuery(parts []wire.KVQueryResult, in []wire.KVQueryCont, limit, maxBytes int) wire.KVQueryResult {
-	if limit < 1 {
-		limit = 1 // a limit of 0 emits nothing, so the cursor never advances
-	}
+	// limit is 1..KVQueryMaxLimit by the time it gets here: DecodeKVQueryArgs
+	// refuses anything outside that range, so there is no clamp to make. A zero
+	// would emit no row, leave every continuation where it was, and page forever
+	// — which is why the decoder, not this function, is where it is caught.
 	inAfter := make(map[uint32][]byte, len(in))
 	for _, c := range in {
 		inAfter[c.Group] = c.After

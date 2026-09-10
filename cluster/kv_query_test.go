@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -206,10 +207,26 @@ func TestKVQueryFanOutIsParallel(t *testing.T) {
 	}
 	waitKVIndexReadyEverywhere(t, tc, 1)
 
-	var legs atomic.Int32
+	// THE ASSERTION IS CONCURRENCY, NOT WALL TIME. Every leg parks in the hook
+	// for the same interval, so if they run together the peak count of legs
+	// inside it reaches the shard count; if they run in sequence it never
+	// exceeds one. That holds however oversubscribed the box is, which a
+	// wall-clock bound does not — a loaded machine can stretch six 200 ms sleeps
+	// past any margin tight enough to be worth asserting.
+	var mu sync.Mutex
+	var inFlight, peak, legs int
 	kvQueryLegHook = func(int) {
-		legs.Add(1)
+		mu.Lock()
+		legs++
+		inFlight++
+		if inFlight > peak {
+			peak = inFlight
+		}
+		mu.Unlock()
 		time.Sleep(delay)
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
 	}
 	t.Cleanup(func() { kvQueryLegHook = nil })
 
@@ -219,11 +236,57 @@ func TestKVQueryFanOutIsParallel(t *testing.T) {
 	}
 	elapsed := time.Since(began)
 
-	if got := legs.Load(); got != shards {
-		t.Fatalf("%d legs ran, want one per shard group (%d)", got, shards)
+	mu.Lock()
+	gotLegs, gotPeak := legs, peak
+	mu.Unlock()
+	if gotLegs != shards {
+		t.Fatalf("%d legs ran, want one per shard group (%d)", gotLegs, shards)
 	}
-	if elapsed >= 2*delay {
-		t.Fatalf("a %d-group fan-out with a %s delay per leg took %s; the legs are running in sequence", shards, delay, elapsed)
+	if gotPeak != shards {
+		t.Fatalf("at most %d legs were ever in flight at once, want all %d — the fan-out is not parallel", gotPeak, shards)
+	}
+	// A generous corroborating bound: sequential would be at least shards x
+	// delay, and this is well under half of it even on a busy box.
+	if elapsed >= shards*delay/2 {
+		t.Fatalf("a %d-group fan-out with a %s delay per leg took %s", shards, delay, elapsed)
+	}
+}
+
+// A group the cursor has dropped is not asked again — and it does not even cost
+// a goroutine, a context and a timer to decide that. The leg is skipped before
+// the fan-out spawns it.
+func TestKVQueryFinishedGroupsGetNoLeg(t *testing.T) {
+	const shards = 4
+	tc := newTestCluster(t, 1, shards)
+	n := tc.nodes[0]
+
+	seedKVIndexRecords(t, n, "u:", 0, 40)
+	if err := n.SetKVIndex(kvIndexDefFixture("by_age", "u:"), 5*time.Second); err != nil {
+		t.Fatalf("SetKVIndex: %v", err)
+	}
+	waitKVIndexReadyEverywhere(t, tc, 1)
+
+	var mu sync.Mutex
+	asked := map[int]int{}
+	kvQueryLegHook = func(group int) {
+		mu.Lock()
+		asked[group]++
+		mu.Unlock()
+	}
+	t.Cleanup(func() { kvQueryLegHook = nil })
+
+	// A cursor naming ONE group: every other group answered in full on an
+	// earlier page and must not be touched.
+	if _, err := kvQueryCall(t, n, wire.KVQueryArgs{
+		Index: "by_age", Filter: kvQueryAll(), Limit: 10,
+		Cursor: []wire.KVQueryCont{{Group: 2, More: true}},
+	}); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(asked) != 1 || asked[2] != 1 {
+		t.Fatalf("legs ran for %v, want only group 2 — a finished group was asked again", asked)
 	}
 }
 

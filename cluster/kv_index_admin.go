@@ -394,10 +394,27 @@ func decodeKVIndexReadyReply(b []byte, want int) ([]bool, error) {
 // order the legs completed in, and both slices are always NumShards long. A
 // timeout <= 0 means no bound.
 func (n *Node) forEachGroup(timeout time.Duration, fn func(ctx context.Context, group int) ([]byte, error)) ([][]byte, []error) {
+	return n.forEachGroupIn(nil, timeout, fn)
+}
+
+// forEachGroupIn is forEachGroup restricted to the groups `visit` marks true —
+// nil meaning every group, which is forEachGroup itself.
+//
+// It exists because the kv_query fan-out stops asking a group once that group
+// has answered in full, and on a long paging run most groups are finished: a
+// pass that spawned a goroutine, a context and a timer for each of them, only
+// for its fn to return immediately, would pay per page for work it has already
+// decided not to do. Results stay positional and NumShards long whatever is
+// visited, so a skipped group reads as the zero value — which is what "asked
+// nothing, heard nothing" should look like.
+func (n *Node) forEachGroupIn(visit []bool, timeout time.Duration, fn func(ctx context.Context, group int) ([]byte, error)) ([][]byte, []error) {
 	results := make([][]byte, n.cfg.NumShards)
 	errs := make([]error, n.cfg.NumShards)
 	var wg sync.WaitGroup
 	for g := 0; g < n.cfg.NumShards; g++ {
+		if visit != nil && (g >= len(visit) || !visit[g]) {
+			continue
+		}
 		wg.Add(1)
 		go func(g int) {
 			defer wg.Done()
