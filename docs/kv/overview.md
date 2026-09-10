@@ -16,6 +16,19 @@ rather than for hot-path use: `GET`/`PUT`/`DELETE /v1/kv/{key}`,
 endpoints. The Python client's `r.kv` is not one of them — it raises
 `TransportError` on an `http://`-connected client.
 
+!!! warning "Three key names are shadowed over REST, and only over REST"
+
+    The keyless routes are literal paths under the same three-segment prefix the
+    single-key routes use, so `ServeMux` prefers them over `{key}`. A key
+    literally named **`flush`** is therefore not writable by `POST` over REST, and
+    keys named **`query`** and **`indexes`** are not reachable by `POST` and `GET`
+    respectively. The other methods on those keys still work, which means REST can
+    create a key it cannot read back.
+
+    This affects the HTTP surface only. The binary and gRPC transports address
+    keys by value with no path grammar at all, so every one of these keys is fully
+    readable and writable there — which is the remedy if you need such a name.
+
 ## Core operations
 
 === "Go"
