@@ -276,7 +276,8 @@ var adminOps = map[string]struct{}{
 // schema-shaped operation, so it keeps the admin bar. The split is what lets an
 // operator hand a read-scoped key enough to poll "is my index ready yet"
 // without handing it the ability to delete one. Both halves are pinned by
-// TestKVIndexListIsARead / TestKVIndexSetStaysAdmin.
+// TestKVIndexListIsARead and TestActionForKVIndexOpsIsAdmin, and the RBAC
+// consequence by TestRBACKVIndexListAllowsReadScope.
 //
 // The readiness gather this exposes is BOUNDED, which is the precondition for
 // the demotion: the list op takes no arguments at all
