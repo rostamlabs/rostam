@@ -178,10 +178,22 @@ func (req *kvQueryReq) toWire(w http.ResponseWriter) (wire.KVQueryArgs, bool) {
 	}
 	// The cursor is opaque to the caller, so a malformed one is a client mistake
 	// with an obvious remedy (send back what the last page returned, unedited) —
-	// never a 500. Both halves are checked: base64 first, then the block itself,
-	// which is bounded and shape-checked before anything is allocated from it.
+	// never a 500. Three checks, in this order, and the ORDER IS THE POINT.
+	//
+	// The length is checked FIRST, on the ENCODED string. DecodeKVQueryCursor
+	// enforces the 4 MiB cap, but only on bytes it has already been handed, and
+	// base64.DecodeString allocates the whole decoded blob before returning — so
+	// checking the cap after the decode means a caller can make this process
+	// materialize an arbitrarily large buffer (bounded only by maxJSONBody, 32
+	// MiB) for a cursor that is then rejected for being too big. Comparing
+	// against EncodedLen(cap) refuses it before a byte is allocated.
 	var conts []wire.KVQueryCont
 	if req.Cursor != "" {
+		if maxEncoded := base64.StdEncoding.EncodedLen(wire.KVQueryMaxCursorBytes); len(req.Cursor) > maxEncoded {
+			writeError(w, http.StatusBadRequest,
+				"cursor is too large: "+strconv.Itoa(len(req.Cursor))+" encoded bytes exceeds the cap of "+strconv.Itoa(maxEncoded))
+			return wire.KVQueryArgs{}, false
+		}
 		blob, berr := base64.StdEncoding.DecodeString(req.Cursor)
 		if berr != nil {
 			writeError(w, http.StatusBadRequest, "cursor is not valid base64: "+berr.Error())
@@ -291,11 +303,15 @@ var (
 // kvIndexCreate answers POST /v1/kv/indexes: define (or redefine) one KV record
 // index cluster-wide.
 //
-// It is dispatched through callWrite, like kvFlush, so authz classifies it
-// ActionWrite against the EMPTY resource — the global-write bar, which is right
-// for cluster-wide state that no per-collection scope can describe. (The
-// underlying admin op is itself pinned at admin in authz.adminOps; the two are
-// not in conflict — the authorizer takes the higher bar.)
+// It is dispatched through callWrite, like kvFlush, so it takes the write path's
+// shape (and its optional write-consistency envelope) rather than the read
+// path's. The AUTHORIZATION BAR IS HIGHER THAN callWrite”'s NAME SUGGESTS, and
+// deliberately so: authz.actionFor consults adminOps FIRST and __kv_index_set__
+// is enumerated there, so this endpoint requires an ADMIN key — not merely the
+// global-write bar flush settles for. Dropping an index makes every query naming
+// it start failing at once and re-creating it costs a full cache walk on every
+// node, which is schema-shaped rather than data-shaped. Pinned by
+// authz.TestActionForKVIndexOpsIsAdmin.
 //
 // The definition is validated HERE, before dispatch. wire.AppendKVIndexDef is
 // the trusting side of the codec — it writes u8 length prefixes without checking

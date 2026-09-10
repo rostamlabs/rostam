@@ -563,3 +563,49 @@ func TestHTTPNonKVQueryStatusesUnchanged(t *testing.T) {
 		})
 	}
 }
+
+// TestHTTPKVQueryCursorCapIsCheckedBeforeDecoding pins the ORDER of the cursor
+// checks, which is the whole substance of the cap at this edge.
+//
+// wire.DecodeKVQueryCursor enforces the 4 MiB cap, but only on bytes it has
+// already been handed, and base64.DecodeString materializes the entire decoded
+// blob before returning. Checking the cap only after the decode therefore lets a
+// caller make this process allocate a multi-megabyte buffer for a cursor it is
+// about to reject — bounded solely by maxJSONBody. The 400 must come from the
+// ENCODED length, before a byte is allocated.
+func TestHTTPKVQueryCursorCapIsCheckedBeforeDecoding(t *testing.T) {
+	h, _, cleanup := newKVQueryTestAPI(t, 1)
+	defer cleanup()
+
+	// One base64 character past what the cap can encode. The content is
+	// irrelevant: it must be refused on length alone, never decoded.
+	oversized := strings.Repeat("A", base64.StdEncoding.EncodedLen(wire.KVQueryMaxCursorBytes)+1)
+	body := fmt.Sprintf(`{"index":"by_age","cursor":%q}`, oversized)
+	rec := do(t, h, "POST", "/v1/kv/query", body, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
+	}
+	// The message must name the LENGTH, which is what proves the refusal came
+	// from the pre-decode check rather than from the codec after the fact.
+	if !strings.Contains(rec.Body.String(), "cursor is too large") {
+		t.Fatalf("body = %s, want the pre-decode length refusal", rec.Body)
+	}
+}
+
+// TestHTTPKVQueryCursorAtTheCapIsNotRefusedOnLength is the boundary control: a
+// cursor exactly at the encoded cap must get PAST the length gate and be judged
+// on its content, so the guard cannot be tightened into rejecting legal cursors.
+func TestHTTPKVQueryCursorAtTheCapIsNotRefusedOnLength(t *testing.T) {
+	h, _, cleanup := newKVQueryTestAPI(t, 1)
+	defer cleanup()
+
+	atCap := strings.Repeat("A", base64.StdEncoding.EncodedLen(wire.KVQueryMaxCursorBytes))
+	body := fmt.Sprintf(`{"index":"by_age","cursor":%q}`, atCap)
+	rec := do(t, h, "POST", "/v1/kv/query", body, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
+	}
+	if strings.Contains(rec.Body.String(), "cursor is too large") {
+		t.Fatalf("a cursor AT the cap was refused on length: %s", rec.Body)
+	}
+}
