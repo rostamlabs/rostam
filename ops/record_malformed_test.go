@@ -155,13 +155,15 @@ func TestMVAddBatchGatesRecordValuesOnBothPaths(t *testing.T) {
 						t.Fatalf("seed add: %v", err)
 					}
 				}
-				// The bad record comes FIRST and a good one follows it, so a
-				// gate that only looked at the first record and a gate that
-				// walked the whole batch are told apart by the assertion below
-				// that NEITHER document was stored.
+				// The GOOD record comes first and the bad one second, which is
+				// what makes the "neither document was stored" assertion below
+				// a real check: a gate that stopped after the first record
+				// would validate the good one, store it, and fail. With the bad
+				// record first, that broken gate would refuse too and the test
+				// would pass anyway.
 				recs := []vtypes.MultiScanRecord{
-					{ID: 1, Tokens: tokens, Metadata: bad.meta},
-					{ID: 2, Tokens: tokens, Metadata: good},
+					{ID: 1, Tokens: tokens, Metadata: good},
+					{ID: 2, Tokens: tokens, Metadata: bad.meta},
 				}
 				_, err := handleMVAddBatch(tx, EncodeMVAddBatchArgs("mv", recs))
 				if err == nil {
