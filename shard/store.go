@@ -230,7 +230,9 @@ func New(cfg Config) (*Store, error) {
 	// definition is installed this early and a rebuild with none walks nothing;
 	// kept because this is the one point where the cache is warm and the index is
 	// empty.
-	ops.RebuildKVIndex(kvIdx, c)
+	// The error cannot fire here: the cache is not reachable by anything that
+	// could close it until this constructor returns.
+	_ = ops.RebuildKVIndex(kvIdx, c)
 
 	vectorStore, err := vector.OpenCollectionStorePersistent(cfg.DataDir, cfg.PersistentVectors)
 	if err != nil {
@@ -380,8 +382,10 @@ func (s *Store) KVIndex() *kvindex.Set { return s.kvIdx }
 // CacheWalker returns this shard's chunked full-keyspace walk, in the shape
 // kvindex.Rebuild and kvindex.Backfill take. It releases each cache shard's
 // read lock every few thousand slots, so a backfill over a large keyspace does
-// not block writers for the length of a whole shard's walk.
-func (s *Store) CacheWalker() func(func(key, value []byte) bool) { return ops.CacheWalker(s.cache) }
+// not block writers for the length of a whole shard's walk — and it reports
+// cache.ErrClosed if this store is closed while a walk is between chunks, so the
+// caller learns the walk was cut short instead of publishing a partial index.
+func (s *Store) CacheWalker() kvindex.Walker { return ops.CacheWalker(s.cache) }
 
 // raftReplicatedFn builds the FSM's isReplicated gate over a LIVE Raft group-size
 // source (raft.Node.NumServers). It FAILS CLOSED: the gate reports replicated

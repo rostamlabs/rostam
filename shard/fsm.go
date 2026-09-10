@@ -723,6 +723,13 @@ func (f *fsm) Restore(rc io.ReadCloser) error {
 	// which is the normal case for a restore (definitions arrive from the meta
 	// log). Safe here for locking too: we hold no cache lock, and Rebuild does
 	// not hold the index lock across the walk.
-	ops.RebuildKVIndex(f.tx.KVIndex(), f.cache)
+	if err := ops.RebuildKVIndex(f.tx.KVIndex(), f.cache); err != nil {
+		// The walk was cut short (the cache closed underneath it). kvindex
+		// published nothing, so the index stays building and queries get a
+		// retryable refusal rather than a silently short answer. Not fatal to the
+		// restore, which is about the cache, not the derived index.
+		slog.Warn("kv index rebuild after a snapshot restore did not finish; the index stays building until it is walked again",
+			"component", "shard", "err", err)
+	}
 	return nil
 }

@@ -16,6 +16,7 @@ import (
 
 	"github.com/hashicorp/raft"
 
+	"github.com/rostamlabs/rostam/cache"
 	"github.com/rostamlabs/rostam/ops"
 	"github.com/rostamlabs/rostam/ops/kvindex"
 	"github.com/rostamlabs/rostam/sdk/vtypes"
@@ -805,5 +806,62 @@ func TestForEachGroupPerGroupTimeout(t *testing.T) {
 	}
 	if elapsed > 5*timeout {
 		t.Fatalf("one hung group stalled the fan-out for %s (per-group timeout %s)", elapsed, timeout)
+	}
+}
+
+// The reviewer's open question, made a test: a shard removed from this node
+// (RemoveShardOwner -> Store.Close -> Cache.Close) unmaps its region, and the
+// observer's backfill is the one reader that deliberately lets go of the shard
+// lock between chunks. Before cache.ErrClosed existed, reading a page after that
+// unmap was a SIGSEGV, not a wrong answer.
+//
+// Two things must hold: the process survives, and a walk that was cut short
+// publishes NOTHING as ready — a half-read keyspace presented as an exact index
+// answers queries with silently missing rows.
+func TestKVIndexBackfillSurvivesShardClose(t *testing.T) {
+	seeded := 30_000
+	if testing.Short() {
+		seeded = 8_000
+	}
+	for attempt := 0; attempt < 4; attempt++ {
+		func() {
+			tc := newTestCluster(t, 1, 1)
+			n := tc.nodes[0]
+			n.stopKVIndexObserver() // this test drives the walk itself
+
+			seedKVIndexRecords(t, n, "u:", 0, seeded)
+			if err := n.SetKVIndex(kvIndexDefFixture("by_age", "u:"), 5*time.Second); err != nil {
+				t.Fatalf("attempt %d: SetKVIndex: %v", attempt, err)
+			}
+			s := n.getShard(0)
+			idx := s.KVIndex()
+			idx.Install(n.kvIndexDefsFromCatalog())
+
+			walk := s.CacheWalker()
+			started := make(chan struct{})
+			var once sync.Once
+			var walkErr error
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				walkErr = idx.Backfill("by_age", func(yield func(key, value []byte) bool) error {
+					return walk(func(key, value []byte) bool {
+						once.Do(func() { close(started) })
+						return yield(key, value)
+					})
+				})
+			}()
+
+			<-started
+			tc.Close() // closes the stores, and with them the mmap the walk is reading
+			<-done
+
+			if walkErr != nil && !errors.Is(walkErr, cache.ErrClosed) {
+				t.Fatalf("attempt %d: backfill error = %v, want nil or cache.ErrClosed", attempt, walkErr)
+			}
+			if walkErr != nil && idx.IsReady("by_age") {
+				t.Fatalf("attempt %d: a backfill cut short by the shard closing was published as ready", attempt)
+			}
+		}()
 	}
 }

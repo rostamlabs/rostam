@@ -477,7 +477,7 @@ func TestCandidatesMatchesBruteForce(t *testing.T) {
 
 		s := New(1024)
 		s.Install(defs)
-		s.Rebuild(walkOf(ks))
+		_ = s.Rebuild(walkOf(ks))
 
 		for q := 0; q < 10; q++ {
 			sel := randomSelector(rng, defs)
@@ -736,16 +736,17 @@ func TestResetDuringWalkPublishesTheEmptyIndex(t *testing.T) {
 		"k3": intRec("rc", 3), "k4": intRec("rc", 4),
 	}}
 	var flushed bool
-	s.Backfill("ix", func(fn func(key, value []byte) bool) {
+	_ = s.Backfill("ix", func(fn func(key, value []byte) bool) error {
 		for i, k := range ks.keys {
 			if i == 2 {
 				s.Reset() // the flush lands mid-backfill
 				flushed = true
 			}
 			if !fn([]byte(k), ks.vals[k]) {
-				return
+				return nil
 			}
 		}
+		return nil
 	})
 	if !flushed {
 		t.Fatal("the flush did not run")
@@ -774,11 +775,11 @@ func TestResetDuringWalkPublishesTheEmptyIndex(t *testing.T) {
 
 	// Readiness returns to false only at the start of a NEW walk, which will
 	// publish its own result.
-	s.Backfill("ix", func(fn func(key, value []byte) bool) {
+	_ = s.Backfill("ix", func(fn func(key, value []byte) bool) error {
 		if s.IsReady("ix") {
 			t.Error("the index reported ready DURING its backfill")
 		}
-		walkOf(ks)(fn)
+		return walkOf(ks)(fn)
 	})
 	if !s.IsReady("ix") || func() int { k, _ := s.Stats("ix"); return k }() != 4 {
 		t.Fatal("the definition did not come back from its own backfill")
@@ -802,7 +803,7 @@ func TestRebuildFromWalk(t *testing.T) {
 			"o:t": tableRec("tb", 3),
 		},
 	}
-	s.Rebuild(walkOf(ks))
+	_ = s.Rebuild(walkOf(ks))
 
 	if !s.IsReady("by-rc") || !s.IsReady("by-cnt") {
 		t.Fatal("Rebuild did not mark every definition ready")
@@ -822,16 +823,17 @@ func TestRebuildFromWalk(t *testing.T) {
 	seen := 0
 	s.Install([]Def{a})
 	s.MarkReady("by-rc")
-	s.Rebuild(func(fn func(key, value []byte) bool) {
+	_ = s.Rebuild(func(fn func(key, value []byte) bool) error {
 		for _, k := range ks.keys {
 			if s.IsReady("by-rc") {
 				t.Error("the index reported ready DURING a rebuild")
 			}
 			seen++
 			if !fn([]byte(k), ks.vals[k]) {
-				return
+				return nil
 			}
 		}
+		return nil
 	})
 	if seen != len(ks.keys) {
 		t.Fatalf("walk visited %d keys, want %d", seen, len(ks.keys))
@@ -858,7 +860,7 @@ func TestBackfillOneDef(t *testing.T) {
 		"k":  intRec("rc", 1),
 		"k2": intRec("rc", 2),
 	}}
-	s.Backfill("new", walkOf(ks))
+	_ = s.Backfill("new", walkOf(ks))
 
 	if !s.IsReady("new") {
 		t.Fatal("Backfill did not mark its definition ready")
@@ -875,7 +877,7 @@ func TestBackfillOneDef(t *testing.T) {
 	}
 
 	// Backfilling a name that is not installed is a no-op, not a panic.
-	s.Backfill("nope", walkOf(ks))
+	_ = s.Backfill("nope", walkOf(ks))
 }
 
 // TestInstallDuringWalkLeavesTheNewDefBuilding pins the one way a rebuild
@@ -893,7 +895,7 @@ func TestInstallDuringWalkLeavesTheNewDefBuilding(t *testing.T) {
 
 	for _, tc := range []struct {
 		name string
-		run  func(s *Set, walk func(func(key, value []byte) bool))
+		run  func(s *Set, walk Walker)
 		// wantEmpty: whether the replacement definition must be left with no
 		// postings at all. Backfill's walk is pinned to the posting it started
 		// on, so it writes nothing into a replacement. Rebuild's walk goes
@@ -904,23 +906,24 @@ func TestInstallDuringWalkLeavesTheNewDefBuilding(t *testing.T) {
 		// clears them before it is ever published as ready.
 		wantEmpty bool
 	}{
-		{"Rebuild", func(s *Set, w func(func(key, value []byte) bool)) { s.Rebuild(w) }, false},
-		{"Backfill", func(s *Set, w func(func(key, value []byte) bool)) { s.Backfill("ix", w) }, true},
+		{"Rebuild", func(s *Set, w Walker) { _ = s.Rebuild(w) }, false},
+		{"Backfill", func(s *Set, w Walker) { _ = s.Backfill("ix", w) }, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := New(1024)
 			s.Install([]Def{a})
 			n := 0
-			tc.run(s, func(fn func(key, value []byte) bool) {
+			tc.run(s, func(fn func(key, value []byte) bool) error {
 				for _, k := range ks.keys {
 					if n == 2 {
 						s.Install([]Def{moved}) // the definition is replaced mid-walk
 					}
 					n++
 					if !fn([]byte(k), ks.vals[k]) {
-						return
+						return nil
 					}
 				}
+				return nil
 			})
 			if s.IsReady("ix") {
 				t.Fatal("a definition replaced mid-walk was published as ready with a partial posting set")
@@ -960,23 +963,24 @@ func TestOverlappingWalksNeverPublishPartial(t *testing.T) {
 	s.Install([]Def{d})
 
 	// stepped hands out a walk that emits ks.keys[from:to] when driven.
-	stepped := func(from, to int) func(func(key, value []byte) bool) {
-		return func(fn func(key, value []byte) bool) {
+	stepped := func(from, to int) Walker {
+		return func(fn func(key, value []byte) bool) error {
 			for _, k := range ks.keys[from:to] {
 				if !fn([]byte(k), ks.vals[k]) {
-					return
+					return nil
 				}
 			}
+			return nil
 		}
 	}
 
 	// The backfill's walk runs in two halves, with a whole rebuild in between.
 	var rebuildDone bool
-	s.Backfill("ix", func(fn func(key, value []byte) bool) {
-		stepped(0, 50)(fn)        // the backfill fills k:000-k:049
-		s.Rebuild(stepped(0, 20)) // a rebuild empties it and refills k:000-k:019
+	_ = s.Backfill("ix", func(fn func(key, value []byte) bool) error {
+		_ = stepped(0, 50)(fn)        // the backfill fills k:000-k:049
+		_ = s.Rebuild(stepped(0, 20)) // a rebuild empties it and refills k:000-k:019
 		rebuildDone = true
-		stepped(50, 100)(fn) // the backfill's tail, into a generation it no longer owns
+		return stepped(50, 100)(fn) // the backfill's tail, into a generation it no longer owns
 	})
 	if !rebuildDone {
 		t.Fatal("the overlapping rebuild did not run")
@@ -1189,13 +1193,13 @@ func TestSetNeverCallsBack(t *testing.T) {
 	var allowed atomic.Bool
 	var calls atomic.Int64
 	ks := keyspace{keys: []string{"k"}, vals: map[string][]byte{"k": intRec("rc", 1)}}
-	walk := func(fn func(key, value []byte) bool) {
+	walk := func(fn func(key, value []byte) bool) error {
 		if !allowed.Load() {
 			t.Error("the Set called the store walker outside Rebuild/Backfill")
-			return
+			return nil
 		}
 		calls.Add(1)
-		walkOf(ks)(fn)
+		return walkOf(ks)(fn)
 	}
 
 	d := mustDef(t, "by-rc", "", "rc", wire.KVIndexKindScalar)
@@ -1218,8 +1222,8 @@ func TestSetNeverCallsBack(t *testing.T) {
 	s.Install([]Def{d})
 
 	allowed.Store(true)
-	s.Rebuild(walk)
-	s.Backfill("by-rc", walk)
+	_ = s.Rebuild(walk)
+	_ = s.Backfill("by-rc", walk)
 	if got := calls.Load(); got != 2 {
 		t.Fatalf("walker called %d times, want 2", got)
 	}
@@ -1362,5 +1366,58 @@ func BenchmarkCandidatesEq100k(b *testing.B) {
 		if err != nil || len(got) != 100 {
 			b.Fatalf("got %d keys, err %v", len(got), err)
 		}
+	}
+}
+
+// A walk that does not finish has read a PROPER SUBSET of the keyspace.
+// Publishing that as ready would make every query answer from the subset and
+// call it exact — silently missing rows, the one failure this index may not
+// have. Both fillers must return the walk's error and mark nothing.
+func TestBackfillDoesNotPublishOnAWalkError(t *testing.T) {
+	ks := keyspace{keys: []string{"k0", "k1", "k2", "k3"}, vals: map[string][]byte{
+		"k0": intRec("rc", 0), "k1": intRec("rc", 1),
+		"k2": intRec("rc", 2), "k3": intRec("rc", 3),
+	}}
+	cut := errors.New("the shard went away mid-walk")
+
+	s := New(1024)
+	s.Install([]Def{mustDef(t, "ix", "", "rc", wire.KVIndexKindScalar)})
+	err := s.Backfill("ix", func(fn func(key, value []byte) bool) error {
+		for _, k := range ks.keys[:2] {
+			fn([]byte(k), ks.vals[k])
+		}
+		return cut
+	})
+	if !errors.Is(err, cut) {
+		t.Fatalf("Backfill error = %v, want the walk's error", err)
+	}
+	if s.IsReady("ix") {
+		t.Fatal("a half-finished backfill published the index as ready")
+	}
+
+	// And the same for a whole-set rebuild, which must not leave ANY definition
+	// ready off a walk that stopped early.
+	s2 := New(1024)
+	s2.Install([]Def{mustDef(t, "ix", "", "rc", wire.KVIndexKindScalar)})
+	s2.MarkReady("ix") // it was ready before; a failed rebuild must revoke that
+	if err := s2.Rebuild(func(fn func(key, value []byte) bool) error {
+		fn([]byte("k0"), ks.vals["k0"])
+		return cut
+	}); !errors.Is(err, cut) {
+		t.Fatalf("Rebuild error = %v, want the walk's error", err)
+	}
+	if s2.IsReady("ix") {
+		t.Fatal("a half-finished rebuild left the index published as ready")
+	}
+
+	// A walk that DOES finish still publishes, so the guard is not just "never
+	// ready".
+	s3 := New(1024)
+	s3.Install([]Def{mustDef(t, "ix", "", "rc", wire.KVIndexKindScalar)})
+	if err := s3.Backfill("ix", walkOf(ks)); err != nil {
+		t.Fatalf("Backfill: %v", err)
+	}
+	if !s3.IsReady("ix") {
+		t.Fatal("a completed backfill did not publish the index")
 	}
 }

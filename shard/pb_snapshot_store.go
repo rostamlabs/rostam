@@ -5,6 +5,7 @@ package shard
 import (
 	"bytes"
 	"io"
+	"log/slog"
 	"sync/atomic"
 
 	"github.com/rostamlabs/rostam/cache"
@@ -99,7 +100,11 @@ func (p *pbSnapshotStore) InstallFSM(blob []byte) error {
 	// index; Rebuild does not hold the index lock across its walk), and with no
 	// definition installed — the common case — it walks nothing.
 	if p.fsm != nil {
-		ops.RebuildKVIndex(p.fsm.tx.KVIndex(), p.cache)
+		if err := ops.RebuildKVIndex(p.fsm.tx.KVIndex(), p.cache); err != nil {
+			// See fsm.Restore: nothing was published, so the index stays building.
+			slog.Warn("kv index rebuild after a PB snapshot install did not finish; the index stays building until it is walked again",
+				"component", "shard", "err", err)
+		}
 	}
 	p.installs.Add(1)
 	return nil

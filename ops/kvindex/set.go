@@ -367,7 +367,8 @@ func (s *Set) Reset() {
 
 // Rebuild clears every posting and replays the whole keyspace through walk,
 // then marks every definition ready. Used on a warm start, after a restore,
-// and whenever a definition set is installed from scratch.
+// and whenever a definition set is installed from scratch. It returns the walk's
+// error, having marked NOTHING ready, when the walk did not finish.
 //
 // s.mu IS NOT HELD ACROSS walk. walk takes cache locks, and a Set method
 // holding s.mu while a cache lock is taken closes the lock cycle Drop opens
@@ -376,12 +377,12 @@ func (s *Set) Reset() {
 // write may be seen by both the walk and its own Reindex — which is harmless,
 // because Reindex is idempotent in (key, value). The cache's chunked walk can
 // visit a key twice for the same reason (it restarts on a table swap).
-func (s *Set) Rebuild(walk func(func(key, value []byte) bool)) {
+func (s *Set) Rebuild(walk Walker) error {
 	if walk == nil {
 		// Nothing was walked, so nothing may be published as complete. An empty
 		// posting set is only exact over an empty keyspace, and a nil walker is
 		// not evidence of one.
-		return
+		return nil
 	}
 	s.mu.Lock()
 	started := make(map[string]walkToken, len(s.posts))
@@ -395,16 +396,25 @@ func (s *Set) Rebuild(walk func(func(key, value []byte) bool)) {
 	}
 	s.mu.Unlock()
 
-	walk(func(key, value []byte) bool {
+	err := walk(func(key, value []byte) bool {
 		s.Reindex(key, value)
 		return true
 	})
+	if err != nil {
+		// The walk did not finish, so what is in the postings is a PROPER SUBSET
+		// of the keyspace. Publishing it would make every query answer from that
+		// subset and call it exact — the one failure mode this index may not have.
+		// Leaving it not-ready costs queries an ErrIndexBuilding until something
+		// walks it again, which is the honest answer.
+		return err
+	}
 
 	s.mu.Lock()
 	for name, tok := range started {
 		s.grantReadyLocked(name, tok)
 	}
 	s.mu.Unlock()
+	return nil
 }
 
 // walkToken identifies one filling pass over one posting: the posting itself
@@ -439,32 +449,48 @@ func (s *Set) grantReadyLocked(name string, tok walkToken) {
 	}
 }
 
+// Walker is a full-keyspace walk: it calls yield for every live entry and
+// returns nil only when it visited ALL of them.
+//
+// The error is not decoration. The walk source is a live cache whose shards can
+// be closed underneath it (a shard removed from this node), and it reports that
+// as cache.ErrClosed. Rebuild and Backfill both refuse to publish readiness on a
+// non-nil error, because what they filled is then a proper subset of the
+// keyspace and an index published as exact over a subset answers queries with
+// silently missing rows.
+type Walker func(yield func(key, value []byte) bool) error
+
 // Backfill is Rebuild for a single definition: the one a meta write just
 // added. Unknown names are a no-op. The other definitions keep their postings
-// and their readiness throughout.
-func (s *Set) Backfill(name string, walk func(func(key, value []byte) bool)) {
+// and their readiness throughout. It returns the walk's error, having published
+// nothing, when the walk did not finish.
+func (s *Set) Backfill(name string, walk Walker) error {
 	if walk == nil {
-		return // see Rebuild: a nil walker publishes nothing.
+		return nil // see Rebuild: a nil walker publishes nothing.
 	}
 	s.mu.Lock()
 	p := s.posts[name]
 	if p == nil {
 		s.mu.Unlock()
-		return
+		return nil
 	}
 	p.reset()
 	p.ready = false
 	tok := walkToken{p: p, gen: p.gen}
 	s.mu.Unlock()
 
-	walk(func(key, value []byte) bool {
+	err := walk(func(key, value []byte) bool {
 		s.reindexFor(name, tok, key, value)
 		return true
 	})
+	if err != nil {
+		return err // see Rebuild: an unfinished walk publishes nothing.
+	}
 
 	s.mu.Lock()
 	s.grantReadyLocked(name, tok)
 	s.mu.Unlock()
+	return nil
 }
 
 // reindexFor is Reindex scoped to one definition — the backfill's inner step.

@@ -457,12 +457,13 @@ func randomBound(rng *rand.Rand, d Def) vtypes.Value {
 // take (cache.IterateChunked bound to a store). Keys are visited in sorted
 // order so a test that stops the walk stops at a predictable place; the real
 // cache walk has no order, which is exactly why nothing here may depend on it.
-func walkOf(ks keyspace) func(func(key, value []byte) bool) {
-	return func(fn func(key, value []byte) bool) {
+func walkOf(ks keyspace) Walker {
+	return func(fn func(key, value []byte) bool) error {
 		for _, k := range ks.keys {
 			if !fn([]byte(k), ks.vals[k]) {
-				return
+				return nil
 			}
 		}
+		return nil
 	}
 }

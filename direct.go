@@ -107,7 +107,9 @@ func NewDirect(cfg DirectConfig) (Store, error) {
 	// evictions and TTL expiry unpost through it), and the rebuild covers a warm
 	// start off durable pages. Both happen before the store is reachable.
 	kvIdx := ops.NewKVIndexFor(c)
-	ops.RebuildKVIndex(kvIdx, c)
+	// The error cannot fire here: the cache is not reachable by anything that
+	// could close it until this constructor returns.
+	_ = ops.RebuildKVIndex(kvIdx, c)
 	return &directStore{
 		cache:    c,
 		registry: cfg.Ops,

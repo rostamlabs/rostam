@@ -170,9 +170,11 @@ func NewKVIndexFor(c *cache.Cache) *kvindex.Set {
 }
 
 // CacheWalker returns c's chunked full-keyspace walk in the shape
-// kvindex.Rebuild and kvindex.Backfill take.
-func CacheWalker(c *cache.Cache) func(func(key, value []byte) bool) {
-	return func(fn func(key, value []byte) bool) { c.IterateChunked(kvIndexWalkBatch, fn) }
+// kvindex.Rebuild and kvindex.Backfill take. It surfaces cache.ErrClosed when
+// the cache is closed underneath the walk, which is what stops a half-read
+// keyspace being published as a complete index.
+func CacheWalker(c *cache.Cache) kvindex.Walker {
+	return func(fn func(key, value []byte) bool) error { return c.IterateChunked(kvIndexWalkBatch, fn) }
 }
 
 // RebuildKVIndex refills idx from c's live entries: the warm-start and
@@ -188,11 +190,15 @@ func CacheWalker(c *cache.Cache) func(func(key, value []byte) bool) {
 //
 // idx or c being nil is a no-op, so a store built without an index can call it
 // unconditionally.
-func RebuildKVIndex(idx *kvindex.Set, c *cache.Cache) {
+//
+// It returns the walk's error (cache.ErrClosed when the cache went away
+// mid-walk), in which case NOTHING was marked ready — the index stays building
+// and queries get a retryable refusal rather than a silently short answer.
+func RebuildKVIndex(idx *kvindex.Set, c *cache.Cache) error {
 	if idx == nil || c == nil || len(idx.Defs()) == 0 {
-		return
+		return nil
 	}
-	idx.Rebuild(CacheWalker(c))
+	return idx.Rebuild(CacheWalker(c))
 }
 
 // reindexKV is the single seam every KV write handler calls, with the bytes it

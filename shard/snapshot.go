@@ -147,7 +147,10 @@ func serializeSnapshot(c *cache.Cache, vectors *vector.CollectionStore, appliedI
 	var count uint64
 	var entryBuf [2 + 4 + 8]byte
 	var iterErr error
-	c.Iterate(func(key, value []byte, expiryMs uint64) bool {
+	// A cache closed mid-walk yields a PARTIAL keyspace, and a snapshot of a
+	// partial keyspace is a snapshot that silently drops committed keys — so the
+	// walk's error is a snapshot error, not a detail.
+	walkErr := c.Iterate(func(key, value []byte, expiryMs uint64) bool {
 		binary.BigEndian.PutUint16(entryBuf[0:2], uint16(len(key)))   //nolint:gosec // key bounded by upstream limits
 		binary.BigEndian.PutUint32(entryBuf[2:6], uint32(len(value))) //nolint:gosec // value bounded by upstream limits
 		binary.BigEndian.PutUint64(entryBuf[6:14], expiryMs)
@@ -176,6 +179,9 @@ func serializeSnapshot(c *cache.Cache, vectors *vector.CollectionStore, appliedI
 	})
 	if iterErr != nil {
 		return nil, fmt.Errorf("snapshot body: %w", iterErr)
+	}
+	if walkErr != nil {
+		return nil, fmt.Errorf("snapshot body: %w", walkErr)
 	}
 
 	// Vector section: the full CollectionStore snapshot, length-prefixed, appended
@@ -293,12 +299,17 @@ func restoreSnapshot(c *cache.Cache, vectors *vector.CollectionStore, wasmRestor
 	}
 
 	keysToDelete := [][]byte{}
-	c.Iterate(func(key, _ []byte, _ uint64) bool {
+	// A partial walk here would leave PRE-RESTORE keys behind that the restore is
+	// supposed to wipe, so they would survive into the restored state as ghosts.
+	// Refuse rather than restore over a keyspace we could not fully enumerate.
+	if err := c.Iterate(func(key, _ []byte, _ uint64) bool {
 		k := make([]byte, len(key))
 		copy(k, key)
 		keysToDelete = append(keysToDelete, k)
 		return true
-	})
+	}); err != nil {
+		return 0, fmt.Errorf("shard: restore: enumerate pre-restore keys: %w", err)
+	}
 	// Wipe the pre-restore key set. On a PERSISTENT shard each Del also appends a
 	// durable tombstone, which is what makes the wipe survive a later warm restart:
 	// without one, restore left the pre-restore entries physically on the page and

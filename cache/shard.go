@@ -47,6 +47,21 @@ var ErrCannotEvict = errors.New("cache: nothing left to evict and still no room"
 // errors.Is it through the apply path's multi-%w wrapping.
 var ErrFlushNotDurable = errors.New("cache: flush watermark not durable")
 
+// ErrClosed is returned by a walk (Iterate / IterateChunked) that finds the
+// shard it is about to read already closed.
+//
+// It exists because a walk is the one read path that DELIBERATELY lets go of the
+// shard lock and comes back — IterateChunked releases the RLock between chunks
+// so writers are not held out for a whole shard's walk. In mmap mode Close
+// munmaps the region, so a walk that let go, had the shard closed underneath it,
+// and then read a page would touch unmapped memory and take the process down.
+// Close now unmaps under the write lock and publishes `closed` there, and every
+// walk re-checks it on each acquisition, so the walk stops with this error
+// instead. The caller's job is to treat it as "this shard is gone" — NOT as a
+// finished walk: a consumer deriving an index from it must not publish what it
+// managed to read as complete.
+var ErrClosed = errors.New("cache: shard is closed")
+
 // shard is one independent slice of the cache: its own page list, lock,
 // and index. Shards do not share state and are safe to use concurrently
 // across goroutines.
@@ -265,6 +280,14 @@ type shard struct {
 	// nothing depends on it — but it is what proves the restart path (and its
 	// bounded fallback) actually executes.
 	chunkedRestarts atomic.Uint64
+
+	// closed is set by Close under the WRITE lock, in the same critical section
+	// that unmaps the region, and read by every walk immediately after it takes
+	// the read lock. Together those two make "the mapping is alive" an invariant a
+	// reader can rely on for as long as it holds the lock. Guarded by s.mu; not an
+	// atomic, deliberately — an atomic would let a reader observe it OUTSIDE the
+	// lock, which is exactly the race this closes.
+	closed bool
 }
 
 // newShard constructs a shard. dataDir="" selects heap mode (heap-only behavior).
@@ -1058,9 +1081,24 @@ func (s *shard) bytesUsed() uint64 {
 
 // Close stops the sweeper goroutine and, in mmap mode, syncs and unmaps the
 // region. Safe to call once.
+//
+// THE UNMAP RUNS UNDER THE WRITE LOCK, and that is load-bearing rather than
+// tidy. munmap makes every page pointer this shard hands out a dangling
+// reference into unmapped memory, so a reader that touches one afterwards does
+// not get a wrong answer — it gets a SIGSEGV and the process dies. The chunked
+// walk is the path that makes that reachable without any exotic timing: it
+// releases the read lock between chunks by design, so a shard removed from this
+// node (RemoveShardOwner -> Store.Close -> Cache.Close) can be unmapped in the
+// window before it re-acquires. Taking the write lock here means no reader is
+// inside the mapping while it goes away, and setting closed in the same critical
+// section means none can enter afterwards — every walk re-checks it on each
+// acquisition and stops with ErrClosed.
 func (s *shard) Close() error {
 	close(s.stopSweeper)
 	s.sweepWG.Wait()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
 	if s.region != nil {
 		_ = msync(s.file, s.region) // best-effort final sync
 	}

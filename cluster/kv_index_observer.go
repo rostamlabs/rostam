@@ -3,10 +3,12 @@
 package cluster
 
 import (
+	"errors"
 	"log/slog"
 	"sort"
 	"time"
 
+	"github.com/rostamlabs/rostam/cache"
 	"github.com/rostamlabs/rostam/ops/kvindex"
 	"github.com/rostamlabs/rostam/shard"
 )
@@ -109,7 +111,13 @@ func (n *Node) applyKVIndexDefs() {
 			if idx.IsReady(d.Name) {
 				continue
 			}
-			n.backfillKVIndex(group, s, idx, d.Name)
+			if !n.backfillKVIndex(group, s, idx, d.Name) {
+				// The shard went away underneath the walk (it was removed from this
+				// node). Nothing was published, and the remaining definitions on it
+				// would fail the same way; the next pass reads a fresh hosted-shard
+				// set that no longer includes it.
+				break
+			}
 		}
 	}
 }
@@ -154,21 +162,33 @@ func (n *Node) kvIndexDefsFromCatalog() []kvindex.Def {
 // queueing behind a whole shard's walk. It is NOT free for writers, and the log
 // line says so with a number: each chunk holds the read lock, so a writer waits
 // at most one chunk.
-func (n *Node) backfillKVIndex(group int, s *shard.Store, idx *kvindex.Set, name string) {
+// It reports false when the walk was cut short because the shard closed
+// underneath it — a shard this node stopped hosting mid-pass. That is not an
+// error to log loudly and not a reason to retry here: kvindex.Backfill has
+// already declined to publish the partial result, so the definition stays
+// building on a Set nothing will read again.
+func (n *Node) backfillKVIndex(group int, s *shard.Store, idx *kvindex.Set, name string) bool {
 	var visited uint64
 	walk := s.CacheWalker()
 	began := time.Now()
-	idx.Backfill(name, func(yield func(key, value []byte) bool) {
-		walk(func(key, value []byte) bool {
+	err := idx.Backfill(name, func(yield func(key, value []byte) bool) error {
+		return walk(func(key, value []byte) bool {
 			visited++
 			return yield(key, value)
 		})
 	})
-	n.kvBackfills.Add(1)
 	n.kvBackfillKeys.Add(visited)
+	if err != nil {
+		slog.Info("kv index backfill abandoned; the shard closed underneath the walk, so nothing was published as ready",
+			"component", "cluster", "node", n.cfg.NodeID, "shard", group, "index", name,
+			"keys", visited, "err", err)
+		return !errors.Is(err, cache.ErrClosed)
+	}
+	n.kvBackfills.Add(1)
 	slog.Info("kv index backfill complete",
 		"component", "cluster", "node", n.cfg.NodeID, "shard", group, "index", name,
 		"keys", visited, "took", time.Since(began), "ready", idx.IsReady(name))
+	return true
 }
 
 // kvIndexStats snapshots this node's KV index state for Stats().

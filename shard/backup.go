@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"time"
 
 	"github.com/rostamlabs/rostam/ops"
@@ -152,7 +153,14 @@ func (s *Store) RestoreSnapshot(ctx context.Context, data []byte, appliedIndex u
 				// refill and the rebuild. It walks nothing when no definition is
 				// installed. The raft branch below reaches fsm.Restore, which
 				// does the same thing.
-				ops.RebuildKVIndex(s.kvIdx, s.cache)
+				// Inside RunExclusive: a Close cannot interleave, so the walk
+				// cannot be cut short. If it ever were, kvindex publishes nothing
+				// and the index stays building — a retryable refusal, not a short
+				// answer.
+				if rebuildErr := ops.RebuildKVIndex(s.kvIdx, s.cache); rebuildErr != nil {
+					slog.Warn("kv index rebuild after a PB snapshot install did not finish; the index stays building until it is walked again",
+						"component", "shard", "err", rebuildErr)
+				}
 			}
 		})
 		if rErr != nil {
