@@ -454,9 +454,19 @@ func (a *api) kvIndexList(w http.ResponseWriter, r *http.Request) {
 
 // kvIndexPrefix decodes the base64 key prefix, writing the 400 on failure. An
 // absent prefix is a nil one (index the whole keyspace), not an error.
+//
+// THE LENGTH IS CHECKED BEFORE THE DECODE. A prefix over
+// wire.KVIndexMaxPrefixLen is refused by the definition's own Validate anyway,
+// so decoding one first only buys an allocation sized by the request body. The
+// encoded form of the largest legal prefix is base64.EncodedLen of the cap;
+// anything longer cannot decode to a legal prefix whatever its contents.
 func kvIndexPrefix(w http.ResponseWriter, b64 string) ([]byte, bool) {
 	if b64 == "" {
 		return nil, true
+	}
+	if len(b64) > base64.StdEncoding.EncodedLen(wire.KVIndexMaxPrefixLen) {
+		writeError(w, http.StatusBadRequest, "key_prefix_b64 decodes to more than the "+strconv.Itoa(wire.KVIndexMaxPrefixLen)+"-byte key prefix cap")
+		return nil, false
 	}
 	prefix, err := base64.StdEncoding.DecodeString(b64)
 	if err != nil {

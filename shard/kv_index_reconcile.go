@@ -4,6 +4,7 @@ package shard
 
 import (
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/rostamlabs/rostam/ops"
@@ -54,7 +55,15 @@ func (s *Store) startKVIndexReconciler() {
 	if s.cfg.KVIndexReconcileIntervalMs <= 0 || s.kvIdx == nil {
 		return
 	}
-	interval := time.Duration(s.cfg.KVIndexReconcileIntervalMs) * time.Millisecond
+	// CLAMPED. time.Duration is int64 nanoseconds, so a setting above about
+	// 9.2e9 ms overflows the multiplication — and the wrap is an arbitrary value,
+	// including a negative one, which the guard above reads as "disabled". A
+	// misconfigured knob would then silently switch the reconciler OFF rather
+	// than run it slowly. Matches direct_kv_index_reconcile.go's clamp.
+	interval := time.Duration(math.MaxInt64)
+	if int64(s.cfg.KVIndexReconcileIntervalMs) <= int64(math.MaxInt64)/int64(time.Millisecond) {
+		interval = time.Duration(s.cfg.KVIndexReconcileIntervalMs) * time.Millisecond
+	}
 	s.kvReconcileStop = make(chan struct{})
 	stop := s.kvReconcileStop
 	s.kvReconcileWg.Add(1)

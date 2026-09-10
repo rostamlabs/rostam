@@ -4,6 +4,7 @@ package rostam
 
 import (
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/rostamlabs/rostam/ops"
@@ -27,16 +28,31 @@ import (
 // directReconcileInterval turns the config knob into a duration, following the
 // convention DirectConfig already uses for TTLSweepIntervalMs: 0 means the
 // default, negative disables, positive is the interval in milliseconds.
+//
+// THE MULTIPLICATION IS CLAMPED. time.Duration is int64 NANOSECONDS, so any
+// setting above about 9.2e9 ms overflows it — and the wrap is not a large
+// interval but an arbitrary one, including negative values, which this
+// function's own contract reads as "disabled". A misconfigured knob would then
+// silently turn the reconciler OFF instead of setting it slowly. Clamping keeps
+// an absurd setting absurd (about 292 years) rather than letting it change the
+// meaning of the field.
 func directReconcileInterval(ms int) time.Duration {
 	switch {
 	case ms < 0:
 		return 0 // disabled
 	case ms == 0:
 		return defaultKVIndexReconcileInterval
+	case int64(ms) > maxReconcileIntervalMs:
+		return time.Duration(math.MaxInt64)
 	default:
 		return time.Duration(ms) * time.Millisecond
 	}
 }
+
+// maxReconcileIntervalMs is the largest millisecond count that still fits a
+// time.Duration. Shared spelling with shard.Store's ticker so both hosts of this
+// pass clamp identically.
+const maxReconcileIntervalMs = int64(math.MaxInt64) / int64(time.Millisecond)
 
 // defaultKVIndexReconcileInterval matches shard.Config's default, so a Direct
 // deployment and an Embedded one reconcile on the same cadence. It is spelled

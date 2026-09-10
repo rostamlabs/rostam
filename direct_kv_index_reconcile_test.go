@@ -13,6 +13,7 @@ package rostam
 
 import (
 	"fmt"
+	"math"
 	"runtime"
 	"sync"
 	"testing"
@@ -166,6 +167,26 @@ func TestDirectReconcilerInterval(t *testing.T) {
 	}
 	if got := directReconcileInterval(250); got != 250*time.Millisecond {
 		t.Errorf("directReconcileInterval(250) = %v, want 250ms", got)
+	}
+	// AN ABSURD SETTING MUST STAY ABSURD, not wrap into a different meaning.
+	// time.Duration is int64 nanoseconds, so ms * time.Millisecond overflows
+	// above about 9.2e9 — and the wrapped value can be NEGATIVE, which this
+	// function's own contract reads as "disabled". A misconfigured knob would
+	// then silently switch the reconciler off rather than run it slowly.
+	//
+	// Guarded on the platform int width: where int is 32 bits the largest
+	// possible setting is about 2.1e9 ms, which still fits, so there is nothing
+	// to clamp and nothing to assert.
+	if maxReconcileIntervalMs < int64(math.MaxInt) {
+		for _, ms := range []int64{maxReconcileIntervalMs + 1, math.MaxInt64} {
+			if got := directReconcileInterval(int(ms)); got <= 0 {
+				t.Errorf("directReconcileInterval(%d) = %v; an over-large interval must never read as disabled", ms, got)
+			}
+		}
+		boundary := maxReconcileIntervalMs // via a variable: a constant conversion would not compile on a 32-bit int
+		if got := directReconcileInterval(int(boundary)); got != time.Duration(maxReconcileIntervalMs)*time.Millisecond {
+			t.Errorf("directReconcileInterval(%d) = %v, want the exact conversion at the clamp boundary", maxReconcileIntervalMs, got)
+		}
 	}
 
 	d := newDirectForReconcile(t, -1)

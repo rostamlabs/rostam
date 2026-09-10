@@ -262,16 +262,37 @@ func (n *Node) kvIndexDefsFromCatalog() []kvindex.Def {
 	defs := make([]kvindex.Def, 0, len(cat))
 	var rejects uint64
 	rejected := make(map[string]struct{})
+	// LOGGED ON CHANGE, NOT PER PASS. The observer runs on every meta-index
+	// advance, and PB liveness advances it on its own beacon cadence — so a
+	// definition this build cannot parse would print this line about once a
+	// second, per node, for as long as it sat in the catalog: a client-authored
+	// definition with a write handle on the operator's log. The condition is a
+	// STATE, so it is worth saying when it starts, when it changes and when it
+	// clears, and worth nothing repeated. The numbers below (Rejects as a
+	// counter, RejectedDefs as a gauge) are what an operator alerts on, and they
+	// are unaffected.
+	prev := map[string]struct{}{}
+	if p := n.kvIndexRejectedNames.Load(); p != nil {
+		prev = *p
+	}
 	for name, e := range cat {
 		d, err := kvindex.DefFrom(e.Def, e.MetaIndex)
 		if err != nil {
 			rejects++
 			rejected[name] = struct{}{}
-			slog.Warn("kv index definition is in the meta catalog but this node cannot build it; it is NOT installed here and queries naming it will report no such index",
-				"component", "cluster", "node", n.cfg.NodeID, "index", name, "path", e.Def.PayloadPath, "err", err)
+			if _, seen := prev[name]; !seen {
+				slog.Warn("kv index definition is in the meta catalog but this node cannot build it; it is NOT installed here and queries naming it will report no such index",
+					"component", "cluster", "node", n.cfg.NodeID, "index", name, "path", e.Def.PayloadPath, "err", err)
+			}
 			continue
 		}
 		defs = append(defs, d)
+	}
+	for name := range prev {
+		if _, still := rejected[name]; !still {
+			slog.Info("kv index definition is no longer rejected by this node",
+				"component", "cluster", "node", n.cfg.NodeID, "index", name)
+		}
 	}
 	n.kvIndexRejects.Add(rejects)
 	n.kvIndexRejectedDefs.Store(rejects)

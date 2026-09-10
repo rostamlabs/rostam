@@ -5,6 +5,7 @@ package cluster
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/rostamlabs/rostam/ops/kvindex"
 	"github.com/rostamlabs/rostam/sdk/wire"
+	"github.com/rostamlabs/rostam/shard"
 )
 
 // KV index CRUD, following the __set_catalog__ precedent exactly. All three ops
@@ -116,7 +118,35 @@ func (n *Node) handleSetKVIndex(args []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cluster: %s decode: %w", opKVIndexSetName, err)
 	}
-	return nil, n.meta.ApplySetKVIndex(d, kvIndexSetTimeout)
+	err = n.meta.ApplySetKVIndex(d, kvIndexSetTimeout)
+	if errors.Is(err, hraft.ErrNotLeader) {
+		// A REFUSAL THE CALLER CAN ACT ON, not a bare error. Unlike the other
+		// forwarded meta writes, this op has a client-facing entry point: the
+		// native client's CreateKVIndex and DropKVIndex send __kv_index_set__
+		// straight to whichever node they are connected to, so a follower is a
+		// perfectly ordinary destination for it — and CreateKVIndex's own doc
+		// promises the write "can be issued against any node".
+		//
+		// hraft.ErrNotLeader is not shard.ErrNotLeader, so server.mapResult never
+		// answered StatusNotLeader for it and the client's own not-leader hop loop
+		// could not fire: the caller saw a flat failure whose remedy (reconnect to
+		// the meta leader) it had no way to learn. Answering with the shard
+		// package's typed error, carrying the meta leader's CLIENT-FACING address,
+		// makes the existing hop do the work.
+		//
+		// Still not a forward. Re-entering Node.SetKVIndex would forward again,
+		// and under a leadership flap that is a chain of 5 s parked calls (see this
+		// function's doc); one hop decided by the CALLER, which re-resolves the
+		// topology as it goes, is what __set_catalog__'s design intends and what
+		// this now delivers.
+		//
+		// BOTH identities are kept. The shard error is what the transport reads
+		// (errors.Is for the status, errors.As for the hint); hraft.ErrNotLeader
+		// stays wrapped so a cluster-internal caller that checks the meta layer's
+		// own sentinel still matches.
+		return nil, fmt.Errorf("%w: %w", &shard.NotLeaderError{LeaderAddr: n.metaLeaderServerAddr()}, hraft.ErrNotLeader)
+	}
+	return nil, err
 }
 
 // SetKVIndex durably records one KV index definition in the meta-Raft catalog.

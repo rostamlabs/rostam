@@ -583,15 +583,19 @@ func (m *MetaFSM) Apply(log *raft.Log) any {
 		if err := entry.KVIndex.Validate(); err != nil {
 			return fmt.Errorf("meta-fsm: kv index: %w", err)
 		}
-		if m.state.KVIndexes == nil {
-			m.state.KVIndexes = make(map[string]KVIndexEntry)
-		}
 		if !entry.KVIndex.Enabled {
 			// Disable == drop. The map stays sparse, so a lookup miss has exactly
 			// one meaning and no node has to distinguish "absent" from "present but
-			// off". Deleting a name that was never there is a clean no-op.
+			// off". Deleting a name that was never there is a clean no-op — and it
+			// must be a no-op in the STATE too, which is why the map is not
+			// materialised until an enabled definition needs it. Turning a nil
+			// catalog into an empty one here made a logically empty drop change the
+			// FSM's state and the bytes of every snapshot taken after it.
 			delete(m.state.KVIndexes, entry.KVIndex.Name)
 			return nil
+		}
+		if m.state.KVIndexes == nil {
+			m.state.KVIndexes = make(map[string]KVIndexEntry)
 		}
 		// The cap counts NAMES, so updating an existing definition is always
 		// allowed — it takes no new slot. Only a new name can hit the ceiling.
