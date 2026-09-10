@@ -49,7 +49,8 @@
 // per visited entry. Holding Set.mu across a cache read self-deadlocks
 // single-threaded, with no concurrency required: cache.Get of an expired key
 // on a non-replicated shard drops it, which fires onRemove, which wants
-// Set.mu.
+// Set.mu. The bounded reconcile pass is the third consumer of that rule and
+// the one whose whole shape comes from it — see reconcile.go.
 //
 // # Determinism
 //

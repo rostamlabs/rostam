@@ -69,6 +69,16 @@ type posting struct {
 	// still see the same *posting and the later-finishing one would grant
 	// ready over the earlier one's partial refill.
 	gen uint64
+
+	// recCursor and suspects are the reconcile pass's state, both guarded by
+	// Set.mu like everything else here. recCursor is where the rotating sweep
+	// of the reverse map has reached; suspects holds the keys the current tick
+	// snapshotted and has NOT seen written since, which is what makes the drop
+	// exact across the unlocked liveness probe. Both are nil/empty at rest —
+	// suspects only exists between a ReconcileBatch and its DropReconciled. See
+	// reconcile.go.
+	recCursor string
+	suspects  map[string]struct{}
 }
 
 func newPosting() *posting {
@@ -84,6 +94,11 @@ func newPosting() *posting {
 // — cost zero allocations on the KV write path. Only an actual insert
 // allocates, and it allocates ONCE for both maps.
 func (p *posting) set(key []byte, sk scalarKey) {
+	// BEFORE the unchanged-value early return below, not after it. A rewrite
+	// that leaves the indexed field alone still proves the key is live, and the
+	// reconcile pass must not drop a posting a write touched while its probe was
+	// running. See reconcile.go, the re-add race.
+	p.unsuspect(key)
 	if old, ok := p.keys[string(key)]; ok {
 		if old == sk {
 			return
@@ -102,6 +117,7 @@ func (p *posting) set(key []byte, sk scalarKey) {
 
 // drop removes key's posting, if it has one.
 func (p *posting) drop(key []byte) bool {
+	p.unsuspect(key)
 	old, ok := p.keys[string(key)]
 	if !ok {
 		return false
@@ -130,6 +146,24 @@ func (p *posting) reset() {
 	p.vals = make(map[scalarKey]keySet)
 	p.keys = make(map[string]scalarKey)
 	p.gen++
+	// The keyspace this posting described is gone, so an in-flight reconcile
+	// tick's marks and its place in the rotation both describe nothing. Dropping
+	// the marks is what makes DropReconciled a no-op across a Reset.
+	p.recCursor = ""
+	p.suspects = nil
+}
+
+// unsuspect clears key's reconcile mark, if a tick is in flight and marked it.
+// Every write to a key must call it: an unmarked key is one the reconcile pass
+// may not drop, which is exactly the guarantee a write needs.
+//
+// Zero cost at rest — suspects is nil except between a ReconcileBatch and its
+// DropReconciled — and one map delete on a marked key during a tick.
+func (p *posting) unsuspect(key []byte) {
+	if p.suspects == nil {
+		return
+	}
+	delete(p.suspects, string(key))
 }
 
 // Set is a shard's whole KV index: every installed definition and its
@@ -153,6 +187,13 @@ type Set struct {
 	// to do. Written by the query leaf, which holds no lock here, so it is an
 	// atomic rather than a field under s.mu.
 	verifyMisses atomic.Uint64
+
+	// reconcileDrops counts postings the reconcile pass has removed because the
+	// key's live re-read missed. Same shape and same reason as verifyMisses: the
+	// node sums it over hosted groups for Stats().KVIndex.ReconcileDrops, and it
+	// is written from DropReconciled, which does hold s.mu — but a reader
+	// (ReconcileDrops) must not have to take the lock to scrape a counter.
+	reconcileDrops atomic.Uint64
 }
 
 // New returns an empty Set whose resolver caches at most resolverCache

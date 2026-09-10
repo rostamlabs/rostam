@@ -46,6 +46,18 @@ type Config struct {
 	// SnapshotThreshold is the minimum log entry count to trigger a snapshot.
 	SnapshotThreshold uint64
 
+	// KVIndexReconcileIntervalMs is how often this store reconciles ONE of its
+	// KV index definitions against the live cache (milliseconds). Default 60 000;
+	// 0 (or the zero value of a hand-built Config) DISABLES the pass, and a
+	// negative value is a configuration error.
+	//
+	// Disabling it is safe and never changes an answer: every candidate is
+	// re-read and re-checked against the live value, so a posting the pass would
+	// have removed costs one wasted lookup and can never produce a wrong row.
+	// What it bounds is MEMORY, against the few removal paths the cache's
+	// onRemove hook cannot name a key for. See shard/kv_index_reconcile.go.
+	KVIndexReconcileIntervalMs int
+
 	// RaftHeartbeatMs and RaftElectionMs override hashicorp/raft defaults.
 	RaftHeartbeatMs int
 	RaftElectionMs  int
@@ -261,9 +273,11 @@ func DefaultConfig(dataDir, nodeID string, registry *ops.Registry) Config {
 		Bootstrap:          false,
 		SnapshotIntervalMs: 5 * 60 * 1000, // 5 min
 		SnapshotThreshold:  10_000,
-		RaftHeartbeatMs:    1000,
-		RaftElectionMs:     1000,
-		NoSync:             false,
+
+		KVIndexReconcileIntervalMs: defaultKVIndexReconcileIntervalMs,
+		RaftHeartbeatMs:            1000,
+		RaftElectionMs:             1000,
+		NoSync:                     false,
 	}
 }
 
@@ -286,6 +300,9 @@ func (c Config) Validate() error {
 	}
 	if c.SnapshotIntervalMs < 0 {
 		return errors.New("shard.Config: SnapshotIntervalMs must be >= 0")
+	}
+	if c.KVIndexReconcileIntervalMs < 0 {
+		return errors.New("shard.Config: KVIndexReconcileIntervalMs must be >= 0 (0 disables the pass)")
 	}
 	if c.RaftHeartbeatMs < 0 {
 		return errors.New("shard.Config: RaftHeartbeatMs must be >= 0")

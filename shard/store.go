@@ -95,6 +95,18 @@ type Store struct {
 	calls         int
 	callsDraining bool
 	callsIdle     chan struct{} // non-nil only while a drain is waiting
+
+	// The KV index reconcile ticker's state. kvReconcileStop signals it,
+	// kvReconcileWg is how Close WAITS for it (the probe reads the cache, so it
+	// must be out before anything is unmapped), kvReconcileOnce makes the stop
+	// idempotent — Close is not documented as single-shot and a second close(2)
+	// would panic — and kvReconcileNext is the rotation cursor over the
+	// definitions. All nil/zero when the interval disables the pass. See
+	// kv_index_reconcile.go for why the ticker lives here and not on the node.
+	kvReconcileStop chan struct{}
+	kvReconcileWg   sync.WaitGroup
+	kvReconcileOnce sync.Once
+	kvReconcileNext atomic.Uint64
 }
 
 // ErrStoreClosed is returned by Call once Close has begun. It is a REFUSAL, not
@@ -453,7 +465,7 @@ func New(cfg Config) (*Store, error) {
 	// the write path maintains.
 	storeTx := ops.NewTxContextWithIndex(c, vectorStore, kvIdx)
 	storeTx.SetShardIndex(cfg.ShardIndex)
-	return &Store{
+	s := &Store{
 		cfg:        cfg,
 		cache:      c,
 		registry:   cfg.Ops,
@@ -464,7 +476,12 @@ func New(cfg Config) (*Store, error) {
 		kvIdx:      kvIdx,
 		stop:       stop,
 		pbFrontier: pbFrontier,
-	}, nil
+	}
+	// The bounded reconcile pass. Started last, on the fully built Store, so the
+	// goroutine cannot observe a half-initialised one; Close stops and joins it
+	// before the cache is unmapped.
+	s.startKVIndexReconciler()
+	return s, nil
 }
 
 // KVIndex returns this shard's KV record index — the single Set the FSM
@@ -527,6 +544,11 @@ func (s *Store) Close() error {
 	// wait that has no end. sync.Once because Close is not documented as
 	// single-shot and a second close(3) would panic.
 	s.stopOnce.Do(func() { close(s.stop) })
+	// The KV index reconcile ticker probes the cache, so it has to be out before
+	// cache.Close unmaps anything. Stopped FIRST, and joined: a signal alone
+	// would leave a tick already inside cache.Get racing the unmap. Same hazard,
+	// same shape as the Call drain below and the cluster's index-walk gate.
+	s.stopKVIndexReconciler()
 	if err := s.raft.Shutdown(); err != nil {
 		errs = append(errs, err)
 	}
