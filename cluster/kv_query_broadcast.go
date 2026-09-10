@@ -309,23 +309,27 @@ func isKVQueryNoSuchIndex(err error) bool {
 // frame, which is where the client has to put it to ask for the next page.
 //
 // EncodeKVQueryResult bounds the whole page at KVQueryMaxPageBytes, but the
-// cursor's own cap is smaller (KVQueryMaxCursorBytes) and applies on the way
-// BACK IN. A cursor over it would encode here and be rejected on the next
-// request, which reads to the client as a query that dies at page two for no
-// stated reason. It is reachable only with large keys and many groups —
-// NumShards × (7 + key length) — so it fails loud with the arithmetic in the
-// message rather than silently.
+// cursor's own cap (KVQueryMaxCursorBytes) applies on the way BACK IN. A cursor
+// over it would encode here and be rejected on the next request, which reads to
+// the client as a query that dies at page two for no stated reason.
+//
+// THE RESIDUAL CEILING, and it is now a corner rather than a wall. The cursor
+// cap is 4 MiB and the codec stores the keys' shared prefix once, so what each
+// group actually spends is 7 bytes plus its key BEYOND that prefix — about
+// (4 MiB - 3)/NumShards - 7 bytes each. At 128 groups that is ~32 KiB of
+// distinguishing suffix per group, against a 64 KiB maximum key: reachable only
+// by keys that are both enormous and share almost nothing after the index's
+// KeyPrefix. It fails loud, with the per-group arithmetic in the message.
 func checkKVQueryCursorFits(conts []wire.KVQueryCont) error {
 	if len(conts) == 0 {
 		return nil
 	}
-	n := 2
-	for _, c := range conts {
-		n += kvQueryContBytes(c)
-	}
-	if n > wire.KVQueryMaxCursorBytes {
-		return fmt.Errorf("cluster: kv_query: the continuation for %d shard groups needs %d bytes, over the %d-byte cursor cap; use a smaller key prefix or fewer shard groups",
-			len(conts), n, wire.KVQueryMaxCursorBytes)
+	// The EXACT encoded size, not an estimate: the codec factors the keys'
+	// shared prefix out of the block, so an estimate that charged every group
+	// for a whole key would refuse cursors that encode comfortably.
+	if n := wire.KVQueryCursorBytes(conts); n > wire.KVQueryMaxCursorBytes {
+		return fmt.Errorf("cluster: kv_query: the continuation for %d shard groups needs %d bytes, over the %d-byte cursor cap; the room left per group is about %d bytes of key beyond the shared prefix",
+			len(conts), n, wire.KVQueryMaxCursorBytes, (wire.KVQueryMaxCursorBytes-3)/len(conts)-7)
 	}
 	return nil
 }
@@ -499,10 +503,6 @@ func kvQueryRowBytes(r wire.KVQueryRow) int {
 	}
 	return n
 }
-
-// kvQueryContBytes is what one continuation costs: group(4) + more(1) +
-// afterLen(2) + the key.
-func kvQueryContBytes(c wire.KVQueryCont) int { return 7 + len(c.After) }
 
 // kvQueryMergeOverhead upper-bounds everything the merged frame carries that is
 // not row payload: the row count, the cursor count, and one continuation per

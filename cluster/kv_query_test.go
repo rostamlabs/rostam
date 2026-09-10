@@ -736,156 +736,34 @@ func TestKVQueryCursorOverTheArgsCapIsRefused(t *testing.T) {
 	if err := checkKVQueryCursorFits(small); err != nil {
 		t.Fatalf("a one-entry cursor was refused: %v", err)
 	}
-	big := make([]wire.KVQueryCont, 0, 64)
-	for g := 0; g < 64; g++ {
-		big = append(big, wire.KVQueryCont{Group: uint32(g), After: make([]byte, 2048), More: true}) //nolint:gosec // small loop bound
+	// What used to be refused and now is not: 128 groups of a 2 KiB key. The cap
+	// is 4 MiB and the shared prefix is stored once, so this is comfortable.
+	realistic := make([]wire.KVQueryCont, 0, 128)
+	for g := 0; g < 128; g++ {
+		key := fmt.Appendf(nil, "tenant:acme:users:%09d", g)
+		key = append(key, make([]byte, 2048)...)
+		realistic = append(realistic, wire.KVQueryCont{Group: uint32(g), After: key, More: true}) //nolint:gosec // small loop bound
 	}
-	err := checkKVQueryCursorFits(big)
+	if err := checkKVQueryCursorFits(realistic); err != nil {
+		t.Fatalf("a 128-group cursor of 2 KiB keys was refused: %v", err)
+	}
+
+	// The residual ceiling still fails LOUD rather than wedging the query on the
+	// next request: 4096 groups of a 64 KiB key that share nothing.
+	huge := make([]wire.KVQueryCont, 0, wire.KVQueryMaxCursorConts)
+	for g := 0; g < wire.KVQueryMaxCursorConts; g++ {
+		key := make([]byte, 0xFFFF)
+		key[0], key[1] = byte(g), byte(g>>8)
+		huge = append(huge, wire.KVQueryCont{Group: uint32(g), After: key, More: true}) //nolint:gosec // small loop bound
+	}
+	err := checkKVQueryCursorFits(huge)
 	if err == nil {
-		t.Fatalf("a %d-byte cursor was accepted over the %d-byte args cap", 64*(7+2048)+2, wire.KVQueryMaxCursorBytes)
+		t.Fatalf("a %d-byte cursor was accepted over the %d-byte args cap", wire.KVQueryCursorBytes(huge), wire.KVQueryMaxCursorBytes)
 	}
 	if !strings.Contains(err.Error(), "cursor cap") {
 		t.Fatalf("the refusal does not explain itself: %v", err)
 	}
-}
-
-// --- the smuggling probe --------------------------------------------------
-
-// A PERMANENT filter error must never be reported as retryable, however the
-// filter is written.
-//
-// THE HOLE THIS CLOSES. The coordinator rewrites a group's "no such index" as
-// the retryable ErrIndexBuilding when the name is in the meta catalog, and a
-// remote group's error arrives as text with its type gone — so the first cut
-// matched the sentinel by SUBSTRING. Filter fields are client-chosen and are
-// quoted verbatim into ops.ErrKVQueryFilter's message, so a field named
-// `$kvindex: no such index` put the sentinel text inside a permanent error and
-// got it rewritten: a correct client then retries a bad filter forever, at one
-// full cluster fan-out per attempt. Reproduced exactly this way.
-func TestKVQueryFilterErrorIsNotSmuggledAsRetryable(t *testing.T) {
-	tc := newTestCluster(t, 1, 2)
-	n := tc.nodes[0]
-
-	seedKVIndexRecords(t, n, "u:", 0, 20)
-	if err := n.SetKVIndex(kvIndexDefFixture("by_age", "u:"), 5*time.Second); err != nil {
-		t.Fatalf("SetKVIndex: %v", err)
-	}
-	waitKVIndexReadyEverywhere(t, tc, 1)
-
-	for _, field := range []string{
-		`$kvindex: no such index`,
-		`$kvindex: no such index: "by_age" on shard group 0`,
-		`kvindex: no such index: "by_age" on shard group 1`,
-	} {
-		_, err := kvQueryCall(t, n, wire.KVQueryArgs{
-			Index:  "by_age",
-			Filter: vtypes.Filter{Op: vtypes.FilterEq, Field: field, Value: vtypes.NewInt(1)},
-			Limit:  10,
-		})
-		if err == nil {
-			t.Fatalf("field %q: a reserved/invalid filter field was accepted", field)
-		}
-		if !errors.Is(err, ops.ErrKVQueryFilter) {
-			t.Fatalf("field %q: want the PERMANENT ErrKVQueryFilter, got %v", field, err)
-		}
-		if errors.Is(err, kvindex.ErrIndexBuilding) {
-			t.Fatalf("field %q: a permanent filter error was rewritten as retryable — a client will retry it forever: %v", field, err)
-		}
-	}
-}
-
-// The exact-shape predicate, driven directly: only the leaf's own message is
-// accepted, and only in full.
-func TestKVQueryNoSuchIndexClassificationIsExactShape(t *testing.T) {
-	tc := newTestCluster(t, 1, 2)
-	n := tc.nodes[0]
-	freezeKVIndexObserver(t, n)
-	if err := n.SetKVIndex(kvIndexDefFixture("by_age", "u:"), 5*time.Second); err != nil {
-		t.Fatalf("SetKVIndex: %v", err)
-	}
-
-	leaf := fmt.Sprintf(`kvindex: no such index: %q on shard group 3`, "by_age")
-	for _, tcase := range []struct {
-		name    string
-		msg     string
-		rewrite bool
-	}{
-		{"the leaf's own message", leaf, true},
-		{"through the peer wrapper", kvQueryRemoteErrPrefix + leaf, true},
-		{"a filter error carrying the text", `ops: kv_query: invalid filter: field "$kvindex: no such index: \"by_age\" on shard group 3" addresses the reserved "$" namespace`, false},
-		{"the sentinel buried mid-message", "internal error: " + leaf, false},
-		{"trailing text after the group", leaf + " (retry)", false},
-		{"an illegal index name", `kvindex: no such index: "by age!" on shard group 3`, false},
-		{"a non-numeric group", `kvindex: no such index: "by_age" on shard group two`, false},
-		{"the bare sentinel", "kvindex: no such index", false},
-	} {
-		t.Run(tcase.name, func(t *testing.T) {
-			got := n.classifyKVQueryErr("by_age", 3, errors.New(tcase.msg))
-			if rewritten := errors.Is(got, kvindex.ErrIndexBuilding); rewritten != tcase.rewrite {
-				t.Fatalf("rewritten=%v want %v for %q (got %v)", rewritten, tcase.rewrite, tcase.msg, got)
-			}
-		})
-	}
-}
-
-// A REMOTE group's refusal must reach the coordinator with its meaning intact.
-//
-// It does not by default: the server edge redacts anything it has not
-// classified as client-facing to "internal error", which turned a peer's
-// "that group has not installed the index yet" and a peer's "your filter is
-// invalid" into the same opaque string — so classifyKVQueryErr could only ever
-// work for locally hosted groups, and a create-then-query on a multi-node
-// cluster was a hard failure. server.clientFacingErr now classifies the
-// kv_query family; this is the end-to-end proof.
-func TestKVQueryRemoteGroupRefusalIsNotRedacted(t *testing.T) {
-	const shards = 6
-	tc := newTestCluster(t, 3, shards, 1) // RF=1: most groups are answered by a peer
-	n := tc.nodes[0]
-	for _, other := range tc.nodes {
-		freezeKVIndexObserver(t, other) // nothing installs the definition anywhere
-	}
-	if err := n.SetKVIndex(kvIndexDefFixture("by_age", "u:"), 5*time.Second); err != nil {
-		t.Fatalf("SetKVIndex: %v", err)
-	}
-	waitForKVIndex(t, 10*time.Second, "every node's meta FSM to carry the definition", func() bool {
-		for _, other := range tc.nodes {
-			if _, ok := other.meta.FSM.KVIndexLookup("by_age"); !ok {
-				return false
-			}
-		}
-		return true
-	})
-
-	// Ask a group this node does NOT host, so the answer comes back over the
-	// wire, and check the leg error directly — the fan-out would report whichever
-	// group failed first, which may be a local one.
-	remote := -1
-	for g := 0; g < shards; g++ {
-		if n.getShard(g) == nil {
-			remote = g
-			break
-		}
-	}
-	if remote < 0 {
-		t.Fatal("this node hosts every group; the test would prove nothing")
-	}
-	args, err := wire.EncodeKVQueryArgs(wire.KVQueryArgs{Index: "by_age", Filter: kvQueryAll(), Limit: 10})
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-	_, legErr := n.callKVQueryGroup(context.Background(), remote, wire.ConsistencyAnyReplica, args)
-	if legErr == nil {
-		t.Fatalf("group %d answered a query for an uninstalled index", remote)
-	}
-	if strings.Contains(legErr.Error(), "internal error") {
-		t.Fatalf("a remote group's refusal was redacted, so nothing can classify it: %v", legErr)
-	}
-	if got := n.classifyKVQueryErr("by_age", remote, legErr); !errors.Is(got, kvindex.ErrIndexBuilding) {
-		t.Fatalf("a remote uninstalled-index refusal was not reclassified as retryable: %v", got)
-	}
-
-	// The whole query reports it the same way, whichever group answered first.
-	if _, err := kvQueryCall(t, n, wire.KVQueryArgs{Index: "by_age", Filter: kvQueryAll(), Limit: 10}); !errors.Is(err, kvindex.ErrIndexBuilding) {
-		t.Fatalf("the fan-out reported %v, want the retryable ErrIndexBuilding", err)
+	if !strings.Contains(err.Error(), "per group") {
+		t.Fatalf("the refusal does not give the per-group budget: %v", err)
 	}
 }

@@ -3,7 +3,9 @@
 package wire
 
 import (
+	"bytes"
 	"encoding/binary"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -245,5 +247,143 @@ func TestKVQueryRoutingRowIsKeyless(t *testing.T) {
 				t.Fatalf("%s must not have a BuiltinOps row — it is an admin op, like __set_catalog__", name)
 			}
 		}
+	}
+}
+
+// --- the cursor block's shared prefix -------------------------------------
+
+// A composite cursor carries one continuation per shard group, and on an
+// indexed query every one of those keys begins with the definition's KeyPrefix.
+// Storing it once is what keeps the cursor cap from turning into a per-key
+// length limit that shrinks as an operator adds shards.
+func TestKVQueryCursorFactorsOutTheSharedPrefix(t *testing.T) {
+	const groups = 64
+	prefix := "tenant:acme:users:"
+	conts := make([]KVQueryCont, 0, groups)
+	for g := 0; g < groups; g++ {
+		conts = append(conts, KVQueryCont{Group: uint32(g), After: fmt.Appendf(nil, "%s%09d", prefix, g), More: true})
+	}
+	blob := appendKVQueryCursor(nil, conts)
+	if got := KVQueryCursorBytes(conts); got != len(blob) {
+		t.Fatalf("KVQueryCursorBytes = %d, encoder wrote %d", got, len(blob))
+	}
+	// The prefix appears ONCE, not once per group.
+	unfactored := 2 + groups*(7+len(prefix)+9)
+	if len(blob) >= unfactored {
+		t.Fatalf("cursor is %d bytes; storing the %d-byte prefix once should keep it well under %d", len(blob), len(prefix), unfactored)
+	}
+	if !bytes.Contains(blob, []byte(prefix)) {
+		t.Fatal("the shared prefix is not in the block at all")
+	}
+	if n := bytes.Count(blob, []byte(prefix)); n != 1 {
+		t.Fatalf("the shared prefix appears %d times, want exactly 1", n)
+	}
+
+	got, n, err := decodeKVQueryCursor(blob)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if n != len(blob) {
+		t.Fatalf("decode consumed %d of %d bytes", n, len(blob))
+	}
+	if len(got) != len(conts) {
+		t.Fatalf("decoded %d continuations, want %d", len(got), len(conts))
+	}
+	for i := range conts {
+		if got[i].Group != conts[i].Group || got[i].More != conts[i].More || !bytes.Equal(got[i].After, conts[i].After) {
+			t.Fatalf("entry %d round-tripped as %+v, want %+v", i, got[i], conts[i])
+		}
+	}
+}
+
+// Entries that share nothing — a scan cursor, or a group that has emitted
+// nothing and carries an empty After — must round-trip too.
+func TestKVQueryCursorWithoutASharedPrefix(t *testing.T) {
+	conts := []KVQueryCont{
+		{Group: 0, After: nil, More: true},
+		{Group: 1, After: []byte("aaa"), More: true},
+		{Group: 2, After: []byte("zzz"), More: false},
+		{Group: 3, After: []byte{}, More: true},
+	}
+	blob := appendKVQueryCursor(nil, conts)
+	if got := KVQueryCursorBytes(conts); got != len(blob) {
+		t.Fatalf("KVQueryCursorBytes = %d, encoder wrote %d", got, len(blob))
+	}
+	got, _, err := decodeKVQueryCursor(blob)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for i := range conts {
+		if got[i].Group != conts[i].Group || got[i].More != conts[i].More || !bytes.Equal(got[i].After, conts[i].After) {
+			t.Fatalf("entry %d round-tripped as %+v, want %+v", i, got[i], conts[i])
+		}
+	}
+	if len(got[0].After) != 0 || len(got[3].After) != 0 {
+		t.Fatalf("an empty After came back as %q / %q", got[0].After, got[3].After)
+	}
+}
+
+// The cap is 4 MiB and it is checked against the DECLARED length before
+// anything is sized from it.
+func TestKVQueryCursorCapIsFourMiB(t *testing.T) {
+	if KVQueryMaxCursorBytes != 4<<20 {
+		t.Fatalf("KVQueryMaxCursorBytes = %d, want 4 MiB", KVQueryMaxCursorBytes)
+	}
+	a := KVQueryArgs{Index: "x", Limit: 10, Return: KVQueryReturnKeys, Consistency: ConsistencyLeaderOnly}
+	// A cursor that fits: 1024 groups of a 512-byte key sharing no prefix.
+	for g := 0; g < 1024; g++ {
+		key := make([]byte, 512)
+		key[0] = byte(g)
+		key[1] = byte(g >> 8)
+		a.Cursor = append(a.Cursor, KVQueryCont{Group: uint32(g), After: key, More: true})
+	}
+	if n := KVQueryCursorBytes(a.Cursor); n > KVQueryMaxCursorBytes {
+		t.Fatalf("fixture: the cursor is %d bytes, over the cap", n)
+	}
+	b, err := EncodeKVQueryArgs(a)
+	if err != nil {
+		t.Fatalf("a %d-byte cursor was refused: %v", KVQueryCursorBytes(a.Cursor), err)
+	}
+	back, err := DecodeKVQueryArgs(b)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(back.Cursor) != len(a.Cursor) {
+		t.Fatalf("decoded %d continuations, want %d", len(back.Cursor), len(a.Cursor))
+	}
+
+	// A LYING declared cursor length is rejected on the cap before any
+	// allocation: the frame claims 0xFFFFFFFF bytes of cursor.
+	hostile := append([]byte(nil), b...)
+	// Find the cursor length field: flags, indexLen, index, limit, ret, rc.
+	off := 1 + 1 + len(a.Index) + 2 + 1 + 1
+	binary.BigEndian.PutUint32(hostile[off:], 0xFFFFFFFF)
+	if _, err := DecodeKVQueryArgs(hostile); err == nil {
+		t.Fatal("a cursor length of 0xFFFFFFFF was accepted")
+	}
+}
+
+// A block whose entry claims the shared prefix while the block declares none is
+// corrupt, not a zero-length prefix to silently accept.
+func TestKVQueryCursorPrefixFlagWithoutAPrefixIsRefused(t *testing.T) {
+	blob := appendKVQueryCursor(nil, []KVQueryCont{{Group: 0, After: []byte("k"), More: true}})
+	// prefixLen is byte 2; the flags byte of entry 0 follows count+prefixLen+
+	// prefix+group.
+	if blob[2] == 0 {
+		t.Fatalf("fixture: expected a shared prefix, block = %v", blob)
+	}
+	hostile := append([]byte(nil), blob...)
+	plen := int(hostile[2])
+	flagsAt := 2 + 1 + plen + 4
+	hostile[2] = 0                                     // the block now declares no prefix...
+	hostile = append(hostile[:3], hostile[3+plen:]...) // ...and carries none
+	flagsAt -= plen
+	hostile[flagsAt] |= 1 << 1 // ...but the entry still claims one
+	if _, _, err := decodeKVQueryCursor(hostile); err == nil {
+		t.Fatal("an entry claiming a prefix the block does not carry was accepted")
+	}
+	// A truncated prefix declaration is refused rather than slicing past the end.
+	if _, _, err := decodeKVQueryCursor([]byte{0, 1, 0xFF}); err == nil {
+		t.Fatal("a prefix length past the end of the block was accepted")
 	}
 }

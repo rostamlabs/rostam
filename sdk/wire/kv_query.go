@@ -11,6 +11,7 @@ package wire
 // convention, not the brief's typo.
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -40,7 +41,7 @@ const (
 const (
 	KVQueryMaxLimit       = 1000
 	KVQueryMaxFilterBytes = 64 << 10
-	KVQueryMaxCursorBytes = 64 << 10
+	KVQueryMaxCursorBytes = 4 << 20
 	KVQueryMaxCursorConts = 4096
 	KVQueryMaxFilterNodes = 256
 	KVQueryMaxFilterDepth = 32
@@ -146,23 +147,108 @@ func checkKVQueryCursorShape(conts []KVQueryCont) error {
 	return nil
 }
 
+// kv_query cursor flags, carried in each continuation's flag byte.
+const (
+	kvQueryContFlagMore   uint8 = 1 << 0 // this group has more matching keys beyond After
+	kvQueryContFlagPrefix uint8 = 1 << 1 // After is the block's shared prefix followed by this entry's suffix
+)
+
+// KVQueryCursorMaxPrefixLen caps the shared prefix a cursor block may factor
+// out. It is KVIndexMaxPrefixLen because that IS what the prefix is in
+// practice: every key an indexed query can return starts with the definition's
+// KeyPrefix, whose own cap is this. Capping it also bounds decode expansion —
+// the prefix is stored once and restored n times, so an uncapped one would let
+// a small block decode into KVQueryMaxCursorConts copies of a 64 KiB key.
+const KVQueryCursorMaxPrefixLen = KVIndexMaxPrefixLen
+
+// kvQueryCursorPrefix picks the block's shared prefix: the longest common
+// prefix of the non-empty After keys, capped at KVQueryCursorMaxPrefixLen.
+//
+// An indexed kv_query is scoped to its definition's KeyPrefix, so EVERY key it
+// can return starts with that prefix — which makes the longest common prefix at
+// least the KeyPrefix, without this package needing a catalog to look one up.
+// Deriving it from the keys rather than from the definition also keeps the block
+// SELF-DESCRIBING: a cursor decodes to the same keys it encoded from even if the
+// definition is redefined between two pages, which a name-based lookup could not
+// promise.
+func kvQueryCursorPrefix(conts []KVQueryCont) []byte {
+	var lcp []byte
+	seen := false
+	for _, c := range conts {
+		if len(c.After) == 0 {
+			continue // a group that has emitted nothing shares no prefix
+		}
+		if !seen {
+			lcp = c.After
+			if len(lcp) > KVQueryCursorMaxPrefixLen {
+				lcp = lcp[:KVQueryCursorMaxPrefixLen]
+			}
+			seen = true
+			continue
+		}
+		i := 0
+		for i < len(lcp) && i < len(c.After) && lcp[i] == c.After[i] {
+			i++
+		}
+		lcp = lcp[:i]
+		if len(lcp) == 0 {
+			return nil
+		}
+	}
+	return lcp
+}
+
 // appendKVQueryCursor appends a cursor block's BODY (no length prefix — the
 // caller frames it, since args and result wrap it differently):
 //
-//	[n u16]{ [group u32][more u8][afterLen u16][after] }
+//	[n u16][prefixLen u8][prefix]{ [group u32][flags u8][suffixLen u16][suffix] }
+//
+// THE SHARED PREFIX IS STORED ONCE. A composite cursor carries one continuation
+// per shard group that still has rows, and on an indexed query every one of
+// those keys begins with the definition's KeyPrefix — so without factoring it
+// out the cursor pays for the same bytes NumShards times, and the cap below
+// becomes a per-key length limit that shrinks as an operator adds shards. An
+// entry whose After does not start with the block prefix (an empty After, or a
+// scan cursor over an unrelated part of the keyspace) simply carries the whole
+// key and says so with kvQueryContFlagPrefix clear.
 func appendKVQueryCursor(dst []byte, conts []KVQueryCont) []byte {
+	prefix := kvQueryCursorPrefix(conts)
 	dst = binary.BigEndian.AppendUint16(dst, uint16(len(conts))) //nolint:gosec // bounded by KVQueryMaxCursorConts by the caller
+	dst = append(dst, byte(len(prefix)))                         //nolint:gosec // bounded by KVQueryCursorMaxPrefixLen above
+	dst = append(dst, prefix...)
 	for _, c := range conts {
 		dst = binary.BigEndian.AppendUint32(dst, c.Group)
+		var flags uint8
 		if c.More {
-			dst = append(dst, 1)
-		} else {
-			dst = append(dst, 0)
+			flags |= kvQueryContFlagMore
 		}
-		dst = binary.BigEndian.AppendUint16(dst, uint16(len(c.After))) //nolint:gosec // bounded by KVQueryMaxCursorBytes by the caller
-		dst = append(dst, c.After...)
+		suffix := c.After
+		if len(prefix) > 0 && bytes.HasPrefix(c.After, prefix) {
+			flags |= kvQueryContFlagPrefix
+			suffix = c.After[len(prefix):]
+		}
+		dst = append(dst, flags)
+		dst = binary.BigEndian.AppendUint16(dst, uint16(len(suffix))) //nolint:gosec // bounded by the 64 KiB key cap
+		dst = append(dst, suffix...)
 	}
 	return dst
+}
+
+// KVQueryCursorBytes reports exactly how many bytes appendKVQueryCursor will
+// write for conts — the number that has to fit KVQueryMaxCursorBytes when the
+// client sends this cursor back. Exported so the coordinator can refuse a cursor
+// it cannot represent at the moment it builds one, rather than letting the query
+// die on the next request with nothing to say about why.
+func KVQueryCursorBytes(conts []KVQueryCont) int {
+	prefix := kvQueryCursorPrefix(conts)
+	n := 2 + 1 + len(prefix)
+	for _, c := range conts {
+		n += 4 + 1 + 2 + len(c.After)
+		if len(prefix) > 0 && bytes.HasPrefix(c.After, prefix) {
+			n -= len(prefix)
+		}
+	}
+	return n
 }
 
 // kvQueryContMinBytes is the fewest bytes one KVQueryCont can possibly
@@ -176,11 +262,23 @@ const kvQueryContMinBytes = 7
 // uniformly whether it arrives as a client-supplied args cursor or a
 // (supposedly server-produced) result continuation.
 func decodeKVQueryCursor(b []byte) (conts []KVQueryCont, n int, err error) {
-	if len(b) < 2 {
+	if len(b) < 3 {
 		return nil, 0, ErrKVQueryArgsTruncated
 	}
 	count := binary.BigEndian.Uint16(b)
 	off := 2
+	// The shared prefix comes before the entries and is bounded by its own u8
+	// length, so the expansion it can drive is at most
+	// KVQueryMaxCursorConts x 255 — checked against the remaining input before
+	// anything is sized from it.
+	plen := int(b[off])
+	off++
+	if plen > len(b)-off {
+		return nil, 0, ErrKVQueryArgsTruncated
+	}
+	prefix := b[off : off+plen]
+	off += plen
+
 	if !CountFitsIn(int(count), len(b)-off, kvQueryContMinBytes) {
 		return nil, 0, ErrKVQueryArgsTruncated
 	}
@@ -195,23 +293,37 @@ func decodeKVQueryCursor(b []byte) (conts []KVQueryCont, n int, err error) {
 		}
 		group := binary.BigEndian.Uint32(b[off:])
 		off += 4
-		more := b[off] != 0
+		flags := b[off]
 		off++
-		alen := binary.BigEndian.Uint16(b[off:])
+		slen := binary.BigEndian.Uint16(b[off:])
 		off += 2
-		if int(alen) > len(b)-off {
+		if int(slen) > len(b)-off {
 			return nil, 0, ErrKVQueryArgsTruncated
 		}
+		suffix := b[off : off+int(slen)]
+		off += int(slen)
+
+		// An entry that claims the shared prefix is rebuilt into its OWN
+		// allocation: the two halves are not adjacent in the input, and callers
+		// hold After well past this frame. An entry without the flag keeps the
+		// sub-slice behaviour the frame has always had.
 		var after []byte
-		if alen > 0 {
-			after = b[off : off+int(alen)]
+		switch {
+		case flags&kvQueryContFlagPrefix != 0:
+			if plen == 0 {
+				return nil, 0, fmt.Errorf("%w: cursor entry claims a shared prefix but the block declares none", ErrKVQueryArgs)
+			}
+			after = make([]byte, 0, plen+int(slen))
+			after = append(after, prefix...)
+			after = append(after, suffix...)
+		case slen > 0:
+			after = suffix
 		}
-		off += int(alen)
 		if i > 0 && group <= prevGroup {
 			return nil, 0, fmt.Errorf("%w: cursor groups not strictly increasing", ErrKVQueryArgs)
 		}
 		prevGroup = group
-		conts = append(conts, KVQueryCont{Group: group, More: more, After: after})
+		conts = append(conts, KVQueryCont{Group: group, More: flags&kvQueryContFlagMore != 0, After: after})
 	}
 	return conts, off, nil
 }
