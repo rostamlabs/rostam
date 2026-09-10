@@ -480,7 +480,7 @@ and **unmetered** — so a client polling it in a tight loop is a cluster-wide
 fan-out per poll. Poll it at human intervals, not per request.
 
 **A backfill briefly contends with writers.** The walk releases each shard's read
-lock every chunk of index slots rather than holding it for the whole pass, so a
+lock every 4 096 index slots rather than holding it for the whole pass, so a
 writer waits at most one chunk — never for a whole shard's walk. Creating a
 definition on a large live keyspace is a visible but bounded latency bump on that
 node, once, and again on every restart (the index is rebuilt from the cache every
