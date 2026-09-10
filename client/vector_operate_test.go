@@ -343,3 +343,60 @@ func TestVectorOperateIsNonReplayable(t *testing.T) {
 		}
 	}
 }
+
+// TestCollectionOperateMissingCollectionMapsToSentinel: a call against a
+// collection the server does not know must land on ErrCollectionNotFound, the
+// same sentinel every other Collection method reports, rather than the raw
+// RemoteError this one API used to hand back. The fake server answers with the
+// message shape server/handlers.go lets across the wire verbatim.
+func TestCollectionOperateMissingCollectionMapsToSentinel(t *testing.T) {
+	addr, stop := startFakeServer(t, func(_ []byte) (uint8, []byte) {
+		return StatusError, encodeErrorMsgFrame("vector: no collection \"posts\"")
+	})
+	defer stop()
+
+	c, err := New(Config{Servers: []string{addr}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	a, err := NewOperate(nil).Dynamic().AddT(F("rc"), wire.OperateTypeU32, 1).Args()
+	if err != nil {
+		t.Fatalf("build operate args: %v", err)
+	}
+	found, res, version, err := c.Collection("posts").Operate(context.Background(),
+		OperateRequest{ID: 1, PayloadKey: "session", Args: a})
+	if !errors.Is(err, ErrCollectionNotFound) {
+		t.Fatalf("err = %v, want ErrCollectionNotFound", err)
+	}
+	if found || res != nil || version != 0 {
+		t.Fatalf("failed call returned (found=%v, res=%v, version=%d); want the zero outcome", found, res, version)
+	}
+}
+
+// TestCollectionOperateVersionConflictStillMapped is the negative control for
+// the composition: wrapping mapCollErr around mapWriteErr must not swallow the
+// version-conflict mapping mapWriteErr already performs.
+func TestCollectionOperateVersionConflictStillMapped(t *testing.T) {
+	addr, stop := startFakeServer(t, func(_ []byte) (uint8, []byte) {
+		return StatusError, encodeErrorMsgFrame("vector: version conflict")
+	})
+	defer stop()
+
+	c, err := New(Config{Servers: []string{addr}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	a, err := NewOperate(nil).Dynamic().AddT(F("rc"), wire.OperateTypeU32, 1).Args()
+	if err != nil {
+		t.Fatalf("build operate args: %v", err)
+	}
+	_, _, _, err = c.Collection("posts").Operate(context.Background(),
+		OperateRequest{ID: 1, PayloadKey: "session", Args: a, ExpectedVersion: 9, HasExpectedVersion: true})
+	if !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("err = %v, want ErrVersionConflict", err)
+	}
+}

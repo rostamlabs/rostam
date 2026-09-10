@@ -54,7 +54,11 @@ func (col *Collection) Operate(ctx context.Context, req OperateRequest) (found b
 	}
 	body, err := col.c.Call(ctx, "vector_operate", args)
 	if err != nil {
-		return false, nil, 0, mapWriteErr(err)
+		// mapCollErr around mapWriteErr, the way the read siblings compose it: a
+		// call against a collection that does not exist must land on the
+		// ErrCollectionNotFound sentinel like every other Collection method,
+		// instead of handing back a raw RemoteError only this one API returns.
+		return false, nil, 0, mapCollErr(mapWriteErr(err))
 	}
 	return wire.DecodeVectorOperateResult(body)
 }
