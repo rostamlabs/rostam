@@ -252,7 +252,15 @@ func KVQueryCursorBytes(conts []KVQueryCont) int {
 }
 
 // kvQueryContMinBytes is the fewest bytes one KVQueryCont can possibly
-// occupy on the wire: group(4) + more(1) + afterLen(2), After empty.
+// occupy on the wire: group(4) + flags(1) + suffixLen(2), with an empty
+// suffix.
+//
+// The middle byte was a bare `more` bit when this constant was written. It is
+// now the flags byte appendKVQueryCursor writes — kvQueryContFlagMore plus
+// kvQueryContFlagPrefix — which is still exactly one byte, so the arithmetic
+// never changed and only the comment was stale. Likewise afterLen became
+// suffixLen when the shared prefix was factored out of the block; the field is
+// the same u16 in the same place.
 const kvQueryContMinBytes = 7
 
 // decodeKVQueryCursor reads a cursor block's body (as appendKVQueryCursor
