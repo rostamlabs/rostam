@@ -342,6 +342,11 @@ func TestVectorOperateIsNonReplayable(t *testing.T) {
 			t.Errorf("nonReplayableOp(%q) = false, want true", op)
 		}
 	}
+	// The three are listed individually rather than matched by a "vector_"
+	// prefix, so a read-only vector op must NOT be caught by the same switch.
+	if nonReplayableOp("vector_get") {
+		t.Error("nonReplayableOp(\"vector_get\") = true, want false")
+	}
 }
 
 // TestCollectionOperateMissingCollectionMapsToSentinel: a call against a

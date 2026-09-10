@@ -119,13 +119,22 @@ func TestMVAddBatchGatesRecordValuesOnBothPaths(t *testing.T) {
 	good := vtypes.Metadata{"session": vtypes.NewRecord(sessionRecordForOps(t))}
 	tokens := [][]float32{{1, 0}}
 
+	// BOTH ROWS REJECT INSIDE MultiBulkBuild, AND THAT IS THE POINT. Its
+	// whole-batch validation runs BEFORE it looks at whether the target is empty
+	// (vector/multivector.go: the record gate is in the loop above m.mu.Lock,
+	// the emptiness check is after it), so through this handler a bad record
+	// never reaches the per-record MultiRestoreAddSparse below. The seeded row
+	// therefore pins that the answer does not depend on the target's state — the
+	// exact asymmetry the fix closed — rather than exercising a second gate.
+	// MultiRestoreAddSparse's own gate is driven directly by
+	// TestMVAddVersionedGatesRecordValues, through the other wire op that
+	// reaches it.
 	for _, path := range []struct {
 		name string
-		seed bool // seed a document first, so MultiBulkBuild declines and the
-		// per-record MultiRestoreAddSparse path runs instead
+		seed bool // seed a document, so the target is non-empty
 	}{
-		{"empty target (MultiBulkBuild fast path)", false},
-		{"non-empty target (MultiRestoreAddSparse path)", true},
+		{"empty target", false},
+		{"non-empty target", true},
 	} {
 		for _, bad := range []struct {
 			name string
@@ -146,11 +155,10 @@ func TestMVAddBatchGatesRecordValuesOnBothPaths(t *testing.T) {
 						t.Fatalf("seed add: %v", err)
 					}
 				}
-				// The BAD record comes first on the non-empty path, where the
-				// handler applies records one at a time and a later failure would
-				// leave the earlier ones stored (ordinary batch semantics). On the
-				// empty path the whole batch is refused regardless of order, which
-				// the vector-level test pins directly.
+				// The bad record comes FIRST and a good one follows it, so a
+				// gate that only looked at the first record and a gate that
+				// walked the whole batch are told apart by the assertion below
+				// that NEITHER document was stored.
 				recs := []vtypes.MultiScanRecord{
 					{ID: 1, Tokens: tokens, Metadata: bad.meta},
 					{ID: 2, Tokens: tokens, Metadata: good},
@@ -187,5 +195,72 @@ func TestMVAddBatchGatesRecordValuesOnBothPaths(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestMVAddVersionedGatesRecordValues drives MultiRestoreAddSparse's OWN record
+// gate through the wire op that actually reaches it.
+//
+// vector_mv_add_batch cannot: handleMVAddBatch calls MultiBulkBuild first, and
+// that validates the whole batch before it checks whether the target is empty,
+// so a malformed record is refused there and the per-record restore-add below is
+// never entered. vector_mv_add_versioned — the offline MV-resplit backfill
+// primitive — calls MultiRestoreAddSparse directly, which is where the gate that
+// protects the incremental path has to be proven.
+//
+// A refused record must leave the document absent: the gate runs before any
+// state change, not after a partial one.
+func TestMVAddVersionedGatesRecordValues(t *testing.T) {
+	tokens := [][]float32{{1, 0}}
+	good := vtypes.Metadata{"session": vtypes.NewRecord(sessionRecordForOps(t))}
+
+	for _, bad := range []struct {
+		name string
+		meta vtypes.Metadata
+		want error
+	}{
+		{"malformed", vtypes.Metadata{"session": vtypes.NewRecord(malformedRecordBytes)}, vector.ErrRecordMalformed},
+		{"oversize", vtypes.Metadata{"session": vtypes.NewRecord(make([]byte, overCapRecordBytes))}, vector.ErrRecordTooLarge},
+	} {
+		t.Run(bad.name, func(t *testing.T) {
+			tx := newVecTx(t)
+			cfg := vector.MultiVectorConfig{Dim: 2, M: 4, EfConstruction: 10, EfSearch: 10, Seed: 1}
+			if _, err := handleMVCreate(tx, EncodeMVCreateArgs("mv", cfg)); err != nil {
+				t.Fatalf("create MV: %v", err)
+			}
+			// A seeded document, so this is the INCREMENTAL path and not a
+			// bulk build.
+			if _, err := handleMVAdd(tx, EncodeMVAddArgs("mv", 100, tokens, good)); err != nil {
+				t.Fatalf("seed add: %v", err)
+			}
+
+			_, err := handleMVAddVersioned(tx, EncodeMVAddArgsVersioned("mv", 1, tokens, bad.meta, 7))
+			if err == nil {
+				t.Fatalf("versioned add carrying a %s record: got nil error, want %v", bad.name, bad.want)
+			}
+			if !errors.Is(err, bad.want) {
+				t.Fatalf("err = %v, want %v", err, bad.want)
+			}
+			eb, eerr := handleMVExists(tx, EncodeMVExistsArgs("mv", 1))
+			if eerr != nil {
+				t.Fatalf("mv exists(1): %v", eerr)
+			}
+			if ex, _ := DecodeExistsResult(eb); ex {
+				t.Error("the refused versioned add still stored the document")
+			}
+
+			// The gate is not over-broad: a good record on the same path lands,
+			// with the verbatim version the op exists to preserve.
+			if _, err := handleMVAddVersioned(tx, EncodeMVAddArgsVersioned("mv", 2, tokens, good, 7)); err != nil {
+				t.Fatalf("all-good versioned add: %v, want nil", err)
+			}
+			eb, eerr = handleMVExists(tx, EncodeMVExistsArgs("mv", 2))
+			if eerr != nil {
+				t.Fatalf("mv exists(2): %v", eerr)
+			}
+			if ex, _ := DecodeExistsResult(eb); !ex {
+				t.Fatal("the all-good versioned add did not land")
+			}
+		})
 	}
 }

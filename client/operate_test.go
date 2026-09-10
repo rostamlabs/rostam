@@ -553,20 +553,3 @@ func TestOperateBuilderMigrateInstallsResolutionSchema(t *testing.T) {
 		t.Fatalf("Add path pos = %d, want 4 (the field only v2 declares)", got)
 	}
 }
-
-// TestVectorOperateNonReplayable checks that the three vector operate ops are
-// registered as non-replayable alongside the KV "operate". They are the SAME
-// non-idempotent op-list applied to a record held in a point's payload, so a
-// blind replay after an ambiguous post-commit failure would apply every ADD
-// twice — the exact hole the KV entry exists to close.
-func TestVectorOperateNonReplayable(t *testing.T) {
-	for _, op := range []string{"vector_operate", "vector_named_operate", "vector_mv_operate"} {
-		if !nonReplayableOp(op) {
-			t.Errorf("nonReplayableOp(%q) = false, want true", op)
-		}
-	}
-	// A read-only vector op must NOT be caught by the same switch.
-	if nonReplayableOp("vector_get") {
-		t.Error("nonReplayableOp(\"vector_get\") = true, want false")
-	}
-}
