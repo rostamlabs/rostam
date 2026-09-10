@@ -204,7 +204,16 @@ func grpcError(err error) error {
 		// reach. wire.IsOperateArgsMessage, not strings.Contains: a bare
 		// substring check would also match an unrelated internal error that
 		// merely wraps the sentinel, leaking it unredacted.
-		wire.IsOperateArgsMessage(err.Error()):
+		//
+		// wire.ErrVectorArgsTruncated rides in the same bucket, by both arms, for
+		// the same reasons: DecodeVectorOperateArgs raises it for a frame shorter
+		// than the fields it declares, right beside the ErrOperateArgs it raises
+		// for a complete-but-invalid one. Both are the caller's framing mistake
+		// and both name nothing but "the arguments do not decode"; left
+		// unclassified, a truncated frame read as a server fault.
+		wire.IsOperateArgsMessage(err.Error()),
+		errIs(err, wire.ErrVectorArgsTruncated),
+		wire.IsVectorArgsTruncatedMessage(err.Error()):
 		// wire.ErrOperateArgs: a malformed operate frame — a vector_operate or a KV
 		// operate whose args do not decode, or which names a second target or a
 		// TTL the op does not carry (DecodeVectorOperateArgs /

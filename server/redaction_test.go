@@ -485,3 +485,56 @@ func TestMapResultMalformedOperateFrameIsClientFacing(t *testing.T) {
 		}
 	})
 }
+
+// TestMapResultTruncatedOperateFrameIsClientFacing is the parity guard for
+// wire.ErrVectorArgsTruncated, the sentinel DecodeVectorOperateArgs raises for a
+// frame SHORTER than the fields it declares — right beside the ErrOperateArgs it
+// raises for a complete-but-invalid one.
+//
+// Both are the caller's framing mistake and both say nothing but "the arguments
+// do not decode", so both belong in the same bucket. Left unclassified, a
+// truncated frame was redacted to "internal error" and the caller was told a
+// server fault had happened.
+func TestMapResultTruncatedOperateFrameIsClientFacing(t *testing.T) {
+	disp := &fakeDispatcher{}
+	// A real production shape: a frame that declares a 4-byte collection name
+	// and then simply stops.
+	frame := []byte{4, 'd', 'o'}
+	_, _, _, _, _, _, decErr := wire.DecodeVectorOperateArgs(frame)
+	if !errors.Is(decErr, wire.ErrVectorArgsTruncated) {
+		t.Fatalf("decoder fixture drifted: err = %v, want wire.ErrVectorArgsTruncated", decErr)
+	}
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", wire.ErrVectorArgsTruncated},
+		{"wrapped (%w, exercises errors.Is identity)", fmt.Errorf("vector_operate: %w", wire.ErrVectorArgsTruncated)},
+		{"as the decoder actually returns it", decErr},
+		{"stringified across Raft, real bare shape", errors.New(wire.ErrVectorArgsTruncated.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, payload := mapResult(disp, nil, tc.err, "")
+			if status != StatusError {
+				t.Fatalf("status = %d, want StatusError (%d)", status, StatusError)
+			}
+			msg, _ := DecodeErrorPayload(payload)
+			if msg == "internal error" {
+				t.Fatalf("a truncated frame was redacted to %q — a client protocol mistake reads as a server fault", msg)
+			}
+			if msg != tc.err.Error() {
+				t.Fatalf("payload = %q, want the verbatim message %q", msg, tc.err.Error())
+			}
+		})
+	}
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix", func(t *testing.T) {
+		err := errors.New("apply: " + wire.ErrVectorArgsTruncated.Error())
+		status, payload := mapResult(disp, nil, err, "")
+		if status != StatusError {
+			t.Fatalf("status = %d, want StatusError (%d)", status, StatusError)
+		}
+		if msg, _ := DecodeErrorPayload(payload); msg != "internal error" {
+			t.Fatalf("payload = %q, want the redacted message", msg)
+		}
+	})
+}

@@ -19,6 +19,28 @@ import (
 // shorter than the layout requires.
 var ErrVectorArgsTruncated = errors.New("ops: vector args truncated")
 
+// IsVectorArgsTruncatedMessage reports whether s is the EXACT serialised form of
+// an ErrVectorArgsTruncated error. It is IsOperateArgsMessage's twin, for the
+// same reason and with the same shape: the operate handlers decode their frame
+// INSIDE the FSM apply, so on a cluster shard.decodePBResult rebuilds the error
+// with errors.New, errors.Is identity is gone, and a classifier matching only
+// the sentinel redacts a caller's framing mistake to "internal error".
+//
+// The two sentinels are raised by the SAME decoder, side by side:
+// DecodeVectorOperateArgs answers ErrVectorArgsTruncated for a frame shorter
+// than its declared fields and ErrOperateArgs for a frame that is complete but
+// structurally wrong. Both are the caller's mistake, so both belong in the same
+// classification bucket on every transport.
+//
+// This sentinel has exactly ONE serialised shape: bare, no detail suffix and no
+// wrapper — every producer in sdk/wire returns it unadorned and no site in the
+// tree wraps it. So exact equality is the whole matcher, and it is deliberately
+// not a strings.Contains: a bare substring check would make any internal fault
+// that merely mentions the sentinel text client-facing.
+func IsVectorArgsTruncatedMessage(s string) bool {
+	return s == ErrVectorArgsTruncated.Error()
+}
+
 // ErrMalformedPayloadJSON marks a per-point payload blob that is well-FRAMED —
 // its length prefix is consistent with the body, so the transport streamed it
 // through without looking inside — but is not a metadata object.

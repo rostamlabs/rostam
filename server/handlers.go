@@ -262,10 +262,11 @@ func clientFacingErr(err error) bool {
 		// fault. The message names no key, no path and no size — only that the
 		// arguments are invalid — so it is safe verbatim.
 		//
-		// Sentinel only, no message-shape arm: this error is raised by the
-		// decoder the handler itself calls, so it reaches the classifier with its
-		// identity intact.
-		// The clustered path stringifies the sentinel across the Raft boundary:
+		// Sentinel AND exact message shape, both arms load-bearing. The sentinel
+		// arm covers the direct path, where the decoder the handler itself calls
+		// hands the error back with its identity intact.
+		// The message-shape arm covers the clustered path, which stringifies the
+		// sentinel across the Raft boundary:
 		// an operate handler decodes its frame INSIDE the FSM apply, so
 		// shard.decodePBResult rebuilds the error with errors.New and errors.Is
 		// stops matching — which left a malformed frame from a clustered caller
@@ -273,8 +274,17 @@ func clientFacingErr(err error) bool {
 		// reach. wire.IsOperateArgsMessage, not strings.Contains: a bare
 		// substring check would also match an unrelated internal error that
 		// merely wraps the sentinel, leaking it unredacted.
+		//
+		// wire.ErrVectorArgsTruncated rides in the same bucket, by both arms, for
+		// the same reasons: DecodeVectorOperateArgs raises it for a frame shorter
+		// than the fields it declares, right beside the ErrOperateArgs it raises
+		// for a complete-but-invalid one. Both are the caller's framing mistake
+		// and both name nothing but "the arguments do not decode"; left
+		// unclassified, a truncated frame read as a server fault.
 		wire.IsOperateArgsMessage(err.Error()),
-		errors.Is(err, wire.ErrOperateArgs):
+		errors.Is(err, wire.ErrOperateArgs),
+		wire.IsVectorArgsTruncatedMessage(err.Error()),
+		errors.Is(err, wire.ErrVectorArgsTruncated):
 		return true
 	case errors.Is(err, ops.ErrOperateDuringReshard),
 		// ops.ErrOperateDuringReshard: a vector_operate against a collection a

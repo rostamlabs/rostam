@@ -533,3 +533,33 @@ func TestStatusForErrorMalformedOperateFrame(t *testing.T) {
 		}
 	})
 }
+
+// TestStatusForErrorTruncatedOperateFrame is the parity guard for
+// wire.ErrVectorArgsTruncated: the sentinel DecodeVectorOperateArgs raises for a
+// frame shorter than the fields it declares, beside the ErrOperateArgs it raises
+// for a complete-but-invalid one. Both are the caller's framing mistake, so both
+// answer 400 here, matching the binary transport
+// (server.TestMapResultTruncatedOperateFrameIsClientFacing) and gRPC's
+// InvalidArgument.
+func TestStatusForErrorTruncatedOperateFrame(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", wire.ErrVectorArgsTruncated},
+		{"wrapped (%w, exercises errors.Is identity)", fmt.Errorf("vector_operate: %w", wire.ErrVectorArgsTruncated)},
+		{"stringified across Raft, real bare shape", errors.New(wire.ErrVectorArgsTruncated.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := statusForError(tc.err); got != http.StatusBadRequest {
+				t.Errorf("statusForError = %d, want 400", got)
+			}
+		})
+	}
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix", func(t *testing.T) {
+		err := errors.New("apply: " + wire.ErrVectorArgsTruncated.Error())
+		if got := statusForError(err); got != http.StatusInternalServerError {
+			t.Errorf("statusForError(%v) = %d, want 500", err, got)
+		}
+	})
+}

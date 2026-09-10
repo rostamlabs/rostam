@@ -298,3 +298,32 @@ func TestGrpcErrorMalformedOperateFrameIsInvalidArgument(t *testing.T) {
 		}
 	})
 }
+
+// TestGrpcErrorTruncatedOperateFrameIsInvalidArgument is the parity guard for
+// wire.ErrVectorArgsTruncated: the sentinel DecodeVectorOperateArgs raises for a
+// frame shorter than the fields it declares, beside the ErrOperateArgs it raises
+// for a complete-but-invalid one. Both are the caller's framing mistake, so both
+// answer InvalidArgument here, matching HTTP's 400 and the binary transport's
+// client-facing message.
+func TestGrpcErrorTruncatedOperateFrameIsInvalidArgument(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", wire.ErrVectorArgsTruncated},
+		{"wrapped (%w, exercises errIs identity)", fmt.Errorf("vector_operate: %w", wire.ErrVectorArgsTruncated)},
+		{"stringified across replication, real bare shape", errors.New(wire.ErrVectorArgsTruncated.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := status.Code(grpcError(tc.err)); got != codes.InvalidArgument {
+				t.Errorf("grpcError(%v) = %v, want InvalidArgument", tc.err, got)
+			}
+		})
+	}
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix", func(t *testing.T) {
+		err := errors.New("apply: " + wire.ErrVectorArgsTruncated.Error())
+		if got := status.Code(grpcError(err)); got != codes.Internal {
+			t.Errorf("grpcError(%v) = %v, want Internal", err, got)
+		}
+	})
+}
