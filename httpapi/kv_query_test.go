@@ -668,3 +668,79 @@ func TestHTTPKVIndexCreateUninstallablePathIs400(t *testing.T) {
 		t.Fatalf("a valid definition = %d, want 200: %s", rr.Code, rr.Body.String())
 	}
 }
+
+// TestHTTPKVQueryFilterIsSizedBeforeItIsExpanded pins the ORDER of the two
+// checks on the filter, which is the whole fix and is not observable from the
+// status code alone (both refusals are 400).
+//
+// Decoded straight into a vtypes.Filter, the only bound on a filter was the body
+// cap — 32 MiB — and a megabyte of nested `and` arrays expands into a tree
+// costing far more heap than the bytes that asked for it, allocated before the
+// filter budget runs and before the request is authorized. So the byte cap must
+// be compared against the RAW bytes, before anything is unmarshalled.
+//
+// The proof is a filter that is BOTH oversized AND carries a field
+// DisallowUnknownFields must reject. Whichever check runs first names itself in
+// the message, so the message says which one it was.
+func TestHTTPKVQueryFilterIsSizedBeforeItIsExpanded(t *testing.T) {
+	h, _, cleanup := newKVQueryTestAPI(t, 0)
+	defer cleanup()
+
+	// ~1 MiB of legal, deeply UNnested filter JSON: a flat `and` of many
+	// conjuncts, which is what a real oversized filter looks like.
+	var b strings.Builder
+	b.WriteString(`{"unknown_marker":1,"op":"and","and":[`)
+	for i := 0; b.Len() < 1<<20; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"op":"eq","field":"f%d","value":{"kind":"int","int":%d}}`, i, i)
+	}
+	b.WriteString(`]}`)
+	huge := b.String()
+	if len(huge) <= wire.KVQueryMaxFilterBytes {
+		t.Fatalf("the fixture is only %d bytes; it must exceed the %d-byte cap", len(huge), wire.KVQueryMaxFilterBytes)
+	}
+
+	rec := do(t, h, "POST", "/v1/kv/query", `{"index":"by_age","filter":`+huge+`}`, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "exceeds the cap of") {
+		t.Fatalf("body %s does not name the byte cap: the filter was expanded before it was sized", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "unknown_marker") {
+		t.Fatalf("body %s reports the unmarshal's complaint: the filter was expanded before it was sized", rec.Body.String())
+	}
+
+	// The control that makes the assertion above mean something: the SAME
+	// unknown field, under the cap, IS reported — so the strict unmarshal really
+	// does run, and the oversized case skipped it rather than lacking it.
+	small := `{"unknown_marker":1,"op":"eq","field":"age","value":{"kind":"int","int":1}}`
+	rec = do(t, h, "POST", "/v1/kv/query", `{"index":"by_age","filter":`+small+`}`, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("an unknown filter field = %d, want 400 (%s)", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "unknown_marker") {
+		t.Fatalf("body %s does not name the unknown field: the filter is not being decoded strictly", rec.Body.String())
+	}
+
+	// And a filter over the NODE budget but under the byte cap is still refused,
+	// by the budget rather than by the size.
+	var deep strings.Builder
+	for i := 0; i < wire.KVQueryMaxFilterDepth+2; i++ {
+		deep.WriteString(`{"op":"not","not":`)
+	}
+	deep.WriteString(`{"op":"eq","field":"age","value":{"kind":"int","int":1}}`)
+	deep.WriteString(strings.Repeat("}", wire.KVQueryMaxFilterDepth+2))
+	if deep.Len() > wire.KVQueryMaxFilterBytes {
+		t.Fatalf("the nesting fixture is %d bytes; it must stay under the byte cap", deep.Len())
+	}
+	rec = do(t, h, "POST", "/v1/kv/query", `{"index":"by_age","filter":`+deep.String()+`}`, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("an over-nested filter = %d, want 400 (%s)", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "nesting") {
+		t.Fatalf("body %s is not the nesting-budget refusal", rec.Body.String())
+	}
+}

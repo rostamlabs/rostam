@@ -3,7 +3,9 @@
 package httpapi
 
 import (
+	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"strconv"
 	"unicode/utf8"
@@ -40,14 +42,23 @@ const (
 // a caller writing 2 is not, and a caller writing 3 by mistake would be asking
 // for a projection that does not exist in a field the codec would then reject
 // with a number.
+//
+// FILTER IS RAW, and for the same reason the cursor is a string: it must be
+// SIZED BEFORE IT IS EXPANDED. Decoded straight into a vtypes.Filter, the body
+// cap (maxJSONBody, 32 MiB) is the only bound on the work, and 32 MiB of
+// `{"and":[{"and":[...` expands into a tree of allocated nodes costing orders of
+// magnitude more heap than the bytes that asked for it — paid before the filter
+// budget runs and before the request is authorized, so anonymously. Held as raw
+// bytes the decoder only scans past the value, and the byte cap is checked on
+// what the caller actually sent. See toWire.
 type kvQueryReq struct {
-	Index       string        `json:"index"`
-	Filter      vtypes.Filter `json:"filter"`
-	Limit       *int          `json:"limit"`
-	Return      string        `json:"return"`
-	Consistency string        `json:"consistency"`
-	Scan        bool          `json:"scan"`
-	Cursor      string        `json:"cursor"`
+	Index       string          `json:"index"`
+	Filter      json.RawMessage `json:"filter"`
+	Limit       *int            `json:"limit"`
+	Return      string          `json:"return"`
+	Consistency string          `json:"consistency"`
+	Scan        bool            `json:"scan"`
+	Cursor      string          `json:"cursor"`
 }
 
 // kvQueryRow is one row of the answer. KeyB64 is always present, with KeyUTF8
@@ -176,6 +187,40 @@ func (req *kvQueryReq) toWire(w http.ResponseWriter) (wire.KVQueryArgs, bool) {
 		writeError(w, http.StatusBadRequest, `consistency must be "any", "leader" or "linearizable"`)
 		return wire.KVQueryArgs{}, false
 	}
+	// The filter is SIZED, then expanded, then budgeted — in that order, and the
+	// order is the point, exactly as it is for the cursor below.
+	//
+	// The cap is compared against the RAW bytes the caller sent. That is
+	// marginally stricter than the codec's cap, which applies to the compacted
+	// JSON EncodeKVQueryArgs produces, so a filter padded with tens of kilobytes
+	// of whitespace can be refused here while its compact form would have fit.
+	// That is the right side to err on: the alternative is to unmarshal first to
+	// find out how big it really is, which is the allocation this check exists to
+	// prevent, and the remedy (send compact JSON) is under the caller's control.
+	//
+	// Unmarshalled with DisallowUnknownFields, matching decodeBody: holding the
+	// filter raw must not quietly turn a misspelled operator into a silently
+	// ignored one.
+	var filter vtypes.Filter
+	if len(req.Filter) > 0 && !bytes.Equal(bytes.TrimSpace(req.Filter), []byte("null")) {
+		if len(req.Filter) > wire.KVQueryMaxFilterBytes {
+			writeError(w, http.StatusBadRequest,
+				"filter is too large: "+strconv.Itoa(len(req.Filter))+" bytes exceeds the cap of "+strconv.Itoa(wire.KVQueryMaxFilterBytes))
+			return wire.KVQueryArgs{}, false
+		}
+		dec := json.NewDecoder(bytes.NewReader(req.Filter))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&filter); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+			return wire.KVQueryArgs{}, false
+		}
+		// The node/depth budget, run here rather than left to the codec so the
+		// message names the filter and no fan-out is dispatched.
+		if err := wire.CheckFilterBudget(filter, wire.KVQueryMaxFilterNodes, wire.KVQueryMaxFilterDepth); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return wire.KVQueryArgs{}, false
+		}
+	}
 	// The cursor is opaque to the caller, so a malformed one is a client mistake
 	// with an obvious remedy (send back what the last page returned, unedited) —
 	// never a 500. Three checks, in this order, and the ORDER IS THE POINT.
@@ -207,7 +252,7 @@ func (req *kvQueryReq) toWire(w http.ResponseWriter) (wire.KVQueryArgs, bool) {
 	}
 	return wire.KVQueryArgs{
 		Index:       req.Index,
-		Filter:      req.Filter,
+		Filter:      filter,
 		Limit:       uint16(limit), //nolint:gosec // bounded by KVQueryMaxLimit above
 		Return:      ret,
 		Consistency: rc,
