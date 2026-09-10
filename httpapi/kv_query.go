@@ -305,7 +305,7 @@ var (
 //
 // It is dispatched through callWrite, like kvFlush, so it takes the write path's
 // shape (and its optional write-consistency envelope) rather than the read
-// path's. The AUTHORIZATION BAR IS HIGHER THAN callWrite”'s NAME SUGGESTS, and
+// path's. The AUTHORIZATION BAR IS HIGHER THAN THAT PATH SUGGESTS, and
 // deliberately so: authz.actionFor consults adminOps FIRST and __kv_index_set__
 // is enumerated there, so this endpoint requires an ADMIN key — not merely the
 // global-write bar flush settles for. Dropping an index makes every query naming

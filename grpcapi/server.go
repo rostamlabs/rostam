@@ -239,11 +239,13 @@ func grpcError(err error) error {
 		kvindex.ErrIndexChanged,
 		ops.ErrKVQueryUnavailable),
 		// shard.ErrStoreClosed reaches this package as TEXT — grpcapi cannot
-		// import shard — so it is matched by ops.IsStoreClosedMessage: an
-		// anchored suffix over the spelling shard.ErrStoreClosed is DECLARED
-		// from, vetoed by the permanent filter sentinel so a caller-chosen
-		// filter field quoting the refusal cannot make its own error retryable.
-		// NOT strings.Contains, for the reason every matcher above records.
+		// import shard — so it is matched by ops.IsStoreClosedMessage: it peels
+		// the known wrappers by anchored cut and then requires what REMAINS to
+		// EQUAL the spelling shard.ErrStoreClosed is DECLARED from. Exact form,
+		// never a suffix or a substring: this arm makes an error RETRYABLE, and
+		// caller text is quoted verbatim into other refusals in this family, so
+		// anything short of equality lets a client make its own permanent error
+		// retry forever.
 		ops.IsStoreClosedMessage(err.Error()):
 		return status.Error(codes.Unavailable, err.Error())
 	case errIs(err, vector.ErrDimMismatch, vector.ErrEmptyFilter, vector.ErrEmptyGroupBy,

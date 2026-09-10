@@ -573,10 +573,13 @@ func statusForError(err error) int {
 		// a cluster the group's other replicas can serve it — so it belongs in
 		// the same retryable bucket the reshard refusal further down uses. This package
 		// cannot import shard (the layering wall server.clientFacingErr
-		// documents), so it is matched by ops.IsStoreClosedMessage: an anchored
-		// suffix over the shared spelling shard.ErrStoreClosed is DECLARED from,
-		// with a veto on the permanent filter sentinel so a caller-chosen filter
-		// field quoting the refusal cannot make its own error retryable.
+		// documents), so it is matched by ops.IsStoreClosedMessage: it peels the
+		// known wrappers by anchored cut and then requires what REMAINS to EQUAL
+		// the shared spelling shard.ErrStoreClosed is DECLARED from. Exact form,
+		// not a suffix or a substring — this arm makes an error RETRYABLE, and
+		// caller text is quoted verbatim into other refusals in this family, so
+		// anything short of equality is a way for a client to make its own
+		// permanent error retry forever.
 		ops.IsStoreClosedMessage(err.Error()):
 		return http.StatusServiceUnavailable
 	case errors.Is(err, vector.ErrDimMismatch),
