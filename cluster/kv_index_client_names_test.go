@@ -59,6 +59,7 @@ func TestKVQueryClientErrorTextsMatchTheSentinels(t *testing.T) {
 		{ops.ErrKVQueryFilter.Error(), client.ErrKVQueryFilter},
 		{ops.ErrKVQueryScanRequired.Error(), client.ErrKVQueryFilter},
 		{ops.ErrKVQueryScanBudget.Error(), client.ErrKVQueryFilter},
+		{ops.ErrKVQueryCursorCap.Error(), client.ErrKVQueryFilter},
 		{ops.ErrKVIndexUnavailable.Error(), client.ErrKVQueryFilter},
 		{ops.ErrKVQueryUnavailable.Error(), client.ErrKVQueryUnavailable},
 		{shard.ErrStoreClosed.Error(), client.ErrKVQueryUnavailable},

@@ -227,6 +227,7 @@ const (
 	kvErrScanRequired  = "ops: kv_query: filter needs an index or scan:true"
 	kvErrScanBudget    = "ops: kv_query: scan budget exceeded; use an index"
 	kvErrIndexMissing  = "ops: kv_query: no KV index on this dispatcher"
+	kvErrCursorCap     = "ops: kv_query: continuation exceeds the cursor cap"
 	kvErrUnavailable   = "ops: kv_query: shard is unavailable; retry"
 	kvErrStoreClosed   = "shard: store is closed"
 	kvErrNoSuchIndex   = "kvindex: no such index"
@@ -269,7 +270,12 @@ func ClassifyKVQueryMessage(msg string) error {
 		strings.HasPrefix(msg, kvErrScanRequired),
 		strings.HasPrefix(msg, kvErrScanBudget),
 		strings.HasPrefix(msg, kvErrIndexMissing),
-		strings.HasPrefix(msg, kvErrCandidateCap):
+		strings.HasPrefix(msg, kvErrCandidateCap),
+		// The coordinator built a continuation too large to send back. Without
+		// this arm KVQuery returned it UNCLASSIFIED, so a caller paging until it
+		// sees a permanent error kept paging — asking again for a cursor that
+		// cannot exist, forever.
+		strings.HasPrefix(msg, kvErrCursorCap):
 		return ErrKVQueryFilter
 	case strings.HasPrefix(msg, kvErrIndexBuilding),
 		strings.HasPrefix(msg, kvErrIndexChanged):
