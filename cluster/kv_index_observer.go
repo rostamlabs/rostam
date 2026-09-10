@@ -179,7 +179,13 @@ func (n *Node) kvIndexPass(installOnly bool) {
 		if idx == nil {
 			continue // a store built without an index
 		}
-		if install {
+		// The fingerprint decides globally; this decides per group. A Set with the
+		// wrong number of definitions installed has not seen this pass's set —
+		// which is what a store that was just created looks like — so install into
+		// it whatever the fingerprint said. It makes the correctness of the skip
+		// independent of the fingerprint's ability to tell two stores apart, and
+		// therefore independent of the allocator ever reusing an address.
+		if install || len(idx.Defs()) != len(defs) {
 			idx.Install(defs)
 		}
 		if installOnly {
@@ -219,7 +225,14 @@ func kvIndexPassFingerprint(defs []kvindex.Def, shards []*shard.Store) string {
 	b.WriteByte('|')
 	for i, s := range shards {
 		if s != nil {
-			fmt.Fprintf(&b, "%d,", i)
+			// The STORE, not just the index it sits at. A group removed and
+			// re-added at the same index is a DIFFERENT store with a brand-new,
+			// empty index Set; keyed on the index alone the two passes fingerprint
+			// identically, the install is skipped, and that Set never receives the
+			// definitions — after which Backfill has no posting to fill and no-ops
+			// forever. Fail-closed (the index reports not-ready, so it is never
+			// queried from) but silent, which is the worst shape for a bug.
+			fmt.Fprintf(&b, "%d:%p,", i, s)
 		}
 	}
 	return b.String()

@@ -128,9 +128,14 @@ type KVIndexStats struct {
 	// answering from it would silently return a proper subset of the matches.
 	Ready int
 
-	// Backfills counts completed definition walks since process start, and
-	// BackfillKeys the cache entries they visited. Both climb on a restart (the
-	// index is rebuilt from the cache every time) and on every new definition.
+	// Backfills counts COMPLETED definition walks since process start.
+	// BackfillKeys counts cache entries visited by walks, completed or not — a
+	// walk aborted because its shard is being removed still contributes what it
+	// read before it stopped, because the cost was paid. So the two do not move
+	// together: a rise in BackfillKeys with Backfills flat is walks being
+	// abandoned, which is worth seeing rather than hiding. Both climb on a restart
+	// (the index is rebuilt from the cache every time) and on every new
+	// definition.
 	Backfills    uint64
 	BackfillKeys uint64
 

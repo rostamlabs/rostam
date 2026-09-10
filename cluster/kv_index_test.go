@@ -621,6 +621,59 @@ func TestKVIndexPassSkipsUnchangedInstall(t *testing.T) {
 	}
 }
 
+// A group removed and re-added at the SAME index is a different store with a
+// brand-new, empty index Set. Keyed on the index alone, the two passes look
+// identical, the install is skipped, and that Set never receives the definitions
+// — after which Backfill has no posting to fill and no-ops forever. The index
+// then stays not-ready on that group for the life of the process, which is
+// fail-closed but entirely silent.
+//
+// It also covers the walk gate's re-arm: a re-added group can only be
+// backfilled if AddShardOwner reopened the gate RemoveShardOwner closed.
+func TestKVIndexPassInstallsIntoAReAddedShard(t *testing.T) {
+	tc := newTestCluster(t, 1, 2)
+	n := tc.nodes[0]
+	freezeKVIndexObserver(t, n)
+	seedKVIndexRecords(t, n, "u:", 0, 200)
+	if err := n.SetKVIndex(kvIndexDefFixture("by_age", "u:"), 5*time.Second); err != nil {
+		t.Fatalf("SetKVIndex: %v", err)
+	}
+
+	n.applyKVIndexDefs()
+	if st := n.Stats().KVIndex; st.Ready != 1 {
+		t.Fatalf("Ready = %d before the swap, want 1", st.Ready)
+	}
+
+	// Take group 1 away and give it straight back at the same index.
+	if err := n.RemoveShardOwner(1); err != nil {
+		t.Fatalf("RemoveShardOwner: %v", err)
+	}
+	if err := n.AddShardOwner(1); err != nil {
+		t.Fatalf("AddShardOwner: %v", err)
+	}
+	fresh := n.getShard(1)
+	if fresh == nil {
+		t.Fatal("the group was not re-added")
+	}
+	if len(fresh.KVIndex().Defs()) != 0 {
+		t.Fatal("precondition: a re-added group must start with an empty index Set")
+	}
+
+	// The next pass has to notice. Ready counts names ready on EVERY hosted
+	// group, so it can only return to 1 if the fresh Set was installed into and
+	// then backfilled.
+	n.applyKVIndexDefs()
+	if got := len(fresh.KVIndex().Defs()); got != 1 {
+		t.Fatalf("the re-added group has %d definitions installed, want 1 — the pass skipped its install", got)
+	}
+	if st := n.Stats().KVIndex; st.Ready != 1 {
+		t.Fatalf("Ready = %d after the swap, want 1 — the re-added group never became usable", st.Ready)
+	}
+	if !fresh.KVIndex().IsReady("by_age") {
+		t.Fatal("the re-added group's index never became ready")
+	}
+}
+
 // Two reject numbers answering two questions: Rejects is a monotonic event
 // counter (a rate can be taken from it), RejectedDefs a gauge that reports what
 // is broken NOW and returns to zero when the offending definition is removed.
