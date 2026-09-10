@@ -545,6 +545,32 @@ func TestKVQueryScanWalkErrorIsRetryable(t *testing.T) {
 	}
 }
 
+func TestKVQueryScanWalkAbortedIsRetryable(t *testing.T) {
+	// kvindex.ErrWalkAborted is the concrete walk error this branch's fence
+	// produces: the cluster observer's wrapper returns it when a shard is being
+	// removed under the walk. It must reach the caller as the same retryable
+	// refusal any other cut-short walk does — never as a short page, because the
+	// keys the walk did not reach are indistinguishable from keys that did not
+	// match.
+	tx, _, _ := newIndexedTx(t, "rc")
+	seedKV(t, tx, "u:a", kvRec(7, "gold"))
+
+	walk := kvindex.Walker(func(fn func(key, value []byte) bool) error {
+		fn([]byte("u:a"), kvRec(7, "gold"))
+		return kvindex.ErrWalkAborted
+	})
+	out, err := scanPage(tx, walk, nil, nil, wire.KVQueryArgs{Scan: true, Limit: 10}, 0, kvQueryBudget())
+	if out != nil {
+		t.Fatalf("an aborted walk must yield no page, got %d bytes", len(out))
+	}
+	if !errors.Is(err, kvindex.ErrWalkAborted) {
+		t.Fatalf("the abort must stay inspectable through the wrap, got %v", err)
+	}
+	if !errors.Is(err, ErrKVQueryUnavailable) {
+		t.Fatalf("an aborted walk must be classified retryable, got %v", err)
+	}
+}
+
 // --- the index gate -------------------------------------------------------
 
 func TestKVQueryRouteGate(t *testing.T) {

@@ -57,10 +57,19 @@ var (
 	// the one op that cannot work without one.
 	ErrKVIndexUnavailable = errors.New("ops: kv_query: no KV index on this dispatcher")
 	// ErrKVQueryUnavailable marks a refusal that is RETRYABLE and about this
-	// replica rather than about the query: the walk was cut short because the
-	// cache is closing (a shard being removed from this node). The coordinator
-	// classifies it like kvindex.ErrIndexBuilding — try again, elsewhere or
-	// later — and it is never a short page.
+	// replica rather than about the query: a scan's walk was cut short, which
+	// today means kvindex.ErrWalkAborted (the cluster observer's walk gate
+	// stopping the walk because this shard is being removed from the node). The
+	// coordinator classifies it like kvindex.ErrIndexBuilding — try again,
+	// elsewhere or later.
+	//
+	// It is NEVER a short page. The keys an aborted walk did not reach are
+	// indistinguishable from keys that did not match, so a page built from a
+	// partial walk would be a silently wrong answer rather than a slow one.
+	//
+	// EVERY non-nil walk error lands here, not just the ones named above: a
+	// walker that fails is a walker whose result cannot be trusted, whatever it
+	// failed with.
 	ErrKVQueryUnavailable = errors.New("ops: kv_query: shard is unavailable; retry")
 )
 
