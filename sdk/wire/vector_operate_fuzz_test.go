@@ -3,6 +3,8 @@
 package wire
 
 import (
+	"encoding/binary"
+	"errors"
 	"reflect"
 	"testing"
 )
@@ -24,6 +26,13 @@ func FuzzDecodeVectorOperateArgs(f *testing.F) {
 	f.Add([]byte{})
 	f.Add([]byte{0})
 	f.Add([]byte{1})
+	// A frame whose declared inner blob is LONGER than the operate args behind
+	// it: every outer field decodes, the outer trailing-bytes check passes
+	// because the slack sits INSIDE the declared length, and only the inner
+	// decoder's exact-consumption rule catches it.
+	if b := overDeclaredInnerBlob(); b != nil {
+		f.Add(b)
+	}
 
 	f.Fuzz(func(t *testing.T, b []byte) {
 		collection, id, payloadKey, a, ev, has, err := DecodeVectorOperateArgs(b)
@@ -91,4 +100,97 @@ func FuzzDecodeVectorOperateResult(f *testing.F) {
 			t.Fatal("not stable")
 		}
 	})
+}
+
+// overDeclaredInnerBlob builds a vector_operate frame whose [argsLen u32]
+// declares four bytes more than the inner operate blob actually occupies, with
+// four zero bytes of slack sitting behind it. Every outer field is well formed
+// and the OUTER trailing-bytes check passes, because the slack is inside the
+// declared length — the frame is only refused because the inner decoder must
+// consume its blob exactly.
+func overDeclaredInnerBlob() []byte {
+	b, err := EncodeVectorOperateArgs("docs", 42, "body", vecOpArgs(), 0, false)
+	if err != nil {
+		return nil
+	}
+	// Walk the outer header to the [argsLen u32] the encoder wrote:
+	// [colLen u8][col][id u64][pkLen u16][payloadKey][casPresent u8].
+	off := 1 + int(b[0]) + 8
+	off += 2 + int(binary.BigEndian.Uint16(b[off:]))
+	off++ // casPresent == 0 for this fixture
+	inner := binary.BigEndian.Uint32(b[off:])
+	out := append([]byte(nil), b...)
+	binary.BigEndian.PutUint32(out[off:], inner+4)
+	return append(out, 0, 0, 0, 0)
+}
+
+// TestVectorOperateArgsRejectsSlackInsideTheDeclaredBlob is the regression for
+// the frame overDeclaredInnerBlob builds: bytes hidden inside an over-declared
+// inner length used to be accepted, because the inner decoder stopped where the
+// call ended and never checked that it had reached the end of its slice.
+func TestVectorOperateArgsRejectsSlackInsideTheDeclaredBlob(t *testing.T) {
+	good, err := EncodeVectorOperateArgs("docs", 42, "body", vecOpArgs(), 0, false)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if _, _, _, _, _, _, err := DecodeVectorOperateArgs(good); err != nil {
+		t.Fatalf("the honest frame must decode: %v", err)
+	}
+	bad := overDeclaredInnerBlob()
+	if bad == nil {
+		t.Fatal("fixture failed to build")
+	}
+	if len(bad) != len(good)+4 {
+		t.Fatalf("fixture is %d bytes, want %d (the honest frame plus four bytes of slack)", len(bad), len(good)+4)
+	}
+	if _, _, _, _, _, _, err := DecodeVectorOperateArgs(bad); !errors.Is(err, ErrOperateArgs) {
+		t.Fatalf("frame with slack inside the declared inner blob = %v, want ErrOperateArgs", err)
+	}
+}
+
+// TestVectorOperateResultRejectsSlackInsideTheDeclaredBlob is the same rule on
+// the RESULT frame, whose inner blob is bounded by its own declared [resLen u32].
+func TestVectorOperateResultRejectsSlackInsideTheDeclaredBlob(t *testing.T) {
+	good, err := EncodeVectorOperateResult(true, &OperateResult{Status: OperateStatusOK}, 9)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if _, _, _, err := DecodeVectorOperateResult(good); err != nil {
+		t.Fatalf("the honest frame must decode: %v", err)
+	}
+	// [found u8][resLen u32][inner][version u64]: grow resLen by four and slide
+	// four zero bytes in behind the inner blob, leaving the version where the
+	// decoder expects it.
+	resLen := binary.BigEndian.Uint32(good[1:])
+	bad := make([]byte, 0, len(good)+4)
+	bad = append(bad, good[0])
+	bad = binary.BigEndian.AppendUint32(bad, resLen+4)
+	bad = append(bad, good[5:5+resLen]...)
+	bad = append(bad, 0, 0, 0, 0)
+	bad = append(bad, good[5+resLen:]...)
+	if _, _, _, err := DecodeVectorOperateResult(bad); !errors.Is(err, ErrOperateArgs) {
+		t.Fatalf("result frame with slack inside the declared inner blob = %v, want ErrOperateArgs", err)
+	}
+}
+
+// TestOperateArgsRejectsTrailingBytes is the same rule at the KV entry point,
+// where the blob is the whole request body rather than a declared sub-slice.
+func TestOperateArgsRejectsTrailingBytes(t *testing.T) {
+	good, err := EncodeOperateArgs(vecOpArgs())
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if _, err := DecodeOperateArgs(good); err != nil {
+		t.Fatalf("the honest frame must decode: %v", err)
+	}
+	if _, err := DecodeOperateArgs(append(append([]byte(nil), good...), 0)); !errors.Is(err, ErrOperateArgs) {
+		t.Fatalf("operate args with a trailing byte = %v, want ErrOperateArgs", err)
+	}
+	goodRes, err := EncodeOperateResult(&OperateResult{Status: OperateStatusOK})
+	if err != nil {
+		t.Fatalf("encode result: %v", err)
+	}
+	if _, err := DecodeOperateResult(append(append([]byte(nil), goodRes...), 0)); !errors.Is(err, ErrOperateArgs) {
+		t.Fatalf("operate result with a trailing byte = %v, want ErrOperateArgs", err)
+	}
 }
