@@ -355,3 +355,49 @@ func TestSelectorForMatchesTheDefinitionsPathExactly(t *testing.T) {
 		t.Fatal("a #count leaf must select the #count definition")
 	}
 }
+
+func TestKVPredicateDoesNotRetainItsMetadata(t *testing.T) {
+	// verifyPage evaluates a whole page against ONE metadata map, rewriting its
+	// single entry per candidate, and lets the record bytes alias the cache page
+	// that the next Get may overwrite. Both rest on the same property: a
+	// compiled predicate reads its argument synchronously and retains nothing —
+	// not the map, not the record bytes, and no memo of an earlier answer.
+	// It is a property, so it is tested rather than asserted in a comment.
+	pred := mustPredicate(t, leaf(vtypes.FilterEq, "rc", vtypes.NewInt(7)))
+	m := make(vector.Metadata, 1)
+
+	// (1) The ENTRY is replaced, which is what verifyPage does per candidate.
+	m[KVRecordAlias] = vtypes.Value{Kind: vtypes.ValueRecord, Rec: kvRec(7, "gold")}
+	if !pred(m) {
+		t.Fatal("rc == 7 must match the first record")
+	}
+	m[KVRecordAlias] = vtypes.Value{Kind: vtypes.ValueRecord, Rec: kvRec(9, "gold")}
+	if pred(m) {
+		t.Fatal("the predicate answered from the PREVIOUS entry; the reused map is not safe")
+	}
+	m[KVRecordAlias] = vtypes.Value{Kind: vtypes.ValueRecord, Rec: kvRec(7, "gold")}
+	if !pred(m) {
+		t.Fatal("an earlier evaluation poisoned a later one on the same map")
+	}
+
+	// (2) The BYTES are overwritten in place, which is what a reused cache page
+	// does underneath a value the predicate was handed a moment ago. Same
+	// length, so the same backing array really is reused.
+	buf := kvRec(7, "gold")
+	other := kvRec(9, "gold")
+	if len(buf) != len(other) {
+		t.Fatalf("fixture: records differ in length (%d vs %d), so this cannot overwrite in place", len(buf), len(other))
+	}
+	m[KVRecordAlias] = vtypes.Value{Kind: vtypes.ValueRecord, Rec: buf}
+	if !pred(m) {
+		t.Fatal("rc == 7 must match before the bytes are rewritten")
+	}
+	copy(buf, other)
+	if pred(m) {
+		t.Fatal("the predicate answered from RETAINED bytes rather than the live ones")
+	}
+	copy(buf, kvRec(7, "gold"))
+	if !pred(m) {
+		t.Fatal("the predicate did not see the bytes change back")
+	}
+}
