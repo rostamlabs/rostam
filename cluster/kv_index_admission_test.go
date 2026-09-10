@@ -42,6 +42,35 @@ func uninstallableDef(name, path string, kind uint8) wire.KVIndexDef {
 	}
 }
 
+
+// commitUnvalidatedKVIndex puts d on the meta log WITHOUT the admission check,
+// which is the only way an unbuildable definition can get there now.
+//
+// It is exactly VERSION SKEW in one process: a node running a build whose path
+// grammar admits d proposes it, and the meta FSM — whose check must be identical
+// on every node at every version, so it is the shallow one — accepts it. Tests
+// that need a definition this build cannot parse must plant it this way;
+// Node.SetKVIndex and MetaRaft.ApplySetKVIndex now refuse it, which is the point
+// of the admission check.
+//
+// The node must be the meta leader (every caller uses a single-node cluster).
+// Raft.Apply's future carries the FSM's own return value, so by the time this
+// returns the local FSM has applied the entry and no polling is needed.
+func commitUnvalidatedKVIndex(t *testing.T, n *Node, d wire.KVIndexDef) {
+	t.Helper()
+	entry, err := encodeLogEntry(LogEntry{Op: OpSetKVIndex, KVIndex: d})
+	if err != nil {
+		t.Fatalf("encodeLogEntry: %v", err)
+	}
+	f := n.meta.Raft.Apply(entry, 5*time.Second)
+	if err := f.Error(); err != nil {
+		t.Fatalf("meta Apply(%q): %v", d.Name, err)
+	}
+	if respErr, isErr := f.Response().(error); isErr {
+		t.Fatalf("the meta FSM refused %q: %v", d.Name, respErr)
+	}
+}
+
 // TestValidateKVIndexDefParsesThePath is the unit-level statement of the rule:
 // the admission check is Validate AND the parse, and a drop is exempt from the
 // parse.
@@ -177,20 +206,16 @@ func TestKVIndexAdmissionRefusesUninstallableDefinitions(t *testing.T) {
 // index that will never install here.
 //
 // The skew is simulated the only honest way available in one build: the entry is
-// applied STRAIGHT INTO THE FSM, bypassing the admission check exactly as a peer
-// running a different binary would.
+// proposed to the meta log WITHOUT the admission check (commitUnvalidatedKVIndex),
+// which is exactly what a peer running a different binary does.
 func TestRejectedDefinitionIsPermanentNotBuilding(t *testing.T) {
 	tc := newTestCluster(t, 1, 2)
 	n := tc.nodes[0]
 	freezeKVIndexObserver(t, n)
 
-	bad := uninstallableDef("from_the_future", "#count", wire.KVIndexKindCount)
-	if got := applyKVIndexEntry(t, n.meta.FSM, bad, n.meta.Raft.LastIndex()+1); got != nil {
-		t.Fatalf("the meta FSM refused the skewed definition: %v", got)
-	}
-	good := kvIndexDefFixture("by_age", "u:")
-	if got := applyKVIndexEntry(t, n.meta.FSM, good, n.meta.Raft.LastIndex()+2); got != nil {
-		t.Fatalf("Apply(good): %v", got)
+	commitUnvalidatedKVIndex(t, n, uninstallableDef("from_the_future", "#count", wire.KVIndexKindCount))
+	if err := n.SetKVIndex(kvIndexDefFixture("by_age", "u:"), 5*time.Second); err != nil {
+		t.Fatalf("SetKVIndex(good): %v", err)
 	}
 	// One observer pass by hand: it is the pass that decides which definitions
 	// this node can build.

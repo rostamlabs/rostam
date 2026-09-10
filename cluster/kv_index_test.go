@@ -684,10 +684,13 @@ func TestKVIndexRejectsCounterAndGauge(t *testing.T) {
 
 	// "#count" with no field in front of it passes wire.KVIndexDef.Validate and
 	// fails record.ParsePath in kvindex.DefFrom.
+	//
+	// It has to be planted PAST the admission check, which now refuses exactly
+	// this definition (cluster.validateKVIndexDef): the only way one reaches the
+	// catalog is a peer whose build parses it, and that is what
+	// commitUnvalidatedKVIndex reproduces.
 	bad := wire.KVIndexDef{Name: "headless", PayloadPath: "#count", Kind: wire.KVIndexKindCount, Enabled: true}
-	if err := n.SetKVIndex(bad, 5*time.Second); err != nil {
-		t.Fatalf("SetKVIndex(unparsable): %v", err)
-	}
+	commitUnvalidatedKVIndex(t, n, bad)
 	n.applyKVIndexDefs()
 	st := n.Stats().KVIndex
 	if st.RejectedDefs != 1 {
@@ -753,15 +756,17 @@ func TestKVIndexStatsPopulated(t *testing.T) {
 	// A definition the meta FSM accepts but this build cannot parse: "#count"
 	// with no field in front of it passes wire.KVIndexDef.Validate (no '/', the
 	// suffix agrees with Kind) and fails record.ParsePath in kvindex.DefFrom.
+	//
+	// Admission refuses it now, so it is planted the way version skew plants one:
+	// straight onto the meta log, past the check a peer with a wider grammar
+	// would have passed.
 	unparsable := wire.KVIndexDef{
 		Name:        "headless_count",
 		PayloadPath: "#count",
 		Kind:        wire.KVIndexKindCount,
 		Enabled:     true,
 	}
-	if err := n.SetKVIndex(unparsable, 5*time.Second); err != nil {
-		t.Fatalf("SetKVIndex(unparsable): %v", err)
-	}
+	commitUnvalidatedKVIndex(t, n, unparsable)
 	waitForKVIndex(t, 20*time.Second, "the observer to reject the unparsable definition", func() bool {
 		return n.Stats().KVIndex.Rejects > 0
 	})
