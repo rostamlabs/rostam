@@ -311,6 +311,26 @@ func TestMergeKVQueryDropsRowsAtOrBelowTheCursor(t *testing.T) {
 	}
 }
 
+// A group's continuation is a PEER's word. One that points below the cursor the
+// caller sent would make the next page re-request what it just received, drop
+// every row as already-seen, and rewrite the same cursor — paging that never
+// terminates and never advances.
+func TestMergeKVQueryCursorNeverMovesBackwards(t *testing.T) {
+	in := []wire.KVQueryCont{{Group: 0, After: []byte("m"), More: true}}
+	parts := []wire.KVQueryResult{{
+		Rows:   kvMergeRows("n"),
+		Cursor: []wire.KVQueryCont{{Group: 0, After: []byte("a"), More: true}}, // below the caller's cursor
+	}}
+	got := mergeKVQuery(parts, in, 10, wire.KVQueryMaxPageBytes)
+	c, ok := kvMergeCont(t, got, 0)
+	if !ok {
+		t.Fatalf("group 0 left the cursor: %+v", got.Cursor)
+	}
+	if string(c.After) < "m" {
+		t.Fatalf("cont = %q, want at least %q — the continuation moved backwards", c.After, "m")
+	}
+}
+
 // --- the paging property --------------------------------------------------
 
 // kvFakeGroup is one shard group's leaf: it answers with the smallest

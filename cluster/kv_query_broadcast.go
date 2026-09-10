@@ -309,10 +309,12 @@ func checkKVQueryCursorFits(conts []wire.KVQueryCont) error {
 //
 // THE RULES ARE ORDERED, AND RULE 4 READS THE More RULE 3 WROTE:
 //
-//  1. Concatenate every part's rows and sort ascending by key. Keys are globally
-//     unique across groups (a key lives in exactly one group), so there is no
-//     dedup — TestMergeKVQueryKeysAreGloballyUnique asserts that rather than
-//     assuming it.
+//  1. Concatenate every part's rows — minus any row at or below that group's
+//     incoming After, which the caller has already seen — and sort ascending by
+//     key. Keys are globally unique across groups (a key lives in exactly one
+//     group), so there is no dedup — TestMergeKVQueryKeysAreGloballyUnique
+//     asserts that rather than assuming it. "Its rows" below means the rows that
+//     survive this filter.
 //  2. Take rows in order until `limit` rows or `maxBytes` of encoded frame,
 //     whichever comes first. The first row is always emitted, so a page always
 //     advances and paging always terminates.
@@ -409,6 +411,16 @@ func mergeKVQuery(parts []wire.KVQueryResult, in []wire.KVQueryCont, limit, maxB
 			after = last[g]
 		default:
 			after = inAfter[group]
+		}
+		// THE CONTINUATION NEVER MOVES BACKWARDS. Two of the three sources above
+		// are this node's own arithmetic, but `leaf.After` is a PEER's word: a
+		// buggy or hostile group that answered with a continuation below the
+		// cursor it was given would make the next page re-request what it just
+		// got, drop every row as already-seen, and rewrite the same cursor —
+		// paging that never terminates and never advances. Clamping to the
+		// incoming bound costs one comparison and makes that unreachable.
+		if a := inAfter[group]; len(a) > 0 && bytes.Compare(after, a) < 0 {
+			after = a
 		}
 		// Rule 4, reading the More rule 3 just wrote.
 		if !more && usable[g] < limit {
