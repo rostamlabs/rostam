@@ -103,6 +103,28 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   the signal that the memory budget, not the TTL, is deciding how long entries
   survive.
 
+- **`kv_query`: find KV keys by what their record holds.** A new read op
+  answers "which keys hold a record matching this filter" over the KV
+  keyspace, using the same JSON filter grammar the vector side uses with bare
+  record paths as fields (`rc`, `b#count`, `b/42/hi`). Named, cluster-wide
+  **KV index definitions** — one top-level field or a table's `#count`, scoped
+  to a key prefix — are committed through the meta log and backfilled per shard
+  group; an `eq`/`in`/range leaf on an index's own path (at the filter root or
+  in a top-level `and`) drives the candidate set, and everything else, every
+  negation included, is re-checked against the live value, so a stale posting
+  can never produce a wrong row. An indexed query answers *"the keys under this
+  index's prefix that match"*, never "the keys that match"; a filter no index
+  can drive needs explicit `scan: true` consent and is bounded by a per-node
+  scan budget. Pages are bounded by a row limit (≤1000) and an 8 MiB page
+  budget, resume through an opaque composite cursor with one continuation per
+  shard group, and come back as `keys`, `values` or `records`. Read consistency
+  is `leader` by default, with `any` and `linearizable` available. On the Go
+  client: `CreateKVIndex` / `ListKVIndexes` / `DropKVIndex` / `KVQuery`; over
+  REST: `POST /v1/kv/query` plus `POST`/`GET`/`DELETE /v1/kv/indexes` (index
+  creation and drops are admin-scoped). New `Stats.KVIndex` counters make the
+  index observable. See
+  [querying records in the KV store](kv/querying-records.md).
+
 - **Filter and index `operate` records stored in vector payloads.** A payload
   value of kind `record` (the bytes `operate` writes) can now be addressed
   directly by filters: a path like `session/rc`, `session/b/42/hi`, or

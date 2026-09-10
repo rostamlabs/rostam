@@ -102,6 +102,7 @@ nav:
       - Persistence & cold tier: vector/persistence.md
   - Key-value store:
       - Overview: kv/overview.md
+      - Querying records: kv/querying-records.md
       - Custom ops: kv/custom-ops.md
       - WASM procedures: kv/wasm.md
       - Cache tuning: kv/cache.md

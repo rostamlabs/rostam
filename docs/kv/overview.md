@@ -5,11 +5,16 @@ TTL, optional mmap persistence, and optional per-shard Raft replication. You use
 it through the `rostam.Store` facade (any backend) or, for a standalone
 in-process cache, through `cache.Cache` directly.
 
-Unlike the vector API, KV is **not on the REST endpoint** — it lives only on the
-binary TCP protocol, because it is built for sub-microsecond operations an HTTP
-round trip would defeat. In Go that is the `Store` facade below; from Python it
-is `r.kv` on a `tcp://`-connected `Rostam` client, which speaks the same
-protocol over a socket.
+Unlike the vector API, KV is **built for the binary TCP protocol**, not for
+REST: it targets sub-microsecond operations an HTTP round trip would defeat, and
+that is where its whole op surface lives — custom ops, WASM procedures and
+`operate` included. In Go that is the `Store` facade below; from Python it is
+`r.kv` on a `tcp://`-connected `Rostam` client, which speaks the same protocol
+over a socket. A few KV endpoints do exist over HTTP for tooling and management
+rather than for hot-path use: `GET`/`PUT`/`DELETE /v1/kv/{key}`,
+`POST /v1/kv/flush`, and the [record query and index](querying-records.md)
+endpoints. The Python client's `r.kv` is not one of them — it raises
+`TransportError` on an `http://`-connected client.
 
 ## Core operations
 
@@ -41,7 +46,8 @@ protocol over a socket.
     flat API directly on `r` (`r.create_collection / upsert / search / get /
     delete`) — see [the vector docs](../vector/collections-and-indexes.md).
     `r.kv.<operation>` raises `TransportError` on an HTTP-connected client (`Rostam("http://...")`);
-    KV has no REST surface.
+    it speaks the binary protocol only, and the handful of KV HTTP endpoints
+    listed above are not wired into it.
 
 Beyond get/put/del, two built-in atomic ops run server-side — no
 read-modify-write race, no extra round trips:
@@ -411,6 +417,25 @@ Every multi-byte field in the call and result frames (lengths, `a`/`b`,
 wire args. The stored **record and cell data themselves are little-endian**
 (fixed-width ints, table row keys) — the wire args format and the on-disk
 record format are independent conventions.
+
+### Finding records by filter: `kv_query`
+
+`get` answers "what is under this key"; `kv_query` answers "which keys hold a
+record matching this filter", using the same filter grammar the vector side
+uses, with bare record paths as fields (`rc`, `b#count`, `b/42/hi`). Define a
+cluster-wide **KV index** over one top-level field (or a table's `#count`) for
+keys under a prefix, and an `eq`/`in`/range leaf on that field drives the
+candidate set; everything else — every negation included — is re-checked on the
+live value, so a stale posting can never produce a wrong row. A filter no index
+can drive needs explicit `scan: true` consent. Results page across every shard
+group under a composite cursor, and are reachable from the native Go client
+(`CreateKVIndex` / `KVQuery` / `ListKVIndexes` / `DropKVIndex`) and over REST
+(`POST /v1/kv/query`, `POST`/`GET`/`DELETE /v1/kv/indexes`) — the one corner of
+the KV surface that does have HTTP endpoints.
+
+See [querying records](querying-records.md) for the index definition rules, what
+is accelerated versus evaluated live, the paging and consistency contract, the
+error table and the cost model.
 
 ### Searching operate records from vector payloads
 
