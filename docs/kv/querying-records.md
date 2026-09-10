@@ -350,6 +350,9 @@ curl -s -X DELETE localhost:8080/v1/kv/indexes/by_rc
 
 ```go
 import (
+	"errors"
+	"time"
+
 	"github.com/rostamlabs/rostam/client"
 	"github.com/rostamlabs/rostam/sdk/vtypes"
 	"github.com/rostamlabs/rostam/sdk/wire"
