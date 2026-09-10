@@ -137,8 +137,14 @@ func isClippedName(s string) bool {
 		// only reached for when it exceeds the shown prefix. ParseUint (not
 		// Atoi) so the width does not depend on GOARCH; an overflowing run of
 		// digits is a shape clipOperateName cannot produce either.
-		n, perr := strconv.ParseUint(rest[i:], 10, 64)
-		if perr != nil || n <= maxClippedNameBytes {
+		//
+		// The digits must also be the CANONICAL decimal rendering of the number
+		// they encode. clipOperateName formats with %d, which never pads, so
+		// "0064" is a count no producer can emit even though it parses to a
+		// legal value — the same reason the quoted name has to be canonical.
+		digits := rest[i:]
+		n, perr := strconv.ParseUint(digits, 10, 64)
+		if perr != nil || n <= maxClippedNameBytes || strconv.FormatUint(n, 10) != digits {
 			return false
 		}
 		quoted, ok := strings.CutSuffix(rest[:i], "… (")

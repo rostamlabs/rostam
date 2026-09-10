@@ -104,6 +104,14 @@ func TestIsOperateDuringReshardMessage(t *testing.T) {
 		{"clipped form whose byte count equals the bound",
 			prefix + strconv.Quote(strings.Repeat("c", maxClippedNameBytes)) +
 				fmt.Sprintf("… (%d bytes)", maxClippedNameBytes)},
+		// clipOperateName formats the count with %d, which never pads, so a
+		// zero-padded count is a shape it cannot emit even though the digits
+		// parse to a legal value.
+		{"clipped form with a zero-padded byte count",
+			prefix + strconv.Quote(strings.Repeat("c", maxClippedNameBytes)) + "… (0200 bytes)"},
+		{"clipped form with a leading zero on a single-digit-padded count",
+			prefix + strconv.Quote(strings.Repeat("c", maxClippedNameBytes)) + "… (0" +
+				strconv.Itoa(maxClippedNameBytes+1) + " bytes)"},
 		// strconv.Quote renders "A" as "A", never as an escape.
 		{"noncanonical escape in the quoted name", prefix + `"\x41"`},
 		{"noncanonical escape in a clipped name's prefix",
