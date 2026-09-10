@@ -170,11 +170,18 @@ func NewKVIndexFor(c *cache.Cache) *kvindex.Set {
 }
 
 // CacheWalker returns c's chunked full-keyspace walk in the shape
-// kvindex.Rebuild and kvindex.Backfill take. It surfaces cache.ErrClosed when
-// the cache is closed underneath the walk, which is what stops a half-read
-// keyspace being published as a complete index.
+// kvindex.Rebuild and kvindex.Backfill take.
+//
+// It always completes, so it always reports nil. The error in the Walker
+// signature is for a walker that can be ABORTED — the cluster observer wraps
+// this one so a shard being removed can stop the walk and wait for it (see
+// cluster.Node.beginKVIndexWalk), and an aborted walk must not be mistaken for a
+// finished one.
 func CacheWalker(c *cache.Cache) kvindex.Walker {
-	return func(fn func(key, value []byte) bool) error { return c.IterateChunked(kvIndexWalkBatch, fn) }
+	return func(fn func(key, value []byte) bool) error {
+		c.IterateChunked(kvIndexWalkBatch, fn)
+		return nil
+	}
 }
 
 // RebuildKVIndex refills idx from c's live entries: the warm-start and
@@ -191,9 +198,10 @@ func CacheWalker(c *cache.Cache) kvindex.Walker {
 // idx or c being nil is a no-op, so a store built without an index can call it
 // unconditionally.
 //
-// It returns the walk's error (cache.ErrClosed when the cache went away
-// mid-walk), in which case NOTHING was marked ready — the index stays building
-// and queries get a retryable refusal rather than a silently short answer.
+// It returns the walk's error, in which case NOTHING was marked ready — the
+// index stays building and queries get a retryable refusal rather than a
+// silently short answer. CacheWalker never aborts, so this is nil today; the
+// path exists for the cluster observer's abortable wrapper.
 func RebuildKVIndex(idx *kvindex.Set, c *cache.Cache) error {
 	if idx == nil || c == nil || len(idx.Defs()) == 0 {
 		return nil

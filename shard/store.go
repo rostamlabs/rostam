@@ -382,9 +382,11 @@ func (s *Store) KVIndex() *kvindex.Set { return s.kvIdx }
 // CacheWalker returns this shard's chunked full-keyspace walk, in the shape
 // kvindex.Rebuild and kvindex.Backfill take. It releases each cache shard's
 // read lock every few thousand slots, so a backfill over a large keyspace does
-// not block writers for the length of a whole shard's walk — and it reports
-// cache.ErrClosed if this store is closed while a walk is between chunks, so the
-// caller learns the walk was cut short instead of publishing a partial index.
+// not block writers for the length of a whole shard's walk.
+//
+// THE WALK ALIASES A LIVE MMAP, so the caller owns the lifetime rule: this store
+// must not be closed while a walk is running. cluster.Node registers each walk
+// and drains it before removing a shard; see cluster.Node.beginKVIndexWalk.
 func (s *Store) CacheWalker() kvindex.Walker { return ops.CacheWalker(s.cache) }
 
 // raftReplicatedFn builds the FSM's isReplicated gate over a LIVE Raft group-size

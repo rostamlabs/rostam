@@ -155,16 +155,23 @@ type Node struct {
 	// assertable, neither of which is visible in any other number.
 	kvIndexPasses   atomic.Uint64
 	kvIndexInstalls atomic.Uint64
+	// kvIndexWalkGates registers in-flight backfill walks per shard group so a
+	// shard removal can DRAIN them before closing the store the walk is reading
+	// out of. See cluster/kv_index_walkgate.go for why a drain rather than a flag.
+	kvIndexWalkMu    sync.Mutex
+	kvIndexWalkGates map[int]*kvIndexWalkGate
 
 	// KV index counters behind Stats().KVIndex. kvBackfills/kvBackfillKeys record
-	// what the observer's walks have cost; kvIndexRejects counts definitions the
-	// meta FSM accepted that this build cannot parse (see kvIndexDefsFromCatalog).
+	// what the observer's walks have cost; kvIndexRejects COUNTS reject events and
+	// kvIndexRejectedDefs GAUGES how many are broken right now (see
+	// kvIndexDefsFromCatalog for why both).
 	// kvIndexVerifyMisses and kvIndexReconcileDrops belong to the query and
 	// reconcile paths and stay zero until those land; they live here so the whole
 	// KVIndexStats block has one owner.
 	kvBackfills           atomic.Uint64
 	kvBackfillKeys        atomic.Uint64
 	kvIndexRejects        atomic.Uint64
+	kvIndexRejectedDefs   atomic.Uint64
 	kvIndexVerifyMisses   atomic.Uint64
 	kvIndexReconcileDrops atomic.Uint64
 
@@ -1908,7 +1915,11 @@ func (n *Node) Close() error {
 			n.pbSeedWg.Wait()
 		}
 		// Stop the KV index observer before the shards close: it installs into and
-		// walks their caches.
+		// walks their caches, and a walk aliases a store's live mmap. Draining the
+		// walk gates first makes this bounded by a walk's abort check instead of by
+		// a whole full-keyspace walk; stopKVIndexObserver then waits for the pass
+		// itself, so no walk is in flight when the stores close below.
+		n.drainAllKVIndexWalks()
 		n.stopKVIndexObserver()
 		// Stop shard formation before the shards close: the driver calls
 		// BootstrapGroup on them.

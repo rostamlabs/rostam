@@ -140,6 +140,9 @@ func (n *Node) AddShardOwner(shardID int) error {
 		return fmt.Errorf("cluster: add shard %d owner: %w", shardID, err)
 	}
 	n.shards[shardID] = store
+	// Re-arm the walk gate: a group that was removed earlier left it closed, and
+	// the observer must be able to backfill the new store's empty index.
+	n.reopenKVIndexWalks(shardID)
 	return nil
 }
 
@@ -154,6 +157,13 @@ func (n *Node) RemoveShardOwner(shardID int) error {
 	s := n.shards[shardID]
 	n.shards[shardID] = nil
 	n.shardMu.Unlock()
+	// Drain any in-flight KV index backfill on this group BEFORE the store closes.
+	// The walk aliases the store's live mmap, which Close unmaps; draining first
+	// means the walk has returned before anything is unmapped, and the gate stays
+	// closed so a pass holding a stale store pointer cannot start a new one. Done
+	// unconditionally, s==nil included, so a concurrent removal of a group this
+	// node had already dropped still shuts its gate.
+	n.drainKVIndexWalks(shardID)
 	if s == nil {
 		return nil
 	}

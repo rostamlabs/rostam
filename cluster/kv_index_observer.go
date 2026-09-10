@@ -3,14 +3,12 @@
 package cluster
 
 import (
-	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/rostamlabs/rostam/cache"
 	"github.com/rostamlabs/rostam/ops/kvindex"
 	"github.com/rostamlabs/rostam/shard"
 )
@@ -195,10 +193,9 @@ func (n *Node) kvIndexPass(installOnly bool) {
 				continue
 			}
 			if !n.backfillKVIndex(group, s, idx, d.Name) {
-				// The shard went away underneath the walk (it was removed from this
-				// node). Nothing was published, and the remaining definitions on it
-				// would fail the same way; the next pass reads a fresh hosted-shard
-				// set that no longer includes it.
+				// The group is being removed from this node. Nothing was published,
+				// and the remaining definitions on it would abort the same way; the
+				// next pass reads a hosted-shard set that no longer includes it.
 				break
 			}
 		}
@@ -239,12 +236,14 @@ func kvIndexPassFingerprint(defs []kvindex.Def, shards []*shard.Store) string {
 // installed as an index that posts nothing, which would answer queries with an
 // empty set and call it exact.
 //
-// Rejects is a GAUGE, not a running total: it is recomputed here on every pass
-// and reports how many definitions the catalog holds right now that this node
-// cannot build. A counter would climb once per pass for as long as a bad
-// definition sat in the catalog, which reads as a worsening problem when nothing
-// is changing; what an operator needs is "how many are broken", and a return to
-// zero when one is fixed or removed.
+// It maintains BOTH reject numbers, and they answer different questions.
+// Rejects is a monotonic counter of reject EVENTS, so it never goes backwards
+// and a rate can be taken from it. RejectedDefs is a gauge recomputed here on
+// every pass: how many definitions the catalog holds right now that this node
+// cannot build. The counter alone reads as a worsening problem while nothing
+// changes (it climbs once per pass for as long as a bad definition sits there);
+// the gauge alone loses the history. An operator watching for "is anything
+// broken, and did it get fixed" reads the gauge.
 func (n *Node) kvIndexDefsFromCatalog() []kvindex.Def {
 	cat := n.meta.FSM.KVIndexes()
 	defs := make([]kvindex.Def, 0, len(cat))
@@ -259,7 +258,8 @@ func (n *Node) kvIndexDefsFromCatalog() []kvindex.Def {
 		}
 		defs = append(defs, d)
 	}
-	n.kvIndexRejects.Store(rejects)
+	n.kvIndexRejects.Add(rejects)
+	n.kvIndexRejectedDefs.Store(rejects)
 	sort.Slice(defs, func(i, j int) bool { return defs[i].Name < defs[j].Name })
 	return defs
 }
@@ -272,27 +272,68 @@ func (n *Node) kvIndexDefsFromCatalog() []kvindex.Def {
 // queueing behind a whole shard's walk. It is NOT free for writers, and the log
 // line says so with a number: each chunk holds the read lock, so a writer waits
 // at most one chunk.
-// It reports false when the walk was cut short because the shard closed
-// underneath it — a shard this node stopped hosting mid-pass. That is not an
-// error to log loudly and not a reason to retry here: kvindex.Backfill has
-// already declined to publish the partial result, so the definition stays
-// building on a Set nothing will read again.
+// kvIndexAbortCheckEvery is how often the walk looks at its abort signal, in
+// entries. A non-blocking channel receive is cheap but not free, and a walk
+// visits every live key; checking on a power-of-two stride keeps it off the hot
+// path while still bounding how long RemoveShardOwner waits to a few thousand
+// entries rather than a whole keyspace.
+const kvIndexAbortCheckEvery = 256
+
+// It reports false when the walk did not finish — the shard is being removed
+// from this node, so the remaining definitions on it are pointless too.
+//
+// THE WALK IS REGISTERED AGAINST THE SHARD GROUP, and that registration is what
+// makes it safe. The walk aliases the store's live mmap, so the store must not
+// close underneath it; RemoveShardOwner drains this registration before calling
+// Store.Close, so the walk has already returned by the time anything is
+// unmapped. Not hosting the walk in the gate at all (ok=false) means the group
+// is already being removed and this walk must never start.
+//
+// An aborted walk publishes NOTHING: kvindex.Backfill grants readiness only when
+// the walker returns nil, and the wrapper reports ErrWalkAborted when it stopped
+// early. A half-read keyspace presented as an exact index answers queries with
+// silently missing rows, which is the one failure this index may not have.
 func (n *Node) backfillKVIndex(group int, s *shard.Store, idx *kvindex.Set, name string) bool {
+	stop, done, ok := n.beginKVIndexWalk(group)
+	if !ok {
+		return false // the group is being removed; do not touch its store
+	}
+	defer done()
+
 	var visited uint64
 	walk := s.CacheWalker()
 	began := time.Now()
+	aborted := false
 	err := idx.Backfill(name, func(yield func(key, value []byte) bool) error {
-		return walk(func(key, value []byte) bool {
+		werr := walk(func(key, value []byte) bool {
 			visited++
+			if visited%kvIndexAbortCheckEvery == 0 {
+				select {
+				case <-stop:
+					aborted = true
+					// Stop by RETURNING FALSE, which unwinds the cache's walk
+					// through its own early-stop path (locks released, no state
+					// left behind). Never by abandoning it.
+					return false
+				default:
+				}
+			}
 			return yield(key, value)
 		})
+		if werr != nil {
+			return werr
+		}
+		if aborted {
+			return kvindex.ErrWalkAborted
+		}
+		return nil
 	})
 	n.kvBackfillKeys.Add(visited)
 	if err != nil {
-		slog.Info("kv index backfill abandoned; the shard closed underneath the walk, so nothing was published as ready",
+		slog.Info("kv index backfill abandoned; nothing was published as ready",
 			"component", "cluster", "node", n.cfg.NodeID, "shard", group, "index", name,
 			"keys", visited, "err", err)
-		return !errors.Is(err, cache.ErrClosed)
+		return false
 	}
 	n.kvBackfills.Add(1)
 	slog.Info("kv index backfill complete",
@@ -312,6 +353,7 @@ func (n *Node) kvIndexStats() KVIndexStats {
 		Backfills:      n.kvBackfills.Load(),
 		BackfillKeys:   n.kvBackfillKeys.Load(),
 		Rejects:        n.kvIndexRejects.Load(),
+		RejectedDefs:   int(n.kvIndexRejectedDefs.Load()), //nolint:gosec // bounded by KVIndexMaxDefs
 		VerifyMisses:   n.kvIndexVerifyMisses.Load(),
 		ReconcileDrops: n.kvIndexReconcileDrops.Load(),
 	}

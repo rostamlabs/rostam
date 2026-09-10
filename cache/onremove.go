@@ -129,37 +129,28 @@ const iterateChunkedMaxRestarts = 8
 // page backing store and are valid only for the duration of the fn call — and,
 // because the lock IS released between chunks, they must not be retained across
 // one. Copy if you need to keep them.
-func (c *Cache) IterateChunked(batch int, fn func(key, value []byte) bool) error {
+func (c *Cache) IterateChunked(batch int, fn func(key, value []byte) bool) {
 	if batch <= 0 {
 		batch = sweepBatchSize
 	}
 	for _, s := range c.shards {
-		cont, err := s.iterateChunked(batch, fn)
-		if err != nil {
-			return err
-		}
-		if !cont {
-			return nil
+		if !s.iterateChunked(batch, fn) {
+			return
 		}
 	}
-	return nil
 }
 
 // iterateChunked walks one shard in chunks, restarting on a table swap and
-// falling back to a locked walk once the restart budget is spent. Reports false
-// when fn asked to stop the whole iteration, and ErrClosed when the shard was
-// closed underneath the walk.
-func (s *shard) iterateChunked(batch int, fn func(key, value []byte) bool) (bool, error) {
+// falling back to a locked walk once the restart budget is spent. Returns false
+// if fn asked to stop the whole iteration.
+func (s *shard) iterateChunked(batch int, fn func(key, value []byte) bool) bool {
 	for restarts := 0; restarts < iterateChunkedMaxRestarts; restarts++ {
-		stopped, rehashed, err := s.iterateChunkedPass(batch, fn)
-		if err != nil {
-			return false, err
-		}
+		stopped, rehashed := s.iterateChunkedPass(batch, fn)
 		if stopped {
-			return false, nil
+			return false
 		}
 		if !rehashed {
-			return true, nil
+			return true
 		}
 		s.chunkedRestarts.Add(1)
 	}
@@ -169,9 +160,8 @@ func (s *shard) iterateChunked(batch int, fn func(key, value []byte) bool) (bool
 }
 
 // iterateChunkedPass makes one attempt at walking the shard. It reports whether
-// fn stopped the iteration, whether the pass was abandoned because the index
-// table was swapped underneath it, and ErrClosed when the shard was closed
-// between chunks.
+// fn stopped the iteration, and whether the pass was abandoned because the index
+// table was swapped underneath it.
 //
 // The body matches shard.iterate's filters — same expiry test against the shard's
 // wall clock, same tombstone guard — so the visited set matches Iterate's for a
@@ -179,7 +169,7 @@ func (s *shard) iterateChunked(batch int, fn func(key, value []byte) bool) (bool
 // chunks: one RLock per chunk instead of one for the whole shard (following
 // sweepIndex's batching), and page resolution through the generation-gated
 // pageSlots rather than s.pages (see the gate below).
-func (s *shard) iterateChunkedPass(batch int, fn func(key, value []byte) bool) (stopped, rehashed bool, err error) {
+func (s *shard) iterateChunkedPass(batch int, fn func(key, value []byte) bool) (stopped, rehashed bool) {
 	now := s.now()
 	t := s.tab.Load()
 	n := len(t.ctrl)
@@ -189,19 +179,11 @@ func (s *shard) iterateChunkedPass(batch int, fn func(key, value []byte) bool) (
 			end = n
 		}
 		s.mu.RLock()
-		// Re-checked on EVERY acquisition, because this walk is the one that lets
-		// go and comes back: the shard can be closed (and its region unmapped) in
-		// the gap between chunks, and reading a page after that is a segfault, not
-		// a stale answer. See shard.Close.
-		if s.closed {
-			s.mu.RUnlock()
-			return false, false, ErrClosed
-		}
 		if s.tab.Load() != t {
 			// A concurrent Put (or compaction) rehashed the table: every slot index
 			// we have left is meaningless against the new one. Abandon and restart.
 			s.mu.RUnlock()
-			return false, true, nil
+			return false, true
 		}
 		for i := start; i < end; i++ {
 			c := t.ctrl[i].Load()
@@ -233,10 +215,10 @@ func (s *shard) iterateChunkedPass(batch int, fn func(key, value []byte) bool) (
 			}
 			if !fn(k, v) {
 				s.mu.RUnlock()
-				return true, false, nil
+				return true, false
 			}
 		}
 		s.mu.RUnlock()
 	}
-	return false, false, nil
+	return false, false
 }

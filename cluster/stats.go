@@ -134,13 +134,19 @@ type KVIndexStats struct {
 	Backfills    uint64
 	BackfillKeys uint64
 
-	// Rejects is how many definitions the catalog holds RIGHT NOW that this node
-	// cannot build — a gauge recomputed on every observer pass, not a running
-	// total. A non-zero value is a standing misconfiguration (or a version skew):
-	// the definition exists cluster-wide and does nothing here. It returns to zero
-	// when the definition is fixed or removed, which is the signal an operator
-	// acts on.
+	// Rejects counts reject EVENTS since process start: definitions the meta FSM
+	// ACCEPTED that this node cannot build, one per offending definition per
+	// observer pass. Monotonic, so it never goes backwards and a rate can be taken
+	// from it — but it keeps climbing while a bad definition simply sits in the
+	// catalog, which is why it is not the number to alert on.
 	Rejects uint64
+
+	// RejectedDefs is how many definitions the catalog holds RIGHT NOW that this
+	// node cannot build — a gauge, recomputed on every pass. A non-zero value is a
+	// standing misconfiguration (or a version skew): the definition exists
+	// cluster-wide and does nothing here. It returns to zero when the definition is
+	// fixed or removed, which is the signal an operator acts on.
+	RejectedDefs int
 
 	// VerifyMisses counts candidates whose live re-read did not match — i.e.
 	// stale postings the query path paid a lookup for and discarded. Postings are

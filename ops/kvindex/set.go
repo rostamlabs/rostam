@@ -452,13 +452,20 @@ func (s *Set) grantReadyLocked(name string, tok walkToken) {
 // Walker is a full-keyspace walk: it calls yield for every live entry and
 // returns nil only when it visited ALL of them.
 //
-// The error is not decoration. The walk source is a live cache whose shards can
-// be closed underneath it (a shard removed from this node), and it reports that
-// as cache.ErrClosed. Rebuild and Backfill both refuse to publish readiness on a
-// non-nil error, because what they filled is then a proper subset of the
-// keyspace and an index published as exact over a subset answers queries with
-// silently missing rows.
+// The error is not decoration. A walk over a live shard can be ABORTED — the
+// cluster observer stops one when the shard it walks is being removed from the
+// node, so the store can be closed without unmapping pages the walk is reading —
+// and Rebuild and Backfill both refuse to publish readiness on a non-nil error.
+// What they filled is then a proper subset of the keyspace, and an index
+// published as exact over a subset answers queries with silently missing rows.
 type Walker func(yield func(key, value []byte) bool) error
+
+// ErrWalkAborted is what a Walker returns when it stopped on request rather than
+// because it ran out of keys. It is the ORDINARY outcome of a shard being
+// removed while its index is being built, not a fault: the caller has already
+// been told, by the same mechanism, that this shard is going away. It is a
+// distinct error so that outcome is not confused with a genuine failure.
+var ErrWalkAborted = errors.New("kvindex: index walk aborted before it finished")
 
 // Backfill is Rebuild for a single definition: the one a meta write just
 // added. Unknown names are a no-op. The other definitions keep their postings

@@ -621,9 +621,10 @@ func TestKVIndexPassSkipsUnchangedInstall(t *testing.T) {
 	}
 }
 
-// Rejects is a gauge: it reports what is broken NOW and returns to zero when the
-// offending definition is removed, rather than climbing once per pass forever.
-func TestKVIndexRejectsIsAGauge(t *testing.T) {
+// Two reject numbers answering two questions: Rejects is a monotonic event
+// counter (a rate can be taken from it), RejectedDefs a gauge that reports what
+// is broken NOW and returns to zero when the offending definition is removed.
+func TestKVIndexRejectsCounterAndGauge(t *testing.T) {
 	tc := newTestCluster(t, 1, 1)
 	n := tc.nodes[0]
 	freezeKVIndexObserver(t, n)
@@ -635,25 +636,38 @@ func TestKVIndexRejectsIsAGauge(t *testing.T) {
 		t.Fatalf("SetKVIndex(unparsable): %v", err)
 	}
 	n.applyKVIndexDefs()
-	if got := n.Stats().KVIndex.Rejects; got != 1 {
-		t.Fatalf("Rejects = %d, want 1", got)
+	st := n.Stats().KVIndex
+	if st.RejectedDefs != 1 {
+		t.Fatalf("RejectedDefs = %d, want 1", st.RejectedDefs)
 	}
-	// Repeated passes do not inflate it.
+	if st.Rejects == 0 {
+		t.Fatal("Rejects = 0, want a reject event counted")
+	}
+	// Repeated passes: the gauge holds, the counter climbs.
 	for i := 0; i < 3; i++ {
 		n.applyKVIndexDefs()
 	}
-	if got := n.Stats().KVIndex.Rejects; got != 1 {
-		t.Fatalf("Rejects = %d after 3 more passes, want 1 — it is counting events, not reporting state", got)
+	st2 := n.Stats().KVIndex
+	if st2.RejectedDefs != 1 {
+		t.Fatalf("RejectedDefs = %d after 3 more passes, want 1 — a gauge reports state, not events", st2.RejectedDefs)
 	}
-	// Removing the definition clears it.
+	if st2.Rejects <= st.Rejects {
+		t.Fatalf("Rejects = %d after 3 more passes, want > %d — the counter must be monotonic per event", st2.Rejects, st.Rejects)
+	}
+
+	// Removing the definition clears the GAUGE and leaves the counter alone.
 	off := bad
 	off.Enabled = false
 	if err := n.SetKVIndex(off, 5*time.Second); err != nil {
 		t.Fatalf("SetKVIndex(disable): %v", err)
 	}
 	n.applyKVIndexDefs()
-	if got := n.Stats().KVIndex.Rejects; got != 0 {
-		t.Fatalf("Rejects = %d after the bad definition was dropped, want 0", got)
+	st3 := n.Stats().KVIndex
+	if st3.RejectedDefs != 0 {
+		t.Fatalf("RejectedDefs = %d after the bad definition was dropped, want 0", st3.RejectedDefs)
+	}
+	if st3.Rejects != st2.Rejects {
+		t.Fatalf("Rejects moved from %d to %d with nothing left to reject — it must never go backwards or drift", st2.Rejects, st3.Rejects)
 	}
 }
 
@@ -913,25 +927,78 @@ func TestForEachGroupPerGroupTimeout(t *testing.T) {
 	}
 }
 
-// The reviewer's open question, made a test: a shard removed from this node
-// (RemoveShardOwner -> Store.Close -> Cache.Close) unmaps its region, and the
-// observer's backfill is the one reader that deliberately lets go of the shard
-// lock between chunks. Before cache.ErrClosed existed, reading a page after that
-// unmap was a SIGSEGV, not a wrong answer.
+// A backfill walk aliases the store's LIVE MMAP, which Store.Close unmaps. The
+// guarantee is a DRAIN, in the shape the cache already uses for its own
+// goroutines: RemoveShardOwner signals the walks registered on that group and
+// WAITS for them before it closes the store, so the store is never closed while
+// a walk is inside it.
 //
-// Two things must hold: the process survives, and a walk that was cut short
-// publishes NOTHING as ready — a half-read keyspace presented as an exact index
-// answers queries with silently missing rows.
-func TestKVIndexBackfillSurvivesShardClose(t *testing.T) {
-	seeded := 30_000
-	if testing.Short() {
-		seeded = 8_000
+// This half is deterministic — it pins the ordering with no walk timing in it.
+func TestRemoveShardOwnerDrainsIndexWalks(t *testing.T) {
+	tc := newTestCluster(t, 1, 2)
+	n := tc.nodes[0]
+	freezeKVIndexObserver(t, n)
+
+	stop, done, ok := n.beginKVIndexWalk(0)
+	if !ok {
+		t.Fatal("a walk could not register on a hosted group")
 	}
-	for attempt := 0; attempt < 4; attempt++ {
+
+	removed := make(chan error, 1)
+	go func() { removed <- n.RemoveShardOwner(0) }()
+
+	// It must NOT return while the walk is still registered: returning here is
+	// exactly the bug — Store.Close would unmap pages the walk is reading.
+	select {
+	case err := <-removed:
+		t.Fatalf("RemoveShardOwner returned (err=%v) while a walk was in flight", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	// And the walk has been told to stop, so the wait is bounded.
+	select {
+	case <-stop:
+	default:
+		t.Fatal("the in-flight walk was never signalled — RemoveShardOwner would wait forever")
+	}
+
+	done()
+	select {
+	case err := <-removed:
+		if err != nil {
+			t.Fatalf("RemoveShardOwner: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("RemoveShardOwner did not return after the walk stopped")
+	}
+
+	// No NEW walk may start on the removed group: a pass holding a stale store
+	// pointer must not begin reading a store that has just been closed.
+	if _, _, ok := n.beginKVIndexWalk(0); ok {
+		t.Fatal("a walk registered on a group that has been removed")
+	}
+	// A group this node still hosts is unaffected.
+	if _, d, ok := n.beginKVIndexWalk(1); !ok {
+		t.Fatal("removing group 0 shut group 1's gate")
+	} else {
+		d()
+	}
+}
+
+// The same guarantee end to end, with a REAL backfill racing a real
+// RemoveShardOwner: it must neither take the process down nor publish what it
+// managed to read. Run under -race with repeats.
+func TestKVIndexBackfillDrainsBeforeShardRemoval(t *testing.T) {
+	seeded := 100_000
+	if testing.Short() {
+		seeded = 20_000
+	}
+	aborts := 0
+	const attempts = 4
+	for attempt := 0; attempt < attempts; attempt++ {
 		func() {
 			tc := newTestCluster(t, 1, 1)
 			n := tc.nodes[0]
-			n.stopKVIndexObserver() // this test drives the walk itself
+			freezeKVIndexObserver(t, n)
 
 			seedKVIndexRecords(t, n, "u:", 0, seeded)
 			if err := n.SetKVIndex(kvIndexDefFixture("by_age", "u:"), 5*time.Second); err != nil {
@@ -941,32 +1008,35 @@ func TestKVIndexBackfillSurvivesShardClose(t *testing.T) {
 			idx := s.KVIndex()
 			idx.Install(n.kvIndexDefsFromCatalog())
 
-			walk := s.CacheWalker()
-			started := make(chan struct{})
-			var once sync.Once
-			var walkErr error
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				walkErr = idx.Backfill("by_age", func(yield func(key, value []byte) bool) error {
-					return walk(func(key, value []byte) bool {
-						once.Do(func() { close(started) })
-						return yield(key, value)
-					})
-				})
-			}()
+			finished := make(chan bool, 1)
+			go func() { finished <- n.backfillKVIndex(0, s, idx, "by_age") }()
 
-			<-started
-			tc.Close() // closes the stores, and with them the mmap the walk is reading
-			<-done
+			// Let the walk get going, then pull the shard out from under it.
+			time.Sleep(2 * time.Millisecond)
+			if err := n.RemoveShardOwner(0); err != nil {
+				t.Fatalf("attempt %d: RemoveShardOwner: %v", attempt, err)
+			}
 
-			if walkErr != nil && !errors.Is(walkErr, cache.ErrClosed) {
-				t.Fatalf("attempt %d: backfill error = %v, want nil or cache.ErrClosed", attempt, walkErr)
+			// RemoveShardOwner waited for it, so it has already returned.
+			select {
+			case completed := <-finished:
+				if !completed {
+					aborts++
+					if idx.IsReady("by_age") {
+						t.Fatalf("attempt %d: an aborted backfill was published as ready", attempt)
+					}
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("attempt %d: RemoveShardOwner returned while the backfill was still running", attempt)
 			}
-			if walkErr != nil && idx.IsReady("by_age") {
-				t.Fatalf("attempt %d: a backfill cut short by the shard closing was published as ready", attempt)
-			}
+			tc.Close()
 		}()
+	}
+	// At least one attempt must actually have raced, or the test proved nothing
+	// about the drain. The walk over `seeded` keys takes tens of milliseconds
+	// against a 2ms head start, so this is not a close call.
+	if aborts == 0 {
+		t.Fatalf("no attempt out of %d aborted its walk — the removal never overlapped a live backfill", attempts)
 	}
 }
 
