@@ -109,6 +109,57 @@ func vectorOperateMutator(a *wire.OperateArgs, stampMs int64, res **wire.Operate
 // change, or a direct call, must not be able to smuggle a second target or a
 // silently-ignored TTL past this boundary.
 func handleVectorOperate(tx *TxContext, args []byte) ([]byte, error) {
+	return vectorOperateBody(tx, args, applyDenseRecordMutation)
+}
+
+// recordMutateApply is a family's ENGINE ENTRY, and the only thing the three
+// vector_operate handlers do not share. It picks the stamped or unstamped
+// variant, which is the same decision in every family: only a stamped apply has
+// a clock every replica agrees on (see vector.recordKeyPastDeadline).
+//
+// The three implementations are package-level functions, not closures, so
+// passing one costs no allocation on the apply path.
+type recordMutateApply func(v *vector.CollectionStore, name string, id uint64, pk string,
+	fn vector.RecordMutator, cas vector.CASCond, stampMs int64, stamped bool) (applied bool, version uint64, err error)
+
+func applyDenseRecordMutation(v *vector.CollectionStore, name string, id uint64, pk string,
+	fn vector.RecordMutator, cas vector.CASCond, stampMs int64, stamped bool,
+) (bool, uint64, error) {
+	if stamped {
+		return v.MutatePayloadRecordCASAt(name, id, pk, fn, cas, stampMs)
+	}
+	return v.MutatePayloadRecordCAS(name, id, pk, fn, cas)
+}
+
+func applyNamedRecordMutation(v *vector.CollectionStore, name string, id uint64, pk string,
+	fn vector.RecordMutator, cas vector.CASCond, stampMs int64, stamped bool,
+) (bool, uint64, error) {
+	if stamped {
+		return v.NamedMutatePayloadRecordCASAt(name, id, pk, fn, cas, stampMs)
+	}
+	return v.NamedMutatePayloadRecordCAS(name, id, pk, fn, cas)
+}
+
+func applyMVRecordMutation(v *vector.CollectionStore, name string, docID uint64, pk string,
+	fn vector.RecordMutator, cas vector.CASCond, stampMs int64, stamped bool,
+) (bool, uint64, error) {
+	if stamped {
+		return v.MVMutatePayloadRecordCASAt(name, docID, pk, fn, cas, stampMs)
+	}
+	return v.MVMutatePayloadRecordCAS(name, docID, pk, fn, cas)
+}
+
+// vectorOperateBody is the whole of a vector_operate handler except its engine
+// entry: the decode, the argument re-assertion, the CAS threading, the mutator
+// construction and the result frame.
+//
+// It exists as ONE copy because the three families' handlers were three copies
+// of it, and a validation or result-format fix landing in only two of them is a
+// silent divergence between ops that are documented as identical. This is the
+// same reasoning the Store layer already follows, where one shared body serves
+// nine methods — that duplication is how set_payload lost its CAS precondition
+// on three of its four paths.
+func vectorOperateBody(tx *TxContext, args []byte, apply recordMutateApply) ([]byte, error) {
 	if tx.vectors == nil {
 		return nil, ErrVectorsNotAvailable
 	}
@@ -124,13 +175,7 @@ func handleVectorOperate(tx *TxContext, args []byte) ([]byte, error) {
 	var res *wire.OperateResult
 	fn := vectorOperateMutator(a, stampMs, &res)
 
-	var applied bool
-	var version uint64
-	if stamped {
-		applied, version, err = tx.vectors.MutatePayloadRecordCASAt(name, id, pk, fn, cas, stampMs)
-	} else {
-		applied, version, err = tx.vectors.MutatePayloadRecordCAS(name, id, pk, fn, cas)
-	}
+	applied, version, err := apply(tx.vectors, name, id, pk, fn, cas, stampMs, stamped)
 	if err != nil {
 		return nil, err // incl. ErrVersionConflict, ErrPayloadKeyNotRecord, ErrRecordTooLarge
 	}
@@ -146,74 +191,14 @@ func handleVectorOperate(tx *TxContext, args []byte) ([]byte, error) {
 // collection's shared payload. See handleVectorOperate for the whole contract;
 // only the engine entry point differs.
 func handleNamedVectorOperate(tx *TxContext, args []byte) ([]byte, error) {
-	if tx.vectors == nil {
-		return nil, ErrVectorsNotAvailable
-	}
-	name, id, pk, a, expected, hasExpected, err := wire.DecodeVectorOperateArgs(args)
-	if err != nil {
-		return nil, err
-	}
-	if err := checkVectorOperateArgs(a); err != nil {
-		return nil, err
-	}
-	cas := vector.CASCond{Expected: expected, Has: hasExpected}
-	stampMs, stamped := tx.applyStamp()
-	var res *wire.OperateResult
-	fn := vectorOperateMutator(a, stampMs, &res)
-
-	var applied bool
-	var version uint64
-	if stamped {
-		applied, version, err = tx.vectors.NamedMutatePayloadRecordCASAt(name, id, pk, fn, cas, stampMs)
-	} else {
-		applied, version, err = tx.vectors.NamedMutatePayloadRecordCAS(name, id, pk, fn, cas)
-	}
-	if err != nil {
-		return nil, err // incl. ErrVersionConflict, ErrPayloadKeyNotRecord, ErrRecordTooLarge
-	}
-	// version is the point's version AFTER the call — bumped when the op-list
-	// applied, and the CURRENT unbumped one when it was a deliberate no-op (a
-	// failed CHECK). Returning it lets a CAS loop feed the next attempt straight
-	// from this result instead of re-reading the point, which is both a round trip
-	// and a race.
-	return wire.EncodeVectorOperateResult(applied, res, version)
+	return vectorOperateBody(tx, args, applyNamedRecordMutation)
 }
 
 // handleMVVectorOperate is handleVectorOperate against a multi-vector
 // collection's document payload. See handleVectorOperate for the whole contract;
 // only the engine entry point differs.
 func handleMVVectorOperate(tx *TxContext, args []byte) ([]byte, error) {
-	if tx.vectors == nil {
-		return nil, ErrVectorsNotAvailable
-	}
-	name, docID, pk, a, expected, hasExpected, err := wire.DecodeVectorOperateArgs(args)
-	if err != nil {
-		return nil, err
-	}
-	if err := checkVectorOperateArgs(a); err != nil {
-		return nil, err
-	}
-	cas := vector.CASCond{Expected: expected, Has: hasExpected}
-	stampMs, stamped := tx.applyStamp()
-	var res *wire.OperateResult
-	fn := vectorOperateMutator(a, stampMs, &res)
-
-	var applied bool
-	var version uint64
-	if stamped {
-		applied, version, err = tx.vectors.MVMutatePayloadRecordCASAt(name, docID, pk, fn, cas, stampMs)
-	} else {
-		applied, version, err = tx.vectors.MVMutatePayloadRecordCAS(name, docID, pk, fn, cas)
-	}
-	if err != nil {
-		return nil, err // incl. ErrVersionConflict, ErrPayloadKeyNotRecord, ErrRecordTooLarge
-	}
-	// version is the point's version AFTER the call — bumped when the op-list
-	// applied, and the CURRENT unbumped one when it was a deliberate no-op (a
-	// failed CHECK). Returning it lets a CAS loop feed the next attempt straight
-	// from this result instead of re-reading the point, which is both a round trip
-	// and a race.
-	return wire.EncodeVectorOperateResult(applied, res, version)
+	return vectorOperateBody(tx, args, applyMVRecordMutation)
 }
 
 // checkVectorOperateArgs re-asserts, at the handler boundary, the two rules the
