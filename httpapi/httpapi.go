@@ -525,10 +525,12 @@ func statusForError(err error) int {
 	// TestHTTPKVQueryFilterTextCannotSteerTheStatus. Matching by IDENTITY first
 	// is strictly more precise than any heuristic below it, so nothing else
 	// loses.
-	// The kv_query refusals, kept in sync with server.clientFacingErr, which
-	// classifies the same set for the TCP edge — and, crucially, for the
-	// peer-to-peer __kv_query_shard__ leg, where redaction would leave the
-	// coordinator nothing to classify (see the comment there).
+	//
+	// The set is kept in sync with server.clientFacingErr, which classifies the
+	// same errors for the TCP edge — and, crucially, for the peer-to-peer
+	// __kv_query_shard__ leg, where redaction would leave the coordinator
+	// nothing to classify (see the comment there) — and with grpcapi.grpcError,
+	// which maps them onto InvalidArgument/NotFound/Unavailable.
 	//
 	// PERMANENT ones are 400: the filter, the missing scan consent, the scan
 	// budget and a malformed frame are all facts about the query the caller
@@ -569,7 +571,7 @@ func statusForError(err error) int {
 		// shard.ErrStoreClosed: the store refused the Call because it is
 		// draining for close. A REFUSAL, not a fault — the op never ran, and in
 		// a cluster the group's other replicas can serve it — so it belongs in
-		// the same retryable bucket as the reshard refusal above. This package
+		// the same retryable bucket the reshard refusal further down uses. This package
 		// cannot import shard (the layering wall server.clientFacingErr
 		// documents), so it is matched by ops.IsStoreClosedMessage: an anchored
 		// suffix over the shared spelling shard.ErrStoreClosed is DECLARED from,

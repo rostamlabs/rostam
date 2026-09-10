@@ -198,11 +198,12 @@ func grpcError(err error) error {
 	// policies retry. Reproduced before this move; pinned by
 	// TestGRPCKVQueryFilterTextCannotSteerTheCode. Matching by IDENTITY first is
 	// strictly more precise than any heuristic below it, so nothing else loses.
-	// The kv_query family, kept in sync with server.clientFacingErr (which lets
-	// these cross the wire unredacted) and httpapi.statusForError (which maps the
-	// same set onto 400/404/503). Three transports, one classification: a caller
-	// that switches from REST to gRPC must not discover that its retry loop has
-	// become a hard failure.
+	//
+	// The set is kept in sync with server.clientFacingErr (which lets these cross
+	// the wire unredacted) and httpapi.statusForError (which maps the same set
+	// onto 400/404/503). Three transports, one classification: a caller that
+	// switches from REST to gRPC must not discover that its retry loop has become
+	// a hard failure.
 	//
 	// NotFound: the caller named a definition that does not exist. Distinct from
 	// the InvalidArgument bucket on purpose — the remedy is to CREATE the index,
