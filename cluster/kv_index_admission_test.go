@@ -42,7 +42,6 @@ func uninstallableDef(name, path string, kind uint8) wire.KVIndexDef {
 	}
 }
 
-
 // commitUnvalidatedKVIndex puts d on the meta log WITHOUT the admission check,
 // which is the only way an unbuildable definition can get there now.
 //
