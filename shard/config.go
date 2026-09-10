@@ -51,6 +51,14 @@ type Config struct {
 	// 0 (or the zero value of a hand-built Config) DISABLES the pass, and a
 	// negative value is a configuration error.
 	//
+	// BEWARE THE TWIN KNOB. rostam.DirectConfig has a field of the same name and
+	// units whose zero means the OPPOSITE: there 0 keeps the 60 s default and a
+	// NEGATIVE value disables. Each follows its own struct's established
+	// convention — this one is reached through DefaultConfig, which fills the
+	// default in, while DirectConfig is a bare literal and mirrors its own
+	// Cache.TTLSweepIntervalMs. So porting a config across by copying the field
+	// silently flips the pass on or off; set it deliberately on each side.
+	//
 	// Disabling it is safe and never changes an answer: every candidate is
 	// re-read and re-checked against the live value, so a posting the pass would
 	// have removed costs one wasted lookup and can never produce a wrong row.

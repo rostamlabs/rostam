@@ -44,6 +44,13 @@ type DirectConfig struct {
 	// convention as Cache.TTLSweepIntervalMs above: 0 keeps the default (60 s),
 	// negative disables the pass, positive sets the interval in milliseconds.
 	//
+	// BEWARE THE TWIN KNOB. shard.Config has a field of the same name and units
+	// whose zero means the OPPOSITE: there 0 DISABLES the pass (shard.Config is
+	// reached through shard.DefaultConfig, which fills the 60 000 in) and a
+	// negative value is rejected outright. So porting an Embedded config here by
+	// copying the field, and writing 0 to turn the pass off, silently gets you a
+	// 60 s ticker instead. Write -1 to disable on this side.
+	//
 	// Disabling it is safe and never changes an answer: every candidate is
 	// re-read and re-checked against the live value, so a posting the pass
 	// would have removed costs one wasted lookup and can never produce a wrong
