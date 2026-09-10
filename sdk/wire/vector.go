@@ -32,11 +32,16 @@ var ErrVectorArgsTruncated = errors.New("ops: vector args truncated")
 // structurally wrong. Both are the caller's mistake, so both belong in the same
 // classification bucket on every transport.
 //
-// This sentinel has exactly ONE serialised shape: bare, no detail suffix and no
-// wrapper — every producer in sdk/wire returns it unadorned and no site in the
-// tree wraps it. So exact equality is the whole matcher, and it is deliberately
-// not a strings.Contains: a bare substring check would make any internal fault
-// that merely mentions the sentinel text client-facing.
+// This sentinel has exactly ONE serialised shape as a server classifier sees it:
+// bare, no detail suffix and no wrapper. Every producer in sdk/wire returns it
+// unadorned, and no SERVER-SIDE site wraps it with context — the %w wraps that
+// exist are in tests, constructing the shape a wrapped error would have so the
+// negative controls can prove it is declined. So exact equality is the whole
+// matcher, and it is deliberately not a strings.Contains: a bare substring check
+// would make any internal fault that merely mentions the sentinel text
+// client-facing. If a future server-side site does wrap it, add that exact
+// shape here, anchored, rather than loosening this to a substring — the same
+// rule IsOperateArgsMessage states for its own sentinel.
 func IsVectorArgsTruncatedMessage(s string) bool {
 	return s == ErrVectorArgsTruncated.Error()
 }
