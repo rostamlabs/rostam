@@ -21,6 +21,7 @@ import (
 	"github.com/rostamlabs/rostam/ops/kvindex"
 	"github.com/rostamlabs/rostam/sdk/vtypes"
 	"github.com/rostamlabs/rostam/sdk/wire"
+	"github.com/rostamlabs/rostam/shard"
 )
 
 // --- fixtures -------------------------------------------------------------
@@ -863,5 +864,154 @@ func TestKVIndexBackfillSurvivesShardClose(t *testing.T) {
 				t.Fatalf("attempt %d: a backfill cut short by the shard closing was published as ready", attempt)
 			}
 		}()
+	}
+}
+
+// Close waits on the in-flight pass, so the pass has to look at the stop signal.
+// Without that check a node hosting several groups over a large keyspace takes
+// the SUM of every remaining backfill to shut down.
+func TestKVIndexPassAbortsOnStop(t *testing.T) {
+	tc := newTestCluster(t, 1, 4)
+	n := tc.nodes[0]
+	n.stopKVIndexObserver() // this test drives the passes itself
+	seedKVIndexRecords(t, n, "u:", 0, 2000)
+
+	// Control: with the observer already stopped, a pass must do nothing at all.
+	if err := n.SetKVIndex(kvIndexDefFixture("by_age", "u:"), 5*time.Second); err != nil {
+		t.Fatalf("SetKVIndex: %v", err)
+	}
+	began := time.Now()
+	n.applyKVIndexDefs()
+	if got := n.Stats().KVIndex.Backfills; got != 0 {
+		t.Fatalf("a pass ran %d backfills after the observer was stopped, want 0", got)
+	}
+	if elapsed := time.Since(began); elapsed > 2*time.Second {
+		t.Fatalf("an aborted pass took %s", elapsed)
+	}
+
+	// And the same pass on a node that has NOT been stopped does the work, so
+	// the assertion above is about the stop signal and not about the pass being
+	// broken.
+	tc2 := newTestCluster(t, 1, 4)
+	n2 := tc2.nodes[0]
+	seedKVIndexRecords(t, n2, "u:", 0, 2000)
+	if err := n2.SetKVIndex(kvIndexDefFixture("by_age", "u:"), 5*time.Second); err != nil {
+		t.Fatalf("SetKVIndex: %v", err)
+	}
+	waitForKVIndex(t, 20*time.Second, "every hosted group to finish its backfill", func() bool {
+		return n2.Stats().KVIndex.Ready == 1
+	})
+	if got := n2.Stats().KVIndex.Backfills; got == 0 {
+		t.Fatal("a live observer ran no backfills at all")
+	}
+}
+
+// Node construction must not pay for a full-keyspace walk. The definitions go in
+// synchronously (so the very first apply reindexes through them); the walk
+// happens on the observer goroutine afterwards.
+func TestKVIndexBackfillIsOffTheConstructionPath(t *testing.T) {
+	seeded := 100_000
+	if testing.Short() {
+		seeded = 20_000
+	}
+	tc := newTestCluster(t, 1, 1)
+	n := tc.nodes[0]
+	seedKVIndexRecords(t, n, "u:", 0, seeded)
+	if err := n.SetKVIndex(kvIndexDefFixture("by_age", "u:"), 5*time.Second); err != nil {
+		t.Fatalf("SetKVIndex: %v", err)
+	}
+	waitForKVIndex(t, 30*time.Second, "the first node to finish its backfill", func() bool {
+		return n.Stats().KVIndex.Ready == 1
+	})
+	dir := tc.dataDirs[0]
+	tc.Close()
+
+	// Restart on the SAME data dir: the catalog and the keyspace are both already
+	// there, so this is the restart the split is for.
+	reg := ops.NewRegistry()
+	if err := ops.RegisterBuiltins(reg); err != nil {
+		t.Fatal(err)
+	}
+	cc := cache.DefaultConfig()
+	cc.NumShards = 1
+	cfg := Config{
+		NodeID:    tc.peers[0].NodeID,
+		DataDir:   dir,
+		NumShards: 1,
+		Bootstrap: true,
+		RaftAddr:  tc.peers[0].RaftAddr,
+		Peers:     tc.peers,
+		ShardCfg: shard.Config{
+			NodeID: "ignored", DataDir: "ignored",
+			Cache: cc, Ops: reg, Bootstrap: true,
+			RaftHeartbeatMs: 200, RaftElectionMs: 1000, NoSync: true,
+		},
+		Ops: reg,
+	}
+	began := time.Now()
+	n2, err := New(cfg)
+	if err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	construct := time.Since(began)
+	defer func() { _ = n2.Close() }()
+
+	// Raft bootstrap dominates this number, so it is a smoke bound, not the
+	// assertion — TestKVIndexInstallWithoutBackfill is what pins the split.
+	if construct > 20*time.Second {
+		t.Fatalf("node construction took %s", construct)
+	}
+	// The definitions are back (the install is synchronous, so this needs at most
+	// one poll interval for the meta FSM to finish replaying its own log).
+	waitForKVIndex(t, 30*time.Second, "the restarted node to install its definitions", func() bool {
+		return n2.Stats().KVIndex.Definitions == 1
+	})
+	// And the walk lands on the observer goroutine.
+	waitForKVIndex(t, 30*time.Second, "the restarted node to backfill", func() bool {
+		return n2.Stats().KVIndex.Ready == 1
+	})
+	if got := n2.Stats().KVIndex.BackfillKeys; got < uint64(seeded) {
+		t.Fatalf("the restarted node walked %d keys, want at least %d", got, seeded)
+	}
+}
+
+// The deterministic half of the split: the synchronous part of node start
+// installs definitions and walks NOTHING. Calling the two halves by hand removes
+// every timing question — construction cannot be slow because of a walk it does
+// not perform.
+func TestKVIndexInstallWithoutBackfill(t *testing.T) {
+	tc := newTestCluster(t, 1, 2)
+	n := tc.nodes[0]
+	n.stopKVIndexObserver()
+	seedKVIndexRecords(t, n, "u:", 0, 2000)
+	if err := n.SetKVIndex(kvIndexDefFixture("by_age", "u:"), 5*time.Second); err != nil {
+		t.Fatalf("SetKVIndex: %v", err)
+	}
+
+	// installKVIndexDefs honours the stop signal like any pass, so restart the
+	// observer's channel state for this call: a stopped node is not what node
+	// start looks like.
+	n.kvIndexStop = nil
+	n.installKVIndexDefs()
+
+	st := n.Stats().KVIndex
+	if st.Definitions != 1 {
+		t.Fatalf("Definitions after the install-only pass = %d, want 1", st.Definitions)
+	}
+	if st.BackfillKeys != 0 || st.Backfills != 0 {
+		t.Fatalf("the install-only pass walked %d keys in %d backfills, want 0/0", st.BackfillKeys, st.Backfills)
+	}
+	if st.Ready != 0 {
+		t.Fatalf("Ready = %d after an install with no walk, want 0 — an unwalked index must not be usable", st.Ready)
+	}
+
+	// The full pass then does the walk the install skipped.
+	n.applyKVIndexDefs()
+	st = n.Stats().KVIndex
+	if st.Ready != 1 {
+		t.Fatalf("Ready = %d after the full pass, want 1", st.Ready)
+	}
+	if st.BackfillKeys < 2000 {
+		t.Fatalf("the full pass walked %d keys, want at least 2000", st.BackfillKeys)
 	}
 }

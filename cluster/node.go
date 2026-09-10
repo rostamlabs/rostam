@@ -137,6 +137,11 @@ type Node struct {
 	kvIndexStop     chan struct{}
 	kvIndexWg       sync.WaitGroup
 	kvIndexStopOnce sync.Once
+	// kvIndexApplyMu serialises one whole install-and-backfill pass. The observer
+	// runs passes on its own goroutine and Close can race one; serialising them
+	// keeps two walks off the same definition, which the Set's generation guard
+	// survives but which would waste a full keyspace walk.
+	kvIndexApplyMu sync.Mutex
 
 	// KV index counters behind Stats().KVIndex. kvBackfills/kvBackfillKeys record
 	// what the observer's walks have cost; kvIndexRejects counts definitions the

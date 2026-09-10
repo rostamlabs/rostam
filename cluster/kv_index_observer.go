@@ -28,22 +28,33 @@ const kvIndexObserveInterval = time.Second
 // startKVIndexObserver derives this node's local KV index state from the meta
 // catalog and keeps it in step with it.
 //
-// It runs once SYNCHRONOUSLY before returning, so a node that restarts with
-// definitions already in the catalog begins installing and backfilling them
-// before it serves anything, rather than a poll interval later. The goroutine
-// then re-derives whenever the meta FSM's applied index moves — any meta write
-// at all, which deliberately includes the OpSetPlacement a rebalance commits
-// when this node starts hosting a new shard group whose index Set is empty.
+// THE INSTALL IS SYNCHRONOUS, THE BACKFILL IS NOT, and the split is the whole
+// point of this function's shape. Installing is cheap and has to happen before
+// the node serves anything: from the moment a definition is installed every
+// apply reindexes through it, so a write that lands in the first second of the
+// process's life is recorded rather than lost. The WALK is O(live keys) — on a
+// restart with a large keyspace and definitions already in the catalog, running
+// it here would hold the node in its constructor for the length of a full-cache
+// walk before it could accept a single request. It runs on the observer
+// goroutine instead, and until it finishes the index is not ready, so a query
+// naming it gets the retryable ErrIndexBuilding: the designed answer, not a
+// silently short one.
+//
+// The goroutine then re-derives whenever the meta FSM's applied index moves —
+// any meta write at all, which deliberately includes the OpSetPlacement a
+// rebalance commits when this node starts hosting a new shard group whose index
+// Set is empty.
 func (n *Node) startKVIndexObserver() {
 	if n.meta == nil {
 		return // single-node mode: no meta catalog, so nothing to derive from
 	}
 	n.kvIndexStop = make(chan struct{})
 	stop := n.kvIndexStop
-	n.applyKVIndexDefs() // node start: install and begin backfilling before serving
+	n.installKVIndexDefs() // definitions in place before the first apply
 	n.kvIndexWg.Add(1)
 	go func() {
 		defer n.kvIndexWg.Done()
+		n.applyKVIndexDefs() // the first backfill, off the construction path
 		t := time.NewTicker(kvIndexObserveInterval)
 		defer t.Stop()
 		var seen uint64
@@ -64,6 +75,10 @@ func (n *Node) startKVIndexObserver() {
 // stopKVIndexObserver ends the polling goroutine and waits for it to exit.
 // Idempotent (Close calls it, and a test may have called it first), and safe on
 // a node whose observer was never started.
+//
+// The wait is only bounded because a pass CHECKS the stop signal: see
+// applyKVIndexDefs. Without that, Close on a node with a large keyspace and
+// several hosted groups would block for the length of every remaining backfill.
 func (n *Node) stopKVIndexObserver() {
 	n.kvIndexStopOnce.Do(func() {
 		if n.kvIndexStop != nil {
@@ -71,6 +86,22 @@ func (n *Node) stopKVIndexObserver() {
 		}
 	})
 	n.kvIndexWg.Wait()
+}
+
+// kvIndexStopped reports whether the observer has been asked to exit. Reading
+// n.kvIndexStop is race-free: it is assigned once in startKVIndexObserver before
+// the goroutine exists and never reassigned, and observing a channel close needs
+// no further synchronisation.
+func (n *Node) kvIndexStopped() bool {
+	if n.kvIndexStop == nil {
+		return false
+	}
+	select {
+	case <-n.kvIndexStop:
+		return true
+	default:
+		return false
+	}
 }
 
 // applyKVIndexDefs brings every hosted shard's index Set into line with the meta
@@ -93,12 +124,38 @@ func (n *Node) stopKVIndexObserver() {
 // is the enable-then-backfill shape, not an oversight: the Set's own lock
 // serialises Install against every concurrent Reindex, and a write that
 // interleaves is precisely the write the ordering above is designed to keep.
-func (n *Node) applyKVIndexDefs() {
+func (n *Node) applyKVIndexDefs() { n.kvIndexPass(false) }
+
+// installKVIndexDefs is applyKVIndexDefs' first half alone: put the definitions
+// in place on every hosted group and walk nothing. Used at node start, where the
+// install must precede the first apply but the walk must not precede the node
+// serving. See startKVIndexObserver.
+func (n *Node) installKVIndexDefs() { n.kvIndexPass(true) }
+
+// kvIndexPass is the body of both. installOnly skips every walk.
+//
+// IT CHECKS THE STOP SIGNAL BETWEEN SHARDS AND BETWEEN DEFINITIONS, and
+// deliberately NOT inside a walk. Close waits on this pass, so a node hosting
+// several groups over a large keyspace would otherwise take the sum of every
+// remaining backfill to shut down. Aborting MID-walk would be worse than slow:
+// the walk would return normally, having visited a prefix of the keyspace, and
+// kvindex would publish that subset as a complete index. A walk either finishes
+// or reports an error; it never stops early and calls itself done.
+//
+// The whole pass is serialised by kvIndexApplyMu so the observer's pass and a
+// direct call cannot interleave two walks over one definition.
+func (n *Node) kvIndexPass(installOnly bool) {
 	if n.meta == nil {
 		return
 	}
+	n.kvIndexApplyMu.Lock()
+	defer n.kvIndexApplyMu.Unlock()
+
 	defs := n.kvIndexDefsFromCatalog()
 	for group, s := range n.snapshotShards() {
+		if n.kvIndexStopped() {
+			return
+		}
 		if s == nil {
 			continue // not hosted here (partitioned cluster)
 		}
@@ -107,7 +164,13 @@ func (n *Node) applyKVIndexDefs() {
 			continue // a store built without an index
 		}
 		idx.Install(defs)
+		if installOnly {
+			continue
+		}
 		for _, d := range defs {
+			if n.kvIndexStopped() {
+				return
+			}
 			if idx.IsReady(d.Name) {
 				continue
 			}
