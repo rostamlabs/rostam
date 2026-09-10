@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rostamlabs/rostam/ops"
 	"github.com/rostamlabs/rostam/ops/kvindex"
 	"github.com/rostamlabs/rostam/sdk/wire"
 )
@@ -196,6 +197,62 @@ func TestKVIndexAdmissionRefusesUninstallableDefinitions(t *testing.T) {
 	if _, in := n.meta.FSM.KVIndexes()["by_age"]; !in {
 		t.Fatal("the valid definition did not reach the catalog")
 	}
+}
+
+// TestHandleSetKVIndexRefusesUninstallableDefinitions covers the FORWARDED
+// handler directly. It is the route every remote caller takes: REST and the
+// native Go client both send __kv_index_set__, and a non-leader node forwards
+// the same op to the meta leader, so this handler is where most admissions
+// actually happen.
+//
+// It asserts the two things a peer-facing refusal has to get right — the error
+// reaches the caller in the PERMANENT class, and nothing was committed — rather
+// than only that an error came back.
+func TestHandleSetKVIndexRefusesUninstallableDefinitions(t *testing.T) {
+	tc := newTestCluster(t, 1, 2)
+	n := tc.nodes[0]
+
+	for _, p := range kvIndexUninstallablePaths {
+		t.Run(p.name, func(t *testing.T) {
+			d := uninstallableDef(p.name, p.path, p.kind)
+			body, err := n.handleSetKVIndex(wire.EncodeKVIndexSetArgs(d))
+			if err == nil {
+				t.Fatalf("handleSetKVIndex accepted the uninstallable path %q", p.path)
+			}
+			if body != nil {
+				t.Fatalf("a refused write returned a body: %q", body)
+			}
+			if class, found := kvQueryClassOf(err); !found || class != ops.KVQueryErrPermanent {
+				t.Fatalf("err %v classifies as %v (in the family: %v), want permanent", err, class, found)
+			}
+			if _, in := n.meta.FSM.KVIndexes()[p.name]; in {
+				t.Fatal("a refused definition entered the meta catalog")
+			}
+		})
+	}
+
+	// The control: the same handler still commits a definition that parses, so
+	// the refusals above are about the path and not about the handler.
+	good := kvIndexDefFixture("by_age", "u:")
+	if _, err := n.handleSetKVIndex(wire.EncodeKVIndexSetArgs(good)); err != nil {
+		t.Fatalf("handleSetKVIndex refused a valid definition: %v", err)
+	}
+	if _, in := n.meta.FSM.KVIndexes()["by_age"]; !in {
+		t.Fatal("the valid definition did not reach the catalog")
+	}
+}
+
+// kvQueryClassOf reports how the shared error family classifies err, which is
+// what all three transports spell in their own vocabulary. Asserting through the
+// family rather than against a sentinel means this test fails if the sentinel is
+// ever moved between classes.
+func kvQueryClassOf(err error) (ops.KVQueryErrorClass, bool) {
+	for _, spec := range ops.KVQueryErrorFamily() {
+		if errors.Is(err, spec.Err) {
+			return spec.Class, true
+		}
+	}
+	return 0, false
 }
 
 // TestRejectedDefinitionIsPermanentNotBuilding covers the residue admission

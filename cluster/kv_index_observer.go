@@ -303,6 +303,14 @@ func (n *Node) kvIndexDefsFromCatalog() []kvindex.Def {
 // peer's reject state; a query against such a cluster retries until the old node
 // is upgraded. Closing that would mean carrying the reject bit back in the leaf
 // reply, which is a wire change and is left as a follow-up.
+//
+// IT ALSO ANSWERS false BEFORE THE FIRST OBSERVER PASS, when no map has been
+// published yet, so for up to one poll interval after this node starts a
+// rejected definition still classifies as "still building". That bound is
+// deliberate and is the safe direction: "retry" is the wrong answer for at most
+// one interval, whereas assuming the worst before anything has been observed
+// would make every definition permanent during startup — including the ones that
+// really are still installing.
 func (n *Node) kvIndexDefRejected(name string) bool {
 	m := n.kvIndexRejectedNames.Load()
 	if m == nil {

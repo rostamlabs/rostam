@@ -457,6 +457,13 @@ coordinator can build it, the query is still reported as retryable, because a
 peer's reject state is not carried back in the leaf reply. Upgrade the lagging
 node, or drop the definition.
 
+During a **rolling upgrade** that means the answer depends on which node you ask.
+A coordinator that cannot build the definition refuses permanently, and it does
+so even when it hosts the group and an upgraded replica of that same group could
+have served the read: a hosted copy is preferred locally, `consistency: "any"`
+included, so the upgraded replica is never consulted. Issue the query at an
+upgraded node, or wait for the upgrade to finish.
+
 ## Operating it
 
 `Stats.KVIndex` makes the index observable, which matters because it is derived
