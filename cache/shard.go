@@ -253,11 +253,17 @@ type shard struct {
 	nowFn atomic.Pointer[func() uint64]
 
 	// onRemove points at the OWNING CACHE's removal hook (Cache.onRemove), so a
-	// SetOnRemove is one store seen by every shard. It is assigned once in
-	// Cache.New, before the cache is published, and never mutated afterwards — the
-	// hook VALUE behind it is what changes, atomically. nil for a shard built
-	// directly by newShard (tests, benchmarks): fireOnRemove short-circuits on it.
-	// See cache/onremove.go for the callback contract.
+	// SetOnRemove is one store seen by every shard. It is set in the STRUCT
+	// LITERAL in newShard and never written again — the hook VALUE behind it is
+	// what changes, atomically. nil for a shard built directly by newShard with
+	// no owner (tests, benchmarks): fireOnRemove short-circuits on it.
+	//
+	// IT CANNOT BE ASSIGNED AFTER newShard RETURNS. newShard starts the sweeper
+	// goroutine, and the sweeper reaches fireOnRemove on the very first tick of a
+	// warm open that already holds expired entries — so a later `s.onRemove = …`
+	// in Cache.New is a plain write racing a live reader. Passing it in removes
+	// the window rather than narrowing it: by the time any goroutine exists, the
+	// field is already final. See cache/onremove.go for the callback contract.
 	onRemove *atomic.Pointer[func([]byte)]
 
 	// chunkedRestarts counts how many times IterateChunked abandoned a shard pass
@@ -270,11 +276,16 @@ type shard struct {
 // newShard constructs a shard. dataDir="" selects heap mode (heap-only behavior).
 // With a non-empty dataDir the shard is mmap-backed; the directory is created
 // if it does not exist.
-func newShard(cfg Config, dataDir string) (*shard, error) {
+//
+// onRemove is the owning cache's removal hook, or nil for an owner-less shard
+// (tests, benchmarks). It is a PARAMETER because this function starts the
+// sweeper: see the field's doc comment.
+func newShard(cfg Config, dataDir string, onRemove *atomic.Pointer[func([]byte)]) (*shard, error) {
 	s := &shard{
 		cfg:         cfg,
 		dataDir:     dataDir,
 		stopSweeper: make(chan struct{}),
+		onRemove:    onRemove,
 	}
 	if cfg.NowFn != nil {
 		fn := cfg.NowFn

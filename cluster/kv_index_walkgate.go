@@ -46,6 +46,14 @@ type kvIndexWalkGate struct {
 }
 
 // kvIndexWalkGateFor returns group's gate, creating it on first use.
+//
+// A GATE CREATED AFTER THE NODE-WIDE SHUTDOWN LATCH IS BORN CLOSED. Gates are
+// lazy, so before this the FIRST scan on a hosted group could create its gate
+// AFTER drainAllKVIndexWalks had already snapshotted the map: the drain would
+// find nothing to wait for, Node.Close would go on to unmap the stores, and the
+// scan would be walking pages that no longer exist. The latch closes that by
+// construction — once shutdown has begun, every gate this hands out, existing or
+// brand new, refuses to admit a walk.
 func (n *Node) kvIndexWalkGateFor(group int) *kvIndexWalkGate {
 	n.kvIndexWalkMu.Lock()
 	defer n.kvIndexWalkMu.Unlock()
@@ -55,6 +63,10 @@ func (n *Node) kvIndexWalkGateFor(group int) *kvIndexWalkGate {
 	g := n.kvIndexWalkGates[group]
 	if g == nil {
 		g = &kvIndexWalkGate{stop: make(chan struct{})}
+		if n.kvIndexWalkAllClosed {
+			g.closed = true
+			close(g.stop)
+		}
 		n.kvIndexWalkGates[group] = g
 	}
 	return g
@@ -75,22 +87,44 @@ func (n *Node) beginKVIndexWalk(group int) (stop <-chan struct{}, done func(), o
 	return g.stop, g.wg.Done, true
 }
 
-// drainKVIndexWalks closes group's gate and waits for every walk already running
-// on it. After it returns, no walk is inside that group's store and none can
-// start, so the store is safe to close.
+// closeKVIndexWalkGate shuts group's gate: no new walk can register, and every
+// walk already running is signalled. It does NOT wait — see waitKVIndexWalks.
 //
-// It is called with no lock held and may block for as long as one walk takes to
-// notice the signal — bounded by the walk's abort check, not by the size of the
-// keyspace.
-func (n *Node) drainKVIndexWalks(group int) {
+// THE SPLIT EXISTS SO THE SHUT CAN HAPPEN UNDER n.shardMu. Shutting and re-arming
+// are the gate's half of the store swap, and doing them outside that lock let
+// AddShardOwner and RemoveShardOwner interleave the wrong way round: the add
+// could install the replacement store and re-arm the gate, and the concurrent
+// remove could then shut it — leaving a live store behind a permanently closed
+// gate, where every scan answers ErrWalkAborted and the observer can never
+// backfill. Both are now decided in the same critical section that swaps
+// n.shards, so the gate always ends in the state the store slot ended in. The
+// WAIT stays outside, because it can block for a whole chunk.
+func (n *Node) closeKVIndexWalkGate(group int) {
 	g := n.kvIndexWalkGateFor(group)
 	g.mu.Lock()
+	defer g.mu.Unlock()
 	if !g.closed {
 		g.closed = true
 		close(g.stop)
 	}
-	g.mu.Unlock()
-	g.wg.Wait()
+}
+
+// waitKVIndexWalks waits for every walk already running on group. The caller
+// must have shut the gate first, or a new walk can start while it waits.
+//
+// It is called with no lock held and may block for as long as one walk takes to
+// notice the signal — bounded by the walk's abort check, not by the size of the
+// keyspace.
+func (n *Node) waitKVIndexWalks(group int) {
+	n.kvIndexWalkGateFor(group).wg.Wait()
+}
+
+// drainKVIndexWalks closes group's gate and waits for every walk already running
+// on it. After it returns, no walk is inside that group's store and none can
+// start, so the store is safe to close.
+func (n *Node) drainKVIndexWalks(group int) {
+	n.closeKVIndexWalkGate(group)
+	n.waitKVIndexWalks(group)
 }
 
 // reopenKVIndexWalks re-arms group's gate after the group is hosted again
@@ -178,6 +212,13 @@ func (n *Node) gatedKVWalk(group int, walk kvindex.Walker, yield func(key, value
 // waits for its walk), but it would wait for the whole walk to finish.
 func (n *Node) drainAllKVIndexWalks() {
 	n.kvIndexWalkMu.Lock()
+	// THE LATCH GOES UP BEFORE THE SNAPSHOT, and that ordering is the whole
+	// point. Gates are created lazily, so a group that has never been walked has
+	// none — and a first scan arriving between the snapshot and the unmap would
+	// otherwise create a fresh, OPEN gate and walk a store Close is about to
+	// unmap. With the latch set first, any gate created from here on is born
+	// closed, so the snapshot below does not have to be complete to be safe.
+	n.kvIndexWalkAllClosed = true
 	groups := make([]int, 0, len(n.kvIndexWalkGates))
 	for group := range n.kvIndexWalkGates {
 		groups = append(groups, group)

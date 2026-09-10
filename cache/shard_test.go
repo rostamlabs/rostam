@@ -15,7 +15,7 @@ func newTestShard(t *testing.T, cfg Config) *shard {
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("invalid config: %v", err)
 	}
-	s, err := newShard(cfg, "")
+	s, err := newShard(cfg, "", nil)
 	if err != nil {
 		t.Fatalf("newShard: %v", err)
 	}

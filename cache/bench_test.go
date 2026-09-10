@@ -77,7 +77,7 @@ func BenchmarkRostamPut(b *testing.B) {
 // --- Single-shard low-level micro-benchmark to measure index-only overhead ---
 
 func BenchmarkShardGetHit(b *testing.B) {
-	s, err := newShard(DefaultConfig(), "")
+	s, err := newShard(DefaultConfig(), "", nil)
 	if err != nil {
 		b.Fatal(err)
 	}

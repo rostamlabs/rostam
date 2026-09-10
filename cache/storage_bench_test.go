@@ -73,7 +73,7 @@ func BenchmarkShardPutEvict(b *testing.B) {
 			cfg.PageSize = 1 << 20 // 1 MiB
 			cfg.MaxMemoryPerShard = pages << 20
 			cfg.TTLSweepIntervalMs = 0 // no background sweeper interference
-			s, err := newShard(cfg, "")
+			s, err := newShard(cfg, "", nil)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -107,7 +107,7 @@ func BenchmarkShardSweep(b *testing.B) {
 	cfg := DefaultConfig()
 	cfg.NumShards = 1
 	cfg.TTLSweepIntervalMs = 0
-	s, err := newShard(cfg, "")
+	s, err := newShard(cfg, "", nil)
 	if err != nil {
 		b.Fatal(err)
 	}

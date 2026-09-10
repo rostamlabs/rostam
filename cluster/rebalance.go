@@ -182,14 +182,23 @@ func (n *Node) RemoveShardOwner(shardID int) error {
 			n.kvIndexReconcileDrops.Add(idx.ReconcileDrops())
 		}
 	}
-	n.shardMu.Unlock()
-	// Drain any in-flight KV index backfill on this group BEFORE the store closes.
-	// The walk aliases the store's live mmap, which Close unmaps; draining first
-	// means the walk has returned before anything is unmapped, and the gate stays
-	// closed so a pass holding a stale store pointer cannot start a new one. Done
+	// SHUT THE GATE IN THE SAME CRITICAL SECTION THAT TAKES THE STORE OUT, so the
+	// gate's state and the shard slot's state are decided together. Shutting it
+	// after the unlock let a concurrent AddShardOwner — which installs the
+	// replacement store and re-arms the gate under this same lock — be undone by
+	// this removal: the new store would sit behind a gate nothing ever reopens,
+	// every scan on it answering ErrWalkAborted and the observer unable to
+	// backfill its index until the group was removed and re-added again. Done
 	// unconditionally, s==nil included, so a concurrent removal of a group this
 	// node had already dropped still shuts its gate.
-	n.drainKVIndexWalks(shardID)
+	n.closeKVIndexWalkGate(shardID)
+	n.shardMu.Unlock()
+	// Then WAIT, outside the lock, for any walk already inside this store. The
+	// walk aliases the store's live mmap, which Close unmaps; waiting first means
+	// the walk has returned before anything is unmapped, and the gate is already
+	// shut so a pass holding a stale store pointer cannot start a new one. The
+	// wait can block for a whole chunk, which is why it is not under shardMu.
+	n.waitKVIndexWalks(shardID)
 	if s == nil {
 		return nil
 	}

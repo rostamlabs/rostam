@@ -160,6 +160,12 @@ type Node struct {
 	// out of. See cluster/kv_index_walkgate.go for why a drain rather than a flag.
 	kvIndexWalkMu    sync.Mutex
 	kvIndexWalkGates map[int]*kvIndexWalkGate
+	// kvIndexWalkAllClosed latches on the node-wide drain (Node.Close). Gates are
+	// created lazily, so without it a first walk on a never-walked group could
+	// create its gate after drainAllKVIndexWalks had already snapshotted the map
+	// and walk a store Close is about to unmap. While it is set, every gate handed
+	// out is born closed. Guarded by kvIndexWalkMu.
+	kvIndexWalkAllClosed bool
 
 	// KV index counters behind Stats().KVIndex. kvBackfills/kvBackfillKeys record
 	// what the observer's walks have cost; kvIndexRejects COUNTS reject events and

@@ -46,7 +46,7 @@ func New(cfg Config) (*Cache, error) {
 		if cfg.DataDir != "" {
 			sd = filepath.Join(cfg.DataDir, fmt.Sprintf("shard-%04d", i))
 		}
-		s, err := newShard(cfg, sd)
+		s, err := newShard(cfg, sd, &c.onRemove)
 		if err != nil {
 			// Roll back already-constructed shards.
 			for j := 0; j < i; j++ {
@@ -54,11 +54,6 @@ func New(cfg Config) (*Cache, error) {
 			}
 			return nil, fmt.Errorf("cache: shard %d: %w", i, err)
 		}
-		// Point the shard at the cache's single removal hook. Done here (before the
-		// cache is published to any other goroutine) rather than in newShard, which
-		// has no Cache to point at — a shard built directly in a test keeps a nil
-		// pointer and fireOnRemove short-circuits on it.
-		s.onRemove = &c.onRemove
 		c.shards[i] = s
 	}
 	if cfg.Durable && cfg.DataDir != "" {

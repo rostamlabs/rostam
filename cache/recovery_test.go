@@ -98,7 +98,7 @@ func TestRecoverRejectsVersion1File(t *testing.T) {
 	dir := t.TempDir()
 	writeVersion1BigEndianFile(t, filepath.Join(dir, "pages.dat"), cfg.PageSize, 1)
 
-	s, err := newShard(cfg, dir)
+	s, err := newShard(cfg, dir, nil)
 	if err != nil {
 		t.Fatalf("newShard: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestRebuildCountsCorruptEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s, err := newShard(cfg, dir)
+	s, err := newShard(cfg, dir, nil)
 	if err != nil {
 		t.Fatalf("newShard: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestRebuildRejectsCorruptPageTail(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s, err := newShard(cfg, dir)
+	s, err := newShard(cfg, dir, nil)
 	if err != nil {
 		t.Fatalf("newShard: %v, want a clean error/reset instead of a panic", err)
 	}
@@ -263,7 +263,7 @@ func TestRebuildRejectsCorruptEqualHeadTail(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s, err := newShard(cfg, dir)
+	s, err := newShard(cfg, dir, nil)
 	if err != nil {
 		t.Fatalf("newShard: %v, want a clean error/reset instead of a panic", err)
 	}
@@ -317,7 +317,7 @@ func TestTornEntrySurvivesEviction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s, err := newShard(cfg, dir)
+	s, err := newShard(cfg, dir, nil)
 	if err != nil {
 		t.Fatalf("newShard: %v", err)
 	}
@@ -351,7 +351,7 @@ func TestMmapRejectPolicyScansAllPages(t *testing.T) {
 	cfg.AtCapPolicy = PolicyRejectWrites
 	cfg.TTLSweepIntervalMs = 0
 
-	s, err := newShard(cfg, t.TempDir())
+	s, err := newShard(cfg, t.TempDir(), nil)
 	if err != nil {
 		t.Fatalf("newShard: %v", err)
 	}
