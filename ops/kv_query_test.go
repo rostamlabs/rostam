@@ -1067,3 +1067,45 @@ func TestKVQueryEmptyValueIsPresentNotOmitted(t *testing.T) {
 		t.Fatalf("value = %d bytes, want 0", len(res.Rows[0].Value))
 	}
 }
+
+func TestKVQueryScanUsesTheInstalledWalker(t *testing.T) {
+	// The seam, end to end through the REAL handler: with a gated walker
+	// installed, an aborted walk reaches the caller as the retryable refusal.
+	// Without the seam the leaf called ops.CacheWalker directly, which can never
+	// fail, so ErrKVQueryUnavailable was unreachable in production and a scan
+	// racing a shard's removal had no gate at all.
+	tx, _, _ := newIndexedTx(t, "rc")
+	seedKV(t, tx, "u:a", kvRec(7, "gold"))
+
+	// Unset, the dispatcher walks its own cache and answers normally.
+	res := runKVQuery(t, tx, wire.KVQueryArgs{Scan: true})
+	if len(res.Rows) != 1 {
+		t.Fatalf("default walker: got %d rows, want 1", len(res.Rows))
+	}
+
+	called := 0
+	tx.SetWalker(func(fn func(key, value []byte) bool) error {
+		called++
+		fn([]byte("u:a"), kvRec(7, "gold")) // some progress, then the abort
+		return kvindex.ErrWalkAborted
+	})
+	err := runKVQueryErr(t, tx, wire.KVQueryArgs{Scan: true})
+	if called != 1 {
+		t.Fatalf("the installed walker was called %d times, want 1", called)
+	}
+	if !errors.Is(err, ErrKVQueryUnavailable) {
+		t.Fatalf("an aborted gated walk must be retryable, got %v", err)
+	}
+	if !errors.Is(err, kvindex.ErrWalkAborted) {
+		t.Fatalf("the abort must stay inspectable through the wrap, got %v", err)
+	}
+
+	// The INDEXED path does not walk at all, so the gate is irrelevant to it.
+	res = runKVQuery(t, tx, wire.KVQueryArgs{Index: wiringIndexName, Filter: eqFilter("rc", vtypes.NewInt(7))})
+	if len(res.Rows) != 1 {
+		t.Fatalf("indexed path: got %d rows, want 1", len(res.Rows))
+	}
+	if called != 1 {
+		t.Fatalf("the indexed path must not walk; walker called %d times", called)
+	}
+}

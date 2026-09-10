@@ -58,6 +58,10 @@ type TxContext struct {
 	// else — see reindexKV.
 	kvIdx *kvindex.Set
 
+	// walker is the full-keyspace walk a scan-mode kv_query uses, or nil for
+	// the plain, ungated walk of this dispatcher's own cache. See SetWalker.
+	walker kvindex.Walker
+
 	// shardIdx is the index of the shard GROUP whose dispatcher owns this
 	// TxContext. It is set once when the dispatcher is built (one TxContext per
 	// shard.Store / per FSM) and never varies per entry, unlike applyStamped.
@@ -132,6 +136,36 @@ func NewTxContextWithVectors(c *cache.Cache, v *vector.CollectionStore) *TxConte
 // the FSM's TxContext and for the store's read-only one.
 func NewTxContextWithIndex(c *cache.Cache, v *vector.CollectionStore, idx *kvindex.Set) *TxContext {
 	return &TxContext{c: c, vectors: v, kvIdx: idx}
+}
+
+// SetWalker installs the full-keyspace walk a scan-mode kv_query on this
+// dispatcher uses. It is called once at wiring time, not per call.
+//
+// WHY THIS IS A SEAM AND NOT JUST CacheWalker. A walk aliases a LIVE mmap, so a
+// walk still running when its shard is removed reads unmapped memory. The index
+// observer already closes that hole for BACKFILL walks by registering each one
+// and draining it before Store.Close (cluster.Node.beginKVIndexWalk). A scan
+// page walks the same keyspace for as long, and CacheWalker can never fail, so
+// without this seam a scan has exactly the exposure the drain was built to
+// remove — and ops.ErrKVQueryUnavailable would be unreachable.
+//
+// The store/cluster layer installs a GATED walker here: one that registers the
+// walk with the same gate and returns kvindex.ErrWalkAborted when the shard is
+// going away. The leaf surfaces any walk error as the retryable
+// ErrKVQueryUnavailable, so the abort reaches the client as "retry", never as a
+// short page.
+//
+// Unset, the dispatcher walks its own cache directly, which is right for Direct
+// and for every embedder that has no shard lifecycle to race.
+func (tx *TxContext) SetWalker(w kvindex.Walker) { tx.walker = w }
+
+// Walker returns the walk installed by SetWalker, or the plain walk of this
+// dispatcher's cache.
+func (tx *TxContext) Walker() kvindex.Walker {
+	if tx.walker != nil {
+		return tx.walker
+	}
+	return CacheWalker(tx.c)
 }
 
 // KVIndex returns the KV record index, or nil when the dispatcher was built

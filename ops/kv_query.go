@@ -59,10 +59,16 @@ var (
 	ErrKVIndexUnavailable = errors.New("ops: kv_query: no KV index on this dispatcher")
 	// ErrKVQueryUnavailable marks a refusal that is RETRYABLE and about this
 	// replica rather than about the query: a scan's walk was cut short, which
-	// today means kvindex.ErrWalkAborted (the cluster observer's walk gate
-	// stopping the walk because this shard is being removed from the node). The
-	// coordinator classifies it like kvindex.ErrIndexBuilding — try again,
-	// elsewhere or later.
+	// today means kvindex.ErrWalkAborted — the walk gate stopping the walk
+	// because this shard is being removed from the node. The coordinator
+	// classifies it like kvindex.ErrIndexBuilding — try again, elsewhere or
+	// later.
+	//
+	// The GATING IS SUPPLIED BY THE STORE, not by this package: the leaf walks
+	// through TxContext.Walker(), and the store/cluster layer installs the
+	// gated walker there (shard.Store.SetKVWalker). A dispatcher with no gate
+	// installed walks its cache directly and this error is simply never
+	// produced.
 	//
 	// It is NEVER a short page. The keys an aborted walk did not reach are
 	// indistinguishable from keys that did not match, so a page built from a
@@ -160,7 +166,7 @@ func handleKVQuery(tx *TxContext, args []byte) ([]byte, error) {
 	if a.Index == "" {
 		// The decoder already rejected index == "" && !scan, so this is a
 		// consented scan and nothing else.
-		return scanPage(tx, CacheWalker(tx.Cache()), after, pred, a, group, b)
+		return scanPage(tx, tx.Walker(), after, pred, a, group, b)
 	}
 
 	cands, err := kvQueryCandidates(idx, a, after, group, b)
@@ -172,7 +178,7 @@ func handleKVQuery(tx *TxContext, args []byte) ([]byte, error) {
 		if !a.Scan {
 			return nil, ErrKVQueryScanRequired
 		}
-		return scanPage(tx, CacheWalker(tx.Cache()), after, pred, a, group, b)
+		return scanPage(tx, tx.Walker(), after, pred, a, group, b)
 	case err != nil:
 		return nil, err
 	}

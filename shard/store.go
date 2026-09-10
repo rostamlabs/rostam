@@ -389,6 +389,17 @@ func (s *Store) KVIndex() *kvindex.Set { return s.kvIdx }
 // and drains it before removing a shard; see cluster.Node.beginKVIndexWalk.
 func (s *Store) CacheWalker() kvindex.Walker { return ops.CacheWalker(s.cache) }
 
+// SetKVWalker installs the walk a scan-mode kv_query on this store uses, on the
+// READ-ONLY dispatcher that serves it. It is the seam the cluster layer uses to
+// put a scan walk behind the same gate a backfill walk goes through, so both are
+// drained before this store is closed — without it a long scan racing
+// RemoveShardOwner reads an unmapped page. See ops.TxContext.SetWalker for why
+// the gate cannot live in ops.
+//
+// Only the read-only dispatcher: kv_query is OpReadOnly and never applied, so
+// the FSM's TxContext never walks.
+func (s *Store) SetKVWalker(w kvindex.Walker) { s.tx.SetWalker(w) }
+
 // raftReplicatedFn builds the FSM's isReplicated gate over a LIVE Raft group-size
 // source (raft.Node.NumServers). It FAILS CLOSED: the gate reports replicated
 // (halt-on-classFatal enabled) unless the group is positively observed to have
