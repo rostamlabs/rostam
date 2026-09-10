@@ -249,20 +249,18 @@ func TestKVQueryGroupTimeout(t *testing.T) {
 			close(resumed)
 		}
 	}
-	// THE ABANDONED LEG MUST FINISH BEFORE THE HARNESS CLOSES THE NODE. A leg the
-	// per-group timeout gave up on is still running — that is the documented
-	// shape of forEachGroup — and here it is parked inside a store whose cache
-	// tc.Close is about to unmap. Releasing it and waiting is what keeps this
-	// test from segfaulting on the way out; the settle covers the microseconds
-	// between the hook returning and the local read completing. (In production
-	// the node stays up and the leg simply finishes; a read in flight when
-	// Node.Close runs is the pre-existing Get-during-Close follow-up recorded in
-	// Task 5, which this test does not widen.)
+	// THE ABANDONED LEG IS RELEASED BEFORE THE HARNESS CLOSES THE NODE. A leg the
+	// per-group timeout gave up on keeps running — the documented shape of
+	// forEachGroup — and this one is parked in the HOOK, which sits OUTSIDE
+	// shard.Store.Call and therefore outside the drain that now covers the store
+	// itself (Store.Close waits for the calls already inside it, which is what
+	// stopped this test segfaulting on the way out). So the hook still has to be
+	// let go; waiting for it to resume is also what keeps the kvQueryLegHook
+	// write below from racing the leg's read of it.
 	t.Cleanup(func() {
 		kvQueryGroupTimeout = prev
 		close(release)
 		<-resumed
-		time.Sleep(500 * time.Millisecond)
 		kvQueryLegHook = nil
 	})
 
@@ -381,14 +379,16 @@ func TestKVQueryClassifiesStringifiedNoSuchIndex(t *testing.T) {
 		t.Fatalf("SetKVIndex: %v", err)
 	}
 
-	// What a peer's reply looks like once the type has been lost.
-	remote := errors.New(`cluster: __kv_query_shard__: kvindex: no such index: "by_age" on shard group 1`)
+	// What a peer's reply looks like once the type has been lost: the leaf's own
+	// message, behind the client's op wrapper and nothing else.
+	remote := errors.New(kvQueryRemoteErrPrefix + `kvindex: no such index: "by_age" on shard group 1`)
 	got := n.classifyKVQueryErr("by_age", 1, remote)
 	if !errors.Is(got, kvindex.ErrIndexBuilding) {
 		t.Fatalf("a stringified no-such-index was not reclassified: %v", got)
 	}
 	// A name the catalog does not hold is left exactly as it came.
-	if got := n.classifyKVQueryErr("other", 1, remote); !errors.Is(got, remote) {
+	other := errors.New(kvQueryRemoteErrPrefix + `kvindex: no such index: "other" on shard group 1`)
+	if got := n.classifyKVQueryErr("other", 1, other); !errors.Is(got, other) {
 		t.Fatalf("an unknown name's error was rewritten: %v", got)
 	}
 	// And every other leaf refusal passes through untouched.
@@ -746,5 +746,146 @@ func TestKVQueryCursorOverTheArgsCapIsRefused(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "cursor cap") {
 		t.Fatalf("the refusal does not explain itself: %v", err)
+	}
+}
+
+// --- the smuggling probe --------------------------------------------------
+
+// A PERMANENT filter error must never be reported as retryable, however the
+// filter is written.
+//
+// THE HOLE THIS CLOSES. The coordinator rewrites a group's "no such index" as
+// the retryable ErrIndexBuilding when the name is in the meta catalog, and a
+// remote group's error arrives as text with its type gone — so the first cut
+// matched the sentinel by SUBSTRING. Filter fields are client-chosen and are
+// quoted verbatim into ops.ErrKVQueryFilter's message, so a field named
+// `$kvindex: no such index` put the sentinel text inside a permanent error and
+// got it rewritten: a correct client then retries a bad filter forever, at one
+// full cluster fan-out per attempt. Reproduced exactly this way.
+func TestKVQueryFilterErrorIsNotSmuggledAsRetryable(t *testing.T) {
+	tc := newTestCluster(t, 1, 2)
+	n := tc.nodes[0]
+
+	seedKVIndexRecords(t, n, "u:", 0, 20)
+	if err := n.SetKVIndex(kvIndexDefFixture("by_age", "u:"), 5*time.Second); err != nil {
+		t.Fatalf("SetKVIndex: %v", err)
+	}
+	waitKVIndexReadyEverywhere(t, tc, 1)
+
+	for _, field := range []string{
+		`$kvindex: no such index`,
+		`$kvindex: no such index: "by_age" on shard group 0`,
+		`kvindex: no such index: "by_age" on shard group 1`,
+	} {
+		_, err := kvQueryCall(t, n, wire.KVQueryArgs{
+			Index:  "by_age",
+			Filter: vtypes.Filter{Op: vtypes.FilterEq, Field: field, Value: vtypes.NewInt(1)},
+			Limit:  10,
+		})
+		if err == nil {
+			t.Fatalf("field %q: a reserved/invalid filter field was accepted", field)
+		}
+		if !errors.Is(err, ops.ErrKVQueryFilter) {
+			t.Fatalf("field %q: want the PERMANENT ErrKVQueryFilter, got %v", field, err)
+		}
+		if errors.Is(err, kvindex.ErrIndexBuilding) {
+			t.Fatalf("field %q: a permanent filter error was rewritten as retryable — a client will retry it forever: %v", field, err)
+		}
+	}
+}
+
+// The exact-shape predicate, driven directly: only the leaf's own message is
+// accepted, and only in full.
+func TestKVQueryNoSuchIndexClassificationIsExactShape(t *testing.T) {
+	tc := newTestCluster(t, 1, 2)
+	n := tc.nodes[0]
+	freezeKVIndexObserver(t, n)
+	if err := n.SetKVIndex(kvIndexDefFixture("by_age", "u:"), 5*time.Second); err != nil {
+		t.Fatalf("SetKVIndex: %v", err)
+	}
+
+	leaf := fmt.Sprintf(`kvindex: no such index: %q on shard group 3`, "by_age")
+	for _, tcase := range []struct {
+		name    string
+		msg     string
+		rewrite bool
+	}{
+		{"the leaf's own message", leaf, true},
+		{"through the peer wrapper", kvQueryRemoteErrPrefix + leaf, true},
+		{"a filter error carrying the text", `ops: kv_query: invalid filter: field "$kvindex: no such index: \"by_age\" on shard group 3" addresses the reserved "$" namespace`, false},
+		{"the sentinel buried mid-message", "internal error: " + leaf, false},
+		{"trailing text after the group", leaf + " (retry)", false},
+		{"an illegal index name", `kvindex: no such index: "by age!" on shard group 3`, false},
+		{"a non-numeric group", `kvindex: no such index: "by_age" on shard group two`, false},
+		{"the bare sentinel", "kvindex: no such index", false},
+	} {
+		t.Run(tcase.name, func(t *testing.T) {
+			got := n.classifyKVQueryErr("by_age", 3, errors.New(tcase.msg))
+			if rewritten := errors.Is(got, kvindex.ErrIndexBuilding); rewritten != tcase.rewrite {
+				t.Fatalf("rewritten=%v want %v for %q (got %v)", rewritten, tcase.rewrite, tcase.msg, got)
+			}
+		})
+	}
+}
+
+// A REMOTE group's refusal must reach the coordinator with its meaning intact.
+//
+// It does not by default: the server edge redacts anything it has not
+// classified as client-facing to "internal error", which turned a peer's
+// "that group has not installed the index yet" and a peer's "your filter is
+// invalid" into the same opaque string — so classifyKVQueryErr could only ever
+// work for locally hosted groups, and a create-then-query on a multi-node
+// cluster was a hard failure. server.clientFacingErr now classifies the
+// kv_query family; this is the end-to-end proof.
+func TestKVQueryRemoteGroupRefusalIsNotRedacted(t *testing.T) {
+	const shards = 6
+	tc := newTestCluster(t, 3, shards, 1) // RF=1: most groups are answered by a peer
+	n := tc.nodes[0]
+	for _, other := range tc.nodes {
+		freezeKVIndexObserver(t, other) // nothing installs the definition anywhere
+	}
+	if err := n.SetKVIndex(kvIndexDefFixture("by_age", "u:"), 5*time.Second); err != nil {
+		t.Fatalf("SetKVIndex: %v", err)
+	}
+	waitForKVIndex(t, 10*time.Second, "every node's meta FSM to carry the definition", func() bool {
+		for _, other := range tc.nodes {
+			if _, ok := other.meta.FSM.KVIndexLookup("by_age"); !ok {
+				return false
+			}
+		}
+		return true
+	})
+
+	// Ask a group this node does NOT host, so the answer comes back over the
+	// wire, and check the leg error directly — the fan-out would report whichever
+	// group failed first, which may be a local one.
+	remote := -1
+	for g := 0; g < shards; g++ {
+		if n.getShard(g) == nil {
+			remote = g
+			break
+		}
+	}
+	if remote < 0 {
+		t.Fatal("this node hosts every group; the test would prove nothing")
+	}
+	args, err := wire.EncodeKVQueryArgs(wire.KVQueryArgs{Index: "by_age", Filter: kvQueryAll(), Limit: 10})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	_, legErr := n.callKVQueryGroup(context.Background(), remote, wire.ConsistencyAnyReplica, args)
+	if legErr == nil {
+		t.Fatalf("group %d answered a query for an uninstalled index", remote)
+	}
+	if strings.Contains(legErr.Error(), "internal error") {
+		t.Fatalf("a remote group's refusal was redacted, so nothing can classify it: %v", legErr)
+	}
+	if got := n.classifyKVQueryErr("by_age", remote, legErr); !errors.Is(got, kvindex.ErrIndexBuilding) {
+		t.Fatalf("a remote uninstalled-index refusal was not reclassified as retryable: %v", got)
+	}
+
+	// The whole query reports it the same way, whichever group answered first.
+	if _, err := kvQueryCall(t, n, wire.KVQueryArgs{Index: "by_age", Filter: kvQueryAll(), Limit: 10}); !errors.Is(err, kvindex.ErrIndexBuilding) {
+		t.Fatalf("the fan-out reported %v, want the retryable ErrIndexBuilding", err)
 	}
 }

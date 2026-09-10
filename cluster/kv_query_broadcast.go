@@ -262,12 +262,47 @@ func (n *Node) classifyKVQueryErr(index string, group int, err error) error {
 		kvindex.ErrIndexBuilding, index, group)
 }
 
-// isKVQueryNoSuchIndex reports whether err is kvindex.ErrNoSuchIndex, wrapped or
-// stringified. A LOCAL group's error still carries the sentinel; a remote one is
-// a text error rebuilt from the peer's reply, so the message is all that is
-// left of it.
+// kvQueryRemoteErrPrefix is what a peer's reply looks like once it has crossed
+// the wire: client.ServerError renders `server error on op %q: %s` around the
+// message the peer's edge chose to return. It is stripped by an ANCHORED CUT,
+// never searched for.
+var kvQueryRemoteErrPrefix = fmt.Sprintf("client: server error on op %q: ", opKVQueryShardName)
+
+// isKVQueryNoSuchIndex reports whether err is the leaf's "no such index"
+// refusal — by sentinel when the group was served locally, and otherwise by the
+// EXACT SHAPE of the message, since a remote group's error reaches this node as
+// text with its type gone.
+//
+// IT IS DELIBERATELY NOT A SUBSTRING TEST, and that is a hole rather than a
+// style point. This predicate decides whether a PERMANENT refusal is rewritten
+// as RETRYABLE, and a client told "retryable" retries — so any string an
+// attacker can get into an error message is, under a substring test, a way to
+// make a permanent error retry forever, at one full cluster fan-out per
+// attempt. Filter fields are client-chosen and are quoted verbatim into
+// ops.ErrKVQueryFilter's message, so a field named `$kvindex: no such index`
+// smuggles the sentinel text into a permanent error exactly. Reproduced against
+// the substring version; TestKVQueryFilterErrorIsNotSmuggledAsRetryable pins it.
+//
+// Three things close it, in order: a message carrying a PERMANENT sentinel's
+// text is never rewritten, whatever else it says; the known wrapper prefix is
+// removed by anchored cut; and what remains must be the leaf's message in full
+// — sentinel, a legal index name, the shard number, nothing else
+// (ops.IsKVQueryNoSuchIndexMessage).
 func isKVQueryNoSuchIndex(err error) bool {
-	return errors.Is(err, kvindex.ErrNoSuchIndex) || strings.Contains(err.Error(), kvindex.ErrNoSuchIndex.Error())
+	if errors.Is(err, kvindex.ErrNoSuchIndex) {
+		return true
+	}
+	msg := err.Error()
+	// The veto. Contains is safe HERE and only here, because it can only REFUSE
+	// the rewrite: a false positive costs a retryable error being reported as
+	// permanent, which is the safe direction.
+	if strings.Contains(msg, ops.ErrKVQueryFilter.Error()) {
+		return false
+	}
+	if rest, ok := strings.CutPrefix(msg, kvQueryRemoteErrPrefix); ok {
+		msg = rest
+	}
+	return ops.IsKVQueryNoSuchIndexMessage(msg)
 }
 
 // checkKVQueryCursorFits refuses a composite cursor that would not fit an ARGS

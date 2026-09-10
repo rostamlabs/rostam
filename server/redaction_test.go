@@ -10,6 +10,7 @@ import (
 
 	"github.com/rostamlabs/rostam/cache"
 	"github.com/rostamlabs/rostam/ops"
+	"github.com/rostamlabs/rostam/ops/kvindex"
 	"github.com/rostamlabs/rostam/sdk/wire"
 	"github.com/rostamlabs/rostam/shard"
 	"github.com/rostamlabs/rostam/vector"
@@ -537,4 +538,47 @@ func TestMapResultTruncatedOperateFrameIsClientFacing(t *testing.T) {
 			t.Fatalf("payload = %q, want the redacted message", msg)
 		}
 	})
+}
+
+// The kv_query refusals must cross the TCP edge unredacted.
+//
+// This edge is not only the client's: a kv_query fans out to every shard group,
+// and a group a node does not host is answered by a PEER through
+// __kv_query_shard__ — so a peer's reply passes through here on its way to the
+// coordinator that has to classify it. Redacted, a permanent client mistake and
+// a retryable "that group is still installing the index" arrive as the same
+// opaque string.
+func TestClientFacingErrKVQueryFamily(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"invalid filter", ops.ErrKVQueryFilter},
+		{"scan not consented", ops.ErrKVQueryScanRequired},
+		{"scan budget", ops.ErrKVQueryScanBudget},
+		{"no index on this dispatcher", ops.ErrKVIndexUnavailable},
+		{"shard unavailable", ops.ErrKVQueryUnavailable},
+		{"no such index", kvindex.ErrNoSuchIndex},
+		{"index building", kvindex.ErrIndexBuilding},
+		{"index changed", kvindex.ErrIndexChanged},
+		{"candidate budget", kvindex.ErrCandidateBudget},
+		{"bad args", wire.ErrKVQueryArgs},
+		{"bad result", wire.ErrKVQueryResult},
+		{"truncated args", wire.ErrKVQueryArgsTruncated},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !clientFacingErr(tc.err) {
+				t.Errorf("clientFacingErr(%v) = false, want true", tc.err)
+			}
+			// Wrapped the way the leaf and the coordinator wrap them.
+			if !clientFacingErr(fmt.Errorf("shard group 3: %w", tc.err)) {
+				t.Errorf("clientFacingErr(wrapped %v) = false, want true", tc.err)
+			}
+		})
+	}
+	// And the bucket has not swallowed everything: an internal fault that merely
+	// mentions kv_query is still redacted.
+	if clientFacingErr(errors.New("wal append failed at /var/lib/rostam/x during kv_query")) {
+		t.Error("an internal fault mentioning kv_query was classified client-facing")
+	}
 }

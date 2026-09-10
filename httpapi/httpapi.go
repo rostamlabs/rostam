@@ -18,6 +18,7 @@ import (
 	"github.com/rostamlabs/rostam/authz"
 	"github.com/rostamlabs/rostam/dashboard"
 	"github.com/rostamlabs/rostam/ops"
+	"github.com/rostamlabs/rostam/ops/kvindex"
 	"github.com/rostamlabs/rostam/sdk/wire"
 	"github.com/rostamlabs/rostam/vector"
 )
@@ -741,6 +742,31 @@ func statusForError(err error) int {
 		// ops.IsOperateDuringReshardMessage, not strings.Contains, so an internal
 		// fault that merely mentions the refusal is not leaked.
 		ops.IsOperateDuringReshardMessage(err.Error()):
+		return http.StatusServiceUnavailable
+	// The kv_query refusals, kept in sync with server.clientFacingErr, which
+	// classifies the same set for the TCP edge — and, crucially, for the
+	// peer-to-peer __kv_query_shard__ leg, where redaction would leave the
+	// coordinator nothing to classify (see the comment there).
+	//
+	// PERMANENT ones are 400: the filter, the missing scan consent, the scan
+	// budget and a malformed frame are all facts about the query the caller
+	// sent. ops.ErrKVIndexUnavailable is the odd one out — it says this
+	// deployment has no KV index at all — but it is equally not something to
+	// retry, and 400 tells the caller to stop rather than to wait.
+	case errors.Is(err, ops.ErrKVQueryFilter),
+		errors.Is(err, ops.ErrKVQueryScanRequired),
+		errors.Is(err, ops.ErrKVQueryScanBudget),
+		errors.Is(err, ops.ErrKVIndexUnavailable),
+		errors.Is(err, wire.ErrKVQueryArgs),
+		errors.Is(err, wire.ErrKVQueryArgsTruncated):
+		return http.StatusBadRequest
+	// RETRYABLE ones are 503, the bucket this transport already uses for every
+	// other "come back in a moment": the index exists but this group has not
+	// finished installing or backfilling it, the definition moved under the
+	// query, or the shard is being removed from the node mid-scan.
+	case errors.Is(err, kvindex.ErrIndexBuilding),
+		errors.Is(err, kvindex.ErrIndexChanged),
+		errors.Is(err, ops.ErrKVQueryUnavailable):
 		return http.StatusServiceUnavailable
 	case strings.Contains(err.Error(), "not leader"),
 		strings.Contains(err.Error(), "no leader"),

@@ -12,6 +12,7 @@ import (
 	"github.com/rostamlabs/rostam/authz"
 	"github.com/rostamlabs/rostam/cache"
 	"github.com/rostamlabs/rostam/ops"
+	"github.com/rostamlabs/rostam/ops/kvindex"
 	"github.com/rostamlabs/rostam/rlog"
 	"github.com/rostamlabs/rostam/sdk/wire"
 	"github.com/rostamlabs/rostam/shard"
@@ -341,6 +342,35 @@ func clientFacingErr(err error) bool {
 		errors.Is(err, vector.ErrNoNamed),
 		errors.Is(err, vector.ErrAPIKeyExists),
 		errors.Is(err, vector.ErrAPIKeyNotFound):
+		return true
+	// The kv_query refusals. Each is a fact about the CALLER'S query or about
+	// this replica's readiness, and each names only things the caller already
+	// sent — the index name, the filter field it chose — plus a shard-group
+	// ordinal it can read out of __topology__ anyway.
+	//
+	// THEY MUST CROSS THE WIRE UNREDACTED, and not merely for a better message.
+	// A kv_query fans out to every shard group, and a group this node does not
+	// host is answered by a PEER through __kv_query_shard__ — so the peer's edge
+	// is this classifier. Redacted to "internal error", a peer's refusal reaches
+	// the coordinator with nothing left to classify: a permanent client mistake
+	// and a retryable "that group is still installing the index" become the same
+	// opaque string, and cluster.classifyKVQueryErr — whose whole job is telling
+	// a create-then-query apart from a bad query — can then only do it for
+	// locally hosted groups. Sentinel matching only, no message-shape arms:
+	// these errors are raised by the handler this edge just called, in-process,
+	// so their identity is intact here.
+	case errors.Is(err, ops.ErrKVQueryFilter),
+		errors.Is(err, ops.ErrKVQueryScanRequired),
+		errors.Is(err, ops.ErrKVQueryScanBudget),
+		errors.Is(err, ops.ErrKVIndexUnavailable),
+		errors.Is(err, ops.ErrKVQueryUnavailable),
+		errors.Is(err, kvindex.ErrNoSuchIndex),
+		errors.Is(err, kvindex.ErrIndexBuilding),
+		errors.Is(err, kvindex.ErrIndexChanged),
+		errors.Is(err, kvindex.ErrCandidateBudget),
+		errors.Is(err, wire.ErrKVQueryArgs),
+		errors.Is(err, wire.ErrKVQueryResult),
+		errors.Is(err, wire.ErrKVQueryArgsTruncated):
 		return true
 	}
 	// Cross-boundary / cluster / routing signals matched by string so the clustered

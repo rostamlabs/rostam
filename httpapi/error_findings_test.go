@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/rostamlabs/rostam/ops"
+	"github.com/rostamlabs/rostam/ops/kvindex"
 	"github.com/rostamlabs/rostam/sdk/wire"
 	"github.com/rostamlabs/rostam/vector"
 )
@@ -562,4 +563,32 @@ func TestStatusForErrorTruncatedOperateFrame(t *testing.T) {
 			t.Errorf("statusForError(%v) = %d, want 500", err, got)
 		}
 	})
+}
+
+// The kv_query refusals, kept in sync with server.clientFacingErr: permanent
+// ones are 400 (the caller must change the query), retryable ones are 503 (the
+// caller should come back). Unclassified they were a redacted 500, which tells
+// the caller neither.
+func TestStatusForErrorKVQueryFamily(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"invalid filter", ops.ErrKVQueryFilter, http.StatusBadRequest},
+		{"scan not consented", ops.ErrKVQueryScanRequired, http.StatusBadRequest},
+		{"scan budget", ops.ErrKVQueryScanBudget, http.StatusBadRequest},
+		{"no index on this dispatcher", ops.ErrKVIndexUnavailable, http.StatusBadRequest},
+		{"bad args", wire.ErrKVQueryArgs, http.StatusBadRequest},
+		{"truncated args", wire.ErrKVQueryArgsTruncated, http.StatusBadRequest},
+		{"index building", kvindex.ErrIndexBuilding, http.StatusServiceUnavailable},
+		{"index changed", kvindex.ErrIndexChanged, http.StatusServiceUnavailable},
+		{"shard unavailable", ops.ErrKVQueryUnavailable, http.StatusServiceUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := statusForError(fmt.Errorf("shard group 3: %w", tc.err)); got != tc.want {
+				t.Fatalf("statusForError(%v) = %d, want %d", tc.err, got, tc.want)
+			}
+		})
+	}
 }

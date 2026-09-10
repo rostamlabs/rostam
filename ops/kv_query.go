@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -209,6 +210,91 @@ func handleKVQuery(tx *TxContext, args []byte) ([]byte, error) {
 // (when the caller consented) rather than with the error itself.
 var errKVQuerySelectorless = errors.New("ops: kv_query: no candidate selector for this index")
 
+// kvQueryNoSuchIndexFmt is the ONE place the "no such index" refusal is
+// rendered, so IsKVQueryNoSuchIndexMessage cannot drift from it.
+const kvQueryNoSuchIndexFmt = "%w: %q on shard group %d"
+
+// maxKVQueryNoSuchIndexMessageLen bounds the input IsKVQueryNoSuchIndexMessage
+// scans, so classification cost cannot scale with an attacker-chosen string.
+// The real message is the sentinel plus a 64-byte name and a shard number.
+const maxKVQueryNoSuchIndexMessageLen = 256
+
+// kvQueryNoSuchIndexOpen and kvQueryNoSuchIndexMid bracket the caller-chosen
+// index name in that format.
+var (
+	kvQueryNoSuchIndexOpen = kvindex.ErrNoSuchIndex.Error() + `: "`
+	kvQueryNoSuchIndexMid  = `" on shard group `
+)
+
+// IsKVQueryNoSuchIndexMessage reports whether s is EXACTLY a kv_query leaf's
+// "no such index" refusal, for a caller that has only the message left because
+// the error crossed a process boundary.
+//
+// WHY EXACT SHAPE AND NOT strings.Contains. The coordinator turns this refusal
+// into a RETRYABLE one when the name is in the meta catalog, and a client that
+// is told an error is retryable retries it — so anything that can be made to
+// LOOK like this message is a way to make a permanent error retry forever, one
+// full cluster fan-out per attempt. Filter fields are client-chosen and are
+// quoted verbatim into ops.ErrKVQueryFilter's message, so a field named
+// `$kvindex: no such index` defeats a substring check exactly. This anchors at
+// the start, requires a legal index name between the brackets, and requires the
+// remainder to be a shard number and nothing else. Same sentinel-plus-exact-
+// shape rule vector.IsRecordTooLargeMessage follows, for the same reason.
+//
+// The CALLER strips any known wrapper prefix first; this never searches.
+func IsKVQueryNoSuchIndexMessage(s string) bool {
+	if len(s) == 0 || len(s) > maxKVQueryNoSuchIndexMessageLen {
+		return false
+	}
+	rest, ok := strings.CutPrefix(s, kvQueryNoSuchIndexOpen)
+	if !ok {
+		return false
+	}
+	i := strings.Index(rest, kvQueryNoSuchIndexMid)
+	if i < 1 {
+		return false // no closing bracket, or an empty index name
+	}
+	if !kvQueryLooksLikeIndexName(rest[:i]) {
+		return false
+	}
+	return kvQueryIsShardNumber(rest[i+len(kvQueryNoSuchIndexMid):])
+}
+
+// kvQueryLooksLikeIndexName mirrors wire.KVIndexDef's name charset. A name
+// outside it never reaches the leaf (DecodeKVQueryArgs refuses it), so a
+// "name" that is not one means the leaf did not write this message — which is
+// what an arbitrary filter field rendered with %q looks like, since %q escapes
+// anything unusual.
+func kvQueryLooksLikeIndexName(s string) bool {
+	if len(s) == 0 || len(s) > wire.KVIndexMaxNameLen {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+		case c == '_', c == '.', c == ':', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// kvQueryIsShardNumber reports whether s is a bare decimal shard index and
+// nothing else — no sign, no trailing text.
+func kvQueryIsShardNumber(s string) bool {
+	if len(s) == 0 || len(s) > 10 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // kvQueryCandidates resolves the definition, gates on readiness, extracts the
 // selector and reads the candidate keys — retrying ONCE if the definition moved
 // under the query.
@@ -229,7 +315,7 @@ func kvQueryCandidates(idx *kvindex.Set, a wire.KVQueryArgs, after []byte, group
 			// COORDINATOR is the layer that knows whether the name exists in the
 			// meta catalog and, if it does, converts this into the retryable
 			// ErrIndexBuilding.
-			return nil, fmt.Errorf("%w: %q on shard group %d", kvindex.ErrNoSuchIndex, a.Index, group)
+			return nil, fmt.Errorf(kvQueryNoSuchIndexFmt, kvindex.ErrNoSuchIndex, a.Index, group)
 		}
 		// PER REPLICA, not per group: readiness is answered by ONE replica, so a
 		// stale read landing on a replica still backfilling must refuse rather
