@@ -70,6 +70,93 @@ type Store struct {
 	// final, exact stamp is both possible (the mapping still exists) and complete
 	// (no further apply can advance the frontier past it).
 	pbFrontier *pbFrontierStamper
+
+	// calls counts the Call invocations currently INSIDE this store;
+	// callsDraining and callsIdle are how Close waits for them.
+	//
+	// A HANDLER ALIASES THE LIVE MMAP. cache.Get hands a handler bytes straight
+	// out of a mapped page and cache.Close unmaps it, so a Call still running
+	// when Close reaches the unmap does not read a stale value — it reads
+	// unmapped memory and the process dies.
+	//
+	// That window is not theoretical. A cluster read fanned out to every shard
+	// group ABANDONS any leg whose per-group timeout expires
+	// (cluster.forEachGroup), so "a Call is still running after its caller gave
+	// up on it" is the designed behaviour of the layer above, not an anomaly;
+	// RemoveShardOwner or Node.Close arriving in that window is all it takes.
+	//
+	// The fix is the drain the cache already uses for its own goroutines and the
+	// cluster layer uses for index walks, one level lower: Close stops NEW calls
+	// and waits for the ones already inside before anything is unmapped. Bounded,
+	// because a wait with no end is its own outage — a store whose handler is
+	// genuinely stuck must still be closable, so past the bound Close proceeds
+	// and says so.
+	callsMu       sync.Mutex
+	calls         int
+	callsDraining bool
+	callsIdle     chan struct{} // non-nil only while a drain is waiting
+}
+
+// ErrStoreClosed is returned by Call once Close has begun. It is a REFUSAL, not
+// a failure of the op: this store is going away, and in a cluster the caller
+// should reach the group's other replicas.
+var ErrStoreClosed = errors.New("shard: store is closed")
+
+// closeCallDrainTimeout bounds how long Close waits for in-flight Calls. Every
+// ordinary handler is microseconds; the bound is there for the pathological one
+// (a scan over a huge keyspace, a handler wedged on something else) so a stuck
+// read cannot make a node unclosable. Past it Close proceeds and logs, which
+// restores exactly the pre-drain exposure — for that one case, and only for it.
+const closeCallDrainTimeout = 5 * time.Second
+
+// beginCall registers a Call as in-flight, or reports false when the store is
+// closing and the caller must not enter.
+func (s *Store) beginCall() bool {
+	s.callsMu.Lock()
+	defer s.callsMu.Unlock()
+	if s.callsDraining {
+		return false
+	}
+	s.calls++
+	return true
+}
+
+// endCall retires an in-flight Call and wakes a waiting drain when it was the
+// last one.
+func (s *Store) endCall() {
+	s.callsMu.Lock()
+	defer s.callsMu.Unlock()
+	s.calls--
+	if s.callsDraining && s.calls == 0 && s.callsIdle != nil {
+		close(s.callsIdle)
+		s.callsIdle = nil
+	}
+}
+
+// drainCalls shuts the door on new Calls and waits, bounded, for the ones
+// already inside. It reports whether the store went quiet within the bound.
+// Idempotent: a second call finds the door shut and nothing in flight.
+func (s *Store) drainCalls(timeout time.Duration) bool {
+	s.callsMu.Lock()
+	s.callsDraining = true
+	if s.calls == 0 {
+		s.callsMu.Unlock()
+		return true
+	}
+	if s.callsIdle == nil {
+		s.callsIdle = make(chan struct{})
+	}
+	idle := s.callsIdle
+	s.callsMu.Unlock()
+
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case <-idle:
+		return true
+	case <-t.C:
+		return false
+	}
 }
 
 // SetLeaderFrontierFn installs the follower-side leader-frontier hook used by
@@ -437,6 +524,15 @@ func (s *Store) Close() error {
 	if err := s.raft.Shutdown(); err != nil {
 		errs = append(errs, err)
 	}
+	// THEN drain the ops still inside this store, before anything is unmapped.
+	// After the shutdown above, so a write parked in raft.Apply has already been
+	// failed rather than waited on: what is left to wait for is reads, which are
+	// microseconds unless one is walking the whole keyspace. New Calls are
+	// refused from here on with ErrStoreClosed. See the calls field.
+	if !s.drainCalls(closeCallDrainTimeout) {
+		slog.Warn("shard: closing with calls still in flight; the cache is about to be unmapped under them",
+			"component", "shard", "shard", s.cfg.ShardIndex, "waited", closeCallDrainTimeout)
+	}
 	// Replication is down, so the applied frontier can no longer move: stamp it
 	// exactly, while the cache mapping is still live. A clean shutdown therefore
 	// restores an EXACT frontier; only an unclean stop falls back to the amortised
@@ -724,6 +820,13 @@ func (s *Store) serveBoundedStaleness(name string, args []byte) error {
 // Call dispatches a registered op by name. Read-only ops execute directly
 // against the cache; read-write ops go through Raft.
 func (s *Store) Call(name string, args []byte) ([]byte, error) {
+	// Registered as in-flight BEFORE anything reads the cache, and retired only
+	// when the handler has returned — so Close cannot unmap under a handler that
+	// is still holding page-backed bytes. See the calls field.
+	if !s.beginCall() {
+		return nil, ErrStoreClosed
+	}
+	defer s.endCall()
 	handler, kind, _, ok := s.registry.Lookup(name)
 	if !ok {
 		return nil, ErrOpNotRegistered
