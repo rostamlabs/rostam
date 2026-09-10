@@ -23,7 +23,16 @@ import (
 // therefore registers the op OpReadWrite FIRST, so what is covered is the
 // dangerous configuration rather than the fallthrough.
 
-var kvIndexOps = []string{"__kv_index_set__", "__kv_index_list__", "__kv_index_ready__"}
+// kvIndexOps is the KV record-search admin surface: the catalog CRUD, the
+// per-group readiness leaf the list handler gathers, and the shard-scoped leg
+// of the kv_query fan-out.
+//
+// __kv_query_shard__ is here for a reason worth stating: `kv_query` ITSELF is an
+// ordinary OpReadOnly and is authorised as a read, but the WRAPPER addresses ONE
+// shard group directly, bypassing the coordinator that is the only thing making
+// a page a complete answer rather than one group's slice of it. A read:* key
+// that could call it would be able to read a partial answer and never know.
+var kvIndexOps = []string{"__kv_index_set__", "__kv_index_list__", "__kv_index_ready__", "__kv_query_shard__"}
 
 func newOpsRegWithKVIndexOps(t *testing.T, names ...string) *ops.Registry {
 	t.Helper()

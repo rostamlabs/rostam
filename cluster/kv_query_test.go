@@ -621,6 +621,13 @@ func TestKVQueryScanDrainsBeforeShardRemoval(t *testing.T) {
 			tc.Close()
 		}()
 	}
+	// At least one attempt must actually have raced, or the test proved nothing
+	// about the gate: a run in which every scan finished first exercises the
+	// drain's WAIT and never its ABORT. The walk over `seeded` keys takes tens of
+	// milliseconds against a 2 ms head start, so this is not a close call.
+	if unavailable == 0 {
+		t.Fatalf("no attempt out of %d overlapped a live scan; the removal never raced one", attempts)
+	}
 	t.Logf("%d of %d attempts raced the removal and were refused as retryable", unavailable, attempts)
 }
 

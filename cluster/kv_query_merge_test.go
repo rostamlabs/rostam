@@ -333,12 +333,22 @@ func TestMergeKVQueryCursorNeverMovesBackwards(t *testing.T) {
 
 // --- the paging property --------------------------------------------------
 
-// kvFakeGroup is one shard group's leaf: it answers with the smallest
-// min(limit, remaining) keys strictly above the cursor, and continues from the
-// last one it returned — the leaf's contract (ops.verifyPage), reduced to keys.
+// kvFakeGroup is one shard group's leaf, modelled on what the REAL one does
+// rather than on what is convenient to assert.
+//
+// TWO THINGS MATTER AND BOTH ARE EASY TO GET WRONG. The leaf's continuation is
+// the last key it EXAMINED, not the last row it returned — that is what makes
+// paging terminate over a run of non-matching keys — and one page examines a
+// BOUNDED CHUNK, so a page can come back with fewer rows than the limit, or
+// with none at all, and still have more to give. An earlier version of this
+// fake returned "the smallest min(limit, remaining) matching keys", which made
+// every page full and let the property test below assert an
+// ascending-across-pages property production does not deliver.
 type kvFakeGroup struct {
 	group int
-	keys  []string // sorted, unique
+	keys  []string // sorted, unique: every key this group holds
+	match map[string]bool
+	chunk int // keys examined per page
 }
 
 func (g kvFakeGroup) page(after string, limit int) wire.KVQueryResult {
@@ -346,59 +356,72 @@ func (g kvFakeGroup) page(after string, limit int) wire.KVQueryResult {
 	for i < len(g.keys) && g.keys[i] <= after {
 		i++
 	}
-	end := i + limit
-	if end > len(g.keys) {
-		end = len(g.keys)
+	res := wire.KVQueryResult{}
+	examined, last := 0, ""
+	for ; i < len(g.keys); i++ {
+		if len(res.Rows) >= limit || examined >= g.chunk {
+			break
+		}
+		examined++
+		last = g.keys[i]
+		if g.match[g.keys[i]] {
+			res.Rows = append(res.Rows, wire.KVQueryRow{Key: []byte(g.keys[i])})
+		}
 	}
-	res := wire.KVQueryResult{Rows: kvMergeRows(g.keys[i:end]...)}
-	if end < len(g.keys) {
-		res.Cursor = []wire.KVQueryCont{{Group: uint32(g.group), After: []byte(g.keys[end-1]), More: true}}
+	if i < len(g.keys) {
+		// Stopped early: the continuation is the last key EXAMINED, which can be
+		// well past the last row returned.
+		res.Cursor = []wire.KVQueryCont{{Group: uint32(g.group), After: []byte(last), More: true}} //nolint:gosec // small test group index
 	}
 	return res
 }
 
-// Threading the composite cursor to exhaustion must deliver EVERY key exactly
-// once, in ascending order, over a bounded number of pages — for any split of
-// the keyspace across groups and any page size.
+// Threading the composite cursor to exhaustion must deliver every MATCHING key
+// exactly once, over a bounded number of pages, for any split of the keyspace
+// across groups, any page size, and any run of non-matching keys.
+//
+// WHAT IS AND IS NOT GUARANTEED ACROSS PAGES. Each page is ascending in itself,
+// and no key is ever lost or delivered twice — those are the properties the
+// merge exists to provide. GLOBAL ascending order across pages is NOT one of
+// them: a leaf page cut short by its own chunk (or its byte budget) returns
+// fewer rows than the limit while still holding smaller keys, so a later page
+// can legitimately deliver a key below one already delivered. Asserting
+// otherwise would be asserting a property production does not have.
 func TestMergeKVQueryPagingIsExhaustive(t *testing.T) {
 	const groups = 6
 	rng := rand.New(rand.NewSource(20260910)) //nolint:gosec // deterministic test input, not cryptography
 
+	shortPages := 0 // pages that returned fewer rows than the limit and still had more
 	for trial := 0; trial < 60; trial++ {
 		limit := 1 + rng.Intn(9)
 		fakes := make([]kvFakeGroup, groups)
-		want := make([]string, 0, groups*40)
+		owned := make(map[string]int)
+		var want []string
 		for g := 0; g < groups; g++ {
-			fakes[g] = kvFakeGroup{group: g}
-			for i := 0; i < rng.Intn(41); i++ {
+			fakes[g] = kvFakeGroup{group: g, match: map[string]bool{}, chunk: 1 + rng.Intn(12)}
+			for i := rng.Intn(41); i > 0; i-- {
 				k := fmt.Sprintf("k%06d", rng.Intn(1_000_000))
-				fakes[g].keys = append(fakes[g].keys, k)
-			}
-			sort.Strings(fakes[g].keys)
-			fakes[g].keys = kvDedup(fakes[g].keys)
-			want = append(want, fakes[g].keys...)
-		}
-		// A key lives in exactly one group, so make the split disjoint the way
-		// routing does.
-		want = kvDedup(kvSorted(want))
-		owned := make(map[string]int, len(want))
-		for g := range fakes {
-			kept := fakes[g].keys[:0]
-			for _, k := range fakes[g].keys {
 				if _, taken := owned[k]; taken {
-					continue
+					continue // a key lives in exactly one group, as routing guarantees
 				}
 				owned[k] = g
-				kept = append(kept, k)
+				fakes[g].keys = append(fakes[g].keys, k)
+				// Most keys do NOT match, so a run of non-matching keys is the
+				// common case here rather than a corner.
+				if rng.Intn(4) == 0 {
+					fakes[g].match[k] = true
+					want = append(want, k)
+				}
 			}
-			fakes[g].keys = kept
+			sort.Strings(fakes[g].keys)
 		}
+		sort.Strings(want)
 
 		var in []wire.KVQueryCont
 		got := make([]string, 0, len(want))
 		for page := 0; ; page++ {
-			if page > 10*len(want)+50 {
-				t.Fatalf("trial %d (limit %d): paging did not terminate after %d pages", trial, limit, page)
+			if page > 20*(len(owned)+len(want))+50 {
+				t.Fatalf("trial %d (limit %d): paging did not terminate after %d pages (%d keys so far)", trial, limit, page, len(got))
 			}
 			parts := make([]wire.KVQueryResult, groups)
 			for g := 0; g < groups; g++ {
@@ -417,26 +440,41 @@ func TestMergeKVQueryPagingIsExhaustive(t *testing.T) {
 			if len(merged.Rows) > limit {
 				t.Fatalf("trial %d: page %d carries %d rows, over the limit %d", trial, page, len(merged.Rows), limit)
 			}
-			got = append(got, kvMergeKeys(merged)...)
+			keys := kvMergeKeys(merged)
+			for i := 1; i < len(keys); i++ {
+				if keys[i-1] >= keys[i] {
+					t.Fatalf("trial %d: page %d is not ascending at %d: %q then %q", trial, page, i, keys[i-1], keys[i])
+				}
+			}
+			got = append(got, keys...)
 			if len(merged.Cursor) == 0 {
 				break
 			}
-			if len(merged.Rows) == 0 && page > 0 && fmt.Sprint(in) == fmt.Sprint(merged.Cursor) {
-				t.Fatalf("trial %d: page %d made no progress and returned the same cursor", trial, page)
+			if len(merged.Rows) < limit {
+				shortPages++
 			}
 			in = merged.Cursor
 		}
 
-		if fmt.Sprint(got) != fmt.Sprint(want) {
-			t.Fatalf("trial %d (limit %d): paged %d keys, want %d\n got=%v\nwant=%v",
-				trial, limit, len(got), len(want), got, want)
+		sorted := kvSorted(got)
+		if fmt.Sprint(sorted) != fmt.Sprint(want) {
+			t.Fatalf("trial %d (limit %d): paged %d matching keys, want %d\n got=%v\nwant=%v",
+				trial, limit, len(sorted), len(want), sorted, want)
 		}
-		for i := 1; i < len(got); i++ {
-			if got[i-1] >= got[i] {
-				t.Fatalf("trial %d: pages are not globally ascending at %d: %q then %q", trial, i, got[i-1], got[i])
+		for i := 1; i < len(sorted); i++ {
+			if sorted[i-1] == sorted[i] {
+				t.Fatalf("trial %d: %q was delivered twice", trial, sorted[i])
 			}
 		}
 	}
+	// The model must actually produce the shape it exists to model: a page that
+	// came back short and still had more to give. Without this the fake could
+	// drift back to "every page is full" and the test would pass for the wrong
+	// reason, which is exactly how the first version of it went wrong.
+	if shortPages == 0 {
+		t.Fatal("no page came back short with more to give; the leaf model is not exercising the examined-key continuation")
+	}
+	t.Logf("%d short pages with more to give", shortPages)
 }
 
 func kvCursorNames(conts []wire.KVQueryCont, group int) bool {
@@ -451,15 +489,5 @@ func kvCursorNames(conts []wire.KVQueryCont, group int) bool {
 func kvSorted(in []string) []string {
 	out := append([]string(nil), in...)
 	sort.Strings(out)
-	return out
-}
-
-func kvDedup(sorted []string) []string {
-	out := sorted[:0]
-	for i, s := range sorted {
-		if i == 0 || sorted[i-1] != s {
-			out = append(out, s)
-		}
-	}
 	return out
 }
