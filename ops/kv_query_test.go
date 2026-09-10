@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -873,5 +874,92 @@ func TestKVQueryBudgetSanitised(t *testing.T) {
 	got := kvQueryBudget()
 	if got.Candidates <= 0 || got.Scan <= 0 || got.ScanChunk <= 0 {
 		t.Fatalf("SetKVQueryBudget must fall back to the defaults for non-positive values, got %+v", got)
+	}
+}
+
+// --- the scan chunk heap --------------------------------------------------
+
+// heapContents drains h and returns what it held, ascending.
+func heapContents(h *kvKeyHeap) []string {
+	out := make([]string, 0, h.Len())
+	for _, k := range h.ascending() {
+		out = append(out, string(k))
+	}
+	return out
+}
+
+// assertSmallestPrefix pins the ONE invariant scanPage's soundness rests on:
+// what the chunk retained is the smallest len(got) keys of everything offered.
+// scanPage's continuation is the largest key retained, so a retained set that
+// is NOT a prefix of the sorted offer set leaves a hole below the continuation
+// — and a key in that hole is never visited again on any later page.
+func assertSmallestPrefix(t *testing.T, got, offered []string) {
+	t.Helper()
+	if len(got) == 0 {
+		t.Fatal("the chunk kept nothing; a page that retains no key never advances")
+	}
+	want := sortedCopy(offered)[:len(got)]
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("the chunk is not the smallest %d keys offered\n got %v\nwant %v", len(got), got, want)
+	}
+}
+
+func TestKVQueryScanHeapKeepsTheSmallestKeys(t *testing.T) {
+	h := &kvKeyHeap{max: 8, maxBytes: 1 << 20}
+	rng := rand.New(rand.NewSource(7))
+	offered := make([]string, 0, 200)
+	for i := 0; i < 200; i++ {
+		k := fmt.Sprintf("k%04d", rng.Intn(100000))
+		if slices.Contains(offered, k) {
+			continue
+		}
+		offered = append(offered, k)
+		h.offer([]byte(k))
+	}
+	if h.Len() != 8 {
+		t.Fatalf("the count bound must hold: %d keys, want 8", h.Len())
+	}
+	assertSmallestPrefix(t, heapContents(h), offered)
+}
+
+func TestKVQueryScanHeapBoundsItsBytes(t *testing.T) {
+	// THE ORDER THAT USED TO DEFEAT THE CAP: short high-sorting keys first, so
+	// the heap fills by COUNT while staying tiny in bytes, then long low-sorting
+	// keys, every one of which DISPLACES a short key. The old cap guarded only
+	// the growth branch, so displacement grew the heap without limit.
+	const cap = 8 << 10
+	h := &kvKeyHeap{max: 64, maxBytes: cap}
+
+	offered := make([]string, 0, 84)
+	for i := 0; i < 64; i++ {
+		k := fmt.Sprintf("z%03d", i)
+		offered = append(offered, k)
+		h.offer([]byte(k))
+	}
+	if h.bytes > cap {
+		t.Fatalf("short keys alone already exceeded the cap: %d > %d", h.bytes, cap)
+	}
+	for i := 0; i < 20; i++ {
+		k := fmt.Sprintf("a%03d%s", i, strings.Repeat("p", 1024))
+		offered = append(offered, k)
+		h.offer([]byte(k))
+	}
+
+	if h.bytes > cap {
+		t.Fatalf("displacement escaped the byte cap: %d bytes held, cap %d", h.bytes, cap)
+	}
+	// And it stayed SOUND while doing it: the low-sorting long keys are exactly
+	// the ones that belong in the chunk, so they must all be there.
+	assertSmallestPrefix(t, heapContents(h), offered)
+}
+
+func TestKVQueryScanHeapKeepsOneOversizeKey(t *testing.T) {
+	// A single key larger than the whole cap is kept anyway: a chunk of nothing
+	// yields a continuation that never advances, which is an infinite paging
+	// loop. One key is bounded by the encoder's 64 KiB key cap.
+	h := &kvKeyHeap{max: 16, maxBytes: 64}
+	h.offer([]byte(strings.Repeat("x", 4096)))
+	if h.Len() != 1 {
+		t.Fatalf("an oversize lone key must be kept, got %d keys", h.Len())
 	}
 }

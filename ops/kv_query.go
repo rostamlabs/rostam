@@ -130,9 +130,8 @@ const kvQueryPageOverhead = 4 + 2 + (4 + 1 + 2 + 0xFFFF)
 
 // kvQueryScanHeapMaxBytes bounds the KEY BYTES one scan page's chunk heap
 // holds, independently of ScanChunk. ScanChunk bounds the key COUNT, which is
-// only a memory bound if keys are small; this makes the bound unconditional.
-// Hitting it behaves exactly like a full heap — the largest key is dropped, the
-// page is still the smallest keys above the cursor, and paging still advances.
+// only a memory bound if keys are small: at the default chunk of 10 000 and the
+// 64 KiB the encoder allows a key, a count bound alone permits 625 MiB.
 const kvQueryScanHeapMaxBytes = 32 << 20
 
 // handleKVQuery answers one shard group's page of a kv_query.
@@ -420,7 +419,7 @@ func verifyPage(tx *TxContext, idx *kvindex.Set, keys [][]byte, after []byte, pr
 // completion in about ceil(n / ScanChunk) pages, each costing one full walk —
 // quadratic, and honestly so. Use an index.
 func scanPage(tx *TxContext, walk kvindex.Walker, after []byte, pred vector.Predicate, a wire.KVQueryArgs, group uint32, b KVQueryBudget) ([]byte, error) {
-	h := &kvKeyHeap{max: b.ScanChunk}
+	h := &kvKeyHeap{max: b.ScanChunk, maxBytes: kvQueryScanHeapMaxBytes}
 	visited := 0
 	overBudget := false
 	// dropped records that at least one key above the cursor did not fit the
@@ -457,17 +456,29 @@ func scanPage(tx *TxContext, walk kvindex.Walker, after []byte, pred vector.Pred
 }
 
 // kvKeyHeap is the bounded MAX-heap scanPage carries a chunk in: it holds the
-// smallest `max` keys offered to it, so the largest is the one to evict, which
-// is why the ordering is inverted.
+// smallest keys offered to it, so the largest is the one to evict, which is why
+// the ordering is inverted.
 //
-// It bounds BOTH the key count (max) and the key bytes
-// (kvQueryScanHeapMaxBytes), because a count bound alone is only a memory bound
-// when keys are small. It always keeps at least one key, so a page always
-// advances and paging always terminates.
+// THE INVARIANT, and everything depends on it: whatever the heap holds is
+// always the SMALLEST m keys of everything offered so far, for the current m.
+// scanPage's continuation is the largest key retained, so every key at or below
+// it must have been examined — and that is true exactly when the retained set
+// is a prefix of the sorted offer set. It is maintained by only ever discarding
+// the current MAXIMUM (or a key that does not sort below it).
+//
+// This is why a byte cap cannot simply refuse an offer. Refusing a key that
+// sorts BELOW the retained maximum would leave a hole under the continuation,
+// and that key would never be visited again on any later page — a lost row, not
+// a slow one. So when a key belongs in the chunk, it goes in, and the cap is
+// then restored by evicting from the TOP.
+//
+// It bounds both the key count (max) and the key bytes (maxBytes), and always
+// keeps at least one key, so a page always advances and paging terminates.
 type kvKeyHeap struct {
-	keys  [][]byte
-	max   int
-	bytes int
+	keys     [][]byte
+	max      int
+	maxBytes int
+	bytes    int
 }
 
 func (h *kvKeyHeap) Len() int           { return len(h.keys) }
@@ -487,28 +498,55 @@ func (h *kvKeyHeap) Pop() any {
 }
 
 // offer adds key to the chunk if it belongs there, reporting whether nothing
-// was displaced. A false result means a key above the cursor was dropped, which
+// was dropped. A false result means a key above the cursor was discarded, which
 // is what the page's More is derived from.
 //
 // The key is COPIED: the walk's slice aliases the cache's page backing store
 // and is valid only for the duration of the callback.
 func (h *kvKeyHeap) offer(key []byte) bool {
-	if len(h.keys) == 0 || (len(h.keys) < h.max && h.bytes+len(key) <= kvQueryScanHeapMaxBytes) {
-		cp := append([]byte(nil), key...)
-		h.bytes += len(cp)
-		heap.Push(h, cp)
-		return true
+	// Room by COUNT: take it, then restore the byte cap from the top. The
+	// len == 0 arm also makes a heap with a nonsensical max of 0 hold one key
+	// rather than index an empty slice below.
+	if len(h.keys) == 0 || len(h.keys) < h.max {
+		h.pushCopy(key)
+		return h.shrinkToCap()
 	}
-	// Full. The root is the largest key held, so a smaller key displaces it;
-	// anything else is itself the key that is dropped.
+	// Full by count. The root is the largest key held, so a key that does not
+	// sort below it is itself the one dropped.
 	if bytes.Compare(key, h.keys[0]) >= 0 {
 		return false
 	}
-	cp := append([]byte(nil), key...)
-	h.bytes += len(cp) - len(h.keys[0])
-	h.keys[0] = cp
+	// It sorts below the maximum, so it BELONGS in the chunk (see the type's
+	// invariant): the maximum makes way for it, whatever that does to the byte
+	// total, which shrinkToCap then restores by evicting from the top.
+	h.bytes -= len(h.keys[0])
+	h.keys[0] = append([]byte(nil), key...)
+	h.bytes += len(h.keys[0])
 	heap.Fix(h, 0)
-	return false
+	h.shrinkToCap()
+	return false // the displaced maximum was dropped
+}
+
+func (h *kvKeyHeap) pushCopy(key []byte) {
+	cp := append([]byte(nil), key...)
+	h.bytes += len(cp)
+	heap.Push(h, cp)
+}
+
+// shrinkToCap evicts the LARGEST keys until the byte cap holds again, keeping
+// at least one whatever its size (a single key is bounded by the encoder's
+// 64 KiB key cap, and a chunk of none would page forever without advancing).
+// Evicting from the top is what preserves the smallest-m-keys invariant.
+//
+// It reports whether nothing was evicted, so the caller can mark the page.
+func (h *kvKeyHeap) shrinkToCap() bool {
+	kept := true
+	for h.bytes > h.maxBytes && len(h.keys) > 1 {
+		k, _ := heap.Pop(h).([]byte)
+		h.bytes -= len(k)
+		kept = false
+	}
+	return kept
 }
 
 // ascending drains the chunk into a sorted slice, which is the order verifyPage
