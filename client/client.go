@@ -210,7 +210,7 @@ func (c *Client) Call(ctx context.Context, op string, args []byte) ([]byte, erro
 		// another server and retry within the hop budget — but never
 		// replay a non-replayable conditional write across an ambiguous
 		// (post-transmission) failure, which could report a wrong outcome.
-		if isTransportError(err) && hop < maxHops && !(nonReplayableOp(op) && isAmbiguous(err)) {
+		if isTransportError(err) && hop < maxHops && !(nonReplayableCall(op, args) && isAmbiguous(err)) {
 			next := c.nextServer()
 			if next != "" && next != target {
 				target = next
@@ -554,6 +554,38 @@ func nonReplayableOp(op string) bool {
 	return false
 }
 
+// nonReplayableCall is nonReplayableOp seen THROUGH the write-consistency
+// envelope, and it is what the two retry decisions call — never nonReplayableOp
+// directly.
+//
+// WHY THE ENVELOPE HAD TO BE LOOKED THROUGH. A write issued with active
+// write-consistency options is not sent under its own name: the store wraps it
+// (wcWire, root package) so the server's fanout dispatcher can run the
+// post-commit barrier, and the name on the wire becomes wire.WCEnvelopeOp. A
+// guard keyed on that name alone answers false for EVERY op, so exactly the
+// conditional writes the guard exists for — a vector_operate ADD, an incr_ex, a
+// cas — were retried across an ambiguous post-transmission failure and could
+// apply twice. The envelope changes how a write is COMMITTED, never whether
+// replaying it is safe, so the classification has to follow the inner op.
+//
+// An envelope whose head does not decode is treated as non-replayable. This
+// client never builds such a frame, so it is either corruption or a caller
+// hand-rolling one; declining to retry it costs at most one retry, while
+// guessing "replayable" costs a double-applied write.
+func nonReplayableCall(op string, args []byte) bool {
+	if nonReplayableOp(op) {
+		return true
+	}
+	if op != wire.WCEnvelopeOp {
+		return false
+	}
+	inner, ok := wire.WCEnvelopeInnerOp(args)
+	if !ok {
+		return true
+	}
+	return nonReplayableOp(inner)
+}
+
 // isAmbiguous reports whether err is (or wraps) an ambiguousError — a
 // post-transmission transport failure that must not be blindly replayed for a
 // non-replayable op.
@@ -749,7 +781,7 @@ func (c *Client) CallFunc(ctx context.Context, op string, args []byte, fn func(p
 		}
 		// See Call: a non-replayable conditional write is not retried across
 		// an ambiguous (post-transmission) transport failure.
-		if isTransportError(err) && hop < maxHops && !(nonReplayableOp(op) && isAmbiguous(err)) {
+		if isTransportError(err) && hop < maxHops && !(nonReplayableCall(op, args) && isAmbiguous(err)) {
 			next := c.nextServer()
 			if next != "" && next != target {
 				target = next

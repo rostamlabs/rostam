@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+
+	"github.com/rostamlabs/rostam/sdk/wire"
 )
 
 // WCEnvelopeOp is the reserved name of the write-consistency envelope virtual-op.
@@ -15,7 +17,13 @@ import (
 // normal routing/Raft path 100% unchanged, then runs the post-commit barrier.
 // Because the inner op's name + args are byte-identical to a plain write, no
 // existing data-op codec, FSM handler, decoder, or routing path is touched.
-const WCEnvelopeOp = "__wc__"
+//
+// The constant itself lives in sdk/wire (wire.WCEnvelopeOp) because the
+// standalone client module has to agree on it too — it must recognise its own
+// envelope to classify a wrapped write's retryability — and that module can see
+// wire but not ops. This alias keeps every server-side reference reading as
+// ops.WCEnvelopeOp.
+const WCEnvelopeOp = wire.WCEnvelopeOp
 
 // errWCEnvelopeTruncated is returned by DecodeWCEnvelope when the args bytes are
 // shorter than the layout requires (fail-loud, mirroring errAliasArgsTruncated /
