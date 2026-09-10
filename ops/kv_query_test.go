@@ -1109,3 +1109,40 @@ func TestKVQueryScanUsesTheInstalledWalker(t *testing.T) {
 		t.Fatalf("the indexed path must not walk; walker called %d times", called)
 	}
 }
+
+func TestKVQueryVerifyPageIgnoresKeysAtOrBelowTheCursor(t *testing.T) {
+	// Neither producer should ever hand verifyPage a key at or below the cursor.
+	// If one did, emitting it would move the continuation BACKWARDS and the
+	// caller would re-request the same page forever, so verifyPage re-checks.
+	tx, _, _ := newIndexedTx(t, "rc")
+	for _, k := range []string{"u:a", "u:b", "u:c"} {
+		seedKV(t, tx, k, kvRec(7, "gold"))
+	}
+	keys := [][]byte{[]byte("u:a"), []byte("u:b"), []byte("u:c")}
+
+	out, err := verifyPage(tx, nil, keys, []byte("u:b"), nil, wire.KVQueryArgs{Limit: 10}, 0, false)
+	if err != nil {
+		t.Fatalf("verifyPage: %v", err)
+	}
+	res, err := wire.DecodeKVQueryResult(out)
+	if err != nil {
+		t.Fatalf("DecodeKVQueryResult: %v", err)
+	}
+	if len(res.Rows) != 1 || string(res.Rows[0].Key) != "u:c" {
+		t.Fatalf("keys at or below the cursor must be skipped, got %+v", res.Rows)
+	}
+
+	// And a page made ENTIRELY of such keys reports no progress rather than a
+	// continuation that walks backwards.
+	out, err = verifyPage(tx, nil, keys[:2], []byte("u:b"), nil, wire.KVQueryArgs{Limit: 10}, 0, false)
+	if err != nil {
+		t.Fatalf("verifyPage: %v", err)
+	}
+	res, err = wire.DecodeKVQueryResult(out)
+	if err != nil {
+		t.Fatalf("DecodeKVQueryResult: %v", err)
+	}
+	if len(res.Rows) != 0 || len(res.Cursor) != 0 {
+		t.Fatalf("want an empty, complete page, got rows %+v cursor %+v", res.Rows, res.Cursor)
+	}
+}

@@ -333,6 +333,16 @@ func verifyPage(tx *TxContext, idx *kvindex.Set, keys [][]byte, after []byte, pr
 			break
 		}
 		k := keys[i]
+		// DEFENSIVE, and cheap: both producers promise keys strictly ABOVE the
+		// cursor (Candidates filters on it, the scan chunk's walk filters on it).
+		// Trusting that silently is what makes a bug in either one unbounded — a
+		// key at or below the cursor would set `cont` BACKWARDS, and the caller
+		// would then re-request a page it has already seen, forever. Skipping it
+		// without touching `cont` leaves the continuation monotonic whatever the
+		// producer did.
+		if len(after) > 0 && bytes.Compare(k, after) <= 0 {
+			continue
+		}
 		v, err := tx.Get(k)
 		if errors.Is(err, cache.ErrNotFound) {
 			// A posting for a key the cache no longer holds. Harmless — this is
