@@ -70,15 +70,12 @@ type posting struct {
 	// ready over the earlier one's partial refill.
 	gen uint64
 
-	// recCursor and suspects are the reconcile pass's state, both guarded by
-	// Set.mu like everything else here. recCursor is where the rotating sweep
-	// of the reverse map has reached; suspects holds the keys the current tick
-	// snapshotted and has NOT seen written since, which is what makes the drop
-	// exact across the unlocked liveness probe. Both are nil/empty at rest —
-	// suspects only exists between a ReconcileBatch and its DropReconciled. See
-	// reconcile.go.
-	recCursor string
-	suspects  map[string]struct{}
+	// suspects is the reconcile pass's state, guarded by Set.mu like everything
+	// else here: the keys the current tick sampled and has NOT seen written
+	// since, which is what makes the drop exact across the unlocked liveness
+	// probe. It is nil at rest — it exists only between a ReconcileBatch and its
+	// DropReconciled. See reconcile.go.
+	suspects map[string]struct{}
 }
 
 func newPosting() *posting {
@@ -147,9 +144,8 @@ func (p *posting) reset() {
 	p.keys = make(map[string]scalarKey)
 	p.gen++
 	// The keyspace this posting described is gone, so an in-flight reconcile
-	// tick's marks and its place in the rotation both describe nothing. Dropping
-	// the marks is what makes DropReconciled a no-op across a Reset.
-	p.recCursor = ""
+	// tick's marks describe nothing. Dropping them is what makes DropReconciled
+	// a no-op across a Reset.
 	p.suspects = nil
 }
 

@@ -25,10 +25,12 @@ const defaultKVIndexReconcileIntervalMs = 60_000
 //     same cache the postings describe, and that is a per-store object. A
 //     node-level goroutine would be reaching back into each store to find one.
 //
-//  2. A SINGLE-NODE Direct store has no cluster Node at all. rostam.NewEmbedded
-//     builds shard.Stores directly, so a pass hosted in cluster would never run
-//     for the whole single-node deployment — the one where nothing else is
-//     going to notice the index growing either.
+//  2. A DEPLOYMENT WITHOUT A CLUSTER NODE still needs the pass.
+//     rostam.NewEmbedded builds shard.Stores directly, with no cluster.Node to
+//     host a per-group goroutine, so a pass living in cluster would simply not
+//     run there. (rostam.NewDirect builds no shard.Store at all — a bare cache
+//     and index — so it runs its own copy of the same tick; see the reconciler
+//     in direct.go.)
 //
 //  3. CLOSE IS THE FENCE, and the store already owns it. The probe touches the
 //     live mmap and cache.Close unmaps it, which is the same hazard the index
@@ -93,9 +95,10 @@ func (s *Store) stopKVIndexReconciler() {
 //
 // One per tick, not all of them: a tick's cost is then bounded by one budget
 // however many definitions a deployment has, and the rotation is what stops the
-// first definition's work from starving the rest. A definition still BUILDING
-// is skipped — its posting set is a proper subset being refilled by a walk, so
-// nothing in it can be called dangling yet.
+// first definition's work from starving the rest. (Within a definition the
+// sample is random rather than rotated — ops/kvindex/reconcile.go says why.) A
+// definition still BUILDING is skipped: its posting set is a proper subset
+// being refilled by a walk, so nothing in it can be called dangling yet.
 func (s *Store) kvIndexReconcileTick(stop <-chan struct{}) {
 	if s.kvIdx == nil {
 		return
@@ -112,7 +115,7 @@ func (s *Store) kvIndexReconcileTick(stop <-chan struct{}) {
 	if !s.kvIdx.IsReady(d.Name) {
 		return
 	}
-	dropped, _ := ops.ReconcileKVIndex(s.kvIdx, s.cache, d.Name, kvindex.ReconcileBudget, stop)
+	dropped := ops.ReconcileKVIndex(s.kvIdx, s.cache, d.Name, kvindex.ReconcileBudget, stop)
 	if dropped > 0 {
 		slog.Info("kv index reconcile dropped dangling postings",
 			"component", "shard", "shard", s.cfg.ShardIndex, "index", d.Name, "dropped", dropped)

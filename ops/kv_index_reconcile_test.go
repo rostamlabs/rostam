@@ -104,7 +104,7 @@ func recCandidates(t *testing.T, idx *kvindex.Set, v int64) []string {
 
 // TestReconcileDropsDangling: with the removal hook detached, deleting keys
 // leaves their postings behind — exactly the residue this pass exists for —
-// and two budgeted ticks remove precisely those postings and no others.
+// and a tick removes precisely those postings and no others.
 func TestReconcileDropsDangling(t *testing.T) {
 	c, idx := recCache(t)
 	for i := 0; i < 100; i++ {
@@ -126,13 +126,12 @@ func TestReconcileDropsDangling(t *testing.T) {
 		t.Fatalf("before reconciling the index offers %d keys, want all 100 (the dangling postings)", got)
 	}
 
-	total := 0
-	for tick := 0; tick < 2; tick++ {
-		n, _ := ReconcileKVIndex(idx, c, recIndexName, 60, nil)
-		total += n
-	}
+	// Budget above the index size, so one tick samples the whole reverse map and
+	// the assertion is exact. (Coverage BELOW the budget is probabilistic and is
+	// pinned separately, in ops/kvindex.)
+	total := ReconcileKVIndex(idx, c, recIndexName, kvindex.ReconcileBudget, nil)
 	if total != 20 {
-		t.Fatalf("two ticks dropped %d postings, want exactly the 20 deleted keys", total)
+		t.Fatalf("the tick dropped %d postings, want exactly the 20 deleted keys", total)
 	}
 	got := recCandidates(t, idx, 7)
 	if len(got) != 80 {
@@ -162,8 +161,7 @@ func TestReconcileOnExpiredKeysDoesNotDeadlock(t *testing.T) {
 
 	done := make(chan int, 1)
 	go func() {
-		n, _ := ReconcileKVIndex(idx, c, recIndexName, kvindex.ReconcileBudget, nil)
-		done <- n
+		done <- ReconcileKVIndex(idx, c, recIndexName, kvindex.ReconcileBudget, nil)
 	}()
 	select {
 	case <-done:
@@ -218,7 +216,7 @@ func TestReconcileDropsAPostingWhoseKeyRereadsAsAnother(t *testing.T) {
 	if got := recCandidates(t, idx, 7); len(got) != 2 {
 		t.Fatalf("before reconciling the index offers %v, want both keys", got)
 	}
-	n, _ := ReconcileKVIndex(idx, c, recIndexName, kvindex.ReconcileBudget, nil)
+	n := ReconcileKVIndex(idx, c, recIndexName, kvindex.ReconcileBudget, nil)
 	if n != 1 {
 		t.Fatalf("the tick dropped %d postings, want 1", n)
 	}
@@ -242,8 +240,8 @@ func TestReconcileTickStopsPromptly(t *testing.T) {
 	}
 	stop := make(chan struct{})
 	close(stop)
-	if n, wrapped := ReconcileKVIndex(idx, c, recIndexName, kvindex.ReconcileBudget, stop); n != 0 || wrapped {
-		t.Fatalf("a stopped tick returned (%d, %v), want (0, false)", n, wrapped)
+	if n := ReconcileKVIndex(idx, c, recIndexName, kvindex.ReconcileBudget, stop); n != 0 {
+		t.Fatalf("a stopped tick dropped %d postings, want 0", n)
 	}
 	if got := len(recCandidates(t, idx, 7)); got != 100 {
 		t.Fatalf("a stopped tick dropped postings: %d keys left, want all 100", got)
@@ -254,10 +252,10 @@ func TestReconcileTickStopsPromptly(t *testing.T) {
 // index, rather than a panic on a nil Set.
 func TestReconcileNilArgs(t *testing.T) {
 	c, idx := recCache(t)
-	if n, wrapped := ReconcileKVIndex(nil, c, recIndexName, 10, nil); n != 0 || wrapped {
-		t.Fatalf("nil index = (%d, %v), want (0, false)", n, wrapped)
+	if n := ReconcileKVIndex(nil, c, recIndexName, 10, nil); n != 0 {
+		t.Fatalf("nil index dropped %d, want 0", n)
 	}
-	if n, wrapped := ReconcileKVIndex(idx, nil, recIndexName, 10, nil); n != 0 || wrapped {
-		t.Fatalf("nil cache = (%d, %v), want (0, false)", n, wrapped)
+	if n := ReconcileKVIndex(idx, nil, recIndexName, 10, nil); n != 0 {
+		t.Fatalf("nil cache dropped %d, want 0", n)
 	}
 }

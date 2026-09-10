@@ -25,7 +25,7 @@ func forceReconcileDrops(t *testing.T, idx *kvindex.Set, name string, keys [][]b
 	for _, k := range keys {
 		idx.Reindex(k, rec)
 	}
-	batch, _ := idx.ReconcileBatch(name, kvindex.ReconcileBudget)
+	batch := idx.ReconcileBatch(name, kvindex.ReconcileBudget)
 	if len(batch) == 0 {
 		t.Fatalf("ReconcileBatch(%q) returned nothing to reconcile", name)
 	}

@@ -18,9 +18,13 @@ import (
 const kvReconcileStopCheckEvery = 256
 
 // ReconcileKVIndex runs ONE bounded reconcile tick for one index definition:
-// snapshot a batch of posted keys, probe each one's liveness against the live
+// sample a batch of posted keys, probe each one's liveness against the live
 // cache, and drop the postings whose key is gone. It reports how many postings
-// went and whether the batch reached the end of that definition's rotation.
+// went.
+//
+// The batch is a truncated range over the reverse map, so which keys a tick
+// examines is randomised and coverage across ticks is probabilistic. See
+// ops/kvindex/reconcile.go for why exact coverage was traded away.
 //
 // THIS IS THE FUNCTION THE THREE-PHASE SPLIT EXISTS FOR, and the shape of the
 // loop below is the whole of it: NO INDEX LOCK IS HELD ACROSS c.Get. Cache.Get
@@ -44,23 +48,23 @@ const kvReconcileStopCheckEvery = 256
 // The tick abandons quietly when stop is closed: it ends the batch (which
 // clears the marks it set) and drops NOTHING, because a half-probed batch is
 // not evidence about the keys it never reached.
-func ReconcileKVIndex(idx *kvindex.Set, c *cache.Cache, name string, budget int, stop <-chan struct{}) (dropped int, wrapped bool) {
+func ReconcileKVIndex(idx *kvindex.Set, c *cache.Cache, name string, budget int, stop <-chan struct{}) (dropped int) {
 	if idx == nil || c == nil {
-		return 0, false
+		return 0
 	}
-	keys, wrapped := idx.ReconcileBatch(name, budget)
+	keys := idx.ReconcileBatch(name, budget)
 	if len(keys) == 0 {
 		// Still end the tick: ReconcileBatch may have marked nothing, but calling
 		// DropReconciled is what guarantees no marks are left standing.
 		idx.DropReconciled(name, nil)
-		return 0, wrapped
+		return 0
 	}
 
 	var dead [][]byte
 	for i, k := range keys {
 		if i%kvReconcileStopCheckEvery == 0 && kvReconcileStopped(stop) {
 			idx.DropReconciled(name, nil)
-			return 0, false
+			return 0
 		}
 		// The value is discarded — only the hit/miss matters. It is not retained
 		// past this call either, which is what makes the zero-copy alias a
@@ -69,7 +73,7 @@ func ReconcileKVIndex(idx *kvindex.Set, c *cache.Cache, name string, budget int,
 			dead = append(dead, k)
 		}
 	}
-	return idx.DropReconciled(name, dead), wrapped
+	return idx.DropReconciled(name, dead)
 }
 
 // kvReconcileStopped reports whether the tick has been asked to abandon. A nil
