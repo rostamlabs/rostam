@@ -7,6 +7,8 @@ import (
 	"encoding/binary"
 	"reflect"
 	"testing"
+
+	"github.com/rostamlabs/rostam/sdk/vtypes"
 )
 
 // FuzzDecodeKVQueryArgs extends the DecodeVectorOperateArgs-style identity to
@@ -33,6 +35,28 @@ func FuzzDecodeKVQueryArgs(f *testing.F) {
 	})
 	seed(KVQueryArgs{Limit: 10, Return: KVQueryReturnKeys, Consistency: ConsistencyAnyReplica, Scan: true})
 	seed(KVQueryArgs{Index: "x", Limit: 1, Return: KVQueryReturnValues, Consistency: ConsistencyLinearizable})
+	// The VALUE-ONLY filter: non-empty only in a Value field that Kind does not
+	// name, which is what a JSON body setting "int" without "kind" decodes to.
+	// It is the shape the encoder's presence test used to DROP
+	// (TestKVQueryArgsValueOnlyFilterSurvivesRoundtrip states the rule); seeded
+	// so the mutator starts adjacent to it instead of rediscovering it.
+	seed(KVQueryArgs{
+		Index:  "by_rc",
+		Filter: vtypes.Filter{Value: vtypes.Value{Int: 42}},
+		Limit:  10, Return: KVQueryReturnKeys, Consistency: ConsistencyLeaderOnly,
+	})
+	// A composite tree, so the mutator has the recursive JSON shapes to work
+	// from and not only flat leaves — including a `not`, whose pointer child is
+	// the one part of the tree that can be nil.
+	seed(KVQueryArgs{
+		Index: "by_rc",
+		Filter: vtypes.Filter{Op: vtypes.FilterAnd, And: []vtypes.Filter{
+			{Op: vtypes.FilterGt, Field: "rc", Value: vtypes.NewInt(5)},
+			{Op: vtypes.FilterNot, Not: &vtypes.Filter{Op: vtypes.FilterEq, Field: "tag", Value: vtypes.NewString("de")}},
+			{Op: vtypes.FilterIn, Field: "b#count", Value: vtypes.Value{Kind: vtypes.ValueInts, Ints: []int64{1, 2}}},
+		}},
+		Limit: 1000, Return: KVQueryReturnValues, Consistency: ConsistencyLinearizable,
+	})
 	f.Add([]byte{})
 	f.Add([]byte{0})
 	f.Add([]byte{1})
