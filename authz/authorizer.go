@@ -227,6 +227,30 @@ var adminOps = map[string]struct{}{
 	// pins the shard-scoped leg at admin so it can never be silently demoted to
 	// write and handed to any write:* key.
 	"__flush_shard__": {},
+	// The KV record-index catalog ops (cluster/kv_index_admin.go). Enumerated for
+	// the reason spelled out above __flush_shard__: none of the three is in the
+	// ops registry today, so all three would be admin by actionFor's
+	// deny-by-default fallthrough — by coincidence, not by decision, and one
+	// natural refactor (registering them so they dispatch through the registry
+	// rather than through n.adminOps) removes it silently.
+	//
+	// __kv_index_set__ CREATES AND DROPS INDEXES CLUSTER-WIDE through the meta
+	// log. Dropping one is what makes it admin rather than write: every query
+	// naming that index starts failing, and on a large keyspace re-creating it
+	// costs a full-cache walk on every node. A schema-shaped operation, not a
+	// data-shaped one.
+	//
+	// __kv_index_ready__ is the internal per-group readiness leaf. Its only
+	// legitimate caller is a peer, which carries the internal service token and is
+	// granted before this map is consulted, so admin costs the gather nothing.
+	//
+	// __kv_index_list__ is a READ of the catalog and is pinned at admin only
+	// because that is what it is today; demoting it to the read set is a
+	// deliberate decision for the client work, not something a refactor should
+	// make by accident.
+	"__kv_index_set__":   {},
+	"__kv_index_list__":  {},
+	"__kv_index_ready__": {},
 }
 
 // readOps is the small set of cluster-introspection ops that are explicitly

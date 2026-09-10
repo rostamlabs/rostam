@@ -142,6 +142,19 @@ type Node struct {
 	// keeps two walks off the same definition, which the Set's generation guard
 	// survives but which would waste a full keyspace walk.
 	kvIndexApplyMu sync.Mutex
+	// kvIndexInstalled is the fingerprint (definitions + hosted groups) the last
+	// COMPLETED pass installed. A pass whose fingerprint matches skips the
+	// per-group Install entirely — the poll fires on every meta write, and PB
+	// liveness beacons alone would otherwise rebuild every Set once a second for a
+	// catalog that never changed. Guarded by kvIndexApplyMu, which a whole pass
+	// holds.
+	kvIndexInstalled string
+	// kvIndexPasses and kvIndexInstalls count passes run and passes that actually
+	// re-installed. They are diagnostics with no Stats field: what they exist for
+	// is to make "the observer stopped" and "the pass skipped its install"
+	// assertable, neither of which is visible in any other number.
+	kvIndexPasses   atomic.Uint64
+	kvIndexInstalls atomic.Uint64
 
 	// KV index counters behind Stats().KVIndex. kvBackfills/kvBackfillKeys record
 	// what the observer's walks have cost; kvIndexRejects counts definitions the

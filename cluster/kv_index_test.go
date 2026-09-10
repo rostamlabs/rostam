@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -106,6 +105,19 @@ func seedKVIndexRecords(t *testing.T, n *Node, prefix string, from, to int) {
 		}
 	}
 	flush()
+}
+
+// freezeKVIndexObserver stops the polling goroutine and then clears the stop
+// channel, so a test can drive passes BY HAND at moments it chooses.
+//
+// Clearing it is not incidental: a pass checks the stop signal between shards
+// and between definitions, so a hand-driven pass on a merely-stopped node
+// returns having done nothing — which would make several tests below pass for
+// entirely the wrong reason.
+func freezeKVIndexObserver(t *testing.T, n *Node) {
+	t.Helper()
+	n.stopKVIndexObserver()
+	n.kvIndexStop = nil
 }
 
 // --- meta FSM -------------------------------------------------------------
@@ -368,7 +380,7 @@ func TestKVIndexEnableThenBackfillLosesNoWrite(t *testing.T) {
 	tc := newTestCluster(t, 1, 1)
 	n := tc.nodes[0]
 	// Freeze the poller so activation happens exactly where this test says it does.
-	n.stopKVIndexObserver()
+	freezeKVIndexObserver(t, n)
 
 	const (
 		seeded    = 20_000
@@ -442,7 +454,7 @@ func TestKVIndexBackfillDoesNotBlockWrites(t *testing.T) {
 	}
 	tc := newTestCluster(t, 1, 1)
 	n := tc.nodes[0]
-	n.stopKVIndexObserver()
+	freezeKVIndexObserver(t, n)
 
 	seedKVIndexRecords(t, n, "u:", 0, seeded)
 	if err := n.SetKVIndex(kvIndexDefFixture("by_age", "u:"), 5*time.Second); err != nil {
@@ -502,7 +514,7 @@ func TestKVIndexFlushDoesNotRebackfill(t *testing.T) {
 	}
 	idx := n.getShard(0).KVIndex()
 	waitForKVIndex(t, 20*time.Second, "by_age to become ready", func() bool { return idx.IsReady("by_age") })
-	n.stopKVIndexObserver()
+	freezeKVIndexObserver(t, n)
 
 	if _, err := n.Call("flush", nil); err != nil {
 		t.Fatalf("flush: %v", err)
@@ -525,13 +537,20 @@ func TestKVIndexFlushDoesNotRebackfill(t *testing.T) {
 }
 
 func TestKVIndexObserverStopsOnClose(t *testing.T) {
-	baseline := runtime.NumGoroutine()
-
 	tc := newTestCluster(t, 1, 1)
 	n := tc.nodes[0]
 	if n.kvIndexStop == nil {
 		t.Fatal("the observer was never started")
 	}
+	// The observer is alive to begin with: a meta write moves the applied index
+	// and the next tick runs a pass. Without this the assertion below would pass
+	// on an observer that never ran at all.
+	if err := n.SetKVIndex(kvIndexDefFixture("alive", "u:"), 5*time.Second); err != nil {
+		t.Fatalf("SetKVIndex: %v", err)
+	}
+	waitForKVIndex(t, 20*time.Second, "the observer to run a pass", func() bool {
+		return n.kvIndexPasses.Load() > 0
+	})
 
 	// stopKVIndexObserver must return (the goroutine must exit); a hang here is
 	// the failure, surfaced by the test timeout.
@@ -548,10 +567,94 @@ func TestKVIndexObserverStopsOnClose(t *testing.T) {
 	// Idempotent: Close() calls it again.
 	n.stopKVIndexObserver()
 
+	// The goroutine is really gone, not merely un-waited-for: a meta write moves
+	// the applied index, and a live ticker would run a pass within one interval.
+	// This is a leak assertion with no goroutine-count tolerance to tune — a
+	// tolerance wide enough for raft's own churn is wide enough to hide this one.
+	before := n.kvIndexPasses.Load()
+	if err := n.SetKVIndex(kvIndexDefFixture("after_stop", "u:"), 5*time.Second); err != nil {
+		t.Fatalf("SetKVIndex after stop: %v", err)
+	}
+	time.Sleep(3 * kvIndexObserveInterval)
+	if after := n.kvIndexPasses.Load(); after != before {
+		t.Fatalf("the observer ran %d passes after it was stopped — the goroutine is still alive", after-before)
+	}
+
 	tc.Close()
-	waitForKVIndex(t, 10*time.Second, "goroutines to return to baseline", func() bool {
-		return runtime.NumGoroutine() <= baseline+8
-	})
+}
+
+// The poll fires on EVERY meta write, and in PB mode the liveness beacons alone
+// move the applied index every interval. A pass whose definitions and hosted
+// groups have not changed must not rebuild every group's Set.
+func TestKVIndexPassSkipsUnchangedInstall(t *testing.T) {
+	tc := newTestCluster(t, 1, 2)
+	n := tc.nodes[0]
+	freezeKVIndexObserver(t, n)
+	seedKVIndexRecords(t, n, "u:", 0, 500)
+	if err := n.SetKVIndex(kvIndexDefFixture("by_age", "u:"), 5*time.Second); err != nil {
+		t.Fatalf("SetKVIndex: %v", err)
+	}
+
+	n.applyKVIndexDefs()
+	first := n.kvIndexInstalls.Load()
+	if first == 0 {
+		t.Fatal("the first pass installed nothing")
+	}
+	// Several more passes over an unchanged catalog: no further installs.
+	for i := 0; i < 3; i++ {
+		n.applyKVIndexDefs()
+	}
+	if got := n.kvIndexInstalls.Load(); got != first {
+		t.Fatalf("installs = %d after 3 no-op passes, want %d — an unchanged catalog is rebuilding every Set", got, first)
+	}
+	if got := n.kvIndexPasses.Load(); got < 4 {
+		t.Fatalf("passes = %d, want at least 4 — the passes themselves must still run", got)
+	}
+
+	// A NEW definition is a change, so the install runs again.
+	if err := n.SetKVIndex(kvIndexDefFixture("by_age2", "v:"), 5*time.Second); err != nil {
+		t.Fatalf("SetKVIndex: %v", err)
+	}
+	n.applyKVIndexDefs()
+	if got := n.kvIndexInstalls.Load(); got != first+1 {
+		t.Fatalf("installs = %d after a new definition, want %d", got, first+1)
+	}
+}
+
+// Rejects is a gauge: it reports what is broken NOW and returns to zero when the
+// offending definition is removed, rather than climbing once per pass forever.
+func TestKVIndexRejectsIsAGauge(t *testing.T) {
+	tc := newTestCluster(t, 1, 1)
+	n := tc.nodes[0]
+	freezeKVIndexObserver(t, n)
+
+	// "#count" with no field in front of it passes wire.KVIndexDef.Validate and
+	// fails record.ParsePath in kvindex.DefFrom.
+	bad := wire.KVIndexDef{Name: "headless", PayloadPath: "#count", Kind: wire.KVIndexKindCount, Enabled: true}
+	if err := n.SetKVIndex(bad, 5*time.Second); err != nil {
+		t.Fatalf("SetKVIndex(unparsable): %v", err)
+	}
+	n.applyKVIndexDefs()
+	if got := n.Stats().KVIndex.Rejects; got != 1 {
+		t.Fatalf("Rejects = %d, want 1", got)
+	}
+	// Repeated passes do not inflate it.
+	for i := 0; i < 3; i++ {
+		n.applyKVIndexDefs()
+	}
+	if got := n.Stats().KVIndex.Rejects; got != 1 {
+		t.Fatalf("Rejects = %d after 3 more passes, want 1 — it is counting events, not reporting state", got)
+	}
+	// Removing the definition clears it.
+	off := bad
+	off.Enabled = false
+	if err := n.SetKVIndex(off, 5*time.Second); err != nil {
+		t.Fatalf("SetKVIndex(disable): %v", err)
+	}
+	n.applyKVIndexDefs()
+	if got := n.Stats().KVIndex.Rejects; got != 0 {
+		t.Fatalf("Rejects = %d after the bad definition was dropped, want 0", got)
+	}
 }
 
 func TestKVIndexStatsPopulated(t *testing.T) {
@@ -982,16 +1085,11 @@ func TestKVIndexBackfillIsOffTheConstructionPath(t *testing.T) {
 func TestKVIndexInstallWithoutBackfill(t *testing.T) {
 	tc := newTestCluster(t, 1, 2)
 	n := tc.nodes[0]
-	n.stopKVIndexObserver()
+	freezeKVIndexObserver(t, n)
 	seedKVIndexRecords(t, n, "u:", 0, 2000)
 	if err := n.SetKVIndex(kvIndexDefFixture("by_age", "u:"), 5*time.Second); err != nil {
 		t.Fatalf("SetKVIndex: %v", err)
 	}
-
-	// installKVIndexDefs honours the stop signal like any pass, so restart the
-	// observer's channel state for this call: a stopped node is not what node
-	// start looks like.
-	n.kvIndexStop = nil
 	n.installKVIndexDefs()
 
 	st := n.Stats().KVIndex

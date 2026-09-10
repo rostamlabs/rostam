@@ -4,8 +4,10 @@ package cluster
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/rostamlabs/rostam/cache"
@@ -150,11 +152,27 @@ func (n *Node) kvIndexPass(installOnly bool) {
 	}
 	n.kvIndexApplyMu.Lock()
 	defer n.kvIndexApplyMu.Unlock()
+	n.kvIndexPasses.Add(1)
 
 	defs := n.kvIndexDefsFromCatalog()
-	for group, s := range n.snapshotShards() {
+	shards := n.snapshotShards()
+
+	// THE INSTALL IS SKIPPED WHEN NOTHING IT DEPENDS ON MOVED. The poll fires on
+	// ANY meta write, and in PB mode the primary-liveness beacons alone move the
+	// applied index every interval — so without this, every hosted group rebuilt
+	// its definition and posting maps once a second forever, for a catalog that
+	// had not changed. The readiness scan below still runs on every pass: it is
+	// one map read per definition, and skipping it would strand a definition
+	// whose backfill was cut short.
+	fingerprint := kvIndexPassFingerprint(defs, shards)
+	install := fingerprint != n.kvIndexInstalled
+	if install {
+		n.kvIndexInstalls.Add(1)
+	}
+
+	for group, s := range shards {
 		if n.kvIndexStopped() {
-			return
+			return // aborted: kvIndexInstalled is NOT advanced, so the next pass re-installs
 		}
 		if s == nil {
 			continue // not hosted here (partitioned cluster)
@@ -163,7 +181,9 @@ func (n *Node) kvIndexPass(installOnly bool) {
 		if idx == nil {
 			continue // a store built without an index
 		}
-		idx.Install(defs)
+		if install {
+			idx.Install(defs)
+		}
 		if installOnly {
 			continue
 		}
@@ -183,6 +203,29 @@ func (n *Node) kvIndexPass(installOnly bool) {
 			}
 		}
 	}
+	// Only after every hosted group has been visited: a pass that returned early
+	// left some group uninstalled, and recording the fingerprint would tell the
+	// next pass there was nothing to do.
+	n.kvIndexInstalled = fingerprint
+}
+
+// kvIndexPassFingerprint identifies what an install depends on: the definitions
+// (identity AND shape, so a redefinition under the same name is a change) and
+// which shard groups this node hosts (so a group gained by a rebalance forces an
+// install into its empty Set). Anything else moving in the meta log is not a
+// reason to touch a single Set.
+func kvIndexPassFingerprint(defs []kvindex.Def, shards []*shard.Store) string {
+	var b strings.Builder
+	for _, d := range defs {
+		fmt.Fprintf(&b, "%s\x00%s\x00%s\x00%d\x00%d\x01", d.Name, d.Prefix, d.PathText, d.Kind, d.MetaIndex)
+	}
+	b.WriteByte('|')
+	for i, s := range shards {
+		if s != nil {
+			fmt.Fprintf(&b, "%d,", i)
+		}
+	}
+	return b.String()
 }
 
 // kvIndexDefsFromCatalog turns the meta catalog into the Defs this build can
@@ -196,23 +239,27 @@ func (n *Node) kvIndexPass(installOnly bool) {
 // installed as an index that posts nothing, which would answer queries with an
 // empty set and call it exact.
 //
-// Rejects counts reject EVENTS, one per offending definition per install pass,
-// so a definition that no node can parse keeps the counter climbing for as long
-// as it sits in the catalog. That is the intended reading: it is the symptom of
-// a standing misconfiguration, not a one-off.
+// Rejects is a GAUGE, not a running total: it is recomputed here on every pass
+// and reports how many definitions the catalog holds right now that this node
+// cannot build. A counter would climb once per pass for as long as a bad
+// definition sat in the catalog, which reads as a worsening problem when nothing
+// is changing; what an operator needs is "how many are broken", and a return to
+// zero when one is fixed or removed.
 func (n *Node) kvIndexDefsFromCatalog() []kvindex.Def {
 	cat := n.meta.FSM.KVIndexes()
 	defs := make([]kvindex.Def, 0, len(cat))
+	var rejects uint64
 	for name, e := range cat {
 		d, err := kvindex.DefFrom(e.Def, e.MetaIndex)
 		if err != nil {
-			n.kvIndexRejects.Add(1)
+			rejects++
 			slog.Warn("kv index definition is in the meta catalog but this node cannot build it; it is NOT installed here and queries naming it will report no such index",
 				"component", "cluster", "node", n.cfg.NodeID, "index", name, "path", e.Def.PayloadPath, "err", err)
 			continue
 		}
 		defs = append(defs, d)
 	}
+	n.kvIndexRejects.Store(rejects)
 	sort.Slice(defs, func(i, j int) bool { return defs[i].Name < defs[j].Name })
 	return defs
 }

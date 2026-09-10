@@ -134,11 +134,12 @@ type KVIndexStats struct {
 	Backfills    uint64
 	BackfillKeys uint64
 
-	// Rejects counts definitions the meta FSM ACCEPTED that this node cannot
-	// build — one per offending definition per install pass, so it keeps climbing
-	// while the definition sits in the catalog. A non-zero value is a standing
-	// misconfiguration (or a version skew): the definition exists cluster-wide and
-	// does nothing here.
+	// Rejects is how many definitions the catalog holds RIGHT NOW that this node
+	// cannot build — a gauge recomputed on every observer pass, not a running
+	// total. A non-zero value is a standing misconfiguration (or a version skew):
+	// the definition exists cluster-wide and does nothing here. It returns to zero
+	// when the definition is fixed or removed, which is the signal an operator
+	// acts on.
 	Rejects uint64
 
 	// VerifyMisses counts candidates whose live re-read did not match — i.e.
