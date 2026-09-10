@@ -12,58 +12,55 @@ import (
 
 	"github.com/rostamlabs/rostam/ops"
 	"github.com/rostamlabs/rostam/ops/kvindex"
-	"github.com/rostamlabs/rostam/sdk/wire"
 )
 
-// TestGRPCKVQueryErrorCodes pins the kv_query family onto its gRPC codes.
+// TestGRPCKVQueryFamilyParity walks the ONE canonical family list and asserts
+// this transport's spelling of every member's class.
 //
-// The three transports classify the SAME set, and the whole point of doing it
-// three times is that a caller switching from REST to gRPC keeps the same
-// retry behaviour. Unclassified, every one of these fell to codes.Internal —
-// which standard retry policies and service meshes either hammer or hard-fail,
-// so a create-then-query would have become a permanent failure over gRPC while
-// it merely needed a retry over HTTP.
-func TestGRPCKVQueryErrorCodes(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		err  error
-		want codes.Code
-	}{
-		// PERMANENT: facts about the query.
-		{"bad filter", ops.ErrKVQueryFilter, codes.InvalidArgument},
-		{"scan consent missing", ops.ErrKVQueryScanRequired, codes.InvalidArgument},
-		{"scan budget", ops.ErrKVQueryScanBudget, codes.InvalidArgument},
-		{"no KV index on this dispatcher", ops.ErrKVIndexUnavailable, codes.InvalidArgument},
-		{"cursor cap", ops.ErrKVQueryCursorCap, codes.InvalidArgument},
-		{"candidate budget", kvindex.ErrCandidateBudget, codes.InvalidArgument},
-		{"filter budget", wire.ErrKVFilterBudget, codes.InvalidArgument},
-		{"malformed args", wire.ErrKVQueryArgs, codes.InvalidArgument},
-		{"truncated args", wire.ErrKVQueryArgsTruncated, codes.InvalidArgument},
-		{"malformed result", wire.ErrKVQueryResult, codes.InvalidArgument},
-		// The caller named something that does not exist.
-		{"unknown index", kvindex.ErrNoSuchIndex, codes.NotFound},
-		{
-			name: "unknown index, as the leaf renders it",
-			err:  fmt.Errorf("%w: %q on shard group 3", kvindex.ErrNoSuchIndex, "by_age"),
-			want: codes.NotFound,
-		},
-		// RETRYABLE.
-		{"index still building", kvindex.ErrIndexBuilding, codes.Unavailable},
-		{
-			name: "the coordinator's rewrite of a group-level no-such-index",
-			err: fmt.Errorf("%w: %q is in the meta catalog but not yet installed on shard group %d (retry)",
-				kvindex.ErrIndexBuilding, "by_age", 3),
-			want: codes.Unavailable,
-		},
-		{"index changed under the query", kvindex.ErrIndexChanged, codes.Unavailable},
-		{"shard unavailable mid-scan", ops.ErrKVQueryUnavailable, codes.Unavailable},
-		{"store draining", errors.New(ops.StoreClosedMsg), codes.Unavailable},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := status.Code(grpcError(tc.err)); got != tc.want {
-				t.Fatalf("grpcError(%v) = %v, want %v", tc.err, got, tc.want)
+// It replaces three hand-maintained per-transport lists that had already
+// drifted: the Task 7 review found server classifying kvindex.ErrNoSuchIndex,
+// kvindex.ErrCandidateBudget and wire.ErrKVQueryResult while httpapi omitted all
+// three, with both classifiers' comments claiming they were in sync. Adding a
+// refusal to ops.KVQueryErrorFamily now makes all three transports' tests cover
+// it at once, and whichever transport missed it fails here.
+//
+// Unclassified, every one of these fell to codes.Internal — which standard retry
+// policies and service meshes either hammer or hard-fail, so a create-then-query
+// would have been a permanent failure over gRPC while needing only a retry over
+// HTTP.
+func TestGRPCKVQueryFamilyParity(t *testing.T) {
+	want := map[ops.KVQueryErrorClass]codes.Code{
+		ops.KVQueryErrPermanent: codes.InvalidArgument,
+		ops.KVQueryErrNotFound:  codes.NotFound,
+		ops.KVQueryErrRetryable: codes.Unavailable,
+	}
+	for _, spec := range ops.KVQueryErrorFamily() {
+		t.Run(spec.Name, func(t *testing.T) {
+			if got := status.Code(grpcError(spec.Err)); got != want[spec.Class] {
+				t.Fatalf("%s (%s) = %v, want %v", spec.Name, spec.Class, got, want[spec.Class])
+			}
+			// And again through the wrappers the fan-out puts in front of a
+			// refusal, which is how most of these actually arrive.
+			wrapped := fmt.Errorf("cluster: kv_query: shard group 3: %w", spec.Err)
+			if got := status.Code(grpcError(wrapped)); got != want[spec.Class] {
+				t.Fatalf("wrapped %s (%s) = %v, want %v", spec.Name, spec.Class, got, want[spec.Class])
 			}
 		})
+	}
+}
+
+// TestGRPCKVQueryLeafRenderings covers the two shapes the leaf and the
+// coordinator actually produce, which carry a caller-chosen index name the bare
+// sentinels above do not exercise.
+func TestGRPCKVQueryLeafRenderings(t *testing.T) {
+	noSuch := fmt.Errorf("%w: %q on shard group 3", kvindex.ErrNoSuchIndex, "by_age")
+	if got := status.Code(grpcError(noSuch)); got != codes.NotFound {
+		t.Errorf("the leaf's no-such-index rendering = %v, want NotFound", got)
+	}
+	rewritten := fmt.Errorf("%w: %q is in the meta catalog but not yet installed on shard group %d (retry)",
+		kvindex.ErrIndexBuilding, "by_age", 3)
+	if got := status.Code(grpcError(rewritten)); got != codes.Unavailable {
+		t.Errorf("the coordinator's still-building rewrite = %v, want Unavailable", got)
 	}
 }
 

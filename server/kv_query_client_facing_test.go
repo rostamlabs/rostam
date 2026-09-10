@@ -8,8 +8,6 @@ import (
 	"testing"
 
 	"github.com/rostamlabs/rostam/ops"
-	"github.com/rostamlabs/rostam/ops/kvindex"
-	"github.com/rostamlabs/rostam/sdk/wire"
 	"github.com/rostamlabs/rostam/shard"
 )
 
@@ -62,28 +60,76 @@ func TestKVQueryCursorCapIsClientFacing(t *testing.T) {
 	}
 }
 
-// TestKVQueryFamilyIsClientFacing restates the whole family at this edge, so the
-// three transports' tables are compared against one list rather than drifting
-// apart one sentinel at a time.
+// TestKVQueryFamilyIsClientFacing walks the ONE canonical family list.
+//
+// This edge has only two answers — unredacted or redacted — so every class in
+// the table lands in the same bucket here: all of them must cross the wire
+// intact. That is not a weaker assertion than the other two transports'. It is
+// the PRECONDITION for theirs: server.clientFacingErr runs at the peer's edge on
+// the __kv_query_shard__ leg, and anything it redacts reaches the coordinator as
+// "internal error" with nothing left for httpapi or grpcapi to classify.
+//
+// Sharing the list is the point. The Task 7 review found this classifier ahead
+// of httpapi's by three sentinels while both files' comments claimed parity;
+// adding a refusal to ops.KVQueryErrorFamily now reaches all three tests at
+// once.
 func TestKVQueryFamilyIsClientFacing(t *testing.T) {
+	for _, spec := range ops.KVQueryErrorFamily() {
+		t.Run(spec.Name, func(t *testing.T) {
+			if !clientFacingErr(spec.Err) {
+				t.Fatalf("%s (%s) must cross the wire unredacted", spec.Name, spec.Class)
+			}
+			wrapped := fmt.Errorf("cluster: kv_query: shard group 3: %w", spec.Err)
+			if !clientFacingErr(wrapped) {
+				t.Fatalf("wrapped %s (%s) must cross the wire unredacted", spec.Name, spec.Class)
+			}
+		})
+	}
+}
+
+// TestKVQueryFamilyCoversTheRealStoreClosedSentinel closes the one gap the
+// shared table cannot close by itself.
+//
+// ops cannot import shard, so the family carries shard.ErrStoreClosed as its
+// MESSAGE form. This package can import shard, so it is the only place that can
+// check the stand-in against the value production actually raises — by identity
+// here, and through the matcher the other two transports use.
+func TestKVQueryFamilyCoversTheRealStoreClosedSentinel(t *testing.T) {
+	if !clientFacingErr(shard.ErrStoreClosed) {
+		t.Fatal("the real shard.ErrStoreClosed must cross the wire unredacted")
+	}
+	if shard.ErrStoreClosed.Error() != ops.StoreClosedMsg {
+		t.Fatalf("shard.ErrStoreClosed = %q, want ops.StoreClosedMsg %q", shard.ErrStoreClosed, ops.StoreClosedMsg)
+	}
+	if !ops.IsStoreClosedMessage(shard.ErrStoreClosed.Error()) {
+		t.Fatal("the matcher the other two transports use does not recognise the sentinel it was written for")
+	}
+	// The family's stand-in must be indistinguishable, at this edge, from the
+	// real thing — otherwise the other two transports are testing a fiction.
+	var standIn error
+	for _, spec := range ops.KVQueryErrorFamily() {
+		if spec.Err.Error() == ops.StoreClosedMsg {
+			standIn = spec.Err
+		}
+	}
+	if standIn == nil {
+		t.Fatal("ops.KVQueryErrorFamily no longer carries a store-closed entry")
+	}
+	if clientFacingErr(standIn) != clientFacingErr(shard.ErrStoreClosed) {
+		t.Fatal("the family's store-closed stand-in classifies differently from the real sentinel")
+	}
+}
+
+// TestKVQueryFamilyDoesNotLeakUnrelatedFaults is the control: widening the
+// family must not have widened what escapes redaction.
+func TestKVQueryFamilyDoesNotLeakUnrelatedFaults(t *testing.T) {
 	for _, err := range []error{
-		ops.ErrKVQueryFilter,
-		ops.ErrKVQueryScanRequired,
-		ops.ErrKVQueryScanBudget,
-		ops.ErrKVIndexUnavailable,
-		ops.ErrKVQueryUnavailable,
-		ops.ErrKVQueryCursorCap,
-		kvindex.ErrNoSuchIndex,
-		kvindex.ErrIndexBuilding,
-		kvindex.ErrIndexChanged,
-		kvindex.ErrCandidateBudget,
-		wire.ErrKVQueryArgs,
-		wire.ErrKVQueryResult,
-		wire.ErrKVQueryArgsTruncated,
-		shard.ErrStoreClosed,
+		errors.New("open /var/lib/rostam/shard-7: no such file"),
+		errors.New(ops.StoreClosedMsg + " while writing /var/lib/rostam/wal-3"),
+		fmt.Errorf("wal append failed at /var/lib/rostam/x: %v", ops.ErrKVQueryFilter),
 	} {
-		if !clientFacingErr(err) {
-			t.Errorf("%v must cross the wire unredacted", err)
+		if clientFacingErr(err) {
+			t.Errorf("%v must stay redacted", err)
 		}
 	}
 }

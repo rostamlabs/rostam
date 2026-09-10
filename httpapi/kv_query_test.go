@@ -279,58 +279,53 @@ func TestHTTPKVQueryUnknownIndexIs404(t *testing.T) {
 	}
 }
 
-// TestHTTPKVQueryRetryableIs503 pins the retryable bucket for every typed
-// refusal that means "come back in a moment", including the store-draining one
-// that reaches this transport as TEXT because httpapi cannot import shard.
-func TestHTTPKVQueryRetryableIs503(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		err  error
-	}{
-		{"index still building", fmt.Errorf("%w: on shard group 0", kvindex.ErrIndexBuilding)},
-		{"index changed under the query", kvindex.ErrIndexChanged},
-		{"shard unavailable mid-scan", ops.ErrKVQueryUnavailable},
-		{"store draining, in process", errors.New(ops.StoreClosedMsg)},
-		{"store draining, wrapped by the fan-out", errors.New("cluster: kv_query: shard group 3: " + ops.StoreClosedMsg)},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := statusForError(tc.err); got != http.StatusServiceUnavailable {
-				t.Fatalf("statusForError(%v) = %d, want 503", tc.err, got)
+// TestHTTPKVQueryFamilyParity walks the ONE canonical family list and asserts
+// this transport's spelling of every member's class.
+//
+// It replaces three hand-maintained per-transport lists that had already
+// drifted: the Task 7 review found server classifying kvindex.ErrNoSuchIndex,
+// kvindex.ErrCandidateBudget and wire.ErrKVQueryResult while this file omitted
+// all three, with both classifiers' comments claiming they were in sync. Adding
+// a refusal to ops.KVQueryErrorFamily now makes all three transports' tests
+// cover it at once, and whichever transport missed it fails here.
+func TestHTTPKVQueryFamilyParity(t *testing.T) {
+	want := map[ops.KVQueryErrorClass]int{
+		ops.KVQueryErrPermanent: http.StatusBadRequest,
+		ops.KVQueryErrNotFound:  http.StatusNotFound,
+		ops.KVQueryErrRetryable: http.StatusServiceUnavailable,
+	}
+	for _, spec := range ops.KVQueryErrorFamily() {
+		t.Run(spec.Name, func(t *testing.T) {
+			if got := statusForError(spec.Err); got != want[spec.Class] {
+				t.Fatalf("%s (%s) = %d, want %d", spec.Name, spec.Class, got, want[spec.Class])
+			}
+			// And again through the wrappers the fan-out and the peer client put
+			// in front of a refusal, which is how most of these actually arrive.
+			wrapped := fmt.Errorf("cluster: kv_query: shard group 3: %w", spec.Err)
+			if got := statusForError(wrapped); got != want[spec.Class] {
+				t.Fatalf("wrapped %s (%s) = %d, want %d", spec.Name, spec.Class, got, want[spec.Class])
 			}
 		})
 	}
 }
 
-// TestHTTPKVQueryPermanentIs4xx pins the permanent bucket against the same error
-// set, and pins the ONE thing that must not move: a filter refusal that quotes
-// the store-draining text inside a caller-chosen field stays permanent. Under a
-// substring test it would become a 503 the caller retries forever.
-func TestHTTPKVQueryPermanentIs4xx(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		err  error
-		want int
-	}{
-		{"bad filter", ops.ErrKVQueryFilter, http.StatusBadRequest},
-		{"scan consent missing", ops.ErrKVQueryScanRequired, http.StatusBadRequest},
-		{"scan budget", ops.ErrKVQueryScanBudget, http.StatusBadRequest},
-		{"no index on this dispatcher", ops.ErrKVIndexUnavailable, http.StatusBadRequest},
-		{"candidate budget", kvindex.ErrCandidateBudget, http.StatusBadRequest},
-		{"cursor cap", ops.ErrKVQueryCursorCap, http.StatusBadRequest},
-		{"filter budget", wire.ErrKVFilterBudget, http.StatusBadRequest},
-		{"malformed result frame", wire.ErrKVQueryResult, http.StatusBadRequest},
-		{"unknown index", kvindex.ErrNoSuchIndex, http.StatusNotFound},
-		{
-			name: "a filter quoting the draining text stays permanent",
-			err:  fmt.Errorf("%w: field %q is not a path", ops.ErrKVQueryFilter, ops.StoreClosedMsg),
-			want: http.StatusBadRequest,
-		},
+// TestHTTPStoreClosedTextParity covers the family member this transport can only
+// see as TEXT. httpapi cannot import shard, so ops.KVQueryErrorFamily carries the
+// message form; these are the wrapper shapes it really arrives in.
+func TestHTTPStoreClosedTextParity(t *testing.T) {
+	for _, msg := range []string{
+		ops.StoreClosedMsg,
+		"cluster: kv_query: shard group 3: " + ops.StoreClosedMsg,
+		`cluster: kv_query: shard group 3: client: server error on op "__kv_query_shard__": ` + ops.StoreClosedMsg,
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := statusForError(tc.err); got != tc.want {
-				t.Fatalf("statusForError(%v) = %d, want %d", tc.err, got, tc.want)
-			}
-		})
+		if got := statusForError(errors.New(msg)); got != http.StatusServiceUnavailable {
+			t.Errorf("statusForError(%q) = %d, want 503", msg, got)
+		}
+	}
+	// Negative controls: a fault that merely MENTIONS the refusal mid-message is
+	// not the refusal, and must stay a redacted 500.
+	if got := statusForError(errors.New(ops.StoreClosedMsg + " while writing /var/lib/rostam/wal-3")); got != http.StatusInternalServerError {
+		t.Errorf("a fault mentioning the refusal mid-message = %d, want 500", got)
 	}
 }
 

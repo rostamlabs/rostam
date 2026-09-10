@@ -374,7 +374,13 @@ func clientFacingErr(err error) bool {
 		// ops.ErrKVQueryCursorCap: the coordinator built a continuation larger
 		// than the cap that applies on the way back in. Its message is the
 		// per-group arithmetic the caller acts on, and redacted it says nothing.
-		errors.Is(err, ops.ErrKVQueryCursorCap):
+		errors.Is(err, ops.ErrKVQueryCursorCap),
+		// wire.ErrKVFilterBudget: the filter tree is over the node/depth cap.
+		// A fact about the query the caller sent, and the cap is in the message.
+		// Found missing by the shared-family parity test — httpapi and grpcapi
+		// classified it while this edge redacted it, which is the exact drift
+		// that test exists to catch.
+		errors.Is(err, wire.ErrKVFilterBudget):
 		return true
 	// shard.ErrStoreClosed: a Call refused because this store is draining for
 	// close. It is a REFUSAL, not a fault — the op never ran, and in a cluster
@@ -386,9 +392,20 @@ func clientFacingErr(err error) bool {
 	// classifier: redacted, a coordinator draining one replica mid-fan-out
 	// cannot tell that refusal from a real fault, and a retryable page becomes a
 	// hard error on every multi-node cluster. Matched by IDENTITY because this
-	// package already imports shard; httpapi and grpcapi cannot, and match the
-	// shared spelling by message instead (ops.IsStoreClosedMessage).
-	case errors.Is(err, shard.ErrStoreClosed):
+	// package already imports shard.
+	//
+	// THE MESSAGE ARM IS NOT REDUNDANT, and identity alone was a bug: the case
+	// this classification exists for is a PEER's refusal, which arrives here
+	// stringified with its type gone (shard.decodePBResult and the peer client
+	// both rebuild errors from text). Matched only by identity, a peer's
+	// store-closed refusal was still redacted to "internal error" — leaving the
+	// coordinator nothing to classify, which is the whole failure this arm was
+	// added to prevent. Found by the shared-family parity test.
+	//
+	// ops.IsStoreClosedMessage is the same anchored matcher httpapi and grpcapi
+	// use, so all three agree on what counts as this refusal.
+	case errors.Is(err, shard.ErrStoreClosed),
+		ops.IsStoreClosedMessage(err.Error()):
 		return true
 	}
 	// Cross-boundary / cluster / routing signals matched by string so the clustered
