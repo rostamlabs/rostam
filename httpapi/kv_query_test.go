@@ -126,8 +126,14 @@ func newKVQueryTestAPI(t *testing.T, n int) (http.Handler, *kvIndexDispatcher, f
 // --- POST /v1/kv/query ----------------------------------------------------
 
 // TestHTTPKVQuery pages an indexed query to exhaustion over REST: the rows come
-// back base64, the cursor is an opaque blob the client echoes verbatim, and the
-// records projection carries the decoded record JSON.
+// back base64 (key_b64, with key_utf8 beside it when the key is text) and the
+// cursor is an opaque blob the client echoes back verbatim.
+//
+// It asserts NO decoded record, because no projection carries one. `records`
+// means the SERVER validated that each value decodes as a record; the bytes
+// still arrive in value_b64 (and value_utf8 when they are valid UTF-8) for the
+// caller to decode — see kvQueryRow for why this surface deliberately renders
+// no record JSON. TestHTTPKVQueryProjections covers the three projections.
 func TestHTTPKVQuery(t *testing.T) {
 	h, _, cleanup := newKVQueryTestAPI(t, 6)
 	defer cleanup()

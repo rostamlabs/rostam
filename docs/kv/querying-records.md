@@ -102,7 +102,9 @@ branch, have no posting under this leaf's value, and be lost.
 | a leaf on any **other** path (including deeper paths like `b/42/hi`) | evaluated live on every candidate |
 | every **negation** and absence test — `ne`, `not`, `is_empty`, `is_null` | evaluated live; never narrows |
 | `contains`, `match`, `regex`, the `dt_*` and `geo_*` families, `row_exists`, `row_absent` | evaluated live; never narrows |
-| a non-scalar bound (a list, a geo point, a record), or a `NaN` bound | declines to narrow |
+| a bound that is not a scalar — a list under `eq` or a range, a geo point, a record, an absent value | **declines to narrow**: the index is not consulted, and with no other leaf to drive it the query is refused with `filter needs an index or scan:true` |
+| a `NaN` bound, or an ordering (`gt`/`gte`/`lt`/`lte`) against a **bool** | still drives the index, and the candidate set comes back **empty** — so the page is empty, which is what the predicate would have decided anyway |
+| `in` whose value is not a list | a permanent invalid-filter refusal; the predicate itself will not compile |
 
 When `eq` and a range are both available on the index's path, `eq` wins: one
 probe beats a walk over every distinct value.
@@ -194,6 +196,22 @@ row-aligned with `page.Rows`. Over REST, the bytes arrive in `value_b64` and
 decoding them is yours to do — there is deliberately no decoded-record JSON
 field, because that would commit the REST surface to a record-to-JSON shape
 nobody has designed yet.
+
+Over REST a row carries up to four fields, the same convention
+`GET /v1/kv/{key}` already follows:
+
+| Field | When it appears |
+|---|---|
+| `key_b64` | always — a key is arbitrary bytes |
+| `key_utf8` | only when the key bytes are valid UTF-8 |
+| `value_b64` | only under `values` or `records`, and only when the value fit the page |
+| `value_utf8` | only when `value_b64` is present **and** those bytes are valid UTF-8 |
+
+The `_utf8` fields are a convenience, never the authority: they are omitted
+rather than lossily transcoded, so a client that always reads the `_b64` field
+is always correct. A record's bytes are usually binary and `value_utf8` will
+simply be absent; a small dynamic-mode record of ASCII values may happen to
+qualify.
 
 A value under `records` that is *not* a record is skipped, not an error: the KV
 keyspace is shared, and one unrelated value must not fail a query over the
@@ -438,21 +456,66 @@ whose value no longer satisfies the filter is discarded by the predicate and
 counted nowhere, so a zero here is not evidence that the postings agree with the
 data.
 
-A bounded **reconcile** pass runs per group on a timer, snapshotting a batch of
-postings, re-reading each key through the cache, and dropping the ones that no
-longer come back live. It bounds memory against the removal paths the cache's
-hook cannot reach; correctness never depends on it, because verify-on-read
-already makes a dangling posting harmless. The interval is
-`KVIndexReconcileIntervalMs`, default 60 000; `0` disables it.
+### The reconcile pass
+
+Each store runs one **reconcile** ticker. A tick takes a **random sample of at
+most 10 000 posted keys of one definition** — definitions are taken in
+rotation, and one still building is skipped — re-reads each of those keys
+through the cache, and drops only the postings whose key no longer reads back
+live. Nothing else about a posting is inspected: an abandoned slot can decode
+cleanly as some other key, so the re-read is the only sound liveness test.
+
+**Coverage is probabilistic, and that is the design.** The sample is a
+truncated range over the reverse map, and Go randomises where a range starts,
+so successive ticks look at different keys. Every key is reached in
+expectation — roughly `n·ln(n) / 10 000` ticks to have touched all *n* of them
+at least once — with no guarantee for any particular key on any particular
+tick. An ordered cursor would give exact coverage at the price of an
+O(live keys) scan under the index lock every tick, which also starves under
+monotonically increasing keys.
+
+That trade is only available because **correctness never depends on this
+pass**. Verify-on-read already makes a dangling posting harmless: it costs one
+wasted lookup and can never produce a wrong row. What the pass bounds is
+memory, against the residue the cache's removal hook cannot reach — a corrupt
+slot with no key to name, a torn page's abandoned slots, or a rebuild whose
+walk straddled a flush.
+
+**Two knobs, and their zero values mean opposite things.** Both are named
+`KVIndexReconcileIntervalMs` and both are in milliseconds:
+
+| Where | `0` means | Negative means |
+|---|---|---|
+| `shard.Config` (the replicated/embedded store) | **disables** the pass — the 60 000 default is filled in by `shard.DefaultConfig` | rejected as a configuration error |
+| `rostam.DirectConfig` (the single-node store) | keeps the **default**, 60 s — matching its own `Cache.TTLSweepIntervalMs` | **disables** the pass |
+
+Each side follows its own struct's established convention, so porting a config
+across by copying the field silently flips the pass on or off. Set it
+deliberately on each side: to disable it under `DirectConfig`, write `-1`.
+Disabling it is safe and never changes an answer.
 
 ### What each thing costs
 
 **Memory.** One posting plus one reverse entry per indexed key per definition,
-plus one set per distinct value. Measured on a 14-byte key: about **145 bytes per
-indexed key** at low cardinality, and about **270 bytes per distinct value** on
-top. A definition over 200 000 keys with 1 000 distinct values costs about 29 MB; the
-same 200 000 keys spread over 100 000 distinct values cost about 56 MB.
-High cardinality is paid for twice — in memory, and in every range query.
+plus one set per distinct value. `BenchmarkIndexMemory` in `ops/kvindex`
+measures it, so the figures below can be re-derived rather than taken on
+trust:
+
+```
+go test ./ops/kvindex/ -run xxx -bench IndexMemory -benchtime 1x
+
+BenchmarkIndexMemory/100k_keys_1k_distinct-20     1  ...  147.4 B/key
+BenchmarkIndexMemory/100k_keys_100k_distinct-20   1  ...  450.8 B/key
+```
+
+With a 14-byte key that is about **147 bytes per indexed key** at negligible
+cardinality — 100 000 keys for roughly 15 MB — and the difference between the
+two rows, re-spread over the extra distinct values, puts one more posting set
+at about **306 bytes**. That second figure is a ceiling rather than a rate: at
+one key per value every set is a map holding a single entry, the worst ratio
+there is. Both numbers move with the key length, since the key bytes are
+stored once per posting. High cardinality is paid for twice — in memory, and
+in every range query.
 
 **Lookups per query, per shard group.** One map probe per `eq` value; for a range,
 one examination per **distinct value** in the index, plus the union of the

@@ -356,7 +356,11 @@ func (a *api) kvIndexCreate(w http.ResponseWriter, r *http.Request) {
 //
 // Dropping is not undoable in any cheap sense: every query naming the index
 // starts failing at once, and re-creating it costs a full cache walk on every
-// node. That is why it sits behind the same global-write bar as create.
+// node. That is why it sits behind the same bar as create — and that bar is
+// ADMIN, not the global-write one callWrite's name suggests: both endpoints
+// dispatch __kv_index_set__, and authz.actionFor consults adminOps first,
+// where that op is enumerated. Pinned by
+// authz.TestActionForKVIndexOpsIsAdmin, the same test kvIndexCreate cites.
 func (a *api) kvIndexDrop(w http.ResponseWriter, r *http.Request) {
 	def := wire.KVIndexDef{
 		Name: r.PathValue("name"), PayloadPath: "-",
