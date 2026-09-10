@@ -9,47 +9,72 @@ import (
 	"github.com/rostamlabs/rostam/sdk/wire"
 )
 
-// TestMergeKVQueryOversizeFirstRowIsKeyOnly pins the coordinator against the
-// wedge the leaf already refuses to fall into.
+// The coordinator must not wedge the query on a row too large for the merged
+// frame, and it must not strip a value from a row that would have fitted.
 //
 // The first row of a page is always emitted, so that paging advances. But the
 // merged frame reserves one continuation per shard GROUP where the leaf that
 // sized the row reserved one, so with enough groups carrying long keys the
-// merge budget is the smaller of the two and a row the leaf sized to fit can
-// push the merged frame past the cap. EncodeKVQueryResult would then fail the
-// whole query with NO continuation, and every retry would rebuild the same
-// page — so every key sorting after it becomes unreachable.
-//
-// The coordinator must therefore do exactly what the leaf does: emit the row
-// WITHOUT its value (nil already means "omitted, fetch it with get" on this
-// wire) and count it where the leaf counts its own.
-func TestMergeKVQueryOversizeFirstRowIsKeyOnly(t *testing.T) {
-	parts := make([]wire.KVQueryResult, 1)
-	// One row whose value alone dwarfs the budget passed to the merge.
-	parts[0] = wire.KVQueryResult{
-		Rows: []wire.KVQueryRow{{Key: []byte("k"), Value: make([]byte, 4096)}},
+// merged page is the tighter of the two and a row the leaf sized to fit can push
+// it past the cap. EncodeKVQueryResult would then fail the whole query with NO
+// continuation, every retry would rebuild the same page, and every key sorting
+// after that row would be unreachable — the wedge the leaf's own oversize branch
+// exists to prevent.
+func TestEncodeMergedKVQueryOversizeFirstRowIsKeyOnly(t *testing.T) {
+	// One row whose value alone dwarfs the page cap: the merge emits it because a
+	// page must always advance, and the frame then cannot encode.
+	merged := wire.KVQueryResult{
+		Rows: []wire.KVQueryRow{{Key: []byte("k"), Value: make([]byte, wire.KVQueryMaxPageBytes+1)}},
+	}
+	if _, err := wire.EncodeKVQueryResult(merged); err == nil {
+		t.Fatal("fixture: the oversize page encodes, so this test proves nothing")
 	}
 
 	before := ops.KVQueryOversizeRows()
-	// A maxBytes far below the row cost: whatever the per-group overhead works
-	// out to, this row cannot fit with its value.
-	merged := mergeKVQuery(parts, nil, 10, 512)
-	if len(merged.Rows) != 1 {
-		t.Fatalf("merge emitted %d rows, want the single oversize row (a page must always advance)", len(merged.Rows))
+	body, err := encodeMergedKVQuery(merged)
+	if err != nil {
+		t.Fatalf("the coordinator failed the whole query instead of omitting the value: %v", err)
 	}
-	if merged.Rows[0].Value != nil {
-		t.Fatalf("the oversize row kept its %d-byte value; it must be emitted key-only so the frame encodes",
-			len(merged.Rows[0].Value))
+	got, err := wire.DecodeKVQueryResult(body)
+	if err != nil {
+		t.Fatalf("DecodeKVQueryResult: %v", err)
 	}
-	if string(merged.Rows[0].Key) != "k" {
-		t.Fatalf("merge emitted key %q, want %q", merged.Rows[0].Key, "k")
+	if len(got.Rows) != 1 || string(got.Rows[0].Key) != "k" {
+		t.Fatalf("the page came back as %+v, want the single key %q", got.Rows, "k")
 	}
-	if got := ops.KVQueryOversizeRows(); got != before+1 {
-		t.Fatalf("the omitted value was not counted: KVQueryOversizeRows went %d -> %d", before, got)
+	if got.Rows[0].Value != nil {
+		t.Fatalf("the oversize row kept a %d-byte value; it must come back key-only", len(got.Rows[0].Value))
 	}
-	// And the whole point: the merged page encodes.
-	if _, err := wire.EncodeKVQueryResult(merged); err != nil {
-		t.Fatalf("the merged page does not encode: %v", err)
+	if n := ops.KVQueryOversizeRows(); n != before+1 {
+		t.Fatalf("the omitted value was not counted: KVQueryOversizeRows went %d -> %d", before, n)
+	}
+}
+
+// The other half, and the reason the decision is made on the ACTUAL encoded size
+// rather than on mergeKVQuery's budget arithmetic: kvQueryMergeOverhead is a
+// deliberate upper bound — the longest key every group OFFERED, whether or not
+// that group ends up in the cursor — so deciding from it would strip values off
+// small rows that encode perfectly well, contradicting what a nil Value promises
+// a client on this wire. A page that fits must pass through untouched.
+func TestEncodeMergedKVQueryKeepsValuesThatFit(t *testing.T) {
+	merged := wire.KVQueryResult{
+		Rows:   []wire.KVQueryRow{{Key: []byte("k"), Value: []byte("small")}},
+		Cursor: []wire.KVQueryCont{{Group: 0, After: []byte("k"), More: true}},
+	}
+	before := ops.KVQueryOversizeRows()
+	body, err := encodeMergedKVQuery(merged)
+	if err != nil {
+		t.Fatalf("encodeMergedKVQuery: %v", err)
+	}
+	got, err := wire.DecodeKVQueryResult(body)
+	if err != nil {
+		t.Fatalf("DecodeKVQueryResult: %v", err)
+	}
+	if len(got.Rows) != 1 || string(got.Rows[0].Value) != "small" {
+		t.Fatalf("a row that fits came back as %+v; its value must survive", got.Rows)
+	}
+	if n := ops.KVQueryOversizeRows(); n != before {
+		t.Fatalf("a page that fits bumped the oversize counter: %d -> %d", before, n)
 	}
 }
 

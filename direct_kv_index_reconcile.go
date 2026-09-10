@@ -29,13 +29,13 @@ import (
 // convention DirectConfig already uses for TTLSweepIntervalMs: 0 means the
 // default, negative disables, positive is the interval in milliseconds.
 //
-// THE MULTIPLICATION IS CLAMPED. time.Duration is int64 NANOSECONDS, so any
-// setting above about 9.2e9 ms overflows it — and the wrap is not a large
-// interval but an arbitrary one, including negative values, which this
-// function's own contract reads as "disabled". A misconfigured knob would then
-// silently turn the reconciler OFF instead of setting it slowly. Clamping keeps
-// an absurd setting absurd (about 292 years) rather than letting it change the
-// meaning of the field.
+// THE MULTIPLICATION IS CLAMPED. time.Duration is int64 NANOSECONDS, so a
+// setting above maxReconcileIntervalMs — about 9.2e12 ms, or roughly 292 years,
+// so only an absurd one — overflows it. The wrap is not a large interval but an
+// arbitrary one, including negative values, which this function's own contract
+// reads as "disabled": a misconfigured knob would silently turn the reconciler
+// OFF rather than set it slowly. Clamping keeps an absurd setting absurd instead
+// of letting it change the meaning of the field.
 func directReconcileInterval(ms int) time.Duration {
 	switch {
 	case ms < 0:

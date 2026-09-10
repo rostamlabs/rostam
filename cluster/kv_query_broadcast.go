@@ -161,7 +161,7 @@ func (n *Node) broadcastKVQuery(args []byte) ([]byte, error) {
 	if err := checkKVQueryCursorFits(merged.Cursor); err != nil {
 		return nil, err
 	}
-	return wire.EncodeKVQueryResult(merged)
+	return encodeMergedKVQuery(merged)
 }
 
 // kvQueryTargets reports, per group, whether this page must ask it.
@@ -459,34 +459,14 @@ func mergeKVQuery(parts []wire.KVQueryResult, in []wire.KVQueryCont, limit, maxB
 		if len(res.Rows) >= limit {
 			break
 		}
-		row := s.row
-		cost := kvQueryRowBytes(row)
-		if len(res.Rows) == 0 && cost > budget && row.Value != nil {
-			// OVERSIZE FIRST ROW. The first row of a page is always emitted, so
-			// that paging advances — but the merged frame reserves one
-			// continuation per GROUP, and the leaf that sized this row reserved
-			// only one. With enough groups carrying long keys the merge budget is
-			// the smaller of the two, so a row the leaf sized to fit can push the
-			// merged frame over the cap: EncodeKVQueryResult would then reject the
-			// whole query with NO continuation, and every retry would rebuild the
-			// same page. Every key sorting after it becomes unreachable.
-			//
-			// So the coordinator does exactly what the leaf does with a value too
-			// large for any page: emit the row WITHOUT its value. nil already means
-			// "omitted, larger than the page cap; fetch it with get" on this wire,
-			// so the client reads it the same way whichever layer dropped it, and
-			// it is counted in the same place an operator already watches.
-			row.Value = nil
-			cost = kvQueryRowBytes(row)
-			ops.NoteKVQueryOversizeRow()
-		}
+		cost := kvQueryRowBytes(s.row)
 		if len(res.Rows) > 0 && used+cost > budget {
 			break
 		}
-		res.Rows = append(res.Rows, row)
+		res.Rows = append(res.Rows, s.row)
 		used += cost
 		emitted[s.group]++
-		last[s.group] = row.Key
+		last[s.group] = s.row.Key
 	}
 
 	var cursor []wire.KVQueryCont
@@ -530,6 +510,53 @@ func mergeKVQuery(parts []wire.KVQueryResult, in []wire.KVQueryCont, limit, maxB
 	}
 	res.Cursor = cursor
 	return res
+}
+
+// encodeMergedKVQuery encodes the merged page, and if the frame does not fit,
+// retries ONCE with the first row's value omitted.
+//
+// WHY A RETRY AND NOT A PRE-CHECK. mergeKVQuery always emits its first row
+// whatever it costs, so that a page always advances and paging terminates. That
+// is the same rule the leaf follows — and, like the leaf, it can produce a row
+// too large for the frame it ends up in. The merged frame reserves a
+// continuation per shard GROUP where the leaf that sized the row reserved one,
+// so with enough groups carrying long keys the merged page is the tighter of the
+// two: EncodeKVQueryResult then fails the whole query with NO continuation, every
+// retry rebuilds the same page, and every key sorting after that row becomes
+// unreachable.
+//
+// The decision is made on the ACTUAL encoded size rather than on the merge's
+// budget arithmetic, and that distinction is the point. kvQueryMergeOverhead is
+// a deliberate upper bound — the longest key any group OFFERED, for every group,
+// whether or not that group ends up in the cursor at all. Deciding from it would
+// strip values off small rows that would have encoded perfectly well, which
+// contradicts what the wire's nil Value promises a client. Asking the encoder is
+// exact.
+//
+// The dropped value is reported as nil, which on this wire already means
+// "omitted, larger than the page cap; fetch it with get", and counted through
+// ops.NoteKVQueryOversizeRow so one number covers the leaf and the coordinator —
+// a coordinator with a private counter would read zero on exactly the deployment
+// (many groups, long keys) where the condition is reachable.
+func encodeMergedKVQuery(merged wire.KVQueryResult) ([]byte, error) {
+	body, err := wire.EncodeKVQueryResult(merged)
+	if err == nil {
+		return body, nil
+	}
+	if !errors.Is(err, wire.ErrKVQueryResult) || len(merged.Rows) == 0 || merged.Rows[0].Value == nil {
+		return nil, err
+	}
+	retry := merged
+	retry.Rows = append([]wire.KVQueryRow(nil), merged.Rows...)
+	retry.Rows[0].Value = nil
+	body, rerr := wire.EncodeKVQueryResult(retry)
+	if rerr != nil {
+		// Not the oversize row after all — report the original failure, which
+		// describes the page the caller actually asked for.
+		return nil, err
+	}
+	ops.NoteKVQueryOversizeRow()
+	return body, nil
 }
 
 // kvQueryContFor finds group's continuation in a cursor. It is a linear scan

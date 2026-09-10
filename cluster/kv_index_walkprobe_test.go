@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 )
 
 // parkedWalk installs kvIndexWalkProbe so the FIRST walk to reach an abort check
@@ -55,14 +56,23 @@ func (p *parkedWalk) release() {
 // on the STATE CHANGE the removal makes rather than on a duration, which is what
 // lets a test release a parked walk at the exact moment the abort is guaranteed
 // to be observed.
-func (n *Node) waitKVIndexGateShut(group int) {
+//
+// BOUNDED, like every other wait in these tests. An unbounded spin on a gate
+// that never shuts hangs the whole `go test` binary until the package timeout
+// and says nothing about which test wedged; failing here names it.
+func (n *Node) waitKVIndexGateShut(t *testing.T, group int) {
+	t.Helper()
 	g := n.kvIndexWalkGateFor(group)
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		g.mu.Lock()
 		shut := g.closed
 		g.mu.Unlock()
 		if shut {
 			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("shard group %d's walk gate was not shut within 30s; the removal never reached it", group)
 		}
 		runtime.Gosched()
 	}

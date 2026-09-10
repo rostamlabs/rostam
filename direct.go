@@ -173,12 +173,19 @@ type directStore struct {
 	// identical reason (see shard.Store.drainCalls); a Direct store is the third
 	// host of the same hazard and had none.
 	//
-	// IT IS THE READ-ONLY OPS THAT NEED IT. A read-write op serialises on opMu,
-	// but a read-only one deliberately takes no lock at all — the cache's own
-	// per-shard RWMutex gives each individual read its atomicity, which says
+	// IT IS THE READ-ONLY OPS THAT NEED IT MOST. A read-write op serialises on
+	// opMu, but a read-only one deliberately takes no lock at all — the cache's
+	// own per-shard RWMutex gives each individual read its atomicity, which says
 	// nothing about a walk that spans many of them. A kv_query SCAN is the worst
 	// case: it walks the whole keyspace, aliasing pages d.cache.Close() unmaps,
 	// so a scan racing Close reads freed memory and takes the process down.
+	//
+	// EVERY CACHE-TOUCHING ENTRY POINT REGISTERS, not just Call. Get, GetInto,
+	// Put and Del reach the cache directly without going through the registry, so
+	// a fence on Call alone would leave four doors open — opMu makes Put and Del
+	// mutually exclusive with each other and with read-write ops, and none of
+	// that says anything about Close. The vector methods are not listed because
+	// they all funnel through Call.
 	callsMu       sync.Mutex
 	calls         int
 	callsDraining bool
@@ -251,6 +258,10 @@ func (d *directStore) drainCalls(timeout time.Duration) bool {
 }
 
 func (d *directStore) Get(_ context.Context, key []byte) ([]byte, error) {
+	if !d.beginCall() {
+		return nil, ErrDirectClosed
+	}
+	defer d.endCall()
 	raw, err := d.cache.Get(key)
 	if err != nil {
 		if errors.Is(err, cache.ErrNotFound) {
@@ -262,6 +273,10 @@ func (d *directStore) Get(_ context.Context, key []byte) ([]byte, error) {
 }
 
 func (d *directStore) GetInto(_ context.Context, key, dst []byte) ([]byte, error) {
+	if !d.beginCall() {
+		return nil, ErrDirectClosed
+	}
+	defer d.endCall()
 	raw, err := d.cache.GetInto(dst[:0], key)
 	if err != nil {
 		if errors.Is(err, cache.ErrNotFound) {
@@ -280,6 +295,10 @@ func (d *directStore) GetInto(_ context.Context, key, dst []byte) ([]byte, error
 // Raft FSM as incr and can never interleave. Get stays lock-free like read-only
 // ops (the cache shard RWMutex gives each read its own atomicity).
 func (d *directStore) Put(_ context.Context, key, value []byte, ttl time.Duration) error {
+	if !d.beginCall() {
+		return ErrDirectClosed
+	}
+	defer d.endCall()
 	mu := &d.opMu[d.cache.ShardIndex(key)]
 	mu.Lock()
 	defer mu.Unlock()
@@ -300,6 +319,10 @@ func (d *directStore) Put(_ context.Context, key, value []byte, ttl time.Duratio
 }
 
 func (d *directStore) Del(_ context.Context, key []byte) (bool, error) {
+	if !d.beginCall() {
+		return false, ErrDirectClosed
+	}
+	defer d.endCall()
 	mu := &d.opMu[d.cache.ShardIndex(key)]
 	mu.Lock()
 	defer mu.Unlock()
@@ -426,9 +449,9 @@ func (d *directStore) Close() error {
 	d.stopKVIndexReconciler()
 	// Then the CALLERS' reads. A read-only op takes no op lock by design, so a
 	// kv_query scan can still be walking the cache right now; d.cache.Close()
-	// unmaps the pages it is reading. Draining here means no handler is inside
-	// the cache past this point, and every later Call is refused rather than
-	// admitted into a store that is being torn down.
+	// unmaps the pages it is reading. Draining here means nothing is inside the
+	// cache past this point, and every later Call, Get, GetInto, Put or Del is
+	// refused rather than admitted into a store that is being torn down.
 	if !d.drainCalls(directCallDrainTimeout) {
 		slog.Warn("direct store closing with calls still in flight; proceeding after the drain bound",
 			"component", "direct", "waited", directCallDrainTimeout)

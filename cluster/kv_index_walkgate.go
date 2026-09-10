@@ -95,10 +95,45 @@ func (n *Node) kvIndexWalkGateFor(group int) *kvIndexWalkGate {
 	return g
 }
 
+// beginKVIndexWalkFor registers a walk on group AND confirms that s is still the
+// store this node hosts for it. It is what every caller holding a store pointer
+// must use; beginKVIndexWalk alone is only safe for a caller that has none.
+//
+// THE GATE IS PER GROUP, THE HAZARD IS PER STORE, and that gap is a real window.
+// A removal shuts the gate inside the shardMu section that nils the slot, then
+// waits, then closes the store. A concurrent AddShardOwner re-arms the gate for
+// the REPLACEMENT store — correctly, that store needs to be walkable — and if a
+// pass is still holding the OLD store pointer it can now register against the
+// re-armed gate, after the removal's wait has already returned, and be walking
+// the old store when s.Close() unmaps it.
+//
+// The re-check closes it without a generation counter, because n.shards IS the
+// generation: the removal nils the slot before it shuts the gate, both under
+// shardMu, so any walk that registers afterwards reads a slot that is nil or
+// holds a different store and refuses. A walk that registered BEFORE that
+// critical section is covered by the wait, as it always was. getShard takes only
+// shardMu.RLock and is called with the gate mutex already released, so the lock
+// order (shardMu then gate) that RemoveShardOwner uses is not inverted.
+func (n *Node) beginKVIndexWalkFor(group int, s *shard.Store) (stop <-chan struct{}, done func(), ok bool) {
+	stop, done, ok = n.beginKVIndexWalk(group)
+	if !ok {
+		return nil, func() {}, false
+	}
+	if n.getShard(group) != s {
+		done()
+		return nil, func() {}, false
+	}
+	return stop, done, true
+}
+
 // beginKVIndexWalk registers a walk on group. It reports ok=false when the group
 // is being (or has been) removed, in which case the caller must not walk that
 // store at all. On ok the caller MUST call done when the walk returns, and
 // should stop the walk when stop is closed.
+//
+// A caller that already holds a *shard.Store must use beginKVIndexWalkFor
+// instead: this function answers for the GROUP, and a group can have been
+// removed and re-added under a pass still holding the old store.
 func (n *Node) beginKVIndexWalk(group int) (stop <-chan struct{}, done func(), ok bool) {
 	g := n.kvIndexWalkGateFor(group)
 	g.mu.Lock()
@@ -180,8 +215,10 @@ func (n *Node) reopenKVIndexWalks(group int) {
 // existence: both node constructors and AddShardOwner.
 func (n *Node) installKVQueryScanGate(group int, s *shard.Store) {
 	plain := s.CacheWalker()
+	// s is captured, so the walk can assert it is still THIS node's store for the
+	// group — see beginKVIndexWalkFor for the remove/re-add window that needs.
 	s.SetKVWalker(func(yield func(key, value []byte) bool) error {
-		return n.gatedKVWalk(group, plain, yield)
+		return n.gatedKVWalk(group, s, plain, yield)
 	})
 }
 
@@ -198,8 +235,8 @@ func (n *Node) installKVQueryScanGate(group int, s *shard.Store) {
 // A walk that could not register (ok=false) means the group is already being
 // removed. It must not touch that store at all, and the caller must be told:
 // a scan that visited nothing looks exactly like a scan that matched nothing.
-func (n *Node) gatedKVWalk(group int, walk kvindex.Walker, yield func(key, value []byte) bool) error {
-	stop, done, ok := n.beginKVIndexWalk(group)
+func (n *Node) gatedKVWalk(group int, s *shard.Store, walk kvindex.Walker, yield func(key, value []byte) bool) error {
+	stop, done, ok := n.beginKVIndexWalkFor(group, s)
 	if !ok {
 		return fmt.Errorf("%w: shard group %d is being removed from this node", kvindex.ErrWalkAborted, group)
 	}

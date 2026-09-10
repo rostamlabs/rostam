@@ -702,7 +702,7 @@ func TestKVQueryScanDrainsBeforeShardRemoval(t *testing.T) {
 
 	// Shut the gate first, then let the parked walk run into it, so the refusal
 	// is deterministic rather than a coin toss.
-	n.waitKVIndexGateShut(0)
+	n.waitKVIndexGateShut(t, 0)
 	park.release()
 
 	select {

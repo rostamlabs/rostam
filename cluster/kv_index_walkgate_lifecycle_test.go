@@ -4,6 +4,8 @@ package cluster
 
 import (
 	"testing"
+
+	"github.com/rostamlabs/rostam/shard"
 )
 
 // TestKVIndexWalkGateBornClosedAfterNodeDrain pins the shutdown latch.
@@ -75,5 +77,52 @@ func TestKVIndexWalkGateShutAndReArmAreOrdered(t *testing.T) {
 	n.closeKVIndexWalkGate(3)
 	if _, _, ok := n.beginKVIndexWalk(3); ok {
 		t.Fatal("after a removal the gate must refuse walks")
+	}
+}
+
+// TestKVIndexWalkRegistrationIsBoundToTheStore.
+//
+// The gate is per GROUP; the hazard is per STORE, and that gap is a real window.
+// A removal shuts the gate inside the shardMu section that nils the slot, then
+// waits, then closes the store — but a concurrent AddShardOwner re-arms the gate
+// for the REPLACEMENT store, correctly, since that store must be walkable. A
+// pass still holding the OLD store pointer could then register against the
+// re-armed gate AFTER the removal's wait had already returned, and be walking the
+// old store when Close unmapped it.
+//
+// n.shards is the generation that closes it: the removal nils the slot before it
+// shuts the gate, both under shardMu, so any walk registering afterwards reads a
+// slot that no longer names its store and is refused.
+func TestKVIndexWalkRegistrationIsBoundToTheStore(t *testing.T) {
+	c := newTestCluster(t, 1, 2)
+	n := c.nodes[0]
+
+	live := n.getShard(0)
+	if live == nil {
+		t.Fatal("fixture: the node does not host shard group 0")
+	}
+
+	// The store this node actually hosts is admitted.
+	stop, done, ok := n.beginKVIndexWalkFor(0, live)
+	if !ok {
+		t.Fatal("a walk on the hosted store was refused")
+	}
+	if stop == nil {
+		t.Fatal("an admitted walk got no stop channel")
+	}
+	done()
+
+	// A DIFFERENT store pointer for the same group — what a pass holds after a
+	// remove and re-add — is refused even though the gate is wide open.
+	stale := &shard.Store{}
+	if _, _, ok := n.beginKVIndexWalkFor(0, stale); ok {
+		t.Fatal("a walk registered against a store this node no longer hosts for the group; a re-armed gate must not admit a stale store pointer")
+	}
+
+	// And the refusal must not leak a registration, or a later removal would wait
+	// on a walk that never started. A drain that returns proves the count is zero.
+	n.drainKVIndexWalks(0)
+	if _, _, ok := n.beginKVIndexWalkFor(0, live); ok {
+		t.Fatal("the gate admitted a walk after being drained")
 	}
 }

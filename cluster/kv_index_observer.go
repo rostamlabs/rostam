@@ -371,7 +371,11 @@ const kvIndexAbortCheckEvery = 256
 // early. A half-read keyspace presented as an exact index answers queries with
 // silently missing rows, which is the one failure this index may not have.
 func (n *Node) backfillKVIndex(group int, s *shard.Store, idx *kvindex.Set, name string) bool {
-	stop, done, ok := n.beginKVIndexWalk(group)
+	// FOR THIS STORE, not merely for this group: a pass can be holding a store
+	// pointer that a removal has already taken out of n.shards, and a concurrent
+	// re-add would otherwise let this walk in through the replacement's re-armed
+	// gate and straight into the old store's mapping. See beginKVIndexWalkFor.
+	stop, done, ok := n.beginKVIndexWalkFor(group, s)
 	if !ok {
 		return false // the group is being removed; do not touch its store
 	}

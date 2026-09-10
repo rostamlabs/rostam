@@ -56,10 +56,16 @@ func (s *Store) startKVIndexReconciler() {
 		return
 	}
 	// CLAMPED. time.Duration is int64 nanoseconds, so a setting above about
-	// 9.2e9 ms overflows the multiplication — and the wrap is an arbitrary value,
-	// including a negative one, which the guard above reads as "disabled". A
-	// misconfigured knob would then silently switch the reconciler OFF rather
-	// than run it slowly. Matches direct_kv_index_reconcile.go's clamp.
+	// 9.2e12 ms (roughly 292 years — only an absurd one) overflows the
+	// multiplication into an arbitrary value, negative included.
+	//
+	// AND HERE A NEGATIVE ONE IS NOT "DISABLED", IT IS A PANIC. The guard above
+	// reads the raw config field, which is positive, so the wrapped duration
+	// sails past it and reaches time.NewTicker — which panics on a non-positive
+	// interval, taking the store's construction down at startup. (The Direct twin
+	// in direct_kv_index_reconcile.go fails the other way: it tests the DURATION,
+	// so a wrapped negative there reads as "disabled" and silently switches the
+	// pass off. Same clamp, two different failure modes it prevents.)
 	interval := time.Duration(math.MaxInt64)
 	if int64(s.cfg.KVIndexReconcileIntervalMs) <= int64(math.MaxInt64)/int64(time.Millisecond) {
 		interval = time.Duration(s.cfg.KVIndexReconcileIntervalMs) * time.Millisecond

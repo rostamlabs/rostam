@@ -1097,7 +1097,7 @@ func TestKVIndexBackfillDrainsBeforeShardRemoval(t *testing.T) {
 
 	// Let the removal shut the gate before the walk looks at it, so the abort is
 	// not a coin toss. Then let the walk run on into that shut gate.
-	n.waitKVIndexGateShut(0)
+	n.waitKVIndexGateShut(t, 0)
 	park.release()
 
 	select {
