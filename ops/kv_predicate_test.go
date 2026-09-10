@@ -11,6 +11,7 @@ package ops
 // a store or a dispatcher.
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/rostamlabs/rostam/ops/kvindex"
@@ -133,8 +134,15 @@ func TestBuildKVPredicateRejectsBadFields(t *testing.T) {
 		{"count not last", "a#count/b"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := BuildKVPredicate(leaf(vtypes.FilterEq, tc.field, vtypes.NewInt(1))); err == nil {
+			_, err := BuildKVPredicate(leaf(vtypes.FilterEq, tc.field, vtypes.NewInt(1)))
+			if err == nil {
 				t.Fatalf("BuildKVPredicate(field %q): want an error, got nil", tc.field)
+			}
+			// The MARKER, not just an error: the coordinator classifies a
+			// permanent client error by it, and an unmarked one is retried
+			// across every replica before failing identically.
+			if !errors.Is(err, ErrKVQueryFilter) {
+				t.Fatalf("BuildKVPredicate(field %q): %v is not marked ErrKVQueryFilter", tc.field, err)
 			}
 		})
 	}
@@ -160,8 +168,40 @@ func TestBuildKVPredicateRefusesAnOversizeTree(t *testing.T) {
 	for i := 0; i < wire.KVQueryMaxFilterDepth+2; i++ {
 		deep = vtypes.Filter{Op: vtypes.FilterNot, Not: ptrFilter(deep)}
 	}
-	if _, err := BuildKVPredicate(deep); err == nil {
+	_, err := BuildKVPredicate(deep)
+	if err == nil {
 		t.Fatal("a filter deeper than KVQueryMaxFilterDepth must be refused")
+	}
+	if !errors.Is(err, ErrKVQueryFilter) {
+		t.Fatalf("an over-budget tree must be marked ErrKVQueryFilter, got %v", err)
+	}
+	// And the inner sentinel stays inspectable through the wrap.
+	if !errors.Is(err, wire.ErrKVFilterBudget) {
+		t.Fatalf("the budget error must stay inspectable through the wrap, got %v", err)
+	}
+}
+
+func TestBuildKVPredicateMarksCompilerRejections(t *testing.T) {
+	// vector.CompileFilter's own rejections are permanent client errors too, so
+	// they carry the same marker. An `in` whose value is not a list is the
+	// cheapest one to reach.
+	for _, tc := range []struct {
+		name string
+		f    vtypes.Filter
+	}{
+		{"in over a non-list", leaf(vtypes.FilterIn, "rc", vtypes.NewInt(1))},
+		{"unknown op", vtypes.Filter{Op: vtypes.FilterOp(250), Field: "rc"}},
+		{"not with no child", vtypes.Filter{Op: vtypes.FilterNot}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := BuildKVPredicate(tc.f)
+			if err == nil {
+				t.Fatalf("BuildKVPredicate(%+v): want an error, got nil", tc.f)
+			}
+			if !errors.Is(err, ErrKVQueryFilter) {
+				t.Fatalf("%v is not marked ErrKVQueryFilter", err)
+			}
+		})
 	}
 }
 

@@ -32,7 +32,14 @@ const KVRecordAlias = "$rec"
 // ErrKVQueryFilter marks a kv_query filter as one this leaf will not compile:
 // a leaf addressing a reserved "$" name (the record alias itself, or any other
 // name the evaluator gives special meaning), a field record.ParsePath rejects,
-// or a tree over the node/depth budget.
+// a tree over the node/depth budget, or anything vector.CompileFilter itself
+// refuses.
+//
+// EVERY rejection BuildKVPredicate can return carries this marker, and that is
+// load-bearing rather than tidy: these are all PERMANENT client errors, and the
+// coordinator tells permanent from retryable by this sentinel. An unwrapped one
+// would be retried against every replica of every shard group before failing
+// with the same answer.
 //
 // A MALFORMED PATH IS AN ERROR, NOT A FALSE LEAF. vector.newFieldLookup
 // degrades an unparseable path to an exact-key lookup, which against this
@@ -65,13 +72,23 @@ func BuildKVPredicate(f vtypes.Filter) (vector.Predicate, error) {
 	// decoder. The rewrite below recurses, so the depth cap is what keeps a
 	// hostile tree off the goroutine stack.
 	if err := wire.CheckFilterBudget(f, wire.KVQueryMaxFilterNodes, wire.KVQueryMaxFilterDepth); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrKVQueryFilter, err)
 	}
 	rewritten, err := rewriteKVFilter(f)
 	if err != nil {
 		return nil, err
 	}
-	return vector.CompileFilter(rewritten)
+	pred, err := vector.CompileFilter(rewritten)
+	if err != nil {
+		// WRAPPED, like every other rejection here. An unknown op, a malformed
+		// geo region, an `in` whose value is not a list: all are the client's
+		// filter being wrong, and all are PERMANENT. The coordinator classifies
+		// a permanent error by this marker, so an unwrapped one would be
+		// retried against every replica of every group before failing — the
+		// same wrong answer, N times slower.
+		return nil, fmt.Errorf("%w: %w", ErrKVQueryFilter, err)
+	}
+	return pred, nil
 }
 
 // rewriteKVFilter returns a copy of f with every leaf field aliased. It
