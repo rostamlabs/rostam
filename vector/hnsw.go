@@ -3099,18 +3099,30 @@ func (h *hnsw) mutatePayloadRecordBody(id uint64, key string, fn RecordMutator, 
 		// it cannot reach bytes the operate engine just produced, which is what
 		// this site exists for. Keep the two in step.
 		//
-		// SIZE ONLY, DELIBERATELY: no record.Validate here. These bytes come from
-		// applyRecordBytes, which phase 1 held to the tree oracle, so they are
-		// well-formed by construction; re-decoding the whole record on every
-		// counter increment would double the op's cost for a case that cannot
-		// arise. The shape check belongs where bytes arrive from a CALLER, which
-		// is checkRecordValues.
+		// SIZE FIRST, THEN SHAPE — the same order and the same two gates
+		// checkRecordValues applies to a caller's patch, so an oversize value is
+		// refused without ever being decoded.
 		//
-		// The MESSAGE comes from recordTooLargeErr (vector/metadata.go), the one
-		// producer of this error's detailed form: one canonical shape for the
-		// matcher to anchor on across replication, with the caller's key bounded.
+		// The shape check is here because MutatePayloadRecordCAS is EXPORTED. The
+		// mutator ops supplies returns applyRecordBytes' output, which phase 1
+		// held to the tree oracle and which cannot be malformed — but a direct Go
+		// caller of this API supplies its own mutator, and whatever bytes it
+		// returns were being stored on the size cap alone. That poisons the
+		// payload key for the whole collection: every path under it declines to
+		// accelerate, and a later vector_operate on the same key fails with
+		// wire.ErrOperateRecord. The cost is one decode of the bytes the engine
+		// just produced, on a write that already decoded and re-encoded the
+		// record.
+		//
+		// Both MESSAGES come from the one producer of their detailed form
+		// (recordTooLargeErr / recordMalformedErr, vector/metadata.go): one
+		// canonical shape for the transport matchers to anchor on across
+		// replication, with the caller's key bounded.
 		if len(rec) > maxRecordValueBytes {
 			return nil, nil, 0, false, recordTooLargeErr(key, len(rec))
+		}
+		if verr := validateRecord(rec); verr != nil {
+			return nil, nil, 0, false, recordMalformedErr(key, verr)
 		}
 	default:
 		return nil, nil, 0, false, ErrRecordMutation

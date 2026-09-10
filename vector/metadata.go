@@ -201,6 +201,20 @@ func recordTooLargeErr(key string, n int) error {
 		ErrRecordTooLarge, clipField(key), n, maxRecordValueBytes)
 }
 
+// recordMalformedErr is the ONE producer of ErrRecordMalformed's detailed form,
+// the twin of recordTooLargeErr and for the same two reasons: the message is
+// carried across replication as a string, so IsRecordMalformedMessage has to
+// anchor on ONE shape; and the key is caller-supplied, so it goes through
+// clipField rather than %q.
+//
+// err is what validateRecord (record.Validate) said about the bytes; it is
+// wrapped, not summarised, so the caller learns which part of the record could
+// not be opened. Both the ingest gate (checkRecordValues) and the four
+// post-mutation gates in the engine bodies raise it from here.
+func recordMalformedErr(key string, err error) error {
+	return fmt.Errorf("%w: payload key %s: %w", ErrRecordMalformed, clipField(key), err)
+}
+
 // checkRecordValues is the INGEST gate for every payload a caller supplies. It
 // rejects a ValueRecord that is oversize (ErrRecordTooLarge) or that no operate
 // engine could open (ErrRecordMalformed). Every wire-reachable mutation entry
@@ -264,7 +278,7 @@ func checkRecordValues(m Metadata) error {
 			return recordTooLargeErr(k, len(v.Rec))
 		}
 		if err := validateRecord(v.Rec); err != nil {
-			return fmt.Errorf("%w: payload key %s: %w", ErrRecordMalformed, clipField(k), err)
+			return recordMalformedErr(k, err)
 		}
 	}
 	return nil

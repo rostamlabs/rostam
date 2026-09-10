@@ -988,3 +988,108 @@ func TestMutateRecordNamedWALNoOp(t *testing.T) {
 		})
 	}
 }
+
+// TestMutateRejectsMalformedMutatorBytes drives every engine's post-mutation
+// SHAPE gate, the twin of the size cap beside it.
+//
+// MutatePayloadRecordCAS is exported. The mutator ops supplies cannot produce
+// malformed bytes — it returns applyRecordBytes' output — but a direct Go caller
+// brings its own, and bytes that no operate engine can open used to be stored on
+// the size cap alone. That poisons the payload key for the whole collection: no
+// path under it accelerates, and the next vector_operate on the same key fails.
+//
+// The refusal must leave the point byte-identical AND unbumped, exactly like a
+// failed CHECK — the record the caller already had is not collateral for a bad
+// mutator.
+func TestMutateRejectsMalformedMutatorBytes(t *testing.T) {
+	garbage := []byte{0xff, 0x00, 0x13, 0x37}
+	if err := validateRecord(garbage); err == nil {
+		t.Fatal("fixture is not malformed: validateRecord accepted it")
+	}
+	for _, newH := range allMutateHarnesses(t) {
+		h := newH(t)
+		t.Run(h.name, func(t *testing.T) {
+			before, ok := h.record(t, 1, "session")
+			if !ok {
+				t.Fatal("harness seed is missing the session record")
+			}
+			beforeVersion := h.version(1)
+
+			_, changed, err := h.mutate(1, "session", func(_ []byte, _ bool) ([]byte, RecordMutation, error) {
+				return garbage, RecordStore, nil
+			}, CASCond{})
+			if !errors.Is(err, ErrRecordMalformed) {
+				t.Fatalf("a mutator returning malformed bytes = %v, want ErrRecordMalformed", err)
+			}
+			if changed {
+				t.Fatal("the refused mutation reported changed=true")
+			}
+			if !IsRecordMalformedMessage(err.Error()) {
+				t.Fatalf("message %q is not the shape the transport classifiers match; "+
+					"a clustered caller would see it redacted to an internal error", err)
+			}
+
+			after, ok := h.record(t, 1, "session")
+			if !ok {
+				t.Fatal("the refused mutation removed the record")
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatal("the refused mutation changed the stored record")
+			}
+			if got := h.version(1); got != beforeVersion {
+				t.Fatalf("version = %d after a refused mutation, want %d (unbumped)", got, beforeVersion)
+			}
+		})
+	}
+}
+
+// TestMutateValidatesRecordExactlyOnce pins the cost of the gate above: one
+// decode of the bytes the engine just produced, never two. The shape check is
+// O(record) with allocations, so a path that grew a second pass would multiply
+// the cost of every operate — the same invariant
+// TestRecordValidationCountPerWrite holds for the ingest paths.
+func TestMutateValidatesRecordExactlyOnce(t *testing.T) {
+	want := sessionRecordBytesRC(t, 9)
+	for _, newH := range allMutateHarnesses(t) {
+		h := newH(t)
+		t.Run(h.name, func(t *testing.T) {
+			n := countValidates(t, func() {
+				if _, _, err := h.mutate(1, "session", func(_ []byte, _ bool) ([]byte, RecordMutation, error) {
+					return want, RecordStore, nil
+				}, CASCond{}); err != nil {
+					t.Fatalf("mutate: %v", err)
+				}
+			})
+			if n != 1 {
+				t.Fatalf("a record mutation decoded its result %d times, want exactly 1", n)
+			}
+		})
+	}
+}
+
+// TestMutateSkipsValidationWhenNothingIsStored is the other half of the cost
+// invariant: a mutation that stores nothing must not decode anything.
+func TestMutateSkipsValidationWhenNothingIsStored(t *testing.T) {
+	for _, newH := range allMutateHarnesses(t) {
+		h := newH(t)
+		t.Run(h.name, func(t *testing.T) {
+			for _, act := range []struct {
+				name string
+				act  RecordMutation
+			}{{"unchanged", RecordUnchanged}, {"delete", RecordDelete}} {
+				t.Run(act.name, func(t *testing.T) {
+					n := countValidates(t, func() {
+						if _, _, err := h.mutate(1, "session", func(_ []byte, _ bool) ([]byte, RecordMutation, error) {
+							return nil, act.act, nil
+						}, CASCond{}); err != nil {
+							t.Fatalf("mutate: %v", err)
+						}
+					})
+					if n != 0 {
+						t.Fatalf("a %s mutation decoded a record %d times, want 0", act.name, n)
+					}
+				})
+			}
+		})
+	}
+}
