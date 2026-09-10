@@ -356,6 +356,58 @@ func TestVectorOperateRefusedDuringReshard(t *testing.T) {
 	}
 }
 
+// TestVectorOperateRefusedWhenDualRoutingCollapses is the case gating on
+// dualTargets' `dual` answer let through.
+//
+// A reshard whose state carries no old-gen pin (OldP == 0 — a meta entry
+// written by pre-upgrade code) takes dualTargets' backward-compat branch, which
+// returns dual=false as soon as the catalog has flipped to the new generation.
+// The reshard is still RUNNING: Status is only cleared later, and meta-followers
+// that have not applied the flip still route reads to the OLD generation. An
+// operate allowed through there applies its non-idempotent op-list to the new
+// generation alone, and the two generations hold different record bytes until
+// the old one is dropped.
+//
+// Gating on Status instead of on dual makes the refusal cover the whole reshard,
+// which is what ErrOperateDuringReshard's "retry after cutover" already promises.
+func TestVectorOperateRefusedWhenDualRoutingCollapses(t *testing.T) {
+	const (
+		coll       = "collapsed"
+		oldP, newP = 4, 8
+		id         = uint64(7)
+	)
+	ee := setupReshardingDense(t, coll, oldP, newP)
+	ctx := context.Background()
+
+	must(t, ee.VectorInsert(ctx, coll, id, []float32{1, 0, 0, 0}))
+
+	// Post-cutover, no old-gen pin: the catalog routes to the new gen and the
+	// reshard state names only the new one — dualTargets answers dual=false.
+	must(t, ee.catalog.SetPartitionsGen(coll, newP, 1))
+	must(t, ee.catalog.SetReshardState(coll, ReshardState{Status: 1, NewP: newP, NewGen: 1}))
+	if _, _, dual := ee.dualTargets(coll, id); dual {
+		t.Fatal("fixture is wrong: dualTargets still reports dual=true, so it does not exercise the collapse")
+	}
+
+	if _, _, _, err := ee.VectorOperate(ctx, coll, id, "session", bumpRC()); !errors.Is(err, ErrOperateDuringReshard) {
+		t.Fatalf("operate while a reshard is in progress but dual routing has collapsed = %v, "+
+			"want ErrOperateDuringReshard", err)
+	}
+	newPhys := string(ops.PartitionKeyGen(coll, 1, ops.PartitionOf(id, newP)))
+	if !physRecordAbsent(t, ee, newPhys, id, "session") {
+		t.Fatalf("the refused operate wrote a record to %q", newPhys)
+	}
+
+	// Same negative control as the dual-write case: with the reshard cleared the
+	// identical call goes through, so the gate is the STATUS and nothing else.
+	must(t, ee.catalog.SetReshardState(coll, ReshardState{Status: 0}))
+	found, res, _, err := ee.VectorOperate(ctx, coll, id, "session", bumpRC())
+	must(t, err)
+	if !found || retRC(t, res) != 1 {
+		t.Fatalf("operate after the reshard cleared: found=%v res=%+v, want rc=1", found, res)
+	}
+}
+
 // TestVectorOperateMissingPointFlagThroughFanOut: an absent point is the
 // not-found FLAG, never an error — the same contract set_payload has.
 func TestVectorOperateMissingPointFlagThroughFanOut(t *testing.T) {
@@ -500,6 +552,85 @@ func TestVectorOperateNamedAndMVThroughStoreAndFanOut(t *testing.T) {
 			must(t, err)
 			if found {
 				t.Fatalf("fan %s on an absent id: found=true, want false", fam.op)
+			}
+		})
+	}
+}
+
+// bumpRCNoCreate is bumpRC with create = NONE: against a payload key that holds
+// no record it is the error case ops.ErrVectorRecordAbsent, not a silent no-op.
+func bumpRCNoCreate() *wire.OperateArgs {
+	a := bumpRC()
+	a.Create = wire.OperateCreateNone
+	return a
+}
+
+// TestVectorOperateRecordAbsentIsTheSameSentinelOnEveryBackend pins the error
+// contract Store.VectorOperate documents: create = NONE against a payload key
+// holding no record is ops.ErrVectorRecordAbsent, whichever Store implementation
+// the caller holds.
+//
+// The three backends disagreed before this. Direct returned the sentinel;
+// replicated embedded returned it stringified across the Raft boundary, where
+// errors.Is stops matching; and the networked path answered StatusNotFound,
+// which the client turns into its own not-found and the root store into
+// ErrNotFound. A caller writing errors.Is(err, ops.ErrVectorRecordAbsent) — the
+// check the interface doc tells them to write — got a different answer per
+// deployment mode.
+//
+// found stays false and version stays 0 on all three: the call changed nothing.
+func TestVectorOperateRecordAbsentIsTheSameSentinelOnEveryBackend(t *testing.T) {
+	const (
+		coll = "docs"
+		id   = uint64(1)
+	)
+	backends := []struct {
+		name  string
+		build func(t *testing.T) Store
+	}{
+		{"embedded", func(t *testing.T) Store {
+			s := newSingleEmbedded(t)
+			waitLeaderEmbedded(t, s)
+			return s
+		}},
+		{"direct", func(t *testing.T) Store { return newSingleDirect(t) }},
+		{"networked", func(t *testing.T) Store {
+			reg := ops.NewRegistry()
+			must(t, ops.RegisterBuiltins(reg))
+			srv, err := NewDirectServer("127.0.0.1:0", DirectConfig{Ops: reg})
+			must(t, err)
+			t.Cleanup(func() { _ = srv.Close() })
+			s, err := NewClient(ClientConfig{Servers: []string{srv.Addr()}, Ops: reg})
+			must(t, err)
+			t.Cleanup(func() { _ = s.Close() })
+			return s
+		}},
+	}
+	for _, b := range backends {
+		t.Run(b.name, func(t *testing.T) {
+			s := b.build(t)
+			ctx := context.Background()
+			// The point EXISTS and carries no record under "session": an absent
+			// point would be the found=false flag, which is a different outcome.
+			seedOperateCollection(t, s, coll, 0, 1)
+
+			found, res, version, err := s.VectorOperate(ctx, coll, id, "session", bumpRCNoCreate())
+			if !errors.Is(err, ops.ErrVectorRecordAbsent) {
+				t.Fatalf("create=NONE against a keyless payload = %v, want ops.ErrVectorRecordAbsent", err)
+			}
+			if found || res != nil || version != 0 {
+				t.Fatalf("refused call returned (found=%v, res=%v, version=%d); want the zero outcome", found, res, version)
+			}
+
+			// Negative control: with a record present the same call applies, so
+			// the normalisation cannot be swallowing a real success.
+			if _, _, _, err := s.VectorOperate(ctx, coll, id, "session", bumpRC()); err != nil {
+				t.Fatalf("seed operate: %v", err)
+			}
+			found, res, _, err = s.VectorOperate(ctx, coll, id, "session", bumpRCNoCreate())
+			must(t, err)
+			if !found || retRC(t, res) != 2 {
+				t.Fatalf("create=NONE with a record present: found=%v res=%+v, want rc=2", found, res)
 			}
 		})
 	}

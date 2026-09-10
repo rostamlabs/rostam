@@ -842,7 +842,10 @@ func (n *networkedStore) vectorOperate(ctx context.Context, opName, collection s
 	}
 	body, err := n.wcCall(ctx, opName, args, wo)
 	if err != nil {
-		return false, nil, 0, mapErr(err)
+		// mapVectorOperateErr AFTER mapErr: mapErr turns the transport's
+		// StatusNotFound into the root ErrNotFound, and the operate contract
+		// names ops.ErrVectorRecordAbsent for that outcome on every backend.
+		return false, nil, 0, mapVectorOperateErr(mapErr(err))
 	}
 	return ops.DecodeVectorOperateResult(body)
 }

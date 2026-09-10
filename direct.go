@@ -881,7 +881,10 @@ func (d *directStore) vectorOperate(opName, collection string, id uint64, payloa
 	}
 	body, err := d.Call(context.Background(), opName, args)
 	if err != nil {
-		return false, nil, 0, err
+		// Identity survives in-process here, so this is a no-op on the happy
+		// path; it is applied anyway so all three backends run the SAME
+		// normalisation and none can drift.
+		return false, nil, 0, mapVectorOperateErr(err)
 	}
 	return ops.DecodeVectorOperateResult(body)
 }

@@ -1639,33 +1639,60 @@ var ErrOperateDuringReshard = ops.ErrOperateDuringReshard
 //
 // Two things it does that the set_payload family does NOT:
 //
-//   - It REFUSES rather than dual-writes when dualTargets reports a reshard. See
-//     ErrOperateDuringReshard.
+//   - It REFUSES rather than dual-writes for the whole time the catalog reports
+//     a reshard in progress. See ErrOperateDuringReshard.
 //   - It threads the CAS precondition into the ARGS. networkedStore and
 //     directStore's set_payload siblings drop the precondition on the floor
 //     (client.go's non-CAS encoder, direct.go's `_ ...WriteOpts`); every operate
 //     path honors it.
 //
-// The refusal is a CHECK, not a fence: dualTargets reads the LOCAL catalog, so a
-// reshard that begins between that read and the Raft apply lets one operate land
-// on the live generation only, and if the backfill already copied that point the
+// The refusal is a CHECK, not a fence: it reads the LOCAL catalog, so a reshard
+// that begins between that read and the Raft apply lets one operate land on the
+// live generation only, and if the backfill already copied that point the
 // increment is lost at cutover. The window is one op's dispatch latency at the
 // instant a reshard starts — the same TOCTOU class set_payload's dual-write
-// already lives with. Closing it needs a catalog-epoch fence on the apply path
-// and is a recorded follow-up; this closes the STEADY-STATE reshard, which is the
-// part that lasts minutes rather than microseconds.
+// already lives with.
+//
+// Closing it is NOT a matter of carrying the observed generation in the args and
+// re-checking inside the apply, which is the obvious-looking fix. The reshard
+// state lives in the META Raft log (cluster.Node's meta FSM) while the operate
+// entry travels in its shard group's OWN log, and two independent logs have no
+// defined relative order: replica A can have applied the reshard-begin entry
+// when it applies operate entry N while replica B has not, so an apply-time
+// check of that state would accept on one replica and reject on another —
+// permanent divergence, strictly worse than the lost increment. The only
+// deterministic closure is a marker entry proposed into each affected
+// partition's own shard log at reshard phase 1, which is a recorded follow-up
+// (it would close set_payload's identical window too). This closes the
+// STEADY-STATE reshard, which is the part that lasts minutes rather than
+// microseconds.
 func (e *embedded) vectorOperate(opName, collection string, id uint64, payloadKey string,
 	a *wire.OperateArgs, opts []WriteOpts,
 ) (bool, *wire.OperateResult, uint64, error) {
 	collection = e.resolveAlias(collection)
-	live, _, dual := e.dualTargets(collection, id)
-	if dual {
+	// The gate is the reshard STATUS, not dualTargets' `dual` answer. dual is a
+	// ROUTING decision and it collapses to false in two situations where the
+	// two generations still both matter:
+	//
+	//   - a reshard whose state carries no old-gen pin (a pre-upgrade meta
+	//     entry, dualTargets' OldP <= 0 branch) reports dual=false the moment
+	//     the catalog flips to the new gen, while meta-followers that have not
+	//     applied the flip still route READS to the old gen — a non-idempotent
+	//     op-list applied to the new gen only leaves the two holding different
+	//     record bytes until the old gen is dropped;
+	//   - the degenerate case where an id happens to hash to the same partition
+	//     in both generations, which says nothing about the backfill still
+	//     copying every OTHER point.
+	//
+	// Refusing for the whole reshard is the conservative reading and matches
+	// what the error says: retry after cutover.
+	if st, on := e.catalog.ReshardState(collection); on && st.Status == 1 {
 		// ops.OperateDuringReshardErr is the one producer of the detailed form:
 		// the shape the transport classifiers anchor on, with the caller's
 		// collection name bounded.
 		return false, nil, 0, ops.OperateDuringReshardErr(collection)
 	}
-	if live != "" {
+	if live, _, _ := e.dualTargets(collection, id); live != "" {
 		collection = live
 	}
 	wo := firstWriteOpts(opts)
@@ -1676,7 +1703,9 @@ func (e *embedded) vectorOperate(opName, collection string, id uint64, payloadKe
 	}
 	body, err := e.Call(context.Background(), opName, args)
 	if err != nil {
-		return false, nil, 0, err
+		// A replicated apply loses the sentinel's identity across the Raft
+		// boundary; mapVectorOperateErr restores the one the contract names.
+		return false, nil, 0, mapVectorOperateErr(err)
 	}
 	if wo.wcActive() {
 		if err := e.barrierPhys(collection, wo); err != nil {
