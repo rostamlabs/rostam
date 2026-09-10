@@ -707,3 +707,55 @@ func CheckFilterBudget(f vtypes.Filter, maxNodes, maxDepth int) error {
 	}
 	return walk(f, 1)
 }
+
+// EncodeKVQueryCursor serialises conts as a standalone, opaque blob — the form
+// a transport that has no place for a typed cursor hands its caller. The REST
+// surface base64s exactly these bytes.
+//
+// It is the same block the args and result frames embed, so a cursor produced
+// here decodes with DecodeKVQueryCursor and vice versa; only the framing differs
+// (those two length-prefix it, this one does not, because the transport already
+// delimits its own field).
+//
+// The shape and size checks are the args frame's, applied HERE rather than left
+// to the next request: a cursor the caller cannot send back is not a
+// continuation, and telling them so on the page that produced it beats a query
+// that dies at page two with nothing to say about why.
+func EncodeKVQueryCursor(conts []KVQueryCont) ([]byte, error) {
+	if len(conts) == 0 {
+		return nil, nil
+	}
+	if err := checkKVQueryCursorShape(conts); err != nil {
+		return nil, err
+	}
+	blob := appendKVQueryCursor(nil, conts)
+	if len(blob) > KVQueryMaxCursorBytes {
+		return nil, fmt.Errorf("%w: cursor %d bytes exceeds cap %d", ErrKVQueryArgs, len(blob), KVQueryMaxCursorBytes)
+	}
+	return blob, nil
+}
+
+// DecodeKVQueryCursor reads a blob EncodeKVQueryCursor produced, rejecting
+// anything a hostile client might send in its place: the length is checked
+// against KVQueryMaxCursorBytes BEFORE decode (so a lying block cannot size an
+// allocation), and the block must be consumed EXACTLY — trailing bytes are
+// corruption, not a forward-compatible extension, and a cursor that decodes from
+// a prefix of its input is a cursor whose remaining bytes went unexamined.
+//
+// An empty input is an empty cursor (a first page), not an error.
+func DecodeKVQueryCursor(b []byte) ([]KVQueryCont, error) {
+	if len(b) == 0 {
+		return nil, nil
+	}
+	if len(b) > KVQueryMaxCursorBytes {
+		return nil, fmt.Errorf("%w: cursor %d bytes exceeds cap %d", ErrKVQueryArgs, len(b), KVQueryMaxCursorBytes)
+	}
+	conts, n, err := decodeKVQueryCursor(b)
+	if err != nil {
+		return nil, err
+	}
+	if n != len(b) {
+		return nil, fmt.Errorf("%w: %d bytes left after the cursor block", ErrKVQueryArgs, len(b)-n)
+	}
+	return conts, nil
+}

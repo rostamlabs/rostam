@@ -99,8 +99,14 @@ type Store struct {
 
 // ErrStoreClosed is returned by Call once Close has begun. It is a REFUSAL, not
 // a failure of the op: this store is going away, and in a cluster the caller
-// should reach the group's other replicas.
-var ErrStoreClosed = errors.New("shard: store is closed")
+// should reach the group's other replicas — which is why every transport
+// classifies it retryable (503 / Unavailable) rather than as a fault.
+//
+// Its text comes from ops.StoreClosedMsg because httpapi and grpcapi cannot
+// import this package and must recognise the refusal by message
+// (ops.IsStoreClosedMessage). Sharing the constant makes a rewording a
+// compile-time concern instead of a silent regression to "internal error".
+var ErrStoreClosed = errors.New(ops.StoreClosedMsg)
 
 // closeCallDrainTimeout bounds how long Close waits for in-flight Calls. Every
 // ordinary handler is microseconds; the bound is there for the pathological one

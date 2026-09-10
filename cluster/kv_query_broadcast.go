@@ -328,8 +328,12 @@ func checkKVQueryCursorFits(conts []wire.KVQueryCont) error {
 	// shared prefix out of the block, so an estimate that charged every group
 	// for a whole key would refuse cursors that encode comfortably.
 	if n := wire.KVQueryCursorBytes(conts); n > wire.KVQueryMaxCursorBytes {
-		return fmt.Errorf("cluster: kv_query: the continuation for %d shard groups needs %d bytes, over the %d-byte cursor cap; the room left per group is about %d bytes of key beyond the shared prefix",
-			len(conts), n, wire.KVQueryMaxCursorBytes, (wire.KVQueryMaxCursorBytes-3)/len(conts)-7)
+		// Marked with ops.ErrKVQueryCursorCap so every transport classifies it as
+		// the CLIENT error it is (400 / InvalidArgument) instead of redacting it
+		// to an opaque 500 — the per-group arithmetic below is the whole value of
+		// the message, and a caller that never sees it cannot act on it.
+		return fmt.Errorf("%w: the continuation for %d shard groups needs %d bytes, over the %d-byte cursor cap; the room left per group is about %d bytes of key beyond the shared prefix",
+			ops.ErrKVQueryCursorCap, len(conts), n, wire.KVQueryMaxCursorBytes, (wire.KVQueryMaxCursorBytes-3)/len(conts)-7)
 	}
 	return nil
 }

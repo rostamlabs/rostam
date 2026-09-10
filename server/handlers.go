@@ -370,7 +370,25 @@ func clientFacingErr(err error) bool {
 		errors.Is(err, kvindex.ErrCandidateBudget),
 		errors.Is(err, wire.ErrKVQueryArgs),
 		errors.Is(err, wire.ErrKVQueryResult),
-		errors.Is(err, wire.ErrKVQueryArgsTruncated):
+		errors.Is(err, wire.ErrKVQueryArgsTruncated),
+		// ops.ErrKVQueryCursorCap: the coordinator built a continuation larger
+		// than the cap that applies on the way back in. Its message is the
+		// per-group arithmetic the caller acts on, and redacted it says nothing.
+		errors.Is(err, ops.ErrKVQueryCursorCap):
+		return true
+	// shard.ErrStoreClosed: a Call refused because this store is draining for
+	// close. It is a REFUSAL, not a fault — the op never ran, and in a cluster
+	// the group's other replicas can serve it — so the caller must be told to
+	// retry rather than handed the opaque "internal error" redaction gives an
+	// unclassified sentinel. It names nothing but the condition itself.
+	//
+	// It matters most on the __kv_query_shard__ leg, where a peer's edge is THIS
+	// classifier: redacted, a coordinator draining one replica mid-fan-out
+	// cannot tell that refusal from a real fault, and a retryable page becomes a
+	// hard error on every multi-node cluster. Matched by IDENTITY because this
+	// package already imports shard; httpapi and grpcapi cannot, and match the
+	// shared spelling by message instead (ops.IsStoreClosedMessage).
+	case errors.Is(err, shard.ErrStoreClosed):
 		return true
 	}
 	// Cross-boundary / cluster / routing signals matched by string so the clustered

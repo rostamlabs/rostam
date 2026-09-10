@@ -244,12 +244,9 @@ var adminOps = map[string]struct{}{
 	// legitimate caller is a peer, which carries the internal service token and is
 	// granted before this map is consulted, so admin costs the gather nothing.
 	//
-	// __kv_index_list__ is a READ of the catalog and is pinned at admin only
-	// because that is what it is today; demoting it to the read set is a
-	// deliberate decision for the client work, not something a refactor should
-	// make by accident.
+	// __kv_index_list__ is NOT here: it is a READ of the catalog and lives in
+	// readOps below. See the note there for why that demotion is safe.
 	"__kv_index_set__":   {},
-	"__kv_index_list__":  {},
 	"__kv_index_ready__": {},
 	// The INTERNAL shard-scoped leg of the kv_query fan-out
 	// (cluster/kv_query_broadcast.go), enumerated for the same reason as the three
@@ -262,14 +259,38 @@ var adminOps = map[string]struct{}{
 }
 
 // readOps is the small set of cluster-introspection ops that are explicitly
-// "read": __ping__ (liveness), __topology__ (cluster map) and __collections__
-// (the dashboard's dense-collection list). All are also registered OpReadOnly,
-// but enumerating them keeps the classification explicit and independent of
-// registration order.
+// "read": __ping__ (liveness), __topology__ (cluster map), __collections__ (the
+// dashboard's dense-collection list) and __kv_index_list__ (the KV index
+// catalog). All but the last are also registered OpReadOnly; enumerating them
+// keeps the classification explicit and independent of registration order, and
+// __kv_index_list__ is in NO registry at all (it is intercepted by cluster.Node
+// before routing), so without this entry it would fall to actionFor's
+// deny-by-default "admin".
+//
+// WHY __kv_index_list__ IS A READ while __kv_index_set__ stays admin. Listing
+// returns definitions and readiness bits — names, key prefixes, payload paths
+// and a bool — which is metadata about the caller's own keyspace and no more
+// privileged than __topology__. Its sibling CREATES AND DROPS indexes through
+// the meta log: a drop makes every query naming that index start failing at
+// once, and re-creating it costs a full cache walk on every node. That is a
+// schema-shaped operation, so it keeps the admin bar. The split is what lets an
+// operator hand a read-scoped key enough to poll "is my index ready yet"
+// without handing it the ability to delete one. Both halves are pinned by
+// TestKVIndexListIsARead / TestKVIndexSetStaysAdmin.
+//
+// The readiness gather this exposes is BOUNDED, which is the precondition for
+// the demotion: the list op takes no arguments at all
+// (cluster.handleListKVIndexes rejects a non-empty payload), so nothing a
+// caller sends sizes any allocation; the names come from the meta catalog and
+// are capped at wire.KVIndexMaxDefs (64); every per-group leg runs under
+// cluster.kvIndexReadyGroupTimeout with the bound enforced OUTSIDE the leg, so
+// one silent group costs one timeout rather than the call; and the legs run
+// concurrently, so the cost is the slowest group's latency, not the sum.
 var readOps = map[string]struct{}{
-	"__ping__":        {},
-	"__topology__":    {},
-	"__collections__": {},
+	"__ping__":          {},
+	"__topology__":      {},
+	"__collections__":   {},
+	"__kv_index_list__": {},
 }
 
 // actionFor returns the required action ("read"|"write"|"admin") for op.

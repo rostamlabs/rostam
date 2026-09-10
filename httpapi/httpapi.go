@@ -164,6 +164,18 @@ func Handler(disp Dispatcher, opts Options) http.Handler {
 	// Wipe the whole KV keyspace. A fixed, keyless route — no {key} — so it never
 	// collides with the /v1/kv/{key} patterns above (those are GET/PUT/DELETE only).
 	mux.HandleFunc("POST /v1/kv/flush", a.kvFlush)
+	// KV record search. Fixed, keyless routes under /v1/kv/, like flush.
+	//
+	// A NOTE ON SHADOWING: ServeMux prefers the more specific pattern, so
+	// "GET /v1/kv/indexes" and "DELETE /v1/kv/indexes/{name}" win over
+	// "/v1/kv/{key}" — a KV key literally named "indexes" is no longer readable
+	// or deletable through the {key} route (PUT still reaches it, since no PUT is
+	// registered here). The same carve-out /v1/kv/flush already made, and the
+	// remedy is the same: address such a key over the binary or gRPC transport.
+	mux.HandleFunc("POST /v1/kv/query", a.kvQuery)
+	mux.HandleFunc("POST /v1/kv/indexes", a.kvIndexCreate)
+	mux.HandleFunc("GET /v1/kv/indexes", a.kvIndexList)
+	mux.HandleFunc("DELETE /v1/kv/indexes/{name}", a.kvIndexDrop)
 	mux.HandleFunc("POST /v1/collections", a.createCollection)
 	mux.HandleFunc("DELETE /v1/collections/{name}", a.dropCollection)
 	mux.HandleFunc("POST /v1/collections/{name}/points", a.putPoint)
@@ -753,11 +765,28 @@ func statusForError(err error) int {
 	// sent. ops.ErrKVIndexUnavailable is the odd one out — it says this
 	// deployment has no KV index at all — but it is equally not something to
 	// retry, and 400 tells the caller to stop rather than to wait.
+	//
+	// kvindex.ErrNoSuchIndex is the one that is NOT a 400 but a 404: the caller
+	// named a definition that does not exist, which is what 404 says, and it
+	// tells a client library to create the index rather than to fix its filter.
+	// It is matched by SENTINEL only — the leaf's message shape carries a
+	// caller-chosen index name, and rewriting a message into a 404 is not worth
+	// a matcher when a coordinator that finds the name in the meta catalog has
+	// already rewritten it to the retryable ErrIndexBuilding below.
+	case errors.Is(err, kvindex.ErrNoSuchIndex):
+		return http.StatusNotFound
 	case errors.Is(err, ops.ErrKVQueryFilter),
 		errors.Is(err, ops.ErrKVQueryScanRequired),
 		errors.Is(err, ops.ErrKVQueryScanBudget),
 		errors.Is(err, ops.ErrKVIndexUnavailable),
+		// The coordinator built a continuation it cannot represent, and the
+		// candidate/filter budgets. All are facts about what the caller asked
+		// for, and each message carries the arithmetic the caller acts on.
+		errors.Is(err, ops.ErrKVQueryCursorCap),
+		errors.Is(err, kvindex.ErrCandidateBudget),
+		errors.Is(err, wire.ErrKVFilterBudget),
 		errors.Is(err, wire.ErrKVQueryArgs),
+		errors.Is(err, wire.ErrKVQueryResult),
 		errors.Is(err, wire.ErrKVQueryArgsTruncated):
 		return http.StatusBadRequest
 	// RETRYABLE ones are 503, the bucket this transport already uses for every
@@ -766,7 +795,17 @@ func statusForError(err error) int {
 	// query, or the shard is being removed from the node mid-scan.
 	case errors.Is(err, kvindex.ErrIndexBuilding),
 		errors.Is(err, kvindex.ErrIndexChanged),
-		errors.Is(err, ops.ErrKVQueryUnavailable):
+		errors.Is(err, ops.ErrKVQueryUnavailable),
+		// shard.ErrStoreClosed: the store refused the Call because it is
+		// draining for close. A REFUSAL, not a fault — the op never ran, and in
+		// a cluster the group's other replicas can serve it — so it belongs in
+		// the same retryable bucket as the reshard refusal above. This package
+		// cannot import shard (the layering wall server.clientFacingErr
+		// documents), so it is matched by ops.IsStoreClosedMessage: an anchored
+		// suffix over the shared spelling shard.ErrStoreClosed is DECLARED from,
+		// with a veto on the permanent filter sentinel so a caller-chosen filter
+		// field quoting the refusal cannot make its own error retryable.
+		ops.IsStoreClosedMessage(err.Error()):
 		return http.StatusServiceUnavailable
 	case strings.Contains(err.Error(), "not leader"),
 		strings.Contains(err.Error(), "no leader"),

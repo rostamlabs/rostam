@@ -79,6 +79,20 @@ var (
 	// walker that fails is a walker whose result cannot be trusted, whatever it
 	// failed with.
 	ErrKVQueryUnavailable = errors.New("ops: kv_query: shard is unavailable; retry")
+	// ErrKVQueryCursorCap marks a composite continuation the coordinator built
+	// but cannot represent: it needs more than wire.KVQueryMaxCursorBytes, which
+	// is the cap on the way BACK IN, so encoding it would hand the client a
+	// cursor its own next request would be refused for.
+	//
+	// It is a PERMANENT client error (400 / InvalidArgument) rather than an
+	// internal fault: it happens only for keys that are both enormous and share
+	// almost nothing after the index's prefix, and the remedy is the caller's —
+	// a narrower filter, or shorter keys. It is DECLARED HERE, in the package
+	// every transport classifier already imports, for the reason
+	// ErrOperateDuringReshard records: the raising code is in cluster, which
+	// httpapi and grpcapi cannot import, and an unclassified refusal is redacted
+	// to an opaque 500 that says nothing about the arithmetic in its message.
+	ErrKVQueryCursorCap = errors.New("ops: kv_query: continuation exceeds the cursor cap")
 )
 
 // KVQueryBudget bounds the work ONE page of a kv_query may do on one shard.
