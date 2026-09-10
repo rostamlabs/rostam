@@ -2,7 +2,13 @@
 
 package cluster
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+
+	"github.com/rostamlabs/rostam/ops/kvindex"
+	"github.com/rostamlabs/rostam/shard"
+)
 
 // A backfill walk aliases a LIVE MMAP. cache.IterateChunked hands the index the
 // key and value bytes straight out of the shard's mapped pages, and
@@ -99,6 +105,70 @@ func (n *Node) reopenKVIndexWalks(group int) {
 	}
 	g.closed = false
 	g.stop = make(chan struct{})
+}
+
+// installKVQueryScanGate puts group's SCAN walk behind the same per-group gate
+// the backfill walk registers with, by installing a gated walker on the store's
+// read-only dispatcher (shard.Store.SetKVWalker → ops.TxContext.SetWalker).
+//
+// WHY A SCAN NEEDS THE GATE AT LEAST AS MUCH AS A BACKFILL. Both walk the whole
+// keyspace and both alias the store's live mmap, but a scan is CLIENT-DRIVEN:
+// any reader can start one at any moment, and a 5M-key page is a longer window
+// onto pages Close is about to unmap than a backfill that runs once per
+// definition. Without this the leaf walks through ops.CacheWalker, which cannot
+// fail — so a scan racing RemoveShardOwner reads unmapped memory and takes the
+// process down, and ops.ErrKVQueryUnavailable is unreachable.
+//
+// It must be installed for EVERY hosted store, wherever one comes into
+// existence: both node constructors and AddShardOwner.
+func (n *Node) installKVQueryScanGate(group int, s *shard.Store) {
+	plain := s.CacheWalker()
+	s.SetKVWalker(func(yield func(key, value []byte) bool) error {
+		return n.gatedKVWalk(group, plain, yield)
+	})
+}
+
+// gatedKVWalk runs walk under group's gate: it registers the walk (so a removal
+// waits for it), aborts at a chunk boundary once the gate is shut, and reports
+// kvindex.ErrWalkAborted rather than a short walk that returned normally.
+//
+// The abort is by RETURNING FALSE from the yield, which unwinds the cache's own
+// early-stop path with every lock released — never by abandoning the walk. The
+// check runs on the same stride as the backfill's (kvIndexAbortCheckEvery),
+// which is what bounds how long RemoveShardOwner waits to a few thousand entries
+// instead of a whole keyspace.
+//
+// A walk that could not register (ok=false) means the group is already being
+// removed. It must not touch that store at all, and the caller must be told:
+// a scan that visited nothing looks exactly like a scan that matched nothing.
+func (n *Node) gatedKVWalk(group int, walk kvindex.Walker, yield func(key, value []byte) bool) error {
+	stop, done, ok := n.beginKVIndexWalk(group)
+	if !ok {
+		return fmt.Errorf("%w: shard group %d is being removed from this node", kvindex.ErrWalkAborted, group)
+	}
+	defer done()
+
+	var visited uint64
+	aborted := false
+	werr := walk(func(key, value []byte) bool {
+		visited++
+		if visited%kvIndexAbortCheckEvery == 0 {
+			select {
+			case <-stop:
+				aborted = true
+				return false
+			default:
+			}
+		}
+		return yield(key, value)
+	})
+	if werr != nil {
+		return werr
+	}
+	if aborted {
+		return fmt.Errorf("%w: shard group %d was removed from this node mid-walk", kvindex.ErrWalkAborted, group)
+	}
+	return nil
 }
 
 // drainAllKVIndexWalks shuts every group's gate and waits for every in-flight

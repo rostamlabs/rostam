@@ -373,6 +373,11 @@ func newSingleNode(cfg Config) (*Node, error) {
 				return n.fetchShardLeaderFrontier(idx, d)
 			})
 		})
+		// A scan-mode kv_query walks this store's whole keyspace and aliases its
+		// live mmap, so it goes behind the same per-group gate the index backfill
+		// registers with — installed here, at the one moment the store exists and
+		// nothing can be walking it yet. See installKVQueryScanGate.
+		n.installKVQueryScanGate(i, store)
 		n.shards[i] = store
 	}
 
@@ -815,6 +820,11 @@ func newMultiNode(cfg Config) (*Node, error) {
 				return n.fetchShardLeaderFrontier(idx, d)
 			})
 		})
+		// A scan-mode kv_query walks this store's whole keyspace and aliases its
+		// live mmap, so it goes behind the same per-group gate the index backfill
+		// registers with — installed here, at the one moment the store exists and
+		// nothing can be walking it yet. See installKVQueryScanGate.
+		n.installKVQueryScanGate(i, store)
 		n.shards[i] = store
 
 		// Throttle: once the wave is full, wait for it to elect before the next.
@@ -1222,6 +1232,16 @@ func (n *Node) Call(name string, args []byte) ([]byte, error) {
 	if name == flushOpName {
 		return n.broadcastFlush()
 	}
+	// kv_query is the READ with the same shape: keyless (so shardIndexFor returns
+	// 0 for it) but answering over the WHOLE keyspace, which lives in one
+	// independent cache per shard group. Routed like an ordinary shardless op it
+	// would answer from group 0's slice alone and present that as the complete
+	// result. Unlike the two broadcasts above it lands in no log at all — it fans a
+	// read-only leaf to every group that can still contribute rows and merges the
+	// pages. See broadcastKVQuery.
+	if name == kvQueryOpName {
+		return n.broadcastKVQuery(args)
+	}
 	idx, err := n.shardIndexFor(ke, layout, args)
 	if err != nil {
 		return nil, err
@@ -1492,11 +1512,33 @@ func (n *Node) CallPhysical(physCol, op string, args []byte, leaderOnly bool) ([
 // last error after the deadline rather than spinning forever. No sleep happens
 // once a leader is resolved and the call succeeds.
 func (n *Node) forwardToLeader(shardIdx int, op string, args []byte) ([]byte, error) {
+	return n.forwardToLeaderAs(context.Background(), shardIdx, op, args, op, args)
+}
+
+// forwardToLeaderAs is forwardToLeader with the LOCAL serve and the REMOTE hop
+// named separately, and with the caller's context bounding the wait.
+//
+// The two op names are the same for every caller but one. A fan-out leg cannot
+// send its own client-facing op name to a peer — the peer's Node.Call would fan
+// out again — so it carries a shard-scoped WRAPPER instead (see
+// opKVQueryShardName). That wrapper is a node-level admin op and is not in any
+// shard's op registry, so the moment leader resolution lands back on THIS node
+// the call has to switch to the leaf name and the leaf args. Sending the wrapper
+// to a local shard.Store would be an unknown op, not a query — a "leader is us"
+// race that would surface as a spurious failure for one page.
+//
+// ctx bounds the loop as well as each remote call: a leg that has already been
+// abandoned by its caller's per-group timeout stops retrying instead of holding
+// a peer connection for the rest of the internal deadline.
+func (n *Node) forwardToLeaderAs(ctx context.Context, shardIdx int, localOp string, localArgs []byte, remoteOp string, remoteArgs []byte) ([]byte, error) {
 	const (
 		deadline = 3 * time.Second // comfortably above the raft election timeout
 		backoff  = 25 * time.Millisecond
 	)
 	stopAt := time.Now().Add(deadline)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(stopAt) {
+		stopAt = dl
+	}
 	var lastErr = ErrNoShardOwner
 	for {
 		leaderAddr := n.leaderServerAddr(shardIdx)
@@ -1504,7 +1546,7 @@ func (n *Node) forwardToLeader(shardIdx int, op string, args []byte) ([]byte, er
 			// If the leader is this node, serve locally (it must host & lead the shard).
 			if leaderAddr == n.serverAddrFor(n.cfg.NodeID) {
 				if s := n.getShard(shardIdx); s != nil {
-					res, err := s.Call(op, args)
+					res, err := s.Call(localOp, localArgs)
 					if err == nil {
 						return res, nil
 					}
@@ -1515,13 +1557,16 @@ func (n *Node) forwardToLeader(shardIdx int, op string, args []byte) ([]byte, er
 				if err != nil {
 					lastErr = err
 				} else {
-					res, err := cl.Call(context.Background(), op, args)
+					res, err := cl.Call(ctx, remoteOp, remoteArgs)
 					if err == nil {
 						return res, nil
 					}
 					lastErr = err
 				}
 			}
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, lastErr
 		}
 		// Either the leader was unresolvable, or the call hit a transient error
 		// (NotLeader / unreachable / no-owner) during the election window. Retry

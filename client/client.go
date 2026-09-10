@@ -545,6 +545,15 @@ func (e *ambiguousError) Unwrap() error { return e.err }
 // and a replayed CHECK is evaluated against a record the first attempt already
 // changed. They are listed individually rather than matched by a "vector_"
 // prefix so a future read-only vector op cannot be swept in by accident.
+//
+// "kv_query" and its INTERNAL per-group wrapper "__kv_query_shard__" are
+// deliberately ABSENT, and the omission is a decision rather than an oversight.
+// kv_query is a READ: registered OpReadOnly, never proposed into any Raft log,
+// and with nothing a replay could double-apply — a replayed page is answered
+// from the same cursor and returns the same rows. It sits beside "flush" in the
+// cluster layer (both are keyless and both fan out to every shard group), and
+// the resemblance ends exactly here: flush is on this list because re-wiping is
+// a SECOND mutation, and a read has no such thing to repeat.
 func nonReplayableOp(op string) bool {
 	switch op {
 	case "set_nx", "cas", "cad", "getdel", "getset", "incr_ex", "caex", "persist", "flush", "__flush_shard__", "operate",

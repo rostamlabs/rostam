@@ -288,6 +288,10 @@ func (n *Node) registerAdminOps() {
 		opKVIndexSetName:   n.handleSetKVIndex,
 		opKVIndexListName:  n.handleListKVIndexes,
 		opKVIndexReadyName: n.handleKVIndexReady,
+		// Shard-scoped leg of the kv_query fan-out: answers for the ONE group named
+		// in its payload out of that group's leaf, and never re-broadcasts. See
+		// kv_query_broadcast.go.
+		opKVQueryShardName: n.handleKVQueryShard,
 		// WASM blob transport: how a node that lacks a module's bytes obtains
 		// them. Both are node-local leaves — the put verifies, compiles and
 		// stores; the get reads the content-addressed store and NOTHING ELSE (no

@@ -143,6 +143,12 @@ func (n *Node) AddShardOwner(shardID int) error {
 	// Re-arm the walk gate: a group that was removed earlier left it closed, and
 	// the observer must be able to backfill the new store's empty index.
 	n.reopenKVIndexWalks(shardID)
+	// Then put THIS store's scan-mode kv_query walks behind that same gate, so a
+	// scan in flight when the group is removed again is drained exactly like a
+	// backfill rather than reading pages Close has unmapped. Order matters only in
+	// that the gate must be open before a walk can register; installing the walker
+	// starts none. See installKVQueryScanGate.
+	n.installKVQueryScanGate(shardID, store)
 	return nil
 }
 

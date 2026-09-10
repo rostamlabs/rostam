@@ -251,6 +251,14 @@ var adminOps = map[string]struct{}{
 	"__kv_index_set__":   {},
 	"__kv_index_list__":  {},
 	"__kv_index_ready__": {},
+	// The INTERNAL shard-scoped leg of the kv_query fan-out
+	// (cluster/kv_query_broadcast.go), enumerated for the same reason as the three
+	// above. `kv_query` ITSELF is an ordinary OpReadOnly and is classified as a
+	// read from the registry; the WRAPPER is pinned at admin so it can never be
+	// demoted to read and become a way for a read:* key to address ONE shard group
+	// directly — bypassing the coordinator, which is the only thing that makes a
+	// page a complete answer rather than one group's slice of it.
+	"__kv_query_shard__": {},
 }
 
 // readOps is the small set of cluster-introspection ops that are explicitly
