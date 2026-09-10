@@ -184,6 +184,35 @@ type Set struct {
 	// atomic rather than a field under s.mu.
 	verifyMisses atomic.Uint64
 
+	// nDefs is len(defs), published for LOCK-FREE reading by the WRITE PATH.
+	//
+	// Reindex runs on every KV write and Drop is the cache's onRemove hook, so
+	// Drop also runs on every delete, eviction and TTL expiry. Both used to take
+	// s.mu unconditionally, and every shard.Store and Direct store wires a Set —
+	// so a deployment that has never defined an index still funnelled every
+	// writer through one global mutex. Uncontended that is tens of nanoseconds;
+	// under concurrency it is a serialisation point across writers the sharded
+	// cache otherwise keeps apart, and it measured ~4x on the concurrent put path
+	// with zero definitions installed.
+	//
+	// Written under s.mu (Install is the only place s.defs changes), read without
+	// it. A stale read is SOUND IN BOTH DIRECTIONS:
+	//
+	//   - Reading 0 while an Install is landing means this write is not indexed
+	//     here. reindexKV runs AFTER the cache write, so the key is already in
+	//     the cache, and a definition installed after this read publishes nothing
+	//     until its own backfill walk — which runs after Install and visits that
+	//     key. Nothing is lost.
+	//   - Reading 0 in Drop means no definition existed, so no posting for the
+	//     key can exist either. There is nothing to drop.
+	//   - Reading non-zero when the last definition has just been removed costs
+	//     one lock acquisition and a loop over an empty set. Harmless.
+	//
+	// It is an atomic.Int64 rather than a bool because "how many" is what the
+	// loops below are actually asking, and a count cannot be wrong in a way a
+	// flag would hide.
+	nDefs atomic.Int64
+
 	// reconcileDrops counts postings the reconcile pass has removed because the
 	// key's live re-read missed. Same shape and same reason as verifyMisses: the
 	// node sums it over hosted groups for Stats().KVIndex.ReconcileDrops, and it
@@ -241,6 +270,9 @@ func (s *Set) Install(defs []Def) {
 		next = append(next, d)
 	}
 	s.defs, s.posts = next, posts
+	// Published LAST and under the lock: the write path reads this without s.mu,
+	// so it must never see a non-zero count before the definitions it counts.
+	s.nDefs.Store(int64(len(next)))
 }
 
 // Defs returns the installed definitions in install order. The slice is a
@@ -301,6 +333,11 @@ func (s *Set) MarkReady(name string) {
 // posting can then only be STALE (harmless — one wasted lookup), never
 // missing (a lost row).
 func (s *Set) Reindex(key, value []byte) {
+	// The store-with-no-index fast path: no definitions, no lock. See nDefs for
+	// why a stale zero here cannot lose a posting.
+	if s.nDefs.Load() == 0 {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i := range s.defs {
@@ -359,6 +396,13 @@ func (s *Set) resolveValue(d *Def, value []byte) (vtypes.Value, bool) {
 // lock: it takes only s.mu, never calls back into the cache, and does O(number
 // of definitions) map deletes and nothing else.
 func (s *Set) Drop(key []byte) {
+	// The same fast path, and it matters more here: this is the cache's onRemove
+	// hook, so it runs on every delete, eviction and TTL expiry as well — under a
+	// cache shard's write lock. With no definitions installed there is no posting
+	// for any key, so there is nothing to drop.
+	if s.nDefs.Load() == 0 {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, p := range s.posts {

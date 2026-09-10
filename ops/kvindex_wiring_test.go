@@ -16,6 +16,7 @@ package ops
 import (
 	"bytes"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -865,5 +866,80 @@ func BenchmarkPutHotPath(b *testing.B) {
 		idx.Install([]kvindex.Def{def(b)})
 		idx.MarkReady(wiringIndexName)
 		run(b, NewTxContextWithIndex(c, nil, idx), []byte("zz:a"))
+	})
+}
+
+// BenchmarkPutHotPathConcurrent is BenchmarkPutHotPath under contention, which
+// is the only shape in which the index wiring's cost on the write path is
+// visible.
+//
+// Serially, kvindex.Set.Reindex's unconditional s.mu.Lock is an uncontended
+// mutex and costs tens of nanoseconds. Concurrently it is a GLOBAL SERIALISATION
+// POINT across every writer on the store — the cache itself is sharded, so
+// without the index the writers never meet — and the cost is the queue, not the
+// lock. A store with a Set wired and NO definitions installed paid all of it for
+// nothing, and every shard.Store and Direct store wires a Set.
+//
+// Run it at the concurrency the numbers are quoted at:
+//
+//	go test ./ops/ -run '^$' -bench BenchmarkPutHotPathConcurrent -cpu 20
+//
+// no-defs is the case that matters: an index wired, nothing defined. It must
+// track no-index, not indexed-key.
+func BenchmarkPutHotPathConcurrent(b *testing.B) {
+	newCache := func(b *testing.B) *cache.Cache {
+		b.Helper()
+		cfg := cache.DefaultConfig()
+		c, err := cache.New(cfg)
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.Cleanup(func() { _ = c.Close() })
+		return c
+	}
+	def := func(b *testing.B) kvindex.Def {
+		b.Helper()
+		d, err := kvindex.DefFrom(wire.KVIndexDef{
+			Name: wiringIndexName, KeyPrefix: []byte("u:"), PayloadPath: "rc",
+			Kind: wire.KVIndexKindScalar, Enabled: true,
+		}, 1)
+		if err != nil {
+			b.Fatal(err)
+		}
+		return d
+	}
+	// Each goroutine writes its OWN keys, so what the benchmark measures is the
+	// index wiring rather than a cache slot every writer is fighting over.
+	run := func(b *testing.B, tx *TxContext) {
+		var seq atomic.Uint64
+		val := wiringRec(5)
+		b.ReportAllocs()
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			id := seq.Add(1)
+			i := uint64(0)
+			for pb.Next() {
+				i++
+				args := wire.EncodePutArgs(fmt.Appendf(nil, "u:%d:%d", id, i), val, 0)
+				if _, err := handlePut(tx, args); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+
+	b.Run("no-index", func(b *testing.B) {
+		run(b, NewTxContext(newCache(b)))
+	})
+	b.Run("no-defs", func(b *testing.B) {
+		c := newCache(b)
+		run(b, NewTxContextWithIndex(c, nil, NewKVIndexFor(c)))
+	})
+	b.Run("one-def", func(b *testing.B) {
+		c := newCache(b)
+		idx := NewKVIndexFor(c)
+		idx.Install([]kvindex.Def{def(b)})
+		idx.MarkReady(wiringIndexName)
+		run(b, NewTxContextWithIndex(c, nil, idx))
 	})
 }
