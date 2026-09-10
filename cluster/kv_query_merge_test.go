@@ -183,21 +183,23 @@ func TestMergeKVQueryEmpty(t *testing.T) {
 	}
 }
 
-// The merge does NOT dedup, and this pins the reason: a key lives in exactly one
-// group, so two groups can never offer the same key. The assertion is on the
-// INPUT, so a future routing change that broke the property fails here rather
-// than silently doubling rows.
+// The merge does NOT dedup, and this is what makes that safe to read: a key
+// lives in exactly one group, so two groups can never offer the same key.
+//
+// THE UNIQUENESS IS ASSUMED BY CONSTRUCTION, NOT VERIFIED. Each key here is
+// distinct by spelling and its group comes from shardOf applied to that same
+// key, so no dedup check on this input could ever fire — the fixture mirrors
+// whatever the routing function returns rather than testing it. (An earlier
+// version kept a `seen` map and a duplicate branch that was dead for exactly
+// this reason; it is gone rather than left to look like protection.) What the
+// test does pin is the merge itself: all 240 keys come back, once each, in
+// ascending order, out of parts that were sorted per group.
 func TestMergeKVQueryKeysAreGloballyUnique(t *testing.T) {
 	const groups, keys = 6, 40
-	seen := make(map[string]int, groups*keys)
 	parts := make([]wire.KVQueryResult, groups)
 	for i := 0; i < groups*keys; i++ {
 		k := fmt.Sprintf("k%05d", i)
 		g := shardOf([]byte(k), groups)
-		if prev, dup := seen[k]; dup {
-			t.Fatalf("key %q hashes into groups %d and %d", k, prev, g)
-		}
-		seen[k] = g
 		parts[g].Rows = append(parts[g].Rows, wire.KVQueryRow{Key: []byte(k)})
 	}
 	for g := range parts {

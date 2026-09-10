@@ -430,8 +430,8 @@ live value, so a stale posting can never produce a wrong row. A filter no index
 can drive needs explicit `scan: true` consent. Results page across every shard
 group under a composite cursor, and are reachable from the native Go client
 (`CreateKVIndex` / `KVQuery` / `ListKVIndexes` / `DropKVIndex`) and over REST
-(`POST /v1/kv/query`, `POST`/`GET`/`DELETE /v1/kv/indexes`) — the one corner of
-the KV surface that does have HTTP endpoints.
+(`POST /v1/kv/query`, `POST`/`GET`/`DELETE /v1/kv/indexes`) — the only KV
+routes besides the basic `{key}` and `flush` ones above.
 
 See [querying records](querying-records.md) for the index definition rules, what
 is accelerated versus evaluated live, the paging and consistency contract, the

@@ -725,8 +725,12 @@ func TestHTTPKVQueryFilterIsSizedBeforeItIsExpanded(t *testing.T) {
 		t.Fatalf("body %s does not name the unknown field: the filter is not being decoded strictly", rec.Body.String())
 	}
 
-	// And a filter over the NODE budget but under the byte cap is still refused,
-	// by the budget rather than by the size.
+	// And a filter over the DEPTH budget but under the byte cap is still refused,
+	// by the budget rather than by the size. (DEPTH, not NODE: the fixture below
+	// is KVQueryMaxFilterDepth+2 nested "not" wrappers, which is 34 nodes — well
+	// inside the 256-node budget — at depth 34. The assertion checks for
+	// "nesting", which is the depth-budget message. No fixture in this test
+	// crosses the node budget.)
 	var deep strings.Builder
 	for i := 0; i < wire.KVQueryMaxFilterDepth+2; i++ {
 		deep.WriteString(`{"op":"not","not":`)

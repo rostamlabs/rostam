@@ -385,6 +385,7 @@ func (n *Node) backfillKVIndex(group int, s *shard.Store, idx *kvindex.Set, name
 		werr := walk(func(key, value []byte) bool {
 			visited++
 			if visited%kvIndexAbortCheckEvery == 0 {
+				fireKVIndexWalkProbe(group)
 				select {
 				case <-stop:
 					aborted = true

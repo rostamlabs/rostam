@@ -76,9 +76,15 @@ func TestKVIndexReconcileDropsSurviveShardRemoval(t *testing.T) {
 			[]byte("u:phantom-b"),
 			[]byte("u:phantom-c"),
 		}
+		// A LOWER BOUND, NOT AN EQUALITY. Each store runs its own reconcile
+		// ticker, and a tick landing between the plant and this call drops a
+		// phantom first — the drop is then already in ReconcileDrops but not in
+		// this helper's return. Requiring exact counts made the test's subject
+		// (monotonicity across a shard removal) hostage to that timing. At least
+		// one drop per group is enough to make the removal assertion meaningful.
 		got := forceReconcileDrops(t, idx, "by_age", keys, rec)
-		if got != len(keys) {
-			t.Fatalf("group %d: reconcile dropped %d phantom postings, want %d", group, got, len(keys))
+		if got == 0 {
+			t.Fatalf("group %d: reconcile dropped no phantom posting out of %d planted", group, len(keys))
 		}
 		total += got
 	}
@@ -87,17 +93,21 @@ func TestKVIndexReconcileDropsSurviveShardRemoval(t *testing.T) {
 	}
 
 	before := n.Stats().KVIndex.ReconcileDrops
-	if want := uint64(total); before != want { //nolint:gosec // total is a small positive test count
-		t.Fatalf("ReconcileDrops = %d before removal, want %d", before, want)
+	if want := uint64(total); before < want { //nolint:gosec // total is a small positive test count
+		t.Fatalf("ReconcileDrops = %d before removal, want at least the %d this test forced", before, want)
 	}
 
 	if err := n.RemoveShardOwner(0); err != nil {
 		t.Fatalf("RemoveShardOwner: %v", err)
 	}
 
+	// MONOTONICITY IS THE CONTRACT, and the defect this test exists for is a
+	// DECREASE: the count lives on the per-shard Set, so dropping a group without
+	// folding its total in makes a contracted uint64 go backwards, which a
+	// scraper reads as a process restart. A same-or-higher reading is correct —
+	// the surviving group's own ticker may have dropped something meanwhile — so
+	// only a decrease is a failure.
 	if after := n.Stats().KVIndex.ReconcileDrops; after < before {
 		t.Fatalf("ReconcileDrops went BACKWARDS across a shard removal: %d -> %d", before, after)
-	} else if after != before {
-		t.Fatalf("ReconcileDrops = %d after removal, want %d unchanged", after, before)
 	}
 }

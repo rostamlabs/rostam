@@ -5,6 +5,7 @@ package cluster
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/rostamlabs/rostam/ops/kvindex"
 	"github.com/rostamlabs/rostam/shard"
@@ -43,6 +44,28 @@ type kvIndexWalkGate struct {
 	// wg tracks in-flight walks. drain waits on it OUTSIDE mu, so a long walk
 	// blocks the removal (which is the point) and not every other group's gate.
 	wg sync.WaitGroup
+}
+
+// kvIndexWalkProbe, when set, is called at every abort check of every KV index
+// walk — backfill and scan alike, at the same stride the abort check runs on.
+//
+// TEST SEAM, nil in production. The two tests that race a real removal against a
+// real walk previously gave the walk a 2 ms head start and hoped: if the walk
+// finished first the removal exercised the drain's WAIT and never its ABORT, and
+// the tests failed with "the removal never raced one" on a fast or lightly
+// loaded box. The probe lets a test PARK a walk at a known point inside the
+// store, so the overlap is a fact rather than a race the test hopes to win.
+//
+// An atomic pointer rather than a plain variable so installing and clearing it
+// is not itself a data race with the walk that reads it. The cost in production
+// is one atomic load per kvIndexAbortCheckEvery keys.
+var kvIndexWalkProbe atomic.Pointer[func(group int)]
+
+// fireKVIndexWalkProbe runs the test probe if one is installed.
+func fireKVIndexWalkProbe(group int) {
+	if p := kvIndexWalkProbe.Load(); p != nil {
+		(*p)(group)
+	}
 }
 
 // kvIndexWalkGateFor returns group's gate, creating it on first use.
@@ -187,6 +210,7 @@ func (n *Node) gatedKVWalk(group int, walk kvindex.Walker, yield func(key, value
 	werr := walk(func(key, value []byte) bool {
 		visited++
 		if visited%kvIndexAbortCheckEvery == 0 {
+			fireKVIndexWalkProbe(group)
 			select {
 			case <-stop:
 				aborted = true

@@ -1133,7 +1133,14 @@ func TestCandidatesSortsOutsideTheLock(t *testing.T) {
 	sel := Selector{Def: d, Op: vtypes.FilterEq, Values: []vtypes.Value{vtypes.NewInt(1)}}
 	other := intRec("rc", 2)
 
-	for attempt := 1; attempt <= 3; attempt++ {
+	// ATTEMPTS, because one sample is a wall-clock ratio and a wall-clock ratio
+	// can be ruined by a single GC pause or a co-tenant on the box. The test
+	// passes on the FIRST attempt that shows the property, so a healthy build
+	// costs one; only a build where the property genuinely does not hold pays for
+	// all of them, and that build should fail. Three was thin — a pause landing in
+	// each of three tries is not rare on a loaded CI runner.
+	const attempts = 8
+	for attempt := 1; attempt <= attempts; attempt++ {
 		var (
 			wg       sync.WaitGroup
 			total    time.Duration

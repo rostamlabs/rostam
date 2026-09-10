@@ -20,10 +20,14 @@ import (
 
 const kvQueryBenchKeys = 100_000
 
-// newKVQueryBenchTx builds a one-shard indexed store holding kvQueryBenchKeys
-// records under the definition's prefix. One key in a thousand carries the
+// newKVQueryBenchTx builds an indexed store holding kvQueryBenchKeys records
+// under the definition's SINGLE key prefix. One key in a thousand carries the
 // value the benchmarks select on, so an indexed page reads about a hundred
 // candidates out of a hundred thousand keys.
+//
+// The keyspace is one logical prefix; the cache underneath it is the ordinary
+// 8-shard one, so the walk the scan benchmarks pay for is the walk a real
+// deployment pays for.
 func newKVQueryBenchTx(b *testing.B) *TxContext {
 	b.Helper()
 	cfg := cache.DefaultConfig()

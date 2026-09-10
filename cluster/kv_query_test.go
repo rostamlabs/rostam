@@ -245,11 +245,13 @@ func TestKVQueryFanOutIsParallel(t *testing.T) {
 	if gotPeak != shards {
 		t.Fatalf("at most %d legs were ever in flight at once, want all %d — the fan-out is not parallel", gotPeak, shards)
 	}
-	// A generous corroborating bound: sequential would be at least shards x
-	// delay, and this is well under half of it even on a busy box.
-	if elapsed >= shards*delay/2 {
-		t.Fatalf("a %d-group fan-out with a %s delay per leg took %s", shards, delay, elapsed)
-	}
+	// gotPeak == shards above IS the concurrency assertion: every leg was in
+	// flight at the same moment, which a sequential fan-out cannot produce. The
+	// elapsed time adds nothing to that and can only subtract — a scheduler hiccup
+	// or a busy host makes a correct parallel fan-out look slow — so it is logged
+	// as a diagnostic and never failed on.
+	t.Logf("a %d-group fan-out with a %s delay per leg took %s (sequential would be at least %s)",
+		shards, delay, elapsed, time.Duration(shards)*delay)
 }
 
 // A group the cursor has dropped is not asked again — and it does not even cost
@@ -639,59 +641,90 @@ func TestKVQueryScanIsGatedByTheWalkGate(t *testing.T) {
 
 // The same guarantee with a REAL removal racing a real scan: it must neither
 // take the process down nor hand back a partial page as a complete one.
+//
+// TWO THINGS CHANGED HERE, both about the test rather than the code.
+//
+// The overlap is ARRANGED. This used to give the scan a 2 ms head start and
+// then require that at least one of four attempts had been refused, so on a
+// fast or lightly loaded box every scan could finish first, the test would
+// exercise the drain's WAIT and never its ABORT, and it would fail with "the
+// removal never raced one" while nothing was wrong. The probe parks the scan
+// inside the store, so the removal is guaranteed to land on a live walk.
+//
+// And the query runs entirely INSIDE the goroutine. kvQueryCall calls t.Fatalf
+// on an encode or decode failure, and t.Fatalf from a non-test goroutine only
+// Goexits that goroutine — the outcome would never be sent, and this test would
+// sit out its whole timeout and then report "the scan never returned" while
+// silently swallowing the real error.
 func TestKVQueryScanDrainsBeforeShardRemoval(t *testing.T) {
 	seeded := 100_000
 	if testing.Short() {
 		seeded = 20_000
 	}
-	const attempts = 4
-	unavailable := 0
-	for attempt := 0; attempt < attempts; attempt++ {
-		func() {
-			tc := newTestCluster(t, 1, 1)
-			n := tc.nodes[0]
-			freezeKVIndexObserver(t, n)
-			seedKVIndexRecords(t, n, "u:", 0, seeded)
+	tc := newTestCluster(t, 1, 1)
+	n := tc.nodes[0]
+	freezeKVIndexObserver(t, n)
+	seedKVIndexRecords(t, n, "u:", 0, seeded)
 
-			type outcome struct {
-				rows int
-				err  error
-			}
-			done := make(chan outcome, 1)
-			go func() {
-				res, err := kvQueryCall(t, n, wire.KVQueryArgs{Filter: kvQueryAll(), Limit: 1000, Scan: true})
-				done <- outcome{rows: len(res.Rows), err: err}
-			}()
+	type outcome struct {
+		rows int
+		err  error
+	}
+	park := parkFirstKVIndexWalk(t)
+	done := make(chan outcome, 1)
+	go func() {
+		// Encode, call and decode all in here, returning every failure on the
+		// channel: t.Fatalf from this goroutine would not fail the test, it
+		// would just make the channel silent.
+		args, aerr := wire.EncodeKVQueryArgs(wire.KVQueryArgs{Filter: kvQueryAll(), Limit: 1000, Scan: true})
+		if aerr != nil {
+			done <- outcome{err: fmt.Errorf("EncodeKVQueryArgs: %w", aerr)}
+			return
+		}
+		raw, cerr := n.Call(kvQueryOpName, args)
+		if cerr != nil {
+			done <- outcome{err: cerr}
+			return
+		}
+		res, derr := wire.DecodeKVQueryResult(raw)
+		if derr != nil {
+			done <- outcome{err: fmt.Errorf("DecodeKVQueryResult: %w", derr)}
+			return
+		}
+		done <- outcome{rows: len(res.Rows)}
+	}()
 
-			time.Sleep(2 * time.Millisecond) // let the walk get going
-			if err := n.RemoveShardOwner(0); err != nil {
-				t.Fatalf("attempt %d: RemoveShardOwner: %v", attempt, err)
-			}
-			select {
-			case o := <-done:
-				switch {
-				case o.err == nil:
-					// The scan finished before the removal reached it. Fine —
-					// the drain waited for it, which is the whole point.
-				case errors.Is(o.err, ops.ErrKVQueryUnavailable):
-					unavailable++
-				default:
-					t.Fatalf("attempt %d: scan failed with %v, want either success or ErrKVQueryUnavailable", attempt, o.err)
-				}
-			case <-time.After(30 * time.Second):
-				t.Fatalf("attempt %d: the scan never returned", attempt)
-			}
-			tc.Close()
-		}()
+	// The scan is now provably inside the store, aliasing pages Close unmaps.
+	park.waitParked()
+
+	removed := make(chan error, 1)
+	go func() { removed <- n.RemoveShardOwner(0) }()
+
+	// Shut the gate first, then let the parked walk run into it, so the refusal
+	// is deterministic rather than a coin toss.
+	n.waitKVIndexGateShut(0)
+	park.release()
+
+	select {
+	case o := <-done:
+		if o.err == nil {
+			t.Fatalf("the scan returned %d rows as a complete page although the shard was removed under it", o.rows)
+		}
+		if !errors.Is(o.err, ops.ErrKVQueryUnavailable) {
+			t.Fatalf("the scan failed with %v, want the retryable ops.ErrKVQueryUnavailable", o.err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the scan never returned")
 	}
-	// At least one attempt must actually have raced, or the test proved nothing
-	// about the gate: a run in which every scan finished first exercises the
-	// drain's WAIT and never its ABORT. The walk over `seeded` keys takes tens of
-	// milliseconds against a 2 ms head start, so this is not a close call.
-	if unavailable == 0 {
-		t.Fatalf("no attempt out of %d overlapped a live scan; the removal never raced one", attempts)
+	select {
+	case err := <-removed:
+		if err != nil {
+			t.Fatalf("RemoveShardOwner: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("RemoveShardOwner did not return after the scan aborted")
 	}
-	t.Logf("%d of %d attempts raced the removal and were refused as retryable", unavailable, attempts)
+	tc.Close()
 }
 
 // --- projections ----------------------------------------------------------
