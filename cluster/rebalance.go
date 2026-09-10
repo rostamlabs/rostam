@@ -162,12 +162,14 @@ func (n *Node) RemoveShardOwner(shardID int) error {
 	n.shardMu.Lock()
 	s := n.shards[shardID]
 	n.shards[shardID] = nil
-	// FOLD THE GROUP'S VERIFY MISSES INTO THE NODE TOTAL BEFORE ITS INDEX GOES
-	// AWAY. Stats().KVIndex.VerifyMisses is the node counter plus the sum over
-	// HOSTED groups (kvIndexStats), because the query leaf runs in ops and can
-	// only reach the Set it read. Dropping a group without folding would make
-	// that contracted uint64 DECREASE, which every scraper reads as a process
-	// restart and a reset of every other counter alongside it.
+	// FOLD THE GROUP'S KV INDEX COUNTERS INTO THE NODE TOTALS BEFORE ITS INDEX
+	// GOES AWAY. Stats().KVIndex.VerifyMisses and .ReconcileDrops are each the
+	// node counter plus the sum over HOSTED groups (kvIndexStats), because the
+	// query leaf runs in ops and the reconcile pass runs on the store's own
+	// goroutine — both can only reach the Set they hold. Dropping a group
+	// without folding would make those contracted uint64s DECREASE, which every
+	// scraper reads as a process restart and a reset of every other counter
+	// alongside them.
 	//
 	// Inside the lock, in the same critical section that takes the store out of
 	// n.shards, so no observer can see the group counted by neither. A query
@@ -177,6 +179,7 @@ func (n *Node) RemoveShardOwner(shardID int) error {
 	if s != nil {
 		if idx := s.KVIndex(); idx != nil {
 			n.kvIndexVerifyMisses.Add(idx.VerifyMisses())
+			n.kvIndexReconcileDrops.Add(idx.ReconcileDrops())
 		}
 	}
 	n.shardMu.Unlock()

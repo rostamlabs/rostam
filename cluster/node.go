@@ -165,12 +165,14 @@ type Node struct {
 	// what the observer's walks have cost; kvIndexRejects COUNTS reject events and
 	// kvIndexRejectedDefs GAUGES how many are broken right now (see
 	// kvIndexDefsFromCatalog for why both).
-	// kvIndexVerifyMisses holds verify misses that no longer have a hosted group
-	// to be read from: RemoveShardOwner folds a departing group's count in here
-	// before dropping its index, so Stats().KVIndex.VerifyMisses (this plus the
-	// sum over hosted groups) never decreases. kvIndexReconcileDrops belongs to
-	// the reconcile path and stays zero until Task 9 lands; both live here so the
-	// whole KVIndexStats block has one owner.
+	// kvIndexVerifyMisses and kvIndexReconcileDrops hold the counts that no
+	// longer have a hosted group to be read from: RemoveShardOwner folds a
+	// departing group's totals in here before dropping its index, so
+	// Stats().KVIndex.VerifyMisses and .ReconcileDrops (each this plus the sum
+	// over hosted groups) never decrease. Both are maintained on the per-shard
+	// kvindex.Set — the query leaf runs in ops, and the reconcile pass runs on a
+	// goroutine the store owns — so these node counters are only ever the
+	// residue of groups that have left.
 	kvBackfills           atomic.Uint64
 	kvBackfillKeys        atomic.Uint64
 	kvIndexRejects        atomic.Uint64

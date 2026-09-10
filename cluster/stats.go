@@ -169,7 +169,18 @@ type KVIndexStats struct {
 	// count into the node total before its index is dropped.
 	VerifyMisses uint64
 
-	// ReconcileDrops counts postings the reconciler removed because their key is
-	// no longer live.
+	// ReconcileDrops counts postings the bounded reconcile pass removed because
+	// the key's live re-read MISSED. It is the residue VerifyMisses measures,
+	// finally collected: the pass exists to bound the MEMORY those postings hold,
+	// never to make an answer correct — verify-on-read already does that.
+	//
+	// A steady non-zero rate means keys are leaving the cache by a path that
+	// cannot name a key to kvindex.Set.Drop (a corrupt slot, a torn page's
+	// abandoned slots), or that a rebuild straddled a flush. Zero is the ordinary
+	// reading and does not mean the pass is not running.
+	//
+	// Monotonic across shard removal: RemoveShardOwner folds a departing group's
+	// count into the node total before its index is dropped. It stays at zero on
+	// a node whose stores run with shard.Config.KVIndexReconcileIntervalMs = 0.
 	ReconcileDrops uint64
 }
