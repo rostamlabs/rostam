@@ -2,6 +2,11 @@
 
 package cache
 
+import (
+	"fmt"
+	"io"
+)
+
 // Stats is a snapshot of cache counters.
 // Most fields are cumulative counters accumulated since cache creation (Gets, Hits,
 // Puts, Evictions, the Compaction* totals, …); sample and diff them for rates. The
@@ -10,13 +15,20 @@ package cache
 // report current capacity/occupancy, and ReclaimableBytes reports current ghost-byte
 // pressure (which compaction actively drives back down).
 type Stats struct {
-	Gets             uint64
-	Hits             uint64
-	Misses           uint64
-	Puts             uint64
-	Dels             uint64
-	Expirations      uint64 // expired by sweeper or lazy-on-read
-	Evictions        uint64 // displaced by ringbuf eviction
+	Gets        uint64
+	Hits        uint64
+	Misses      uint64
+	Puts        uint64
+	Dels        uint64
+	Expirations uint64 // expired by sweeper or lazy-on-read
+	Evictions   uint64 // entries displaced by ringbuf eviction, live or not
+	// EvictionsLive counts only those evictions that displaced the entry the
+	// index still pointed at: a record lost to CAPACITY rather than to its TTL.
+	// Evictions also covers entries a newer Put had already superseded, so
+	// EvictionsLive is the one to watch to decide whether a cache is sized for
+	// its working set. EvictionsLive > 0 with Expirations low means the budget,
+	// not the TTL, is deciding how long entries survive.
+	EvictionsLive    uint64
 	Rejects          uint64 // refused due to PolicyRejectWrites
 	PagesAllocated   uint64
 	BytesAllocated   uint64
@@ -67,4 +79,54 @@ func (s Stats) HitRate() float64 {
 		return 0
 	}
 	return float64(s.Hits) / float64(s.Gets)
+}
+
+// WritePrometheus renders s in the Prometheus text exposition format. Counters
+// are cumulative since node start; sample and diff them for rates.
+//
+// rostam_kv_evictions_live_total is the one worth alerting on: it counts
+// records displaced because the cache was full rather than because their TTL
+// elapsed. A cache sized for its working set holds that near zero and retires
+// entries through rostam_kv_expirations_total instead.
+func (s Stats) WritePrometheus(w io.Writer) error {
+	counters := []struct {
+		name string
+		help string
+		val  uint64
+	}{
+		{"rostam_kv_gets_total", "KV reads served", s.Gets},
+		{"rostam_kv_hits_total", "KV reads that found a live entry", s.Hits},
+		{"rostam_kv_misses_total", "KV reads that found nothing", s.Misses},
+		{"rostam_kv_puts_total", "KV writes applied", s.Puts},
+		{"rostam_kv_dels_total", "KV deletes applied", s.Dels},
+		{"rostam_kv_expirations_total", "entries retired because their TTL elapsed", s.Expirations},
+		{"rostam_kv_evictions_total", "entries displaced by ringbuf eviction, live or already superseded", s.Evictions},
+		{"rostam_kv_evictions_live_total", "entries displaced by ringbuf eviction that were still the live record for their key - lost to capacity, not TTL", s.EvictionsLive},
+		{"rostam_kv_rejects_total", "writes refused under PolicyRejectWrites", s.Rejects},
+		{"rostam_kv_corruption_errors_total", "CRC mismatches seen on read", s.CorruptionErrors},
+	}
+	gauges := []struct {
+		name string
+		help string
+		val  uint64
+	}{
+		{"rostam_kv_pages_allocated", "cache pages currently allocated", s.PagesAllocated},
+		{"rostam_kv_bytes_allocated", "bytes backing those pages", s.BytesAllocated},
+		{"rostam_kv_bytes_used", "bytes of live entry data", s.BytesUsed},
+		{"rostam_kv_reclaimable_bytes", "page bytes held by entries no longer reachable", s.ReclaimableBytes},
+	}
+
+	for _, c := range counters {
+		if _, err := fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n%s %d\n",
+			c.name, c.help, c.name, c.name, c.val); err != nil {
+			return err
+		}
+	}
+	for _, g := range gauges {
+		if _, err := fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n%s %d\n",
+			g.name, g.help, g.name, g.name, g.val); err != nil {
+			return err
+		}
+	}
+	return nil
 }

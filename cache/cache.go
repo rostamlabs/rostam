@@ -308,6 +308,7 @@ func (c *Cache) Stats() Stats {
 		agg.Dels += x.Dels
 		agg.Expirations += x.Expirations
 		agg.Evictions += x.Evictions
+		agg.EvictionsLive += x.EvictionsLive
 		agg.Rejects += x.Rejects
 		agg.PagesAllocated += x.PagesAllocated
 		agg.BytesAllocated += x.BytesAllocated

@@ -56,6 +56,7 @@ const (
 	MaxPutBatchSize             = wire.MaxPutBatchSize
 	CollectionsOp               = wire.CollectionsOp
 	MetricsOp                   = wire.MetricsOp
+	KVMetricsOp                 = wire.KVMetricsOp
 	OpKeysAdd                   = wire.OpKeysAdd
 	OpKeysList                  = wire.OpKeysList
 	OpKeysRevoke                = wire.OpKeysRevoke

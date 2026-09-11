@@ -81,6 +81,20 @@ func (a *api) metrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
+// kvMetrics serves the node's KV cache stats as Prometheus text via the
+// __kv_metrics__ read op. Separate from /metrics on purpose: that endpoint
+// renders dense-collection stats and returns an empty body on a KV-only node,
+// and folding the two together would change what existing vector scrapers see.
+func (a *api) kvMetrics(w http.ResponseWriter, r *http.Request) {
+	body, ok := a.call(w, r, ops.KVMetricsOp, nil)
+	if !ok {
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
 // replication serves the per-hosted-shard replication view (mode, primary, ISR
 // vs min-ISR, per-backup lag) as JSON. Like ready it is auth-exempt (an ops
 // probe carries no token) and dispatches directly: the __repl_metrics__ op

@@ -144,9 +144,12 @@ type shard struct {
 	dels        atomic.Uint64
 	expirations atomic.Uint64
 	evictions   atomic.Uint64
-	rejects     atomic.Uint64
-	pagesAlloc  atomic.Uint64
-	corrupt     atomic.Uint64
+	// evictionsLive counts only the evictions that displaced the entry the
+	// index still pointed at - a record lost to CAPACITY rather than TTL.
+	evictionsLive atomic.Uint64
+	rejects       atomic.Uint64
+	pagesAlloc    atomic.Uint64
+	corrupt       atomic.Uint64
 
 	// cold-compaction counters (cache/compact.go). Written once, at open, before
 	// the shard is published; atomic only so Stats can read them from any
@@ -984,6 +987,7 @@ func (s *shard) snapshot() Stats {
 		Dels:             s.dels.Load(),
 		Expirations:      s.expirations.Load(),
 		Evictions:        s.evictions.Load(),
+		EvictionsLive:    s.evictionsLive.Load(),
 		Rejects:          s.rejects.Load(),
 		PagesAllocated:   s.pagesAlloc.Load(),
 		BytesAllocated:   uint64(s.numPages()) * uint64(s.cfg.PageSize), //nolint:gosec // numPages and PageSize are always non-negative
@@ -1410,6 +1414,11 @@ func (s *shard) retirePageLocked(idx int) {
 		t := s.tab.Load()
 		if slot, cur, ok := t.findSlot(h); ok && cur == ref {
 			t.tombstone(slot)
+			// The index still pointed here, so this was the live record for
+			// its key: displaced by capacity, not by TTL. Counted separately
+			// from evictions, which also covers entries a newer Put had
+			// already superseded.
+			s.evictionsLive.Add(1)
 		}
 		s.evictions.Add(1)
 		cursor += entrySize(len(key), len(value))
@@ -1455,6 +1464,7 @@ func (s *shard) drainPageLocked(victim int) error {
 		t := s.tab.Load()
 		if slot, cur, ok := t.findSlot(h); ok && cur == ref {
 			t.tombstone(slot)
+			s.evictionsLive.Add(1)
 		}
 		s.evictions.Add(1)
 	}

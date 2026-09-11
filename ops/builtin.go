@@ -97,6 +97,9 @@ var builtinHandlers = map[string]Handler{
 	// Prometheus stats. follow-up: a clustered scrape would gather + concatenate
 	// each shard's exposition; today it serves the node it is dispatched to.
 	wire.MetricsOp: handleMetrics,
+	// __kv_metrics__ is the KV-side twin of __metrics__: cache counters as
+	// Prometheus text, shardless and read-only.
+	wire.KVMetricsOp: handleKVMetrics,
 	// __repl_metrics__ is a shardless REPLICATION-observability op. The default
 	// handler here reports no replicated shards (correct for single-node / Direct,
 	// which replicates nothing). In cluster mode cluster.Node intercepts it in its
@@ -639,6 +642,18 @@ func handleMetrics(tx *TxContext, _ []byte) ([]byte, error) {
 	}
 	var buf bytes.Buffer
 	if err := tx.vectors.WritePrometheusAll(&buf); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// handleKVMetrics renders the node's KV cache stats as Prometheus text. It is
+// the KV counterpart to handleMetrics, which covers the vector side and emits
+// nothing on a KV-only node — so before this a cache-only Rostam reported
+// nothing about itself over the wire.
+func handleKVMetrics(tx *TxContext, _ []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := tx.c.Stats().WritePrometheus(&buf); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil

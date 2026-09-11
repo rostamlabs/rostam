@@ -64,6 +64,13 @@ const MetricsOp = "__metrics__"
 // per-hosted-shard replication state (mode / primary / ISR / min-ISR / lag).
 const ReplMetricsOp = "__repl_metrics__"
 
+// KVMetricsOp is a shardless READ-ONLY op rendering the node's KV cache stats
+// in the Prometheus text format. __metrics__ covers the VECTOR side and emits
+// nothing on a KV-only node, so without this a cache-only Rostam reports
+// nothing about itself: hit rate, eviction pressure and occupancy were all
+// invisible from outside the process.
+const KVMetricsOp = "__kv_metrics__"
+
 // CollectionsOp is the shardless op that enumerates the local node's dense
 // collections. Its result is the name list (EncodeCollectionsResult); the HTTP
 // /v1/collections handler renders it as JSON. Like __metrics__ it reads the SAME

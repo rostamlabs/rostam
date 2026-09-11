@@ -77,6 +77,7 @@ var BuiltinOps = []BuiltinOp{
 	{ReadyOp, OpReadOnly, nil, RouteLayoutNone, false},
 	{MetricsOp, OpReadOnly, nil, RouteLayoutNone, false},
 	{ReplMetricsOp, OpReadOnly, nil, RouteLayoutNone, false},
+	{KVMetricsOp, OpReadOnly, nil, RouteLayoutNone, false},
 	{CollectionsOp, OpReadOnly, nil, RouteLayoutNone, false},
 
 	{"vector_create_collection", OpReadWrite, routeAt1.ke, routeAt1.layout, false},

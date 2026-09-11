@@ -134,6 +134,11 @@ func Handler(disp Dispatcher, opts Options) http.Handler {
 	// stats via the __metrics__ read op.
 	mux.HandleFunc("GET /metrics", a.metrics)
 	mux.HandleFunc("GET /v1/metrics", a.metrics)
+	// KV cache stats. Its own endpoint rather than folded into /metrics: that
+	// one renders dense-collection stats and is empty on a KV-only node, and
+	// merging them would change what existing vector scrapers receive.
+	mux.HandleFunc("GET /kv/metrics", a.kvMetrics)
+	mux.HandleFunc("GET /v1/kv/metrics", a.kvMetrics)
 	// Replication observability (#6): per-hosted-shard mode / primary / ISR vs
 	// min-ISR / per-backup lag as JSON via the __repl_metrics__ read op.
 	// Auth-exempt like /v1/ready — an ops/infra probe carries no token.
