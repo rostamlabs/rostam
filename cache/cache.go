@@ -162,19 +162,6 @@ func (c *Cache) Get(key []byte) ([]byte, error) {
 	return s.getH(key, h)
 }
 
-// StatsNoWalk is Stats without the O(entries) reclaimable-bytes recomputation:
-// ReclaimableBytes is served from the last published figure (or 0). It is for a
-// caller that collects stats while holding a lock others need - the cluster
-// metrics scrape holds the node's shard mutex - where a walk would turn a
-// scrape into a stall on shard add/remove/shutdown.
-func (c *Cache) StatsNoWalk() Stats {
-	var agg Stats
-	for _, s := range c.shards {
-		agg.Add(s.snapshotNoWalk())
-	}
-	return agg
-}
-
 // GetInto appends the value for key to dst and returns the extended slice. It is
 // the allocation-free counterpart to Get: a caller in a hot loop passes its
 // reused buffer (dst[:0]) and incurs zero allocations per hit, instead of the

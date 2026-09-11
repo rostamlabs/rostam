@@ -24,7 +24,6 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   the signal that the memory budget, not the TTL, is deciding how long entries
   survive.
 
-
 - **Filter and index `operate` records stored in vector payloads.** A payload
   value of kind `record` (the bytes `operate` writes) can now be addressed
   directly by filters: a path like `session/rc`, `session/b/42/hi`, or

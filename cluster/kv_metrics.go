@@ -17,28 +17,30 @@ import (
 // and could forward the scrape to whichever node owns that shard, which is not
 // the node the operator asked. Dispatching off n.adminOps (like __ready__ and
 // __repl_metrics__) keeps the answer about the node that received it.
+//
+// The lock is taken PER SHARD rather than once around the loop. Stats on an
+// eligible mmap shard can recompute reclaimable bytes with an O(entries) walk,
+// and RemoveShardOwner nils the slot under the write lock before closing the
+// store — so the read lock is what keeps a store alive across the call, but
+// holding it across every shard would let one scrape stall shard add/remove and
+// node shutdown for the sum of all their walks. Per shard, a waiting writer gets
+// in at the next release, after at most one walk. The cost is that the shards
+// are not sampled at one instant, which a counter scrape can afford.
 func (n *Node) handleKVMetrics(_ []byte) ([]byte, error) {
 	var agg cache.Stats
-	// Hold shardMu across the whole read, rather than iterating a
-	// snapshotShards() copy: that helper releases the lock before returning, so
-	// a store it handed back can be closed by RemoveShardOwner while this loop
-	// is still calling Stats() on it. (RemoveShardOwner nils the slot under the
-	// write lock and closes AFTER releasing, so holding the read lock is what
-	// keeps the store alive for the call.)
-	//
-	// CacheStatsNoWalk, not Stats: the full read recomputes reclaimable bytes
-	// with an O(entries) walk on eligible mmap shards, and doing that under
-	// shardMu would let a metrics scrape stall shard add/remove and node
-	// shutdown for the length of the walk. A scrape takes the last published
-	// figure instead.
-	n.shardMu.RLock()
-	for _, s := range n.shards {
-		if s == nil {
-			continue
+	for i := 0; ; i++ {
+		n.shardMu.RLock()
+		if i >= len(n.shards) {
+			n.shardMu.RUnlock()
+			break
 		}
-		agg.Add(s.CacheStatsNoWalk())
+		var st cache.Stats
+		if s := n.shards[i]; s != nil {
+			st = s.CacheStats()
+		}
+		n.shardMu.RUnlock()
+		agg.Add(st)
 	}
-	n.shardMu.RUnlock()
 	var buf bytes.Buffer
 	if err := agg.WritePrometheus(&buf); err != nil {
 		return nil, err
