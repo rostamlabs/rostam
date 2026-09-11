@@ -454,7 +454,7 @@ func TestDecodeOperateArgsIntoZeroAllocOnWarmDst(t *testing.T) {
 // fails partway has already overwritten elements the old length still covers -
 // a reusing caller that trusted the old contents would read a mix of two calls.
 func TestDecodeOperateArgsIntoResetsOnError(t *testing.T) {
-	good, err := EncodeOperateArgs(sessionShapedArgs(8))
+	good, err := EncodeOperateArgs(manyRowArgs(8))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -487,11 +487,11 @@ func TestDecodeOperateArgsIntoResetsOnError(t *testing.T) {
 // Shrinking a reused dst must not leave the previous call's ops reachable past
 // the new length - they alias that call's request buffer and would pin it.
 func TestDecodeOperateArgsIntoClearsStaleTail(t *testing.T) {
-	big, err := EncodeOperateArgs(sessionShapedArgs(16))
+	big, err := EncodeOperateArgs(manyRowArgs(16))
 	if err != nil {
 		t.Fatal(err)
 	}
-	small, err := EncodeOperateArgs(sessionShapedArgs(1))
+	small, err := EncodeOperateArgs(manyRowArgs(1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -525,16 +525,15 @@ func TestDecodeOperateArgsIntoClearsStaleTail(t *testing.T) {
 	}
 }
 
-// sessionShapedArgs is a realistic hot-path call: one record touched for
-// nBidders keys, ~4 position-addressed ops each, the shape a session cache
-// sends per auction.
-func sessionShapedArgs(nBidders int) *OperateArgs {
+// manyRowArgs is a wide hot-path call: one record touched for nRows keys with
+// ~4 position-addressed ops each, plus one return per key.
+func manyRowArgs(nRows int) *OperateArgs {
 	a := &OperateArgs{
 		Key: []byte("session:42"), Create: OperateCreateSchema,
 		TTL: 2 * time.Hour, TTLMode: OperateTTLSet,
 		Schema: sessionSchema().Encode(),
 	}
-	for i := range nBidders {
+	for i := range nRows {
 		row := []byte{byte(i), byte(i >> 8), 0, 0, 0, 0, 0, 0}
 		col := func(c uint32) OperatePath {
 			return OperatePath{Kind: OperatePathCol, Field: OperateSeg{Pos: 3}, Key: row, Col: OperateSeg{Pos: c}}
@@ -545,7 +544,7 @@ func sessionShapedArgs(nBidders int) *OperateArgs {
 			OperateOp{Opcode: OperateOpOR, Type: OperateTypeFromSchema, Path: col(1), A: 3},
 			OperateOp{Opcode: OperateOpADD, Type: OperateTypeFromSchema, Path: col(2), A: 1},
 		)
-		// One return per key, so Rets scales with nBidders too - a fixed-size
+		// One return per key, so Rets scales with nRows too - a fixed-size
 		// Rets would leave the rets shrink-clear path untested.
 		a.Rets = append(a.Rets, OperateRet{
 			Mode: OperateRetValue,
@@ -556,7 +555,7 @@ func sessionShapedArgs(nBidders int) *OperateArgs {
 }
 
 func BenchmarkDecodeOperateArgs(b *testing.B) {
-	buf, err := EncodeOperateArgs(sessionShapedArgs(16))
+	buf, err := EncodeOperateArgs(manyRowArgs(16))
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -570,7 +569,7 @@ func BenchmarkDecodeOperateArgs(b *testing.B) {
 }
 
 func BenchmarkDecodeOperateArgsInto(b *testing.B) {
-	buf, err := EncodeOperateArgs(sessionShapedArgs(16))
+	buf, err := EncodeOperateArgs(manyRowArgs(16))
 	if err != nil {
 		b.Fatal(err)
 	}

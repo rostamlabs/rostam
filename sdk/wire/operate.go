@@ -432,7 +432,7 @@ func DecodeOperateArgs(b []byte) (*OperateArgs, error) {
 // capacity of dst.Ops and dst.Rets instead of allocating a fresh slice per
 // call. It is for a hot-path caller that pools the struct: the server decodes
 // one OperateArgs per operate request, and that op slice is the single largest
-// allocation on the apply path (an op list of n bidders x ~4 ops per bidder).
+// allocation on the apply path (an op list of n keys x ~4 ops per key).
 //
 // Every field of dst is overwritten, so a pooled dst carries nothing from its
 // previous use. A dst that already has capacity KEEPS it, so a frame carrying

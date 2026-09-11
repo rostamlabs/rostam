@@ -40,8 +40,8 @@ import (
 // been called.
 // operateArgsPool recycles the decoded call. The op slice is the single
 // largest allocation on this path - one operate request carries up to
-// OperateMaxOps ops, and a session-cache style caller sends ~4 per key it
-// touches - so decoding a fresh one per request dominated the server's
+// OperateMaxOps ops, and a caller that touches many keys in one call sends a
+// few ops per key - so decoding a fresh one per request dominated the server's
 // allocation volume. Same pattern as schemaEnginePool/dynamicEnginePool.
 //
 // The decoded args alias the request buffer and applyRecordBytes only reads
