@@ -19,12 +19,19 @@ import (
 // __repl_metrics__) keeps the answer about the node that received it.
 func (n *Node) handleKVMetrics(_ []byte) ([]byte, error) {
 	var agg cache.Stats
-	for _, s := range n.snapshotShards() {
+	// Hold shardMu across the whole read, rather than iterating a
+	// snapshotShards() copy: that helper releases the lock before returning, so
+	// a store it handed back can be closed by RemoveShardOwner while this loop
+	// is still calling Stats() on it. Reading stats is cheap and non-blocking,
+	// so holding the read lock here costs nothing worth the race.
+	n.shardMu.RLock()
+	for _, s := range n.shards {
 		if s == nil {
 			continue
 		}
 		agg.Add(s.Stats().Cache)
 	}
+	n.shardMu.RUnlock()
 	var buf bytes.Buffer
 	if err := agg.WritePrometheus(&buf); err != nil {
 		return nil, err

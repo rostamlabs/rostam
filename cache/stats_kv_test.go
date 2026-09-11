@@ -110,6 +110,11 @@ func TestEvictionsLiveExcludesExpiredEntries(t *testing.T) {
 	cfg.MaxMemoryPerShard = 8 << 20
 	cfg.PageSize = 1 << 20
 	cfg.AtCapPolicy = PolicyRingbufEvict
+	// Disable the background sweeper: this test needs expired-but-unswept pages
+	// to still be there when eviction reaches them, which is the whole scenario.
+	// Left at DefaultConfig's 1000ms the sweeper can reclaim them first and the
+	// test flakes. Same convention as b3b_sweeper_test.go.
+	cfg.TTLSweepIntervalMs = 0
 	c, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
