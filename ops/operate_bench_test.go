@@ -4,8 +4,9 @@ package ops
 
 // Benchmarks for the design doc's §2.6 in-place byte-patching claim: applying
 // a small op list to an existing record should cost one allocation for the
-// record copy and one for the result frame, independent of how many rows the
-// record holds. These measure that against the tree oracle, which rebuilds
+// record copy, independent of how many rows the record holds. (The result frame
+// used to be a second one; it is returned by value now.) Through handleOperate
+// the record copy comes from a pool too — see BenchmarkOperateHandlerExistingRow. These measure that against the tree oracle, which rebuilds
 // the whole record on every call, to quantify the win the byte engines exist
 // for.
 //
@@ -21,6 +22,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/rostamlabs/rostam/cache"
 	"github.com/rostamlabs/rostam/sdk/wire"
 )
 
@@ -199,5 +201,36 @@ func BenchmarkOperateFreshRowInserts(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+// BenchmarkOperateHandlerExistingRow drives a whole call through handleOperate,
+// which is the only way the pooled buffers get exercised: every other benchmark
+// here calls applyRecordBytes directly and so never touches them. What is left
+// per call after the pools is the reply frame EncodeOperateResult builds.
+func BenchmarkOperateHandlerExistingRow(b *testing.B) {
+	cfg := cache.DefaultConfig()
+	cfg.NumShards = 1
+	c, err := cache.New(cfg)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = c.Close() })
+	tx := NewTxContext(c)
+
+	args, err := wire.EncodeOperateArgs(addField0([]byte("bench-handler-key")))
+	if err != nil {
+		b.Fatal(err)
+	}
+	if _, err := handleOperate(tx, args); err != nil { // create, and warm the pools
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := handleOperate(tx, args); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

@@ -5,6 +5,25 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **A warm `operate` write allocates nothing for the record itself.** The apply
+  path worked on a private copy of the stored record (`copyRecord`), one
+  allocation per call and — after the result frame moved to the stack — the last
+  one left in `applyRecordBytes`. `handleOperate` now supplies that buffer from a
+  pool and keeps it across calls, so a steady-state record is patched in a
+  recycled array. A record that grew keeps the larger array, which also stops
+  `insertGap` reallocating on every write once a record reaches its working size.
+
+  Measured through the handler (`BenchmarkOperateHandlerExistingRow`): 2
+  allocs/op to 1, 169 B/op to 71. The call is ~3% slower in `ns/op` — about
+  14 ns for the pool round trip — which is the trade. The remaining allocation
+  is the reply frame `EncodeOperateResult` builds.
+
+  The recycled buffer is the one `out` points at, not the one passed in:
+  `insertGap` REPLACES the array when a record outgrows it. `out` aliases the
+  scratch whenever the record fit, so a caller holding those bytes past its next
+  call holds a buffer someone else is writing — `tx.Put` copies into the page
+  arena, so the store itself never does.
+
 - **The `operate` APPLY path costs one allocation per call instead of two.** The
   result frame was built as `&wire.OperateResult{...}` and returned up the apply
   path, one 32-byte heap object per call. It never outlives the handler — the op

@@ -62,6 +62,21 @@ const maxPooledReadBuf = 64 << 10
 
 var operateReadBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 512); return &b }}
 
+// operateWriteBufPool backs the private record copy the apply path works on
+// (copyRecord). It is separate from operateReadBufPool because a call needs
+// BOTH at once: the stored bytes are read into one and copied into the other,
+// which the engine then patches in place. Same maxPooledReadBuf guard, for the
+// same reason — a record may reach maxOperateRecordBytes, and pooling
+// unconditionally would let a few outsized keys pin a large array per slot.
+var operateWriteBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 512); return &b }}
+
+func putOperateWriteBuf(bp *[]byte) {
+	if cap(*bp) <= maxPooledReadBuf {
+		*bp = (*bp)[:0]
+		operateWriteBufPool.Put(bp)
+	}
+}
+
 func putOperateReadBuf(bp *[]byte) {
 	if cap(*bp) <= maxPooledReadBuf {
 		*bp = (*bp)[:0]
@@ -109,8 +124,25 @@ func handleOperate(tx *TxContext, args []byte) ([]byte, error) {
 		cur = nil
 	}
 
+	// The apply path's working copy of the record. Recycling it is what makes a
+	// warm in-place update allocate nothing: copyRecord reuses this array, and a
+	// record that grew keeps the larger array for the next call, so insertGap
+	// stops reallocating on every write to a steady-state record.
+	//
+	// *wb = out, not the buffer passed in: insertGap REPLACES the array when the
+	// record outgrows it, so out is what must be recycled. Recycling the old
+	// array instead would hand a second caller a buffer while out still aliased
+	// the one the engine actually wrote — and pool the smaller array forever.
+	// Guarded on out != nil so a delete or a failed CHECK (both of which return
+	// no bytes) keeps whatever capacity the slot already had.
+	wb, _ := operateWriteBufPool.Get().(*[]byte)
+	defer func() { putOperateWriteBuf(wb) }()
+
 	stampMs, _ := tx.applyStamp()
-	out, deleted, res, err := applyRecordBytes(cur, a, stampMs)
+	out, deleted, res, err := applyRecordBytesInto((*wb)[:0], cur, a, stampMs)
+	if out != nil {
+		*wb = out
+	}
 	if err != nil {
 		if errors.Is(err, errOperateAbsent) {
 			// design doc §3.5: create = NONE against an absent key is the
