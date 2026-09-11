@@ -3,6 +3,7 @@
 package wire
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"math"
@@ -377,5 +378,139 @@ func TestAppendOperateArgsZeroAllocOnWarmBuffer(t *testing.T) {
 		buf, _ = AppendOperateArgs(buf[:0], a)
 	}); n != 0 {
 		t.Errorf("AppendOperateArgs on a warm buffer allocated %v times, want 0", n)
+	}
+}
+
+// A pooled dst must decode byte-identically to a fresh one, and must carry
+// nothing from its previous use - a stale Key or Schema would be read as the
+// current call's.
+func TestDecodeOperateArgsIntoMatchesDecode(t *testing.T) {
+	full, err := EncodeOperateArgs(sampleArgs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A deliberately different second frame: no ops, no rets, no schema.
+	bare, err := EncodeOperateArgs(&OperateArgs{Key: []byte("k"), Create: OperateCreateDynamic})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, order := range [][][]byte{{full, bare}, {bare, full}, {full, full}, {bare, bare}} {
+		dst := new(OperateArgs)
+		for i, frame := range order {
+			want, dErr := DecodeOperateArgs(frame)
+			if dErr != nil {
+				t.Fatal(dErr)
+			}
+			if iErr := DecodeOperateArgsInto(dst, frame); iErr != nil {
+				t.Fatal(iErr)
+			}
+			// Compared field by field rather than with DeepEqual: a reused
+			// dst keeps its slice capacity, so an op-less frame decodes to
+			// an EMPTY Ops rather than the nil a fresh decode produces.
+			// Semantically identical, and len() is what every caller uses.
+			if !bytes.Equal(dst.Key, want.Key) || dst.TTL != want.TTL ||
+				dst.TTLMode != want.TTLMode || dst.Create != want.Create ||
+				!bytes.Equal(dst.Schema, want.Schema) ||
+				!reflect.DeepEqual(dst.Ops, want.Ops) && (len(dst.Ops) != 0 || len(want.Ops) != 0) ||
+				!reflect.DeepEqual(dst.Rets, want.Rets) && (len(dst.Rets) != 0 || len(want.Rets) != 0) {
+				t.Fatalf("reuse %d:\n got %+v\nwant %+v", i, dst, want)
+			}
+		}
+	}
+}
+
+// Reuse must not allocate once the op slice has grown. Uses schema-POSITION
+// paths only: a path addressed by NAME decodes its name with string(b[...]),
+// which allocates per segment no matter how the op slice is managed. Schema
+// mode - the hot path this pool exists for - always addresses by position.
+func TestDecodeOperateArgsIntoZeroAllocOnWarmDst(t *testing.T) {
+	positional := &OperateArgs{
+		Key: []byte("session:42"), Create: OperateCreateSchema,
+		Schema: sessionSchema().Encode(),
+		Ops: []OperateOp{
+			{Opcode: OperateOpADD, Type: OperateTypeFromSchema, Path: OperatePath{Kind: OperatePathField, Field: OperateSeg{Pos: 0}}, A: 1},
+			{Opcode: OperateOpSHL, Type: OperateTypeFromSchema, Path: OperatePath{Kind: OperatePathCol, Field: OperateSeg{Pos: 3}, Key: []byte{1, 0, 0, 0, 0, 0, 0, 0}, Col: OperateSeg{Pos: 0}}, A: 2},
+		},
+		Rets: []OperateRet{{Mode: OperateRetCount, Path: OperatePath{Kind: OperatePathField, Field: OperateSeg{Pos: 3}}}},
+	}
+	b, err := EncodeOperateArgs(positional)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := new(OperateArgs)
+	if err = DecodeOperateArgsInto(dst, b); err != nil {
+		t.Fatal(err)
+	}
+	if n := testing.AllocsPerRun(100, func() {
+		_ = DecodeOperateArgsInto(dst, b)
+	}); n != 0 {
+		t.Errorf("DecodeOperateArgsInto on a warm dst allocated %v times, want 0", n)
+	}
+}
+
+// A frame that fails to decode must not leave the caller's dst holding the
+// previous call's data.
+func TestDecodeOperateArgsIntoRejectsTrailingBytes(t *testing.T) {
+	b, err := EncodeOperateArgs(sampleArgs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := new(OperateArgs)
+	if err = DecodeOperateArgsInto(dst, append(append([]byte(nil), b...), 0xFF)); err == nil {
+		t.Fatal("trailing bytes must be rejected")
+	}
+}
+
+// sessionShapedArgs is a realistic hot-path call: one record touched for
+// nBidders keys, ~4 position-addressed ops each, the shape a session cache
+// sends per auction.
+func sessionShapedArgs(nBidders int) *OperateArgs {
+	a := &OperateArgs{
+		Key: []byte("session:42"), Create: OperateCreateSchema,
+		TTL: 2 * time.Hour, TTLMode: OperateTTLSet,
+		Schema: sessionSchema().Encode(),
+	}
+	for i := range nBidders {
+		row := []byte{byte(i), byte(i >> 8), 0, 0, 0, 0, 0, 0}
+		col := func(c uint32) OperatePath {
+			return OperatePath{Kind: OperatePathCol, Field: OperateSeg{Pos: 3}, Key: row, Col: OperateSeg{Pos: c}}
+		}
+		a.Ops = append(a.Ops,
+			OperateOp{Opcode: OperateOpADD, Type: OperateTypeFromSchema, Path: col(0), A: 1},
+			OperateOp{Opcode: OperateOpSHL, Type: OperateTypeFromSchema, Path: col(1), A: 2},
+			OperateOp{Opcode: OperateOpOR, Type: OperateTypeFromSchema, Path: col(1), A: 3},
+			OperateOp{Opcode: OperateOpADD, Type: OperateTypeFromSchema, Path: col(2), A: 1},
+		)
+	}
+	return a
+}
+
+func BenchmarkDecodeOperateArgs(b *testing.B) {
+	buf, err := EncodeOperateArgs(sessionShapedArgs(16))
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := DecodeOperateArgs(buf); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkDecodeOperateArgsInto(b *testing.B) {
+	buf, err := EncodeOperateArgs(sessionShapedArgs(16))
+	if err != nil {
+		b.Fatal(err)
+	}
+	dst := new(OperateArgs)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := DecodeOperateArgsInto(dst, buf); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

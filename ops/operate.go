@@ -4,6 +4,7 @@ package ops
 
 import (
 	"errors"
+	"sync"
 
 	"github.com/rostamlabs/rostam/cache"
 	"github.com/rostamlabs/rostam/sdk/wire"
@@ -37,9 +38,24 @@ import (
 // copyRecord) and returns its own, freshly allocated out; this handler never
 // writes through cur and never touches it again once applyRecordBytes has
 // been called.
+// operateArgsPool recycles the decoded call. The op slice is the single
+// largest allocation on this path - one operate request carries up to
+// OperateMaxOps ops, and a session-cache style caller sends ~4 per key it
+// touches - so decoding a fresh one per request dominated the server's
+// allocation volume. Same pattern as schemaEnginePool/dynamicEnginePool.
+//
+// The decoded args alias the request buffer and applyRecordBytes only reads
+// them during the call, so the struct is safe to return to the pool as soon
+// as handleOperate returns.
+var operateArgsPool = sync.Pool{New: func() any { return new(wire.OperateArgs) }}
+
 func handleOperate(tx *TxContext, args []byte) ([]byte, error) {
-	a, err := wire.DecodeOperateArgs(args)
-	if err != nil {
+	a, _ := operateArgsPool.Get().(*wire.OperateArgs)
+	defer func() {
+		*a = wire.OperateArgs{Ops: a.Ops[:0], Rets: a.Rets[:0]}
+		operateArgsPool.Put(a)
+	}()
+	if err := wire.DecodeOperateArgsInto(a, args); err != nil {
 		return nil, err
 	}
 

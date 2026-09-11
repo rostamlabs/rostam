@@ -421,26 +421,52 @@ func AppendOperateArgs(dst []byte, a *OperateArgs) ([]byte, error) {
 // bound, and it closes the KV operate path (where args is the whole request
 // body) at the same time.
 func DecodeOperateArgs(b []byte) (*OperateArgs, error) {
-	a, n, err := decodeOperateArgsN(b)
-	if err != nil {
+	a := new(OperateArgs)
+	if err := DecodeOperateArgsInto(a, b); err != nil {
 		return nil, err
-	}
-	if n != len(b) {
-		return nil, ErrOperateArgs
 	}
 	return a, nil
 }
 
+// DecodeOperateArgsInto is DecodeOperateArgs decoding into dst, reusing the
+// capacity of dst.Ops and dst.Rets instead of allocating a fresh slice per
+// call. It is for a hot-path caller that pools the struct: the server decodes
+// one OperateArgs per operate request, and that op slice is the single largest
+// allocation on the apply path (an op list of n bidders x ~4 ops per bidder).
+//
+// Every field of dst is overwritten, so a pooled dst carries nothing from its
+// previous use. A dst that already has capacity KEEPS it, so a frame carrying
+// no ops decodes to an empty-but-non-nil dst.Ops where DecodeOperateArgs
+// would return nil - read len(dst.Ops), never dst.Ops == nil. A fresh dst
+// (nil slices) decodes identically to DecodeOperateArgs.
+//
+// A path addressed by NAME still allocates that name's string per segment;
+// schema mode addresses by position and so decodes with no allocation at all
+// once dst has grown.
+//
+// The same aliasing rule applies as for DecodeOperateArgs: Key, Schema, Bytes,
+// Name and path-Key fields may point into b, so dst must not outlive b.
+func DecodeOperateArgsInto(dst *OperateArgs, b []byte) error {
+	n, err := decodeOperateArgsN(dst, b)
+	if err != nil {
+		return err
+	}
+	if n != len(b) {
+		return ErrOperateArgs
+	}
+	return nil
+}
+
 // decodeOperateArgsN is DecodeOperateArgs' body, reporting how many bytes it
 // consumed so the exported wrapper can insist that be all of them.
-func decodeOperateArgsN(b []byte) (*OperateArgs, int, error) {
+func decodeOperateArgsN(dst *OperateArgs, b []byte) (int, error) {
 	if len(b) < 2 {
-		return nil, 0, ErrShortArgs
+		return 0, ErrShortArgs
 	}
 	klen := int(binary.BigEndian.Uint16(b[0:2]))
 	off := 2
 	if len(b)-off < klen {
-		return nil, 0, ErrShortArgs
+		return 0, ErrShortArgs
 	}
 	var key []byte
 	if klen > 0 {
@@ -449,11 +475,11 @@ func decodeOperateArgsN(b []byte) (*OperateArgs, int, error) {
 	off += klen
 
 	if len(b)-off < 8+1+1+2 { // ttlMs(8) + ttlMode(1) + create(1) + schemaLen(2)
-		return nil, 0, ErrShortArgs
+		return 0, ErrShortArgs
 	}
 	ttl, err := ttlFromMs(binary.BigEndian.Uint64(b[off : off+8]))
 	if err != nil {
-		return nil, 0, err
+		return 0, err
 	}
 	off += 8
 	ttlMode := b[off]
@@ -461,16 +487,16 @@ func decodeOperateArgsN(b []byte) (*OperateArgs, int, error) {
 	create := b[off]
 	off++
 	if ttlMode > OperateTTLCreateOnly {
-		return nil, 0, ErrOperateArgs
+		return 0, ErrOperateArgs
 	}
 	if create > OperateCreateDynamic {
-		return nil, 0, ErrOperateArgs
+		return 0, ErrOperateArgs
 	}
 
 	schemaLen := int(binary.BigEndian.Uint16(b[off : off+2]))
 	off += 2
 	if len(b)-off < schemaLen {
-		return nil, 0, ErrShortArgs
+		return 0, ErrShortArgs
 	}
 	var schema []byte
 	if schemaLen > 0 {
@@ -479,7 +505,7 @@ func decodeOperateArgsN(b []byte) (*OperateArgs, int, error) {
 	off += schemaLen
 
 	if len(b)-off < 2 {
-		return nil, 0, ErrShortArgs
+		return 0, ErrShortArgs
 	}
 	nOps := int(binary.BigEndian.Uint16(b[off : off+2]))
 	off += 2
@@ -488,18 +514,23 @@ func decodeOperateArgsN(b []byte) (*OperateArgs, int, error) {
 	// than a call may carry), while a count the remaining bytes cannot
 	// possibly hold is a truncated frame.
 	if nOps > OperateMaxOps {
-		return nil, 0, ErrOperateCap
+		return 0, ErrOperateCap
 	}
 	if !CountFitsIn(nOps, len(b)-off, minOpBytes) {
-		return nil, 0, ErrShortArgs
+		return 0, ErrShortArgs
 	}
-	var ops []OperateOp
+	// dst.Ops[:0] on a nil slice is still nil, so a fresh dst keeps
+	// DecodeOperateArgs's "nil when the frame carries none" shape while a
+	// pooled one reuses whatever capacity it already had.
+	ops := dst.Ops[:0]
 	if nOps > 0 {
-		ops = make([]OperateOp, 0, nOps)
+		if cap(ops) < nOps {
+			ops = make([]OperateOp, 0, nOps)
+		}
 		for i := 0; i < nOps; i++ {
 			op, n, oerr := decodeOp(b[off:])
 			if oerr != nil {
-				return nil, 0, oerr
+				return 0, oerr
 			}
 			ops = append(ops, op)
 			off += n
@@ -507,30 +538,32 @@ func decodeOperateArgsN(b []byte) (*OperateArgs, int, error) {
 	}
 
 	if len(b)-off < 2 {
-		return nil, 0, ErrShortArgs
+		return 0, ErrShortArgs
 	}
 	nRet := int(binary.BigEndian.Uint16(b[off : off+2]))
 	off += 2
 	if nRet > OperateMaxRet {
-		return nil, 0, ErrOperateCap
+		return 0, ErrOperateCap
 	}
 	if !CountFitsIn(nRet, len(b)-off, minRetBytes) {
-		return nil, 0, ErrShortArgs
+		return 0, ErrShortArgs
 	}
-	var rets []OperateRet
+	rets := dst.Rets[:0]
 	if nRet > 0 {
-		rets = make([]OperateRet, 0, nRet)
+		if cap(rets) < nRet {
+			rets = make([]OperateRet, 0, nRet)
+		}
 		for i := 0; i < nRet; i++ {
 			ret, n, rerr := decodeRet(b[off:])
 			if rerr != nil {
-				return nil, 0, rerr
+				return 0, rerr
 			}
 			rets = append(rets, ret)
 			off += n
 		}
 	}
 
-	return &OperateArgs{
+	*dst = OperateArgs{
 		Key:     key,
 		TTL:     ttl,
 		TTLMode: ttlMode,
@@ -538,7 +571,8 @@ func decodeOperateArgsN(b []byte) (*OperateArgs, int, error) {
 		Schema:  schema,
 		Ops:     ops,
 		Rets:    rets,
-	}, off, nil
+	}
+	return off, nil
 }
 
 // EncodeOperateResult encodes an operate result frame (design doc §3.4):
