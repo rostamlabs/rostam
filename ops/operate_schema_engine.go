@@ -806,16 +806,25 @@ func (e *schemaEngine) removeRows(pos, idx, count int) error {
 }
 
 // growCap sizes a REALLOCATION for a buffer growing by incr bytes to reach
-// need. The slack is a multiple of the INCREMENT, not of the total: a call
+// need. The slack is a multiple of the INCREMENT, capped at need: a call
 // opening k gaps one at a time consumed the whole fixed +64 on the first one
-// and reallocated O(k) times, copying the whole record each time. Reserving a
-// few increments makes that amortized O(1).
+// and reallocated on nearly every gap after it.
 //
-// Scaling by the increment rather than by need matters - an earlier version
-// used need/2 and measurably REGRESSED a dynamic-mode 16-row insert (+8.7%
-// bytes for zero allocations saved), because a large record growing by a
-// little does not need slack proportional to its size. The slack is also
-// capped at need so a tiny record growing by a lot cannot balloon.
+// This is a constant-factor reduction, NOT a change of complexity. Each
+// reallocation buys 8 more gaps, so opening k gaps still costs ~k/8
+// reallocations and O(k^2) total copying once the record is larger than
+// 8*incr - about 8x fewer reallocations than the fixed +64, not amortized
+// O(1). Only while need <= 8*incr does the cap make it a true doubling.
+//
+// Real geometric growth (slack = max(8*incr, need/2)) was measured and is
+// worse in the range that matters: it saves one allocation on a 32-row insert
+// but costs ~30% more bytes on 4- and 16-row inserts, which are the common
+// shapes. Do not "fix" the asymptotics without re-measuring those.
+//
+// Scaling by the increment rather than by need is load-bearing: an earlier
+// version used need/2 and measurably REGRESSED a dynamic-mode 16-row insert
+// (+8.7% bytes for zero allocations saved), because a large record growing by
+// a little does not need slack proportional to its size.
 //
 // It is deliberately NOT used for the INITIAL reservations (copyRecord,
 // createRecord). Most calls update existing rows and open no gap at all, so
