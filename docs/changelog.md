@@ -19,8 +19,10 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   `vector_operate` still heap-allocates one result, because the mutation
   callback captures its address — unchanged in count there, just moved. Small in
   bytes, since the struct is 32 of them, but on a production node this was the
-  largest single allocation site by object COUNT, which is what allocator and
-  sweep work track and what paces GC cycles.
+  largest single allocation site by object COUNT, and object count is what
+  allocator and sweep work follow. It is not what paces GC — that is heap bytes
+  against GOGC, and 32 bytes a call barely moves it — nor what mark cost
+  follows, which is live pointer-bearing memory.
 
 - **KV cache metrics are now scrapeable, and capacity loss is distinguishable
   from TTL turnover.** A KV-only node previously reported nothing about itself:
