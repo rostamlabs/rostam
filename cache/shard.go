@@ -972,7 +972,19 @@ func (s *shard) delH(key []byte, h uint64) (bool, error) {
 }
 
 // snapshot returns a Stats snapshot. Caller-side concurrency safe.
-func (s *shard) snapshot() Stats {
+// snapshot reports this shard's counters, recomputing ReclaimableBytes when its
+// cached figure has gone stale. snapshotNoWalk is the variant for callers that
+// must not block; see reclaimableBytesCached.
+func (s *shard) snapshot() Stats { return s.snapshotWith(true) }
+
+// snapshotNoWalk is snapshot without the O(entries) reclaimable-bytes walk.
+func (s *shard) snapshotNoWalk() Stats { return s.snapshotWith(false) }
+
+func (s *shard) snapshotWith(allowWalk bool) Stats {
+	reclaimable := s.reclaimableBytesCached()
+	if allowWalk {
+		reclaimable = s.reclaimableBytesForStats()
+	}
 	// Hits is derived: every read bumps gets on entry and bumps misses on any
 	// non-returning path, so Hits = Gets - Misses. Load misses BEFORE gets so an
 	// op in flight between the two loads can only leave gets >= misses (gets is
@@ -999,7 +1011,7 @@ func (s *shard) snapshot() Stats {
 		CompactionBytesReclaimed: s.compactBytesReclaimed.Load(),
 		CompactionDurationMs:     s.compactNanos.Load() / uint64(time.Millisecond),
 
-		ReclaimableBytes:     s.reclaimableBytesForStats(),
+		ReclaimableBytes:     reclaimable,
 		OnlineRelocations:    s.relocations.Load(),
 		OnlineBytesRelocated: s.relocatedBytes.Load(),
 		OnlinePagesRetired:   s.relocatePagesGone.Load(),

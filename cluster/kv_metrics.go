@@ -22,14 +22,21 @@ func (n *Node) handleKVMetrics(_ []byte) ([]byte, error) {
 	// Hold shardMu across the whole read, rather than iterating a
 	// snapshotShards() copy: that helper releases the lock before returning, so
 	// a store it handed back can be closed by RemoveShardOwner while this loop
-	// is still calling Stats() on it. Reading stats is cheap and non-blocking,
-	// so holding the read lock here costs nothing worth the race.
+	// is still calling Stats() on it. (RemoveShardOwner nils the slot under the
+	// write lock and closes AFTER releasing, so holding the read lock is what
+	// keeps the store alive for the call.)
+	//
+	// CacheStatsNoWalk, not Stats: the full read recomputes reclaimable bytes
+	// with an O(entries) walk on eligible mmap shards, and doing that under
+	// shardMu would let a metrics scrape stall shard add/remove and node
+	// shutdown for the length of the walk. A scrape takes the last published
+	// figure instead.
 	n.shardMu.RLock()
 	for _, s := range n.shards {
 		if s == nil {
 			continue
 		}
-		agg.Add(s.Stats().Cache)
+		agg.Add(s.CacheStatsNoWalk())
 	}
 	n.shardMu.RUnlock()
 	var buf bytes.Buffer

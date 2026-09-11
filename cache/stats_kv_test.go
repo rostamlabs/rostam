@@ -152,3 +152,36 @@ func TestEvictionsLiveExcludesExpiredEntries(t *testing.T) {
 			grew, st.Evictions)
 	}
 }
+
+// StatsNoWalk must never trigger the reclaimable-bytes recomputation, because
+// the cluster scrape calls it while holding the node's shard mutex. It agrees
+// with Stats on every counter; only ReclaimableBytes may lag.
+func TestStatsNoWalkMatchesStatsOnCounters(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.NumShards = 2
+	cfg.TTLSweepIntervalMs = 0
+	c, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	for i := range 200 {
+		k := fmt.Appendf(nil, "k-%04d", i)
+		if err := c.Put(k, []byte("v"), 0); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Get(k); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	full, lean := c.Stats(), c.StatsNoWalk()
+	full.ReclaimableBytes, lean.ReclaimableBytes = 0, 0
+	if full != lean {
+		t.Errorf("StatsNoWalk disagrees with Stats outside ReclaimableBytes:\n full %+v\n lean %+v", full, lean)
+	}
+	if lean.Gets == 0 || lean.Puts == 0 {
+		t.Errorf("counters did not come through: %+v", lean)
+	}
+}

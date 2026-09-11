@@ -851,6 +851,11 @@ func (s *Store) LastIndex() uint64 { return s.raft.LastIndex() }
 // signal online rebalancing polls on a joining replica.
 func (s *Store) RaftAppliedIndex() uint64 { return s.raft.AppliedIndex() }
 
+// CacheStatsNoWalk returns this shard's CACHE stats without the O(entries)
+// reclaimable-bytes recomputation, for a caller collecting under a lock others
+// need. See cache.Cache.StatsNoWalk.
+func (s *Store) CacheStatsNoWalk() cache.Stats { return s.cache.StatsNoWalk() }
+
 // Stats returns combined cache + raft stats.
 func (s *Store) Stats() Stats {
 	return Stats{

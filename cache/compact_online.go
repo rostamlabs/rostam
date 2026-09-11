@@ -249,6 +249,25 @@ func (s *shard) reclaimableBytesNow() uint64 {
 // — keeping Stats() O(1) amortized regardless of scrape frequency. A concurrent stale
 // caller may recompute too; that is harmless (the walk is read-locked and idempotent, the
 // store is atomic).
+// reclaimableBytesCached is reclaimableBytesForStats WITHOUT the fallback walk:
+// it serves the last published figure, or 0 if none has been published yet. It
+// exists for callers that must not block - the cluster metrics scrape holds
+// n.shardMu across every hosted shard, and reclaimableBytesNow is an O(entries)
+// liveAndUsedBytes walk, so letting a scrape trigger one would let it stall
+// shard addition, removal and node shutdown for the length of that walk.
+//
+// The cost is freshness on one gauge, which a scrape can afford: the sweeper
+// republishes it as it runs.
+func (s *shard) reclaimableBytesCached() uint64 {
+	if !s.onlineCompactionEligible() {
+		return 0
+	}
+	if snap := s.reclaimableCache.Load(); snap != nil {
+		return snap.bytes
+	}
+	return 0
+}
+
 func (s *shard) reclaimableBytesForStats() uint64 {
 	if !s.onlineCompactionEligible() {
 		return 0
