@@ -535,7 +535,7 @@ func TestOperateOversizedStoredValueNotCopied(t *testing.T) {
 	if !errors.Is(err, wire.ErrOperateRecord) {
 		t.Fatalf("err = %v, want wire.ErrOperateRecord", err)
 	}
-	if out != nil || deleted || res != nil {
+	if out != nil || deleted || !resultIsZero(res) {
 		t.Fatalf("the rejected call returned out=%x deleted=%v res=%+v", out, deleted, res)
 	}
 

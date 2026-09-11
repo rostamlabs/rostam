@@ -59,9 +59,9 @@ type engines struct {
 // means "delete the key" rather than "store nothing" (design doc §2.5). out is
 // never an alias of cur: the caller can write it back without thinking about
 // the store's own page.
-func applyRecordBytes(cur []byte, a *wire.OperateArgs, stampMs int64) ([]byte, bool, *wire.OperateResult, error) {
+func applyRecordBytes(cur []byte, a *wire.OperateArgs, stampMs int64) ([]byte, bool, wire.OperateResult, error) {
 	if len(a.Ops) > wire.OperateMaxOps || len(a.Rets) > wire.OperateMaxRet {
-		return nil, false, nil, wire.ErrOperateCap
+		return nil, false, wire.OperateResult{}, wire.ErrOperateCap
 	}
 	es := engines{
 		se: schemaEnginePool.Get().(*schemaEngine),   //nolint:errcheck,forcetypeassert // the pool's New returns exactly this
@@ -75,24 +75,24 @@ func applyRecordBytes(cur []byte, a *wire.OperateArgs, stampMs int64) ([]byte, b
 	return out, deleted, res, err
 }
 
-func applyWithEngine(es engines, cur []byte, a *wire.OperateArgs, stampMs int64) ([]byte, bool, *wire.OperateResult, error) {
+func applyWithEngine(es engines, cur []byte, a *wire.OperateArgs, stampMs int64) ([]byte, bool, wire.OperateResult, error) {
 	e, err := openRecord(es, cur, a)
 	if err != nil {
-		return nil, false, nil, err
+		return nil, false, wire.OperateResult{}, err
 	}
 
 	status, failedOp, err := applyOps(e, a.Ops, stampMs)
 	if err != nil {
-		return nil, false, nil, err
+		return nil, false, wire.OperateResult{}, err
 	}
 	if status == wire.OperateStatusCheckFailed {
 		// The op list aborts with the record unchanged, and the returns are
 		// evaluated against that unchanged record.
 		vals, verr := retsBefore(es, cur, a.Rets)
 		if verr != nil {
-			return nil, false, nil, verr
+			return nil, false, wire.OperateResult{}, verr
 		}
-		return nil, false, &wire.OperateResult{Status: status, FailedOp: failedOp, Values: vals}, nil
+		return nil, false, wire.OperateResult{Status: status, FailedOp: failedOp, Values: vals}, nil
 	}
 
 	if e.empty() {
@@ -100,16 +100,16 @@ func applyWithEngine(es engines, cur []byte, a *wire.OperateArgs, stampMs int64)
 		// is nothing left to resolve a path against.
 		vals, verr := absentRets(a.Rets)
 		if verr != nil {
-			return nil, false, nil, verr
+			return nil, false, wire.OperateResult{}, verr
 		}
-		return nil, true, &wire.OperateResult{Status: wire.OperateStatusOK, Values: vals}, nil
+		return nil, true, wire.OperateResult{Status: wire.OperateStatusOK, Values: vals}, nil
 	}
 
 	out := e.bytes()
 	// §2.7's backstop, checked on the finished record: a call that would store
 	// an over-large record fails with the record unchanged.
 	if len(out) > maxOperateRecordBytes {
-		return nil, false, nil, wire.ErrOperateCap
+		return nil, false, wire.OperateResult{}, wire.ErrOperateCap
 	}
 	// The returns see the record as it now is, so a record path is present
 	// even when this call created it — ref.present is "existed before the
@@ -118,9 +118,9 @@ func applyWithEngine(es engines, cur []byte, a *wire.OperateArgs, stampMs int64)
 	e.setExisted(true)
 	vals, verr := evalRets(e, a.Rets)
 	if verr != nil {
-		return nil, false, nil, verr
+		return nil, false, wire.OperateResult{}, verr
 	}
-	return out, false, &wire.OperateResult{Status: wire.OperateStatusOK, Values: vals}, nil
+	return out, false, wire.OperateResult{Status: wire.OperateStatusOK, Values: vals}, nil
 }
 
 // openRecord resolves the call's `create` parameter against the stored record

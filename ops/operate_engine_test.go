@@ -776,19 +776,19 @@ func bytesApply(rec *wire.Record, a *wire.OperateArgs, stampMs int64) (*wire.Rec
 	if err != nil {
 		return nil, nil, err
 	}
-	if res != nil && res.Status == wire.OperateStatusCheckFailed {
+	if res.Status == wire.OperateStatusCheckFailed {
 		// A no-op: nothing is stored, and the record the suite sees is the
 		// one it passed in.
-		return rec, res, nil
+		return rec, &res, nil
 	}
 	if deleted || len(out) == 0 {
-		return nil, res, nil
+		return nil, &res, nil
 	}
 	got, derr := wire.DecodeRecord(out)
 	if derr != nil {
 		return nil, nil, fmt.Errorf("engine produced undecodable bytes %x: %w", out, derr)
 	}
-	return got, res, nil
+	return got, &res, nil
 }
 
 // TestApplyOpsTrimByCol pins the narrowing of TRIM's eviction-column operand.

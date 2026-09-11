@@ -58,7 +58,7 @@ func IsVectorRecordAbsentMessage(s string) bool {
 // Both error returns pass vector.RecordUnchanged explicitly. The engine tests
 // err != nil first, so the action is never read on an error — but a bare zero
 // would silently read as RecordStore if that order ever changed.
-func vectorOperateMutator(a *wire.OperateArgs, stampMs int64, res **wire.OperateResult) vector.RecordMutator {
+func vectorOperateMutator(a *wire.OperateArgs, stampMs int64, res *wire.OperateResult) vector.RecordMutator {
 	return func(old []byte, exists bool) ([]byte, vector.RecordMutation, error) {
 		var cur []byte
 		if exists {
@@ -172,7 +172,7 @@ func vectorOperateBody(tx *TxContext, args []byte, apply recordMutateApply) ([]b
 	}
 	cas := vector.CASCond{Expected: expected, Has: hasExpected}
 	stampMs, stamped := tx.applyStamp()
-	var res *wire.OperateResult
+	var res wire.OperateResult
 	fn := vectorOperateMutator(a, stampMs, &res)
 
 	applied, version, err := apply(tx.vectors, name, id, pk, fn, cas, stampMs, stamped)
@@ -184,7 +184,7 @@ func vectorOperateBody(tx *TxContext, args []byte, apply recordMutateApply) ([]b
 	// failed CHECK). Returning it lets a CAS loop feed the next attempt straight
 	// from this result instead of re-reading the point, which is both a round trip
 	// and a race.
-	return wire.EncodeVectorOperateResult(applied, res, version)
+	return wire.EncodeVectorOperateResult(applied, &res, version)
 }
 
 // handleNamedVectorOperate is handleVectorOperate against a named-vector

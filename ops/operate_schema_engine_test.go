@@ -165,7 +165,7 @@ func TestSchemaRecordSizeCap(t *testing.T) {
 	if !errors.Is(err, wire.ErrOperateCap) {
 		t.Fatalf("err=%v, want ErrOperateCap", err)
 	}
-	if out != nil || deleted || res != nil {
+	if out != nil || deleted || !resultIsZero(res) {
 		t.Fatalf("a failed call returned out=%x deleted=%v res=%+v", out, deleted, res)
 	}
 	if !bytes.Equal(base, before) {
@@ -213,7 +213,7 @@ func TestSchemaEngineNeverPanics(t *testing.T) {
 			before := append([]byte(nil), in...)
 			out, deleted, res, err := safeApply(in, args)
 			if err != nil {
-				if out != nil || deleted || res != nil {
+				if out != nil || deleted || !resultIsZero(res) {
 					t.Fatalf("error path returned output for %x: out=%x deleted=%v res=%+v", in, out, deleted, res)
 				}
 			} else if out != nil {
@@ -241,7 +241,7 @@ func TestSchemaEngineNeverPanics(t *testing.T) {
 // safeApply re-panics with the frame that caused it: a bare panic from deep
 // inside the engine says nothing about which of the thousand corpus entries
 // reached it, and that input is the whole finding.
-func safeApply(cur []byte, a *wire.OperateArgs) (out []byte, deleted bool, res *wire.OperateResult, err error) {
+func safeApply(cur []byte, a *wire.OperateArgs) (out []byte, deleted bool, res wire.OperateResult, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			panic(fmt.Sprintf("applyRecordBytes panicked on %x: %v", cur, r))
@@ -553,7 +553,7 @@ func TestMigrateSizeCapAllFixedTarget(t *testing.T) {
 	if !errors.Is(err, wire.ErrOperateCap) {
 		t.Fatalf("err=%v, want ErrOperateCap", err)
 	}
-	if out != nil || deleted || res != nil {
+	if out != nil || deleted || !resultIsZero(res) {
 		t.Fatalf("a refused migration returned out=%x deleted=%v res=%+v", out, deleted, res)
 	}
 	if !bytes.Equal(stored, base) {

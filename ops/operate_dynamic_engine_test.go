@@ -442,7 +442,7 @@ func TestDynamicEngineNeverPanics(t *testing.T) {
 			before := append([]byte(nil), in...)
 			out, deleted, res, err := safeApply(in, args)
 			if err != nil {
-				if out != nil || deleted || res != nil {
+				if out != nil || deleted || !resultIsZero(res) {
 					t.Fatalf("error path returned output for %x: out=%x deleted=%v res=%+v", in, out, deleted, res)
 				}
 			} else if out != nil {

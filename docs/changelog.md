@@ -5,6 +5,17 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **`operate` costs one allocation per call instead of two.** The result frame
+  was built as `&wire.OperateResult{...}` and handed back up the apply path, one
+  32-byte heap object per call. It never outlives the handler — the op encodes it
+  and drops it — so it is now returned by value and stays on the caller's stack.
+  Measured on `BenchmarkOperateSchemaExistingRow` and
+  `BenchmarkOperateDynamicExistingRow`: 2 allocs/op to 1, with bytes down by
+  exactly the struct. The one remaining allocation is the private record copy the
+  design doc's §2.6 budget allows, and a test now pins that budget. Small in
+  bytes, but this was the largest allocation site by OBJECT count on a production
+  node, and object count is what GC scan cost tracks.
+
 - **KV cache metrics are now scrapeable, and capacity loss is distinguishable
   from TTL turnover.** A KV-only node previously reported nothing about itself:
   `/metrics` renders dense-collection stats and returns an empty body without a
