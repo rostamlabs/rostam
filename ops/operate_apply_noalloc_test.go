@@ -91,33 +91,92 @@ func TestApplyRecordBytesIntoWarmScratchIsZeroAlloc(t *testing.T) {
 	}
 }
 
-// out ALIASES the caller's scratch whenever the record fits in it. That is the
-// contract handleOperate depends on — it is why the handler must consume out
-// (tx.Put copies into the page arena) before the scratch is recycled, and why
-// it recycles what out points at rather than what it passed in. A change that
-// quietly started returning an independent array would make the pooling
-// pointless; one that kept aliasing after a GROW would make it unsafe.
-func TestApplyRecordBytesIntoOutAliasesScratchOnlyWhenItFits(t *testing.T) {
+// out ALIASES the caller's scratch whenever scratch's ARRAY had room, and that
+// is what handleOperate's recycling turns on. Growth does not decide it:
+// insertGap extends in place while `cap(buf)-old >= n` holds, so a record that
+// grew can still be sitting in the caller's array. Only exhausting the capacity
+// produces a new one. The three cases below are fits / grows-within-capacity /
+// too-small, and the middle one is the reason handleOperate must recycle what
+// out points at rather than what it passed in — neither growth nor its absence
+// tells it which array is live.
+func TestApplyRecordBytesIntoOutAliasesScratchWhileCapacityLasts(t *testing.T) {
 	rec, upd := seedScalarRecord(t)
 
+	// Compare backing arrays, not contents. Guarded on CAP, not len: the
+	// scratch buffers here are len 0 with spare capacity, and reslicing one to
+	// [:1] within its capacity is legal and addresses the same array.
+	sameArray := func(a, b []byte) bool {
+		return cap(a) > 0 && cap(b) > 0 && &a[:1][0] == &b[:1][0]
+	}
+
+	// 1. In-place update into a scratch with room: aliases.
 	roomy := make([]byte, 0, len(rec)+64)
 	out, _, _, err := applyRecordBytesInto(roomy, rec, upd, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out) == 0 || &out[:1][0] != &roomy[:1][0] {
-		t.Error("out does not alias a scratch big enough to hold it; the record copy was allocated instead of reused")
+	if !sameArray(out, roomy) {
+		t.Error("in-place update did not reuse a scratch big enough to hold it")
 	}
 
-	// Too small to hold the record: copyRecord must allocate, and out must NOT
-	// point into the buffer the caller still owns.
-	tiny := make([]byte, 0, 1)
-	out, _, _, err = applyRecordBytesInto(tiny, rec, upd, 2)
+	// 2. A row insert GROWS the record (insertGap). With slack to grow into it
+	//    still aliases — the case the old version of this test never reached.
+	grower := sessionArgsFor(keyU64(7))
+	grower.Create = wire.OperateCreateSchema
+	base, _, _, err := applyRecordBytes(nil, sessionArgsFor(keyU64(1)), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out) == 0 || &out[:1][0] == &tiny[:1][0] {
+	roomyGrow := make([]byte, 0, len(base)+4096) // plenty of slack for a new row
+	out, _, _, err = applyRecordBytesInto(roomyGrow, base, grower, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) <= len(base) {
+		t.Fatalf("the record did not grow: %d bytes from %d", len(out), len(base))
+	}
+	if !sameArray(out, roomyGrow) {
+		t.Error("a record that grew WITHIN the scratch's capacity should still alias it")
+	}
+
+	// 3. Too small for the initial copy: a fresh array, and the caller's buffer
+	//    is untouched.
+	tiny := make([]byte, 0, 1)
+	out, _, _, err = applyRecordBytesInto(tiny, rec, upd, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sameArray(out, tiny) {
 		t.Error("out aliases a scratch too small for the record")
+	}
+}
+
+// The budget handleOperate itself runs at, which is what this PR changes. The
+// test above supplies a scratch by hand and so still passes if handleOperate
+// stops using the pool, or stops keeping the returned buffer; this one fails.
+// The single remaining allocation is the reply frame EncodeOperateResult builds.
+func TestOperateHandlerWarmCallCostsOneAlloc(t *testing.T) {
+	if raceEnabled {
+		t.Skip("sync.Pool.Put randomly drops items under -race by design, which defeats this allocation budget; see race_detect_test.go")
+	}
+	_, tx := newTestSetup(t)
+	args, err := wire.EncodeOperateArgs(addField0([]byte("warm-budget-key")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ { // create, then warm both pools
+		if _, err := handleOperate(tx, args); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got := testing.AllocsPerRun(200, func() {
+		if _, err := handleOperate(tx, args); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if got != 1 {
+		t.Errorf("handleOperate allocated %.1f objects per warm call; want 1 (the reply frame alone)", got)
 	}
 }
 

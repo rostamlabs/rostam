@@ -36,10 +36,14 @@ import (
 // cur ownership: tx.GetWithExpiryInto copies the stored record into a pooled
 // buffer, so cur is owned by this call rather than aliasing the cache's page.
 // It still must not outlive the handler - the buffer goes back to the pool on
-// return - and nothing here needs it to: applyRecordBytes copies it again
-// before making any change (openRecord -> copyRecord) and returns its own,
-// freshly allocated out, and this handler never writes through cur nor touches
-// it once applyRecordBytes has been called.
+// return - and nothing here needs it to: the apply path copies it again before
+// making any change (openRecord -> copyRecord) and this handler never writes
+// through cur nor touches it once the apply has been called.
+//
+// out ownership: out comes from a SECOND pooled buffer (operateWriteBufPool),
+// not a fresh allocation, and may alias it. It is valid until this handler's
+// deferred recycle, which is after tx.Put has copied the bytes into the page
+// arena and after the reply frame has been encoded.
 // operateArgsPool recycles the decoded call. The op slice is the single
 // largest allocation on this path - one operate request carries up to
 // OperateMaxOps ops, and a caller that touches many keys in one call sends a

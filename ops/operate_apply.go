@@ -67,13 +67,18 @@ func applyRecordBytes(cur []byte, a *wire.OperateArgs, stampMs int64) ([]byte, b
 // for the private record copy — the one allocation the in-place path otherwise
 // costs (design doc §2.6).
 //
-// scratch may be nil, in which case this is exactly applyRecordBytes. The
-// returned out ALIASES scratch whenever it fit, and is a fresh larger array
-// whenever the record had to grow (insertGap replaces the buffer rather than
-// extending it), so a caller recycling the scratch must keep what out points
-// at, never what it passed in. out stays valid until the caller reuses the
-// scratch: tx.Put copies the bytes into the shard's page arena (encodeEntry),
-// so the store never holds onto it.
+// scratch may be nil, in which case this is exactly applyRecordBytes.
+//
+// The returned out ALIASES scratch whenever scratch's array had room — which
+// includes a record that GREW, since insertGap extends in place while capacity
+// allows (`cap(buf)-old >= n`) and only allocates a replacement when it does
+// not. So growth alone does not tell a caller whether out is a new array;
+// capacity does, and the caller cannot see it. That is why a caller recycling
+// the scratch must recycle what out POINTS AT and never what it passed in:
+// either could be the live array.
+//
+// out stays valid until the caller reuses the scratch. tx.Put copies the bytes
+// into the shard's page arena (encodeEntry), so the store never holds onto it.
 func applyRecordBytesInto(scratch, cur []byte, a *wire.OperateArgs, stampMs int64) ([]byte, bool, wire.OperateResult, error) {
 	if len(a.Ops) > wire.OperateMaxOps || len(a.Rets) > wire.OperateMaxRet {
 		return nil, false, wire.OperateResult{}, wire.ErrOperateCap
@@ -258,9 +263,14 @@ func openMode(es engines, buf []byte, existed bool) (modeEngine, error) {
 //
 // FRESHNESS IS LOAD-BEARING FOR A CALLER OUTSIDE THIS PACKAGE. vector's
 // RecordMutator contract hands ownership of the returned bytes to the engine,
-// which stores them by reference in the arena. That is sound only because this
-// function allocates a new buffer per call (and createRecord allocates fresh).
-// Do not turn this into a pooled or reused buffer without changing that contract.
+// which stores them BY REFERENCE in the arena. That is sound only while the
+// bytes are freshly allocated, so vector must keep calling applyRecordBytes —
+// the nil-scratch path, where this function allocates per call and createRecord
+// allocates fresh. Do not hand the vector path a scratch buffer.
+//
+// The KV path may reuse one (applyRecordBytesInto, from handleOperate's pool)
+// for the opposite reason: tx.Put COPIES the record into the shard's page arena
+// (encodeEntry), so the store holds no reference once Put returns.
 // copyRecord copies cur into dst, reusing dst's array when it is already large
 // enough and allocating only when it is not. The +64 of slack is what a first
 // splice or row insert grows into without reallocating (see insertGap).
