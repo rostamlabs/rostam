@@ -54,8 +54,15 @@ func handleOperate(tx *TxContext, args []byte) ([]byte, error) {
 	defer func() {
 		// Clear before recycling: the ops hold Bytes/Name/path-Key slices into
 		// the request buffer, and a pooled entry holding them would pin that
-		// buffer until its next use. Only the live prefix needs it - the
-		// decoder already clears anything it leaves past the new length.
+		// buffer until its next use.
+		//
+		// Clearing the live prefix is enough, by induction on this reset
+		// rather than on anything the decoder does: an entry is handed back
+		// with length 0 and a fully cleared array, so the next decode can only
+		// dirty [0:len) and this clear puts it back. (The decoder's own
+		// shrink-clear never fires here - it triggers on a SHRINK, and a
+		// pooled entry always arrives at length 0. It is there for callers
+		// that reuse a dst without a pool.)
 		clear(a.Ops)
 		clear(a.Rets)
 		*a = wire.OperateArgs{Ops: a.Ops[:0], Rets: a.Rets[:0]}

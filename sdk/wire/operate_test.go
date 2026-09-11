@@ -500,18 +500,27 @@ func TestDecodeOperateArgsIntoClearsStaleTail(t *testing.T) {
 	if err = DecodeOperateArgsInto(dst, big); err != nil {
 		t.Fatal(err)
 	}
-	bigLen := len(dst.Ops)
+	bigOps, bigRets := len(dst.Ops), len(dst.Rets)
 	if err = DecodeOperateArgsInto(dst, small); err != nil {
 		t.Fatal(err)
 	}
-	if len(dst.Ops) >= bigLen {
-		t.Fatalf("small frame decoded to %d ops, want fewer than %d", len(dst.Ops), bigLen)
+	if len(dst.Ops) >= bigOps {
+		t.Fatalf("small frame decoded to %d ops, want fewer than %d", len(dst.Ops), bigOps)
 	}
 
-	tail := dst.Ops[:cap(dst.Ops)][len(dst.Ops):bigLen]
-	for i := range tail {
-		if !reflect.DeepEqual(tail[i], OperateOp{}) {
-			t.Fatalf("stale op at tail index %d still set: %+v", i, tail[i])
+	opTail := dst.Ops[:cap(dst.Ops)][len(dst.Ops):bigOps]
+	for i := range opTail {
+		if !reflect.DeepEqual(opTail[i], OperateOp{}) {
+			t.Fatalf("stale op at tail index %d still set: %+v", i, opTail[i])
+		}
+	}
+	if len(dst.Rets) >= bigRets {
+		t.Fatalf("small frame decoded to %d rets, want fewer than %d", len(dst.Rets), bigRets)
+	}
+	retTail := dst.Rets[:cap(dst.Rets)][len(dst.Rets):bigRets]
+	for i := range retTail {
+		if !reflect.DeepEqual(retTail[i], OperateRet{}) {
+			t.Fatalf("stale ret at tail index %d still set: %+v", i, retTail[i])
 		}
 	}
 }
@@ -536,8 +545,13 @@ func sessionShapedArgs(nBidders int) *OperateArgs {
 			OperateOp{Opcode: OperateOpOR, Type: OperateTypeFromSchema, Path: col(1), A: 3},
 			OperateOp{Opcode: OperateOpADD, Type: OperateTypeFromSchema, Path: col(2), A: 1},
 		)
+		// One return per key, so Rets scales with nBidders too - a fixed-size
+		// Rets would leave the rets shrink-clear path untested.
+		a.Rets = append(a.Rets, OperateRet{
+			Mode: OperateRetValue,
+			Path: OperatePath{Kind: OperatePathRow, Field: OperateSeg{Pos: 3}, Key: row},
+		})
 	}
-	a.Rets = append(a.Rets, OperateRet{Mode: OperateRetCount, Path: OperatePath{Kind: OperatePathField, Field: OperateSeg{Pos: 3}}})
 	return a
 }
 
