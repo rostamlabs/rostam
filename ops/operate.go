@@ -33,11 +33,13 @@ import (
 // prior record, with the same stamp, therefore always produce identical
 // stored bytes and identical expiries.
 //
-// cur aliasing: tx.GetWithExpiry's returned value aliases the cache's page.
-// applyRecordBytes copies it before making any change (openRecord ->
-// copyRecord) and returns its own, freshly allocated out; this handler never
-// writes through cur and never touches it again once applyRecordBytes has
-// been called.
+// cur ownership: tx.GetWithExpiryInto copies the stored record into a pooled
+// buffer, so cur is owned by this call rather than aliasing the cache's page.
+// It still must not outlive the handler - the buffer goes back to the pool on
+// return - and nothing here needs it to: applyRecordBytes copies it again
+// before making any change (openRecord -> copyRecord) and returns its own,
+// freshly allocated out, and this handler never writes through cur nor touches
+// it once applyRecordBytes has been called.
 // operateArgsPool recycles the decoded call. The op slice is the single
 // largest allocation on this path - one operate request carries up to
 // OperateMaxOps ops, and a caller that touches many keys in one call sends a
