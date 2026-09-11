@@ -331,6 +331,19 @@ const minRetBytes = 1 + 1
 // than silently truncating or wrapping, for any field that cannot be
 // represented on the wire or that exceeds a cap (design doc §2.7).
 func EncodeOperateArgs(a *OperateArgs) ([]byte, error) {
+	return AppendOperateArgs(nil, a)
+}
+
+// AppendOperateArgs is EncodeOperateArgs appending into dst (reusing its
+// capacity when large enough), for a hot-loop caller that pools the buffer —
+// the same pair EncodeKeyArgs/AppendKeyArgs already form for point ops.
+// Passing dst=nil reproduces EncodeOperateArgs's bytes exactly. The returned
+// slice may alias dst.
+//
+// A caller that pools dst across calls allocates nothing here once the buffer
+// has grown to the largest op list it builds: an operate call's encoding is
+// otherwise dominated by appendOp growing a fresh buffer per call.
+func AppendOperateArgs(dst []byte, a *OperateArgs) ([]byte, error) {
 	if len(a.Key) > 0xFFFF {
 		return nil, ErrOperateCap
 	}
@@ -356,7 +369,11 @@ func EncodeOperateArgs(a *OperateArgs) ([]byte, error) {
 		return nil, ErrOperateArgs
 	}
 
-	buf := make([]byte, 0, 2+len(a.Key)+8+1+1+2+len(a.Schema)+2+2)
+	n := 2 + len(a.Key) + 8 + 1 + 1 + 2 + len(a.Schema) + 2 + 2
+	buf := dst[:0]
+	if cap(buf) < n {
+		buf = make([]byte, 0, n)
+	}
 	buf = binary.BigEndian.AppendUint16(buf, uint16(len(a.Key))) //nolint:gosec // bounded by the check above
 	buf = append(buf, a.Key...)
 	buf = binary.BigEndian.AppendUint64(buf, uint64(a.TTL/time.Millisecond)) //nolint:gosec // duration to milliseconds always non-negative

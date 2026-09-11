@@ -320,3 +320,62 @@ func TestDecodeOperateResultCountErrors(t *testing.T) {
 		t.Fatalf("nRet within the cap but past the byte budget: err = %v, want ErrShortArgs", err)
 	}
 }
+
+// AppendOperateArgs must be byte-identical to EncodeOperateArgs whether it
+// allocates its own buffer or reuses one, or a pooling caller would put
+// different bytes on the wire than a plain one.
+func TestAppendOperateArgsMatchesEncode(t *testing.T) {
+	a := sampleArgs()
+	want, err := EncodeOperateArgs(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nilDst, err := AppendOperateArgs(nil, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(nilDst, want) {
+		t.Errorf("nil dst:\n got %x\nwant %x", nilDst, want)
+	}
+
+	// A buffer too small to hold even the header, and one large enough for the
+	// whole frame, must both produce the same bytes.
+	for _, size := range []int{0, 4, len(want), 4 * len(want)} {
+		got, aErr := AppendOperateArgs(make([]byte, 0, size), a)
+		if aErr != nil {
+			t.Fatal(aErr)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("dst cap %d:\n got %x\nwant %x", size, got, want)
+		}
+	}
+
+	// Dirty buffers must be overwritten, not appended to.
+	dirty := make([]byte, 8*len(want))
+	for i := range dirty {
+		dirty[i] = 0xAA
+	}
+	got, err := AppendOperateArgs(dirty, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("dirty dst:\n got %x\nwant %x", got, want)
+	}
+}
+
+// The reason the function exists: a pooled buffer must make the encode
+// allocation-free once it has grown.
+func TestAppendOperateArgsZeroAllocOnWarmBuffer(t *testing.T) {
+	a := sampleArgs()
+	buf, err := AppendOperateArgs(nil, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := testing.AllocsPerRun(100, func() {
+		buf, _ = AppendOperateArgs(buf[:0], a)
+	}); n != 0 {
+		t.Errorf("AppendOperateArgs on a warm buffer allocated %v times, want 0", n)
+	}
+}
