@@ -621,7 +621,18 @@ func EncodeOperateResult(r *OperateResult) ([]byte, error) {
 	if r.Status != OperateStatusOK && r.Status != OperateStatusCheckFailed {
 		return nil, ErrOperateArgs
 	}
-	buf := make([]byte, 0, 1+2+2+len(r.Values)*4)
+	// Exact, not an estimate: the old reservation counted the 4-byte length
+	// prefix per value but not the value BYTES, so any non-empty return forced
+	// append to grow the array at least once — a second allocation on exactly
+	// the calls that ask for the most data back.
+	n := 1 + 2 + len(r.Values)*4
+	if r.Status == OperateStatusCheckFailed {
+		n += 2 // failedOp is written only for this status
+	}
+	for _, v := range r.Values {
+		n += len(v)
+	}
+	buf := make([]byte, 0, n)
 	buf = append(buf, r.Status)
 	if r.Status == OperateStatusCheckFailed {
 		buf = binary.BigEndian.AppendUint16(buf, r.FailedOp)

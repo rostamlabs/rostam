@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"strings"
@@ -580,5 +581,64 @@ func BenchmarkDecodeOperateArgsInto(b *testing.B) {
 		if err := DecodeOperateArgsInto(dst, buf); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// BenchmarkEncodeOperateResult measures the reply frame with return values in
+// it — the case the capacity reservation has to get right. With no values the
+// frame is 5 bytes and the tiny allocator handles it; with values, an
+// under-reserved buffer makes append grow the array.
+func BenchmarkEncodeOperateResult(b *testing.B) {
+	for _, n := range []int{1, 4, 16} {
+		r := &OperateResult{Status: OperateStatusOK, Values: make([][]byte, n)}
+		for i := range r.Values {
+			r.Values[i] = make([]byte, 32) // a scalar-ish return
+		}
+		b.Run(fmt.Sprintf("values=%d", n), func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if _, err := EncodeOperateResult(r); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// The reservation must be EXACT: append never grows the array, so the frame
+// comes back with cap == len. A formula that under-counts (the length prefixes
+// without the value bytes, say) regrows and fails this; one that over-counts
+// wastes the slack and fails it too. Covers both statuses, since failedOp is
+// written only for OperateStatusCheckFailed.
+func TestEncodeOperateResultReservesExactly(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status uint8
+		vals   [][]byte
+	}{
+		{"ok/no values", OperateStatusOK, nil},
+		{"ok/one empty value", OperateStatusOK, [][]byte{{}}},
+		{"ok/mixed sizes", OperateStatusOK, [][]byte{make([]byte, 1), make([]byte, 300), make([]byte, 8)}},
+		{"check failed/no values", OperateStatusCheckFailed, nil},
+		{"check failed/with values", OperateStatusCheckFailed, [][]byte{make([]byte, 64), make([]byte, 7)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, err := EncodeOperateResult(&OperateResult{Status: tc.status, FailedOp: 3, Values: tc.vals})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cap(b) != len(b) {
+				t.Errorf("frame is %d bytes in a %d-byte array; the reservation is not exact", len(b), cap(b))
+			}
+			// And it must still decode back to what went in.
+			got, derr := DecodeOperateResult(b)
+			if derr != nil {
+				t.Fatalf("DecodeOperateResult: %v", derr)
+			}
+			if got.Status != tc.status || len(got.Values) != len(tc.vals) {
+				t.Errorf("round trip: status=%d values=%d, want status=%d values=%d",
+					got.Status, len(got.Values), tc.status, len(tc.vals))
+			}
+		})
 	}
 }

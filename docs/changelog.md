@@ -5,6 +5,24 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **The `operate` reply frame is built in one allocation, whatever it returns.**
+  `EncodeOperateResult` reserved room for each value's 4-byte length prefix but
+  not for the value BYTES, so any non-empty return made `append` grow the array —
+  on exactly the calls asking for the most data back. It also reserved a
+  `failedOp` field that only a failed CHECK ever writes. The size is now computed
+  exactly, and a test pins it (`cap == len` on the finished frame).
+
+  `BenchmarkEncodeOperateResult`, 32-byte values:
+
+  | values | before | after |
+  |---|---|---|
+  | 1 | 64 B, 2 allocs | 48 B, 1 alloc |
+  | 4 | 360 B, 4 allocs | 160 B, 1 alloc |
+  | 16 | 2112 B, 5 allocs | 640 B, 1 alloc |
+
+  Roughly 2.6x faster at 16 values. A call that returns nothing was already one
+  tiny allocation and still is.
+
 - **A warm `operate` write allocates nothing for the record itself.** The apply
   path worked on a private copy of the stored record (`copyRecord`), one
   allocation per call and — after the result frame moved to the stack — the last
