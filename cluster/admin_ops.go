@@ -273,6 +273,7 @@ func (n *Node) registerAdminOps() {
 		opShardReadIndexName: n.handleShardReadIndex,
 		ops.ReadyOp:          n.handleReady,
 		ops.ReplMetricsOp:    n.handleReplMetrics,
+		ops.KVMetricsOp:      n.handleKVMetrics,
 		// Shard-scoped leg of the WASM-registration broadcast: proposes to the
 		// ONE group named in its payload and never re-broadcasts. See
 		// wasm_broadcast.go.

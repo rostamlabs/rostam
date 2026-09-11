@@ -49,3 +49,57 @@ func TestHTTPMetrics(t *testing.T) {
 		}
 	}
 }
+
+// TestHTTPKVMetrics covers the KV scrape surface: both route aliases return 200
+// with the Prometheus content type and an exposition body carrying the cache
+// counters — including on a node with no vector collections, which is exactly
+// where /metrics returns nothing.
+func TestHTTPKVMetrics(t *testing.T) {
+	h, cleanup := newTestAPI(t)
+	defer cleanup()
+
+	for _, path := range []string{"/kv-metrics", "/v1/kv-metrics"} {
+		rec := do(t, h, "GET", path, "", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d (%s)", path, rec.Code, rec.Body)
+		}
+		if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+			t.Errorf("GET %s content-type = %q, want text/plain", path, ct)
+		}
+		body := rec.Body.String()
+		for _, want := range []string{
+			"# TYPE rostam_kv_gets_total counter",
+			"# TYPE rostam_kv_evictions_live_total counter",
+			"# TYPE rostam_kv_bytes_used gauge",
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("GET %s missing %q in:\n%s", path, want, body)
+			}
+		}
+	}
+}
+
+// The KV metrics routes must not live under /v1/kv/: a literal segment beats a
+// wildcard in ServeMux, so a route there would shadow GET /v1/kv/{key} and make
+// a key of that name unreadable. This pins the behaviour rather than the path.
+func TestKVMetricsDoesNotShadowKeyGet(t *testing.T) {
+	h, cleanup := newTestAPI(t)
+	defer cleanup()
+
+	const val = "stored-value-not-cache-stats"
+	rec := do(t, h, "PUT", "/v1/kv/metrics", `{"value":"`+val+`"}`, nil)
+	if rec.Code != http.StatusOK && rec.Code != http.StatusCreated && rec.Code != http.StatusNoContent {
+		t.Fatalf("PUT /v1/kv/metrics = %d (%s)", rec.Code, rec.Body)
+	}
+
+	rec = do(t, h, "GET", "/v1/kv/metrics", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /v1/kv/metrics = %d (%s)", rec.Code, rec.Body)
+	}
+	if got := rec.Body.String(); !strings.Contains(got, val) {
+		t.Errorf("a key named \"metrics\" is shadowed by the metrics route; got:\n%s", got)
+	}
+	if strings.Contains(rec.Body.String(), "rostam_kv_gets_total") {
+		t.Error("GET /v1/kv/metrics returned cache stats instead of the stored key")
+	}
+}

@@ -300,29 +300,7 @@ func (c *Cache) Del(key []byte) (bool, error) {
 func (c *Cache) Stats() Stats {
 	var agg Stats
 	for _, s := range c.shards {
-		x := s.snapshot()
-		agg.Gets += x.Gets
-		agg.Hits += x.Hits
-		agg.Misses += x.Misses
-		agg.Puts += x.Puts
-		agg.Dels += x.Dels
-		agg.Expirations += x.Expirations
-		agg.Evictions += x.Evictions
-		agg.EvictionsLive += x.EvictionsLive
-		agg.Rejects += x.Rejects
-		agg.PagesAllocated += x.PagesAllocated
-		agg.BytesAllocated += x.BytesAllocated
-		agg.BytesUsed += x.BytesUsed
-		agg.CorruptionErrors += x.CorruptionErrors
-		agg.Compactions += x.Compactions
-		agg.CompactionsAborted += x.CompactionsAborted
-		agg.CompactionBytesReclaimed += x.CompactionBytesReclaimed
-		agg.CompactionDurationMs += x.CompactionDurationMs
-		agg.ReclaimableBytes += x.ReclaimableBytes
-		agg.OnlineRelocations += x.OnlineRelocations
-		agg.OnlineBytesRelocated += x.OnlineBytesRelocated
-		agg.OnlinePagesRetired += x.OnlinePagesRetired
-		agg.OnlinePagesRecycled += x.OnlinePagesRecycled
+		agg.Add(s.snapshot())
 	}
 	return agg
 }

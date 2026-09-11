@@ -4,8 +4,10 @@ package cache
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 // EvictionsLive must count records displaced because the cache ran out of
@@ -96,5 +98,52 @@ func TestEvictionsLiveExcludesSupersededEntries(t *testing.T) {
 	if st.EvictionsLive > st.Evictions/10 {
 		t.Errorf("EvictionsLive=%d is too close to Evictions=%d; the cur == ref guard is not filtering superseded entries",
 			st.EvictionsLive, st.Evictions)
+	}
+}
+
+// An entry that expired but has not been swept yet is still index-current, so
+// the cur == ref guard alone would count its eviction as capacity pressure.
+// It is TTL turnover, and a correctly-sized cache is full of exactly this.
+func TestEvictionsLiveExcludesExpiredEntries(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.NumShards = 1
+	cfg.MaxMemoryPerShard = 8 << 20
+	cfg.PageSize = 1 << 20
+	cfg.AtCapPolicy = PolicyRingbufEvict
+	c, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// Fill with entries that expire almost immediately, each under its own key
+	// so none supersedes another.
+	val := make([]byte, 4<<10)
+	for i := range 1200 {
+		if err := c.Put(fmt.Appendf(nil, "ttl-key-%06d", i), val, time.Millisecond); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	time.Sleep(30 * time.Millisecond) // everything written so far is now expired
+
+	// Now drive eviction with fresh, long-lived entries. The pages being
+	// reclaimed are full of expired-but-unswept records.
+	before := c.Stats().EvictionsLive
+	for i := range 1200 {
+		if err := c.Put(fmt.Appendf(nil, "live-key-%06d", i), val, time.Hour); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+
+	st := c.Stats()
+	if st.Evictions == 0 {
+		t.Fatalf("expected evictions while overfilling: %+v", st)
+	}
+	// The expired entries must not be booked as capacity loss. Some genuinely
+	// live ones may be evicted late in the run, so allow a small margin rather
+	// than demanding exactly zero.
+	if grew := st.EvictionsLive - before; grew > st.Evictions/4 {
+		t.Errorf("EvictionsLive grew by %d of %d evictions; expired-but-unswept entries are being counted as capacity loss",
+			grew, st.Evictions)
 	}
 }

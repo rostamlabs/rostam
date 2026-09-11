@@ -5,6 +5,26 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **KV cache metrics are now scrapeable, and capacity loss is distinguishable
+  from TTL turnover.** A KV-only node previously reported nothing about itself:
+  `/metrics` renders dense-collection stats and returns an empty body without a
+  vector store, and `cache.Stats()` was only surfaced through the Raft path a
+  single-node deployment never runs. A new shardless read-only op
+  `__kv_metrics__`, served at `/kv-metrics` and `/v1/kv-metrics`, renders the
+  node's cache counters as Prometheus text. In cluster mode it is dispatched
+  node-locally (like `__ready__`/`__repl_metrics__`) and aggregates every shard
+  the receiving node hosts, rather than routing to one shard's cache.
+
+  Alongside it, `rostam_kv_evictions_live_total` separates records displaced
+  because the cache was **full** from records that simply reached their TTL.
+  `rostam_kv_evictions_total` counts every entry a reclaimed page held —
+  including versions a newer write had already superseded and entries that had
+  expired but not yet been swept — so it overstates what a cache actually lost.
+  The `_live_` counter rising while `rostam_kv_expirations_total` stays low is
+  the signal that the memory budget, not the TTL, is deciding how long entries
+  survive.
+
+
 - **Filter and index `operate` records stored in vector payloads.** A payload
   value of kind `record` (the bytes `operate` writes) can now be addressed
   directly by filters: a path like `session/rc`, `session/b/42/hi`, or

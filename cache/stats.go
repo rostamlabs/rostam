@@ -81,6 +81,34 @@ func (s Stats) HitRate() float64 {
 	return float64(s.Hits) / float64(s.Gets)
 }
 
+// Add accumulates o into s field by field. Cache.Stats uses it to fold its
+// shards together, and the cluster node-local scrape uses it to fold the
+// per-shard caches it hosts, so the field list lives in exactly one place.
+func (s *Stats) Add(o Stats) {
+	s.Gets += o.Gets
+	s.Hits += o.Hits
+	s.Misses += o.Misses
+	s.Puts += o.Puts
+	s.Dels += o.Dels
+	s.Expirations += o.Expirations
+	s.Evictions += o.Evictions
+	s.EvictionsLive += o.EvictionsLive
+	s.Rejects += o.Rejects
+	s.PagesAllocated += o.PagesAllocated
+	s.BytesAllocated += o.BytesAllocated
+	s.BytesUsed += o.BytesUsed
+	s.CorruptionErrors += o.CorruptionErrors
+	s.Compactions += o.Compactions
+	s.CompactionsAborted += o.CompactionsAborted
+	s.CompactionBytesReclaimed += o.CompactionBytesReclaimed
+	s.CompactionDurationMs += o.CompactionDurationMs
+	s.ReclaimableBytes += o.ReclaimableBytes
+	s.OnlineRelocations += o.OnlineRelocations
+	s.OnlineBytesRelocated += o.OnlineBytesRelocated
+	s.OnlinePagesRetired += o.OnlinePagesRetired
+	s.OnlinePagesRecycled += o.OnlinePagesRecycled
+}
+
 // WritePrometheus renders s in the Prometheus text exposition format. Counters
 // are cumulative since node start; sample and diff them for rates.
 //
@@ -97,13 +125,21 @@ func (s Stats) WritePrometheus(w io.Writer) error {
 		{"rostam_kv_gets_total", "KV reads served", s.Gets},
 		{"rostam_kv_hits_total", "KV reads that found a live entry", s.Hits},
 		{"rostam_kv_misses_total", "KV reads that found nothing", s.Misses},
-		{"rostam_kv_puts_total", "KV writes applied", s.Puts},
+		{"rostam_kv_puts_total", "KV write ATTEMPTS - incremented before a capacity rejection can return ErrFull, so it includes writes that failed", s.Puts},
 		{"rostam_kv_dels_total", "KV deletes applied", s.Dels},
 		{"rostam_kv_expirations_total", "entries retired because their TTL elapsed", s.Expirations},
 		{"rostam_kv_evictions_total", "entries displaced by ringbuf eviction, live or already superseded", s.Evictions},
 		{"rostam_kv_evictions_live_total", "entries displaced by ringbuf eviction that were still the live record for their key - lost to capacity, not TTL", s.EvictionsLive},
 		{"rostam_kv_rejects_total", "writes refused under PolicyRejectWrites", s.Rejects},
 		{"rostam_kv_corruption_errors_total", "CRC mismatches seen on read", s.CorruptionErrors},
+		{"rostam_kv_compactions_total", "page files rewritten live-only at shard open (mmap)", s.Compactions},
+		{"rostam_kv_compactions_aborted_total", "compactions decided against or abandoned; the original file was kept", s.CompactionsAborted},
+		{"rostam_kv_compaction_bytes_reclaimed_total", "page bytes dropped by those rewrites", s.CompactionBytesReclaimed},
+		{"rostam_kv_compaction_duration_ms_total", "milliseconds spent compacting at open - this is startup latency", s.CompactionDurationMs},
+		{"rostam_kv_online_relocations_total", "live entries relocated by online compaction", s.OnlineRelocations},
+		{"rostam_kv_online_bytes_relocated_total", "bytes moved by those relocations", s.OnlineBytesRelocated},
+		{"rostam_kv_online_pages_retired_total", "source pages fully evacuated and marked retired", s.OnlinePagesRetired},
+		{"rostam_kv_online_pages_recycled_total", "retired pages whose quarantine elapsed and were reset into writable space", s.OnlinePagesRecycled},
 	}
 	gauges := []struct {
 		name string
@@ -112,7 +148,7 @@ func (s Stats) WritePrometheus(w io.Writer) error {
 	}{
 		{"rostam_kv_pages_allocated", "cache pages currently allocated", s.PagesAllocated},
 		{"rostam_kv_bytes_allocated", "bytes backing those pages", s.BytesAllocated},
-		{"rostam_kv_bytes_used", "bytes of live entry data", s.BytesUsed},
+		{"rostam_kv_bytes_used", "bytes occupied by entries in resident pages, INCLUDING superseded and expired entries not yet reclaimed - occupancy, not live data", s.BytesUsed},
 		{"rostam_kv_reclaimable_bytes", "page bytes held by entries no longer reachable", s.ReclaimableBytes},
 	}
 

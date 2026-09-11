@@ -1401,8 +1401,13 @@ func (s *shard) retirePageLocked(idx int) {
 	// (cur != ref) belongs to live data elsewhere and must not be tombstoned.
 	entries := old.entries()
 	tail := old.tail()
+	// Wall clock is correct here even under a replicated apply: these are
+	// observability counters, not stored state. The tombstone decision below is
+	// still cur == ref alone, so what the cache RETAINS stays deterministic
+	// across replicas; only the counter may differ by a sweep's worth.
+	now := s.now()
 	for cursor := old.head(); cursor < tail; {
-		key, value, _, err := decodeEntryFast(entries[cursor:tail])
+		key, value, expiryMs, err := decodeEntryFast(entries[cursor:tail])
 		if err != nil {
 			// Heap pages are written without a CRC and cannot be corrupted by
 			// anything external, so this is unreachable in practice; stop the walk
@@ -1414,11 +1419,14 @@ func (s *shard) retirePageLocked(idx int) {
 		t := s.tab.Load()
 		if slot, cur, ok := t.findSlot(h); ok && cur == ref {
 			t.tombstone(slot)
-			// The index still pointed here, so this was the live record for
-			// its key: displaced by capacity, not by TTL. Counted separately
-			// from evictions, which also covers entries a newer Put had
-			// already superseded.
-			s.evictionsLive.Add(1)
+			// Count it as a capacity loss only if it was BOTH index-current and
+			// still live. cur == ref alone would also catch an entry that had
+			// already expired but not yet been swept, which is TTL turnover
+			// wearing a capacity costume - and precisely the case a
+			// correctly-sized cache is full of.
+			if !isExpired(expiryMs, now) {
+				s.evictionsLive.Add(1)
+			}
 		}
 		s.evictions.Add(1)
 		cursor += entrySize(len(key), len(value))
@@ -1443,10 +1451,21 @@ func (s *shard) retirePageLocked(idx int) {
 // reads hold the read lock. Heap ringbuf never reaches here — it retires pages
 // by frozen replacement (retirePageLocked) so its reads can stay lock-free.
 func (s *shard) drainPageLocked(victim int) error {
+	// See retirePageLocked: wall clock is fine for a counter, the retained set
+	// stays decided by cur == ref alone.
+	now := s.now()
 	for !s.pages[victim].Empty() {
 		// Capture the entry's offset BEFORE EvictFront advances head, so we
 		// can reconstruct the slabRef of the copy being physically removed.
 		off := uint32(s.pages[victim].head()) //nolint:gosec // head < PageSize which is validated ≤ MaxInt32
+		// Read the expiry BEFORE evicting: EvictFront returns only the key, and
+		// evictionsLive must not count an entry that had already expired.
+		var headExpiryMs uint64
+		if ent := s.pages[victim].entries(); int(off) < s.pages[victim].tail() {
+			if _, _, exp, derr := decodeEntryFast(ent[off:s.pages[victim].tail()]); derr == nil {
+				headExpiryMs = exp
+			}
+		}
 		evictedKey, _, err := s.pages[victim].EvictFront()
 		if err != nil {
 			s.corrupt.Add(1)
@@ -1464,7 +1483,9 @@ func (s *shard) drainPageLocked(victim int) error {
 		t := s.tab.Load()
 		if slot, cur, ok := t.findSlot(h); ok && cur == ref {
 			t.tombstone(slot)
-			s.evictionsLive.Add(1)
+			if !isExpired(headExpiryMs, now) {
+				s.evictionsLive.Add(1)
+			}
 		}
 		s.evictions.Add(1)
 	}
