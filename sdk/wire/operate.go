@@ -440,6 +440,9 @@ func DecodeOperateArgs(b []byte) (*OperateArgs, error) {
 // would return nil - read len(dst.Ops), never dst.Ops == nil. A fresh dst
 // (nil slices) decodes identically to DecodeOperateArgs.
 //
+// On error dst is reset to empty rather than left untouched - see the error
+// branch for why.
+//
 // A path addressed by NAME still allocates that name's string per segment;
 // schema mode addresses by position and so decodes with no allocation at all
 // once dst has grown.
@@ -448,11 +451,20 @@ func DecodeOperateArgs(b []byte) (*OperateArgs, error) {
 // Name and path-Key fields may point into b, so dst must not outlive b.
 func DecodeOperateArgsInto(dst *OperateArgs, b []byte) error {
 	n, err := decodeOperateArgsN(dst, b)
-	if err != nil {
-		return err
+	if err == nil && n != len(b) {
+		err = ErrOperateArgs
 	}
-	if n != len(b) {
-		return ErrOperateArgs
+	if err != nil {
+		// dst is left EMPTY, not untouched: the decoder appends into dst's
+		// backing array as it goes, so a call that fails partway has already
+		// overwritten elements that dst's old length still covers. Resetting
+		// is the only cheap state a caller can rely on, and clearing releases
+		// the failed call's buffer.
+		ops, rets := dst.Ops[:0], dst.Rets[:0]
+		clear(ops[:cap(ops)])
+		clear(rets[:cap(rets)])
+		*dst = OperateArgs{Ops: ops, Rets: rets}
+		return err
 	}
 	return nil
 }
@@ -522,10 +534,13 @@ func decodeOperateArgsN(dst *OperateArgs, b []byte) (int, error) {
 	// dst.Ops[:0] on a nil slice is still nil, so a fresh dst keeps
 	// DecodeOperateArgs's "nil when the frame carries none" shape while a
 	// pooled one reuses whatever capacity it already had.
+	oldOps := len(dst.Ops)
 	ops := dst.Ops[:0]
+	reusedOps := true
 	if nOps > 0 {
 		if cap(ops) < nOps {
 			ops = make([]OperateOp, 0, nOps)
+			reusedOps = false
 		}
 		for i := 0; i < nOps; i++ {
 			op, n, oerr := decodeOp(b[off:])
@@ -548,10 +563,13 @@ func decodeOperateArgsN(dst *OperateArgs, b []byte) (int, error) {
 	if !CountFitsIn(nRet, len(b)-off, minRetBytes) {
 		return 0, ErrShortArgs
 	}
+	oldRets := len(dst.Rets)
 	rets := dst.Rets[:0]
+	reusedRets := true
 	if nRet > 0 {
 		if cap(rets) < nRet {
 			rets = make([]OperateRet, 0, nRet)
+			reusedRets = false
 		}
 		for i := 0; i < nRet; i++ {
 			ret, n, rerr := decodeRet(b[off:])
@@ -561,6 +579,17 @@ func decodeOperateArgsN(dst *OperateArgs, b []byte) (int, error) {
 			rets = append(rets, ret)
 			off += n
 		}
+	}
+
+	// A reused slice that shrank still holds the previous call's ops past its
+	// new length, and those keep that call's request buffer alive. Clearing
+	// just the shrink delta is enough: by induction everything past the old
+	// length was already cleared by the decode that shrank it.
+	if reusedOps && len(ops) < oldOps {
+		clear(ops[len(ops):oldOps])
+	}
+	if reusedRets && len(rets) < oldRets {
+		clear(rets[len(rets):oldRets])
 	}
 
 	*dst = OperateArgs{

@@ -52,6 +52,12 @@ var operateArgsPool = sync.Pool{New: func() any { return new(wire.OperateArgs) }
 func handleOperate(tx *TxContext, args []byte) ([]byte, error) {
 	a, _ := operateArgsPool.Get().(*wire.OperateArgs)
 	defer func() {
+		// Clear before recycling: the ops hold Bytes/Name/path-Key slices into
+		// the request buffer, and a pooled entry holding them would pin that
+		// buffer until its next use. Only the live prefix needs it - the
+		// decoder already clears anything it leaves past the new length.
+		clear(a.Ops)
+		clear(a.Rets)
 		*a = wire.OperateArgs{Ops: a.Ops[:0], Rets: a.Rets[:0]}
 		operateArgsPool.Put(a)
 	}()

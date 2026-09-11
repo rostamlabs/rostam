@@ -449,16 +449,70 @@ func TestDecodeOperateArgsIntoZeroAllocOnWarmDst(t *testing.T) {
 	}
 }
 
-// A frame that fails to decode must not leave the caller's dst holding the
-// previous call's data.
-func TestDecodeOperateArgsIntoRejectsTrailingBytes(t *testing.T) {
-	b, err := EncodeOperateArgs(sampleArgs())
+// A failed decode must leave dst EMPTY, not holding the previous call's data.
+// The decoder appends into dst's backing array as it goes, so a call that
+// fails partway has already overwritten elements the old length still covers -
+// a reusing caller that trusted the old contents would read a mix of two calls.
+func TestDecodeOperateArgsIntoResetsOnError(t *testing.T) {
+	good, err := EncodeOperateArgs(sessionShapedArgs(8))
 	if err != nil {
 		t.Fatal(err)
 	}
 	dst := new(OperateArgs)
-	if err = DecodeOperateArgsInto(dst, append(append([]byte(nil), b...), 0xFF)); err == nil {
-		t.Fatal("trailing bytes must be rejected")
+	if err = DecodeOperateArgsInto(dst, good); err != nil {
+		t.Fatal(err)
+	}
+	if len(dst.Ops) == 0 {
+		t.Fatal("seed decode produced no ops; the test proves nothing")
+	}
+
+	for name, bad := range map[string][]byte{
+		"trailing bytes": append(append([]byte(nil), good...), 0xFF),
+		"truncated":      good[:len(good)-1],
+		"truncated hard": good[:len(good)/2],
+	} {
+		if err = DecodeOperateArgsInto(dst, bad); err == nil {
+			t.Fatalf("%s: expected an error", name)
+		}
+		if len(dst.Ops) != 0 || len(dst.Rets) != 0 || dst.Key != nil || dst.Schema != nil {
+			t.Errorf("%s: dst not reset after a failed decode: %+v", name, dst)
+		}
+		// Re-seed so the next case starts from a populated dst again.
+		if err = DecodeOperateArgsInto(dst, good); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// Shrinking a reused dst must not leave the previous call's ops reachable past
+// the new length - they alias that call's request buffer and would pin it.
+func TestDecodeOperateArgsIntoClearsStaleTail(t *testing.T) {
+	big, err := EncodeOperateArgs(sessionShapedArgs(16))
+	if err != nil {
+		t.Fatal(err)
+	}
+	small, err := EncodeOperateArgs(sessionShapedArgs(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dst := new(OperateArgs)
+	if err = DecodeOperateArgsInto(dst, big); err != nil {
+		t.Fatal(err)
+	}
+	bigLen := len(dst.Ops)
+	if err = DecodeOperateArgsInto(dst, small); err != nil {
+		t.Fatal(err)
+	}
+	if len(dst.Ops) >= bigLen {
+		t.Fatalf("small frame decoded to %d ops, want fewer than %d", len(dst.Ops), bigLen)
+	}
+
+	tail := dst.Ops[:cap(dst.Ops)][len(dst.Ops):bigLen]
+	for i := range tail {
+		if !reflect.DeepEqual(tail[i], OperateOp{}) {
+			t.Fatalf("stale op at tail index %d still set: %+v", i, tail[i])
+		}
 	}
 }
 
@@ -483,6 +537,7 @@ func sessionShapedArgs(nBidders int) *OperateArgs {
 			OperateOp{Opcode: OperateOpADD, Type: OperateTypeFromSchema, Path: col(2), A: 1},
 		)
 	}
+	a.Rets = append(a.Rets, OperateRet{Mode: OperateRetCount, Path: OperatePath{Kind: OperatePathField, Field: OperateSeg{Pos: 3}}})
 	return a
 }
 
