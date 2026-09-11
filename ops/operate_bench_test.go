@@ -18,6 +18,7 @@ package ops
 // none of those need a *testing.T.
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/rostamlabs/rostam/sdk/wire"
@@ -158,5 +159,45 @@ func BenchmarkOperateTreeOracle(b *testing.B) {
 		if _, _, err := applyTree(tree, a, 1); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// BenchmarkOperateFreshRowInserts covers a call against a record that does not
+// exist yet, with one op per key, so EVERY key opens a new row. That is the
+// only path the regrow branches (insertGap for schema mode, splice for
+// dynamic) are on - a call that only updates existing rows never opens a gap,
+// and its cost is unchanged by growCap.
+func BenchmarkOperateFreshRowInserts(b *testing.B) {
+	for _, nRows := range []int{4, 16, 32} {
+		b.Run(fmt.Sprintf("schema/rows=%d", nRows), func(b *testing.B) {
+			s := sessionSchema()
+			a := &wire.OperateArgs{Create: wire.OperateCreateSchema, Schema: s.Encode()}
+			for k := 0; k < nRows; k++ {
+				a.Ops = append(a.Ops, wire.OperateOp{Opcode: wire.OperateOpADD, Type: opFromSchema,
+					Path: colPath(3, keyU64(uint64(k)), 0), A: 1})
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, _, _, err := applyRecordBytes(nil, a, 1); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+
+		b.Run(fmt.Sprintf("dynamic/rows=%d", nRows), func(b *testing.B) {
+			a := &wire.OperateArgs{Create: wire.OperateCreateDynamic}
+			for k := 0; k < nRows; k++ {
+				a.Ops = append(a.Ops, wire.OperateOp{Opcode: wire.OperateOpADD, Type: wire.OperateTypeU16,
+					Path: nameColPath("b", keyU64(uint64(k)), "c"), A: 1})
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, _, _, err := applyRecordBytes(nil, a, 1); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

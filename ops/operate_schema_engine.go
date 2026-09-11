@@ -805,6 +805,39 @@ func (e *schemaEngine) removeRows(pos, idx, count int) error {
 	return e.reindexTail()
 }
 
+// growCap sizes a REALLOCATION for a buffer growing by incr bytes to reach
+// need. The slack is a multiple of the INCREMENT, not of the total: a call
+// opening k gaps one at a time consumed the whole fixed +64 on the first one
+// and reallocated O(k) times, copying the whole record each time. Reserving a
+// few increments makes that amortized O(1).
+//
+// Scaling by the increment rather than by need matters - an earlier version
+// used need/2 and measurably REGRESSED a dynamic-mode 16-row insert (+8.7%
+// bytes for zero allocations saved), because a large record growing by a
+// little does not need slack proportional to its size. The slack is also
+// capped at need so a tiny record growing by a lot cannot balloon.
+//
+// It is deliberately NOT used for the INITIAL reservations (copyRecord,
+// createRecord). Most calls update existing rows and open no gap at all, so
+// over-reserving up front would inflate every one of them to buy nothing.
+//
+// Nor is it used by the dynamic engine's splice, which has the same fixed +64
+// regrow: measured across 4/16/32-row inserts it saved no allocation there in
+// any case and cost a few percent more bytes, so that path keeps its +64.
+//
+// The extra capacity never reaches storage - the cache writes the record by
+// length - so it costs transient bytes only.
+func growCap(need, incr int) int {
+	slack := incr * 8
+	if slack < 64 {
+		slack = 64
+	}
+	if slack > need {
+		slack = need
+	}
+	return need + slack
+}
+
 // insertGap opens n zeroed bytes at off, growing buf in one append when its
 // capacity cannot absorb the gap.
 func insertGap(buf []byte, off, n int) []byte {
@@ -815,7 +848,7 @@ func insertGap(buf []byte, off, n int) []byte {
 	if cap(buf)-old >= n {
 		buf = buf[:old+n]
 	} else {
-		grown := make([]byte, old+n, old+n+64)
+		grown := make([]byte, old+n, growCap(old+n, n))
 		copy(grown, buf[:off])
 		copy(grown[off+n:], buf[off:old])
 		for i := off; i < off+n; i++ {
