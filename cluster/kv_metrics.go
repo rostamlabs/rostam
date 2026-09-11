@@ -18,29 +18,32 @@ import (
 // the node the operator asked. Dispatching off n.adminOps (like __ready__ and
 // __repl_metrics__) keeps the answer about the node that received it.
 //
-// The lock is taken PER SHARD rather than once around the loop. Stats on an
-// eligible mmap shard can recompute reclaimable bytes with an O(entries) walk,
-// and RemoveShardOwner nils the slot under the write lock before closing the
-// store — so the read lock is what keeps a store alive across the call, but
-// holding it across every shard would let one scrape stall shard add/remove and
-// node shutdown for the sum of all their walks. Per shard, a waiting writer gets
-// in at the next release, after at most one walk. The cost is that the shards
-// are not sampled at one instant, which a counter scrape can afford.
+// The read lock is held across the WHOLE loop, and the shards must be read from
+// n.shards under it rather than from a snapshotShards() copy. Both shutdown
+// paths close a store the caller may still be holding: RemoveShardOwner nils the
+// slot under the write lock and closes after releasing, and Node.Close closes
+// every store IN PLACE without nilling anything — so after it runs the slots are
+// non-nil and unmapped. Releasing the lock between shards would let either land
+// mid-iteration and turn the next CacheStats into a read of unmapped memory.
+//
+// The cost is that a scrape can delay shard add/remove and node shutdown, since
+// Stats recomputes reclaimable bytes with an O(entries) walk. That exposure is
+// narrow and bounded: only an mmap + replicated + reject-writes shard walks at
+// all (onlineCompactionEligible — every other configuration returns 0 without
+// touching an entry), and reclaimableStatsTTL rate-limits it to once per 2s per
+// shard. Serving the gauge from a cache instead is not an option: nothing
+// publishes that cache unless OnlineCompaction is on, which it is not by
+// default, so the scrape would report a permanent 0.
 func (n *Node) handleKVMetrics(_ []byte) ([]byte, error) {
 	var agg cache.Stats
-	for i := 0; ; i++ {
-		n.shardMu.RLock()
-		if i >= len(n.shards) {
-			n.shardMu.RUnlock()
-			break
+	n.shardMu.RLock()
+	for _, s := range n.shards {
+		if s == nil {
+			continue
 		}
-		var st cache.Stats
-		if s := n.shards[i]; s != nil {
-			st = s.CacheStats()
-		}
-		n.shardMu.RUnlock()
-		agg.Add(st)
+		agg.Add(s.CacheStats())
 	}
+	n.shardMu.RUnlock()
 	var buf bytes.Buffer
 	if err := agg.WritePrometheus(&buf); err != nil {
 		return nil, err
