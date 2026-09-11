@@ -5,16 +5,22 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
-- **`operate` costs one allocation per call instead of two.** The result frame
-  was built as `&wire.OperateResult{...}` and handed back up the apply path, one
-  32-byte heap object per call. It never outlives the handler — the op encodes it
-  and drops it — so it is now returned by value and stays on the caller's stack.
-  Measured on `BenchmarkOperateSchemaExistingRow` and
+- **The `operate` APPLY path costs one allocation per call instead of two.** The
+  result frame was built as `&wire.OperateResult{...}` and returned up the apply
+  path, one 32-byte heap object per call. It never outlives the handler — the op
+  encodes it and drops it — so it is now returned by value, removing that
+  per-call heap allocation. Measured on `BenchmarkOperateSchemaExistingRow` and
   `BenchmarkOperateDynamicExistingRow`: 2 allocs/op to 1, with bytes down by
   exactly the struct. The one remaining allocation is the private record copy the
-  design doc's §2.6 budget allows, and a test now pins that budget. Small in
-  bytes, but this was the largest allocation site by OBJECT count on a production
-  node, and object count is what GC scan cost tracks.
+  design doc's §2.6 budget allows, and a test now pins that budget.
+
+  Scope: this is `applyRecordBytes`, not a whole `operate` call. Encoding the
+  reply still allocates its response buffer in `EncodeOperateResult`, and
+  `vector_operate` still heap-allocates one result, because the mutation
+  callback captures its address — unchanged in count there, just moved. Small in
+  bytes, since the struct is 32 of them, but on a production node this was the
+  largest single allocation site by object COUNT, which is what allocator and
+  sweep work track and what paces GC cycles.
 
 - **KV cache metrics are now scrapeable, and capacity loss is distinguishable
   from TTL turnover.** A KV-only node previously reported nothing about itself:

@@ -19,7 +19,8 @@ func resultIsZero(r wire.OperateResult) bool {
 // budget allows on the in-place path: the private record copy openRecord makes
 // (copyRecord). Everything else on the call is pooled or stack-held — the
 // engines come from schemaEnginePool/dynamicEnginePool, and a call with no
-// return specs builds no values slice.
+// return specs builds no values slice. Pool reliance is why this is skipped
+// under -race, matching TestSchemaEngineAllocs and TestDynamicEngineAllocs.
 //
 // The result used to be a second allocation: returned as
 // &wire.OperateResult{...}, one 32-byte heap object per call, it was the
@@ -28,6 +29,9 @@ func resultIsZero(r wire.OperateResult) bool {
 // value leaves it on the caller's stack. A regression to a pointer return — or
 // anything else that escapes — pushes this back over budget.
 func TestApplyRecordBytesInPlaceUpdateCostsOneAlloc(t *testing.T) {
+	if raceEnabled {
+		t.Skip("sync.Pool.Put randomly drops items under -race by design, which defeats this allocation budget; see race_detect_test.go")
+	}
 	s := &wire.Schema{Version: 1, Fields: []wire.FieldDef{{Name: "rc", Type: wire.OperateTypeU16}}}
 	create := &wire.OperateArgs{
 		Create: wire.OperateCreateSchema,
