@@ -560,3 +560,30 @@ func TestOperateOversizedStoredValueNotCopied(t *testing.T) {
 		t.Fatalf("a stored record under the cap must apply: %v", err)
 	}
 }
+
+// An outsized record must not leave its backing array in the pool. A value can
+// exceed maxOperateRecordBytes via a plain put, and the read buffer grows to
+// hold it before copyRecord rejects it, so without the cap a few such keys
+// would pin a large array per pool slot.
+func TestOperateReadBufNotPooledWhenOversized(t *testing.T) {
+	small := make([]byte, 0, 512)
+	putOperateReadBuf(&small)
+	if cap(small) != 512 {
+		t.Fatalf("a small buffer must keep its capacity, got %d", cap(small))
+	}
+
+	big := make([]byte, maxPooledReadBuf+1)
+	bp := &big
+	putOperateReadBuf(bp)
+
+	// Drain what the pool will hand back and assert none of it is oversized.
+	for i := 0; i < 64; i++ {
+		got, _ := operateReadBufPool.Get().(*[]byte)
+		if got == nil {
+			continue
+		}
+		if cap(*got) > maxPooledReadBuf {
+			t.Fatalf("pool returned an oversized buffer: cap=%d, limit=%d", cap(*got), maxPooledReadBuf)
+		}
+	}
+}
