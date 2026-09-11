@@ -111,3 +111,45 @@ func BenchmarkPageGrowthReport(b *testing.B) {
 	b.ReportMetric(float64(st.PagesAllocated), "pages")
 	b.ReportMetric(float64(st.BytesUsed)/float64(st.BytesAllocated)*100, "%used")
 }
+
+// BenchmarkRostamGetWithExpiry and its Into twin measure the read an apply-path
+// handler makes: the allocating form returns a fresh copy per hit, the Into form
+// copies into a reused buffer. Both COPY - the difference is the allocation.
+func BenchmarkRostamGetWithExpiry(b *testing.B) {
+	c, _ := New(DefaultConfig())
+	defer func() { _ = c.Close() }()
+	keys := buildKeys(benchN)
+	val := benchValue()
+	for _, k := range keys {
+		_ = c.Put(k, val, 0)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, _, err := c.GetWithExpiry(keys[i%len(keys)]); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkRostamGetWithExpiryInto(b *testing.B) {
+	c, _ := New(DefaultConfig())
+	defer func() { _ = c.Close() }()
+	keys := buildKeys(benchN)
+	val := benchValue()
+	for _, k := range keys {
+		_ = c.Put(k, val, 0)
+	}
+
+	buf := make([]byte, 0, 512)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out, _, err := c.GetWithExpiryInto(buf[:0], keys[i%len(keys)])
+		if err != nil {
+			b.Fatal(err)
+		}
+		buf = out
+	}
+}

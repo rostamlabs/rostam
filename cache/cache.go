@@ -174,6 +174,23 @@ func (c *Cache) GetInto(dst, key []byte) ([]byte, error) {
 	return s.getIntoH(dst, key, h)
 }
 
+// GetWithExpiryInto is GetInto that ALSO surfaces the entry's stored absolute
+// expiry (ms since epoch; 0 = no expiry) — GetWithExpiry's allocation-free
+// counterpart. Like GetInto the value is COPIED into dst, never aliased.
+func (c *Cache) GetWithExpiryInto(dst, key []byte) (val []byte, expiryMs uint64, err error) {
+	h, s := c.shardForH(key)
+	return s.getIntoWithExpiryH(dst, key, h)
+}
+
+// GetWithExpiryIntoAt is GetWithExpiryInto with expiry evaluated against the
+// EXPLICIT clock nowMs rather than the wall clock — the apply-path counterpart,
+// matching GetWithExpiryAt. Keeping the clock explicit is what lets a replicated
+// apply use the pooled read without taking a wall-clock dependency.
+func (c *Cache) GetWithExpiryIntoAt(dst, key []byte, nowMs uint64) (val []byte, expiryMs uint64, err error) {
+	h, s := c.shardForH(key)
+	return s.getIntoWithExpiryAtH(dst, key, h, nowMs)
+}
+
 // Put inserts or replaces the value for key with the given TTL.
 // A TTL of zero means no expiry.
 func (c *Cache) Put(key, value []byte, ttl time.Duration) error {

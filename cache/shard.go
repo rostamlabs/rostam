@@ -665,6 +665,31 @@ func (s *shard) getCore(key []byte, h, now uint64, allowPhysicalRemove bool) ([]
 // it; under PolicyRejectWrites it is lock-free. On miss/expiry dst is returned
 // unchanged (its original length) with ErrNotFound.
 func (s *shard) getIntoH(dst, key []byte, h uint64) ([]byte, error) {
+	out, _, err := s.getIntoCore(dst, key, h, s.now(), !s.cfg.Replicated)
+	return out, err
+}
+
+// getIntoWithExpiryH is getIntoH that ALSO surfaces the entry's stored absolute
+// expiry, mirroring getWithExpiryH's relationship to getH.
+func (s *shard) getIntoWithExpiryH(dst, key []byte, h uint64) ([]byte, uint64, error) {
+	return s.getIntoCore(dst, key, h, s.now(), !s.cfg.Replicated)
+}
+
+// getIntoWithExpiryAtH is the APPLY-path counterpart: expiry is judged against
+// the explicit leader-stamped nowMs and physical removal is always permitted,
+// exactly as getWithExpiryAtH does for the allocating read. Keeping the clock
+// explicit is what lets the apply path use the pooled read without reintroducing
+// a wall-clock dependency into replicated state.
+func (s *shard) getIntoWithExpiryAtH(dst, key []byte, h, nowMs uint64) ([]byte, uint64, error) {
+	s.advanceAppliedStamp(nowMs)
+	return s.getIntoCore(dst, key, h, nowMs, true)
+}
+
+// getIntoCore is getCore's append-into-dst twin: same probe, same clock and
+// reclamation rules, but the value is copied into the caller's buffer instead
+// of a fresh allocation. It is ALWAYS a copy, never an alias, so the owned-slice
+// contract is identical to getCore's.
+func (s *shard) getIntoCore(dst, key []byte, h, now uint64, allowPhysicalRemove bool) ([]byte, uint64, error) {
 	s.gets.Add(1)
 
 	if s.needsReadLockForGet() {
@@ -680,19 +705,19 @@ func (s *shard) getIntoH(dst, key []byte, h uint64) ([]byte, error) {
 		case lkCorrupt:
 			s.corrupt.Add(1)
 			s.misses.Add(1)
-			return dst, ErrNotFound
+			return dst, 0, ErrNotFound
 		case lkMiss:
 			s.misses.Add(1)
-			return dst, ErrNotFound
+			return dst, 0, ErrNotFound
 		}
-		if isExpired(exp, s.now()) {
-			if !s.cfg.Replicated {
+		if isExpired(exp, now) {
+			if allowPhysicalRemove {
 				s.dropExpiredLocked(h, ref)
 			}
 			s.misses.Add(1)
-			return dst, ErrNotFound
+			return dst, 0, ErrNotFound
 		}
-		return out, nil
+		return out, exp, nil
 	}
 
 	// Lock-free path: reject-writes (heap+mmap) and heap-mode ringbuf. The value
@@ -703,19 +728,19 @@ func (s *shard) getIntoH(dst, key []byte, h uint64) ([]byte, error) {
 	case lkCorrupt:
 		s.corrupt.Add(1)
 		s.misses.Add(1)
-		return dst, ErrNotFound
+		return dst, 0, ErrNotFound
 	case lkMiss:
 		s.misses.Add(1)
-		return dst, ErrNotFound
+		return dst, 0, ErrNotFound
 	}
-	if isExpired(exp, s.now()) {
-		if !s.cfg.Replicated {
+	if isExpired(exp, now) {
+		if allowPhysicalRemove {
 			s.dropExpiredLocked(h, ref)
 		}
 		s.misses.Add(1)
-		return dst, ErrNotFound
+		return dst, 0, ErrNotFound
 	}
-	return append(dst, v...), nil
+	return append(dst, v...), exp, nil
 }
 
 // dropExpiredLocked removes the entry for h if it still points at ref (i.e. the

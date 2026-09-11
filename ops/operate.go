@@ -49,6 +49,9 @@ import (
 // as handleOperate returns.
 var operateArgsPool = sync.Pool{New: func() any { return new(wire.OperateArgs) }}
 
+// operateReadBufPool backs the pooled record read in handleOperate.
+var operateReadBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 512); return &b }}
+
 func handleOperate(tx *TxContext, args []byte) ([]byte, error) {
 	a, _ := operateArgsPool.Get().(*wire.OperateArgs)
 	defer func() {
@@ -72,7 +75,18 @@ func handleOperate(tx *TxContext, args []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	cur, expiryMs, err := tx.GetWithExpiry(a.Key)
+	// Pooled read buffer: the stored record is only read here and by
+	// applyRecordBytes, which copies whatever it needs, so the bytes never
+	// outlive the call. GetWithExpiryInto copies into this buffer instead of
+	// allocating a fresh one per request - the read was the largest remaining
+	// allocation on this path after the args pool.
+	rb, _ := operateReadBufPool.Get().(*[]byte)
+	defer func() {
+		*rb = (*rb)[:0]
+		operateReadBufPool.Put(rb)
+	}()
+	cur, expiryMs, err := tx.GetWithExpiryInto((*rb)[:0], a.Key)
+	*rb = cur
 	absent := errors.Is(err, cache.ErrNotFound)
 	if err != nil && !absent {
 		return nil, err

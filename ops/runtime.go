@@ -151,6 +151,16 @@ func (tx *TxContext) Put(key, value []byte, ttl time.Duration) error {
 // wall-clock GetWithExpiry. Branches on applyStamped, not applyNowMs != 0, so a
 // stamp of 0 is still deterministic (see the field doc). The returned value
 // slice aliases the page backing store; copy if you need to retain it.
+// GetWithExpiryInto is GetWithExpiry appending into dst, so a handler that
+// reuses one buffer pays no allocation per hit. It honours the apply stamp
+// exactly as GetWithExpiry does.
+func (tx *TxContext) GetWithExpiryInto(dst, key []byte) (val []byte, expiryMs uint64, err error) {
+	if tx.applyStamped {
+		return tx.c.GetWithExpiryIntoAt(dst, key, tx.applyNowMs)
+	}
+	return tx.c.GetWithExpiryInto(dst, key)
+}
+
 func (tx *TxContext) GetWithExpiry(key []byte) (val []byte, expiryMs uint64, err error) {
 	if tx.applyStamped {
 		return tx.c.GetWithExpiryAt(key, tx.applyNowMs)
