@@ -73,12 +73,17 @@ func applyRecordBytes(cur []byte, a *wire.OperateArgs, stampMs int64) ([]byte, b
 // includes a record that GREW, since insertGap extends in place while capacity
 // allows (`cap(buf)-old >= n`) and only allocates a replacement when it does
 // not. So growth alone does not tell a caller whether out is a new array;
-// capacity does, and the caller cannot see it. That is why a caller recycling
-// the scratch must recycle what out POINTS AT and never what it passed in:
-// either could be the live array.
+// capacity does, and the caller cannot see it.
 //
-// out stays valid until the caller reuses the scratch. tx.Put copies the bytes
-// into the shard's page arena (encodeEntry), so the store never holds onto it.
+// A caller recycling the scratch should recycle what out POINTS AT, but that is
+// a CAPACITY contract, not a safety one: when growth allocated a replacement the
+// two arrays no longer alias, so keeping the original is harmless — it just
+// discards the larger array and makes the next call grow again.
+//
+// The safety constraint is ordering: out stays valid only until the caller
+// reuses the scratch, so everything that reads out must happen first. tx.Put
+// copies the bytes into the shard's page arena (encodeEntry), so the store
+// itself never holds onto it.
 func applyRecordBytesInto(scratch, cur []byte, a *wire.OperateArgs, stampMs int64) ([]byte, bool, wire.OperateResult, error) {
 	if len(a.Ops) > wire.OperateMaxOps || len(a.Rets) > wire.OperateMaxRet {
 		return nil, false, wire.OperateResult{}, wire.ErrOperateCap

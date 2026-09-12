@@ -133,12 +133,22 @@ func handleOperate(tx *TxContext, args []byte) ([]byte, error) {
 	// record that grew keeps the larger array for the next call, so insertGap
 	// stops reallocating on every write to a steady-state record.
 	//
-	// *wb = out, not the buffer passed in: insertGap REPLACES the array when the
-	// record outgrows it, so out is what must be recycled. Recycling the old
-	// array instead would hand a second caller a buffer while out still aliased
-	// the one the engine actually wrote — and pool the smaller array forever.
-	// Guarded on out != nil so a delete or a failed CHECK (both of which return
-	// no bytes) keeps whatever capacity the slot already had.
+	// *wb = out, not the buffer passed in, is a CAPACITY contract rather than a
+	// safety one. insertGap replaces the array when the record outgrows it, and
+	// at that point the two arrays no longer alias — recycling the original
+	// would be harmless, it would just pool the smaller array forever and make
+	// the next call reallocate. Keeping out is what lets a record that reached
+	// its working size stop growing on every write. Guarded on out != nil so a
+	// delete or a failed CHECK (both of which return no bytes) keeps whatever
+	// capacity the slot already had.
+	//
+	// The real lifetime constraint is ordering, and the defer supplies it: the
+	// buffer goes back to the pool only after tx.Put has copied the record into
+	// the page arena and after the reply frame has been encoded, so nothing
+	// still reads out when it is recycled.
+	//
+	// Buffers grown past maxPooledReadBuf are dropped rather than pooled, so a
+	// record larger than that does not keep its array across calls.
 	wb, _ := operateWriteBufPool.Get().(*[]byte)
 	defer func() { putOperateWriteBuf(wb) }()
 

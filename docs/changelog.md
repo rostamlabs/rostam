@@ -11,7 +11,10 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   one left in `applyRecordBytes`. `handleOperate` now supplies that buffer from a
   pool and keeps it across calls, so a steady-state record is patched in a
   recycled array. A record that grew keeps the larger array, which also stops
-  `insertGap` reallocating on every write once a record reaches its working size.
+  `insertGap` reallocating on every write once a record reaches its working
+  size — up to 64 KiB. Past that the buffer is dropped rather than pooled (the
+  same bound the read buffer uses), so records larger than that keep
+  reallocating and only lose the result-frame allocation.
 
   Measured through the handler (`BenchmarkOperateHandlerExistingRow`): 2
   allocs/op to 1, 169 B/op to 71. The call is ~3% slower in `ns/op` — about
