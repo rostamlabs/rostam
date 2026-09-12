@@ -593,15 +593,23 @@ func kvQueryRowBytes(r wire.KVQueryRow) int {
 }
 
 // kvQueryMergeOverhead upper-bounds everything the merged frame carries that is
-// not row payload: the row count, the cursor count, and one continuation per
-// group. Reserving it is what makes "the rows fit the budget" imply "the frame
-// encodes".
+// not row payload: the row count, the cursor block's header, and one
+// continuation per group. Reserving it is what makes "the rows fit the budget"
+// imply "the frame encodes".
 //
 // A group's continuation key is always one of three things rule 3 can choose —
 // its incoming After, its part's After, or one of the keys in its part — so the
 // longest of those bounds it exactly.
+//
+// The header is three bytes, not two: appendKVQueryCursor writes the
+// continuation count (2) AND a prefixLen byte before the shared prefix. Omitting
+// that byte let a keys-only page land exactly on the cap and fail to encode,
+// which encodeMergedKVQuery cannot rescue when the first row has no value to
+// drop. The shared prefix itself needs no reservation: every continuation
+// carries it by construction, so stripping it from each suffix frees at least as
+// much as storing it once costs.
 func kvQueryMergeOverhead(parts []wire.KVQueryResult, inAfter map[uint32][]byte) int {
-	n := 4 + 2
+	n := 4 + 2 + 1
 	for g := range parts {
 		group := uint32(g) //nolint:gosec // g indexes parts, which is NumShards long
 		longest := len(inAfter[group])

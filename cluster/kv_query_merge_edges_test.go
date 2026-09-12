@@ -102,3 +102,103 @@ func TestMergeKVQueryResumptionIsPresenceNotLength(t *testing.T) {
 		t.Fatalf("an unresumed merge returned %q, want both keys starting with the empty one", got)
 	}
 }
+
+// A merged page that fills its byte budget exactly must still ENCODE. The budget
+// is maxBytes minus kvQueryMergeOverhead, so that reservation has to cover every
+// byte of the frame the rows do not pay for — and the cursor block's header is
+// three bytes, not two: appendKVQueryCursor writes the continuation count AND a
+// prefixLen byte before the shared prefix.
+//
+// One unreserved byte is enough to break a real query. A keys-only page cannot be
+// rescued by encodeMergedKVQuery's retry (there is no value on the first row to
+// drop), so the merge would fail the whole request with no continuation, every
+// retry would rebuild the same page, and every key after it would be unreachable.
+//
+// The fixture SEARCHES for a key length whose rows divide the budget exactly,
+// asking the real kvQueryMergeOverhead for the reservation rather than restating
+// it, so the test lands on the boundary whatever that reservation becomes.
+func TestMergeKVQueryFillingTheBudgetStillEncodes(t *testing.T) {
+	const groups = 3
+
+	keyOf := func(g, i, keyLen int) []byte {
+		k := make([]byte, keyLen)
+		for j := range k {
+			k[j] = 'a'
+		}
+		k[0] = byte('0' + g) // distinct first byte: the groups share no prefix
+		k[keyLen-2] = byte(i >> 8)
+		k[keyLen-1] = byte(i)
+		return k
+	}
+	// One row per group is enough to measure the reservation: it depends only on
+	// how long the keys are, not on how many there are.
+	probe := func(keyLen int) ([]wire.KVQueryResult, map[uint32][]byte) {
+		parts := make([]wire.KVQueryResult, groups)
+		inAfter := make(map[uint32][]byte, groups)
+		for g := 0; g < groups; g++ {
+			k := keyOf(g, 0, keyLen)
+			parts[g] = wire.KVQueryResult{
+				Rows:   []wire.KVQueryRow{{Key: k}},
+				Cursor: []wire.KVQueryCont{{Group: uint32(g), After: k, More: true}}, //nolint:gosec // g < groups
+			}
+			inAfter[uint32(g)] = k //nolint:gosec // g < groups
+		}
+		return parts, inAfter
+	}
+
+	keyLen, rows := 0, 0
+	for n := 8000; n < 16000 && keyLen == 0; n++ {
+		parts, inAfter := probe(n)
+		budget := wire.KVQueryMaxPageBytes - kvQueryMergeOverhead(parts, inAfter)
+		rowCost := 2 + n + 1 // kvQueryRowBytes for a keys-only row
+		if budget > 0 && budget%rowCost == 0 && budget/rowCost <= wire.KVQueryMaxLimit {
+			keyLen, rows = n, budget/rowCost
+		}
+	}
+	if keyLen == 0 {
+		t.Skip("no key length in the search range divides the budget exactly")
+	}
+
+	// Every group keeps rows in reserve so none is exhausted: all three stay in
+	// the merged cursor, which is the shape the reservation is sized for.
+	per := rows/groups + 2
+	parts := make([]wire.KVQueryResult, groups)
+	in := make([]wire.KVQueryCont, 0, groups)
+	for g := 0; g < groups; g++ {
+		rs := make([]wire.KVQueryRow, 0, per)
+		for i := 0; i < per; i++ {
+			rs = append(rs, wire.KVQueryRow{Key: keyOf(g, i, keyLen)})
+		}
+		parts[g] = wire.KVQueryResult{
+			Rows:   rs,
+			Cursor: []wire.KVQueryCont{{Group: uint32(g), After: rs[len(rs)-1].Key, More: true}}, //nolint:gosec // g < groups
+		}
+		in = append(in, wire.KVQueryCont{Group: uint32(g), After: nil, More: true}) //nolint:gosec // g < groups
+	}
+
+	merged := mergeKVQuery(parts, in, wire.KVQueryMaxLimit, wire.KVQueryMaxPageBytes)
+	if len(merged.Rows) != rows {
+		t.Fatalf("fixture: the merge emitted %d rows, want the %d that fill the budget exactly", len(merged.Rows), rows)
+	}
+	body, err := wire.EncodeKVQueryResult(merged)
+	if err != nil {
+		t.Fatalf("a page the merge sized to fit does not encode: %v", err)
+	}
+	if len(body) > wire.KVQueryMaxPageBytes {
+		t.Fatalf("the merged frame is %d bytes, over the %d cap", len(body), wire.KVQueryMaxPageBytes)
+	}
+
+	// And the reservation must be an upper bound on what the frame actually spends
+	// outside the rows, which is the invariant the constant exists to hold.
+	rowBytes := 0
+	for _, r := range merged.Rows {
+		rowBytes += kvQueryRowBytes(r)
+	}
+	inAfter := map[uint32][]byte{}
+	for _, c := range in {
+		inAfter[c.Group] = c.After
+	}
+	if spent, reserved := len(body)-rowBytes, kvQueryMergeOverhead(parts, inAfter); spent > reserved {
+		t.Fatalf("the frame spent %d bytes outside its rows but only %d were reserved", spent, reserved)
+	}
+}
