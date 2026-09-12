@@ -4,6 +4,7 @@ package backup
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/rostamlabs/rostam/objstore"
 )
 
 // TestFSObjectStorePutRoundTrip verifies that a value written via Put is
@@ -399,9 +402,13 @@ func TestFSObjectStoreRejectsReservedStagingKey(t *testing.T) {
 		}
 		if _, err := store.Get(ctx, key); err == nil {
 			t.Errorf("Get(%q): expected the reserved name space to be refused, got nil", key)
+		} else if errors.Is(err, objstore.ErrNotFound) {
+			t.Errorf("Get(%q): refused as not-found, not as an invalid key: %v", key, err)
 		}
 		if err := store.Delete(ctx, key); err == nil {
 			t.Errorf("Delete(%q): expected the reserved name space to be refused, got nil", key)
+		} else if errors.Is(err, objstore.ErrNotFound) {
+			t.Errorf("Delete(%q): refused as not-found, not as an invalid key: %v", key, err)
 		}
 	}
 
@@ -484,6 +491,16 @@ func TestFSObjectStoreRejectsBackslashKeys(t *testing.T) {
 		}
 		if _, err := store.Get(context.Background(), key); err == nil {
 			t.Errorf("Get(%q): expected a backslash key to be refused, got nil", key)
+		} else if errors.Is(err, objstore.ErrNotFound) {
+			t.Errorf("Get(%q): refused as not-found, not as an invalid key: %v", key, err)
+		}
+		// Delete too: keyToPath gates all three, and on Windows an unguarded
+		// Delete of a backslash key resolves into the reserved staging name space
+		// — where it could unlink a live Put's staging file.
+		if err := store.Delete(context.Background(), key); err == nil {
+			t.Errorf("Delete(%q): expected a backslash key to be refused, got nil", key)
+		} else if errors.Is(err, objstore.ErrNotFound) {
+			t.Errorf("Delete(%q): refused as not-found, not as an invalid key: %v", key, err)
 		}
 	}
 	// Nothing may have been created: keyToPath fails before MkdirAll.
