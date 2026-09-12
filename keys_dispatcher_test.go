@@ -326,17 +326,30 @@ func TestWrapKeysDispatcherPreservesAppendCapability(t *testing.T) {
 }
 
 // The intercepted keys ops are administrative: served by the wrapper itself,
-// never forwarded, and their frame still lands in dst.
+// never forwarded to the inner dispatcher. A LIVE registry is required to see
+// that — with a nil one every keys op fails with ErrKeyAdminUnavailable before
+// producing a frame, so the assertion would hold vacuously.
 func TestKeysAppendDispatcherKeepsKeysOpsLocal(t *testing.T) {
+	reg, _ := newTestRegistry(t)
 	inner := &appendingInner{}
-	ad, ok := wrapKeysDispatcher(inner, nil).(server.AppendDispatcher)
+	ad, ok := wrapKeysDispatcher(inner, reg).(server.AppendDispatcher)
 	if !ok {
 		t.Fatal("expected an append-capable wrapper")
 	}
-	if _, err := ad.CallAppend(ops.OpKeysList, nil, []byte("DST")); err == nil {
-		t.Log("keys op served without a registry error")
+
+	got, err := ad.CallAppend(ops.OpKeysList, nil, []byte("DST"))
+	if err != nil {
+		t.Fatalf("keys list: %v", err)
 	}
 	if inner.appendCalled {
-		t.Error("a keys op must be served by the wrapper, not forwarded")
+		t.Error("a keys op was forwarded to the inner dispatcher instead of being served locally")
+	}
+	if len(got) == 0 {
+		t.Error("keys list produced no frame")
+	}
+	// It is served locally, so the frame is its own rather than an append onto
+	// dst — the payload is explicitly allowed not to alias.
+	if bytes.HasPrefix(got, []byte("DST")) {
+		t.Error("the keys frame was copied into dst; it should be returned as is")
 	}
 }

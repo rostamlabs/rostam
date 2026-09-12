@@ -57,7 +57,10 @@ type Handler func(tx *TxContext, args []byte) ([]byte, error)
 // changes no existing behaviour.
 //
 // OWNERSHIP, AND WHY THIS IS NOT THE DEFAULT. The returned bytes alias the
-// CALLER's buffer and stay valid only until that caller reuses it. That is safe
+// CALLER's buffer and stay valid only until that caller reuses it. (A dispatcher
+// serving an op that has NO variant returns that handler's own reply instead, so
+// at the dispatcher boundary the payload may or may not alias — see
+// server.AppendDispatcher.) That is safe
 // for the TCP server, which copies the payload into its response frame before
 // reading the next request on the connection. It is NOT safe for Store.Call,
 // which is public API handing bytes to in-process application code that may

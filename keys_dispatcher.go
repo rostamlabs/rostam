@@ -89,15 +89,14 @@ type keysAppendDispatcher struct {
 
 // CallAppend serves the three keys ops locally — they build their own frames and
 // are administrative, not hot — and forwards everything else to the inner
-// dispatcher's append path.
+// dispatcher's append path. The returned payload may or may not alias dst; see
+// directStore.CallAppend.
 func (k *keysAppendDispatcher) CallAppend(name string, args, dst []byte) ([]byte, error) {
 	switch name {
 	case ops.OpKeysAdd, ops.OpKeysRevoke, ops.OpKeysList:
-		out, err := k.Call(name, args)
-		if err != nil {
-			return nil, err
-		}
-		return append(dst, out...), nil
+		// Administrative and rare: served locally, and the frame is returned as
+		// is rather than copied into dst. The payload is allowed not to alias.
+		return k.Call(name, args)
 	}
 	return k.inner.CallAppend(name, args, dst)
 }

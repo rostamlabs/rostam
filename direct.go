@@ -189,13 +189,18 @@ func (d *directStore) Call(_ context.Context, op string, args []byte) ([]byte, e
 	return d.callWith(op, args, nil, false)
 }
 
-// CallAppend is Call for a caller that owns a reusable reply buffer: the payload
-// is appended to dst and the returned slice aliases it, valid only until dst is
-// reused. It is deliberately NOT on the Store interface — Store.Call is public
-// API whose bytes reach in-process callers that may retain them, and only a
-// transport that copies the payload out before the next call on that connection
-// can satisfy this contract. An op with no AppendHandler is served by its normal
-// handler and its result copied into dst, so the contract holds uniformly.
+// CallAppend is Call for a caller that owns a reusable reply buffer. An op with
+// an AppendHandler writes its payload into dst; one without is served by its
+// normal handler and its own result returned untouched. So the payload MAY alias
+// dst and may equally be a fresh slice — the caller must check before assuming,
+// which is cheaper than copying every other op's reply just to make the aliasing
+// uniform.
+//
+// When it does alias dst it is valid only until dst is reused. This is
+// deliberately NOT on the Store interface: Store.Call is public API whose bytes
+// reach in-process callers that may retain them, and only a transport that
+// copies the payload out before its next call on that connection can satisfy
+// even the weaker contract.
 func (d *directStore) CallAppend(_ context.Context, op string, args, dst []byte) ([]byte, error) {
 	return d.callWith(op, args, dst, true)
 }
@@ -209,15 +214,12 @@ func (d *directStore) callWith(op string, args, dst []byte, appendMode bool) ([]
 	if appendMode {
 		if af, has := d.registry.LookupAppend(op); has {
 			invoke = func() ([]byte, error) { return af(d.tx, args, dst) }
-		} else {
-			invoke = func() ([]byte, error) {
-				out, err := handler(d.tx, args)
-				if err != nil {
-					return nil, err
-				}
-				return append(dst, out...), nil
-			}
 		}
+		// No append variant: serve through the normal handler and return its
+		// result AS IS. Copying it into dst would add a full reply copy to every
+		// op that has no variant — which is nearly all of them — to satisfy an
+		// aliasing guarantee no caller needs. The payload MAY alias dst; the
+		// transport checks before reusing the buffer.
 	}
 	// Read-only ops run concurrently — the cache's per-shard RWMutex gives each
 	// read its atomicity. A read-write op serializes so a multi-step RMW handler
@@ -1227,11 +1229,10 @@ func (a *directDispatcher) Call(name string, args []byte) ([]byte, error) {
 func (a *directDispatcher) CallAppend(name string, args, dst []byte) ([]byte, error) {
 	switch name {
 	case "vector_query", "vector_named_query", "vector_mv_query":
-		out, err := a.Call(name, args)
-		if err != nil {
-			return nil, err
-		}
-		return append(dst, out...), nil
+		// Result-set encoders, not per-call reply frames: served through Call,
+		// and the (often large) result is returned as is rather than copied into
+		// the connection's buffer.
+		return a.Call(name, args)
 	default:
 		return a.store.CallAppend(context.Background(), name, args, dst)
 	}
