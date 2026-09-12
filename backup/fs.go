@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/rostamlabs/rostam/objstore"
 )
@@ -40,15 +41,20 @@ var _ objstore.ObjectStore = (*FSObjectStore)(nil)
 // putTempPrefix is the fixed name prefix of every Put staging file. It is kept
 // OUT of the ".snap"/".cfg.json" key space (List/LatestKey/prune filter on
 // ".snap") so an in-flight staging file is never seen by retention as a
-// published object. A staging file left behind by a process killed mid-Put is
-// not auto-reclaimed here — a startup sweep would race a concurrent writer on a
-// shared root and cannot tell a final key from a temp by prefix alone, so
-// reclaiming leftovers is left to maintenance (tracked in #115). Note what
-// accumulates: the same Put stages the SNAPSHOT, so a kill mid-copy leaves a
-// partial snapshot as large as whatever had been copied — potentially many GB
-// on a large collection — inert (never selectable as a snapshot) but not small,
-// and unbounded across repeated interrupted backups until reclaimed.
+// published object — and, since no published key can start with it, it is also
+// the marker that makes reclaiming leftovers safe (see reclaimStaleTemps).
+//
+// A staging file left behind by a process killed mid-Put is NOT a small, inert
+// file: the very same Put stages the SNAPSHOT, so the leftover can be a partial
+// snapshot of arbitrary size — gigabytes of dead space on the backup volume,
+// leaked once per kill and never reclaimed on its own.
 const putTempPrefix = ".rostam-put-"
+
+// staleTempAge is how old a putTempPrefix staging file must be before a Put
+// reclaims it. It is the whole safety margin of the sweep: a CONCURRENT Put
+// created its staging file moments ago, so nothing an hour old can belong to a
+// live writer — only to a process that died mid-Put.
+const staleTempAge = time.Hour
 
 // NewFSObjectStore returns an FSObjectStore rooted at root, creating root if it
 // does not exist.
@@ -103,6 +109,13 @@ func (f *FSObjectStore) Put(_ context.Context, key string, r io.Reader, size int
 	if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
 		return fmt.Errorf("fsstore: mkdir for %q: %w", key, err)
 	}
+	// Reclaim staging files abandoned by a process killed mid-Put before staging
+	// ours. Doing it here rather than at open is what makes it race-free on a root
+	// shared by several processes; it is best-effort and never fails the Put.
+	reclaimStaleTemps(filepath.Dir(dst))
+	// Reclaim staging files abandoned by a process killed mid-Put before staging
+	// ours. Doing it here rather than at open is what makes it race-free on a root
+	// shared by several processes; it is best-effort and never fails the Put.
 	// Staging name deliberately does NOT end in snapExt: List/LatestKey/prune
 	// filter on the ".snap" suffix, so a temp named "*.snap" would be visible to
 	// them mid-write — a concurrent prune could delete an in-flight Put's staging
@@ -142,6 +155,42 @@ func (f *FSObjectStore) Put(_ context.Context, key string, r io.Reader, size int
 		return fmt.Errorf("fsstore: sync dir for %q: %w", key, err)
 	}
 	return nil
+}
+
+// reclaimStaleTemps removes abandoned Put staging files from dir. It is called
+// from Put — on the NEXT write to that directory — rather than from a sweep at
+// open: there is then no startup instant to reason about on a shared root, only
+// an age bound, and two filters keep it safe:
+//
+//   - the putTempPrefix name prefix. No PUBLISHED object can start with it (keys
+//     come from the backup layout <tenant>/<col>/<ts>.snap and its .cfg.json
+//     sibling, and List/LatestKey/prune select on the ".snap" suffix), so the
+//     sweep can never remove a real snapshot or config.
+//   - the staleTempAge modtime bound. A concurrent Put created its staging file
+//     moments ago, so a live writer's temp is never old enough to be swept; only
+//     a temp orphaned by a dead process ages past the bound.
+//
+// Every error is ignored, including the removal's: reclaiming dead space must
+// never fail a backup.
+func reclaimStaleTemps(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-staleTempAge)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), putTempPrefix) {
+			continue
+		}
+		info, ierr := e.Info()
+		if ierr != nil {
+			continue
+		}
+		if !info.ModTime().Before(cutoff) {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, e.Name()))
+	}
 }
 
 // syncDir fsyncs the directory at dir so a preceding rename/create within it is

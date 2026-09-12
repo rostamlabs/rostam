@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestFSObjectStorePutRoundTrip verifies that a value written via Put is
@@ -317,5 +318,59 @@ func sortStrings(s []string) {
 		for j := i; j > 0 && s[j-1] > s[j]; j-- {
 			s[j-1], s[j] = s[j], s[j-1]
 		}
+
+// TestFSObjectStorePutReclaimsStaleTemps verifies Put's best-effort reclamation
+// of staging files abandoned by a process killed mid-Put. Such a leftover is not
+// inert — the same Put stages the snapshot itself, so it can be a partial
+// snapshot of arbitrary size — and nothing else ever removes it. A temp older
+// than staleTempAge is swept; a temp with a CURRENT modtime is left alone,
+// because it may belong to a concurrent writer.
+func TestFSObjectStorePutReclaimsStaleTemps(t *testing.T) {
+	root := t.TempDir()
+	store, err := NewFSObjectStore(root)
+	if err != nil {
+		t.Fatalf("NewFSObjectStore: %v", err)
+	}
+
+	dir := filepath.Join(root, "tenant", "coll")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	stale := filepath.Join(dir, putTempPrefix+"stale.tmp")
+	if err := os.WriteFile(stale, []byte("abandoned partial snapshot"), 0o600); err != nil {
+		t.Fatalf("write stale temp: %v", err)
+	}
+	old := time.Now().Add(-2 * staleTempAge)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	fresh := filepath.Join(dir, putTempPrefix+"fresh.tmp")
+	if err := os.WriteFile(fresh, []byte("a concurrent writer's staging file"), 0o600); err != nil {
+		t.Fatalf("write fresh temp: %v", err)
+	}
+
+	const key = "tenant/coll/2026-07-08T00:00:00Z.snap"
+	want := []byte("payload")
+	if err := store.Put(context.Background(), key, strings.NewReader(string(want)), int64(len(want))); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("stale staging file not reclaimed, stat err = %v", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("a current-modtime staging file must be left alone: %v", err)
+	}
+	rc, err := store.Get(context.Background(), key)
+	if err != nil {
+		t.Fatalf("Get after Put: %v", err)
+	}
+	defer rc.Close()
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Errorf("object = %q, want %q", got, want)
 	}
 }
