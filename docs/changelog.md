@@ -5,6 +5,26 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **`get` and `operate` can be served without allocating a reply at all.** The
+  reply payload was the last per-call allocation on a KV node: `tx.Get` copies
+  the stored value into a fresh slice for every read, and `operate` builds its
+  result frame the same way. `AppendHandler` is a new OPTIONAL per-op twin of
+  `Handler` that appends the payload to a caller-owned buffer instead, and
+  `server.AppendDispatcher` lets a transport supply one. Only those two ops opt
+  in; every other op, and every dispatcher without `CallAppend`, is served
+  exactly as before.
+
+  | | before | after |
+  |---|---|---|
+  | `get` | 256 B/op, 1 alloc, 118 ns | **0 B/op, 0 allocs, 60 ns** |
+  | `operate` (with the pooled record buffer) | 1 alloc | **0 allocs** |
+
+  `Store.Call` deliberately keeps the allocating path: it is public API handing
+  bytes to in-process callers that may retain them. The append form's payload
+  aliases the transport's buffer and is valid only until that buffer is reused,
+  which the epoll server satisfies by copying the payload into its response
+  frame before reading the next request.
+
 - **The `operate` reply frame is built in one allocation, whatever it returns.**
   `EncodeOperateResult` reserved room for each value's 4-byte length prefix but
   not for the value BYTES, so any non-empty return made `append` grow the array —
