@@ -585,9 +585,10 @@ func BenchmarkDecodeOperateArgsInto(b *testing.B) {
 }
 
 // BenchmarkEncodeOperateResult measures the reply frame with return values in
-// it — the case the capacity reservation has to get right. With no values the
-// frame is 5 bytes and the tiny allocator handles it; with values, an
-// under-reserved buffer makes append grow the array.
+// it — the case the capacity reservation has to get right. An OK frame with no
+// values is 3 bytes (status u8 + nRet u16; failedOp is written only for a failed
+// CHECK) and the tiny allocator handles it. With values, an under-reserved
+// buffer makes append grow the array.
 func BenchmarkEncodeOperateResult(b *testing.B) {
 	for _, n := range []int{1, 4, 16} {
 		r := &OperateResult{Status: OperateStatusOK, Values: make([][]byte, n)}
@@ -596,7 +597,7 @@ func BenchmarkEncodeOperateResult(b *testing.B) {
 		}
 		b.Run(fmt.Sprintf("values=%d", n), func(b *testing.B) {
 			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				if _, err := EncodeOperateResult(r); err != nil {
 					b.Fatal(err)
 				}
