@@ -540,6 +540,70 @@ func TestMapResultTruncatedOperateFrameIsClientFacing(t *testing.T) {
 	})
 }
 
+// TestMapResultOperateCapIsClientFacing pins the design doc §2.7 cap refusal
+// as the caller's own request shape. wire.ErrOperateCap is what every cap
+// raises — too many ops, too many return specs, returns over the byte budget
+// (OperateMaxRetBytes), a record the call would grow past the size backstop,
+// and the engines' row/column/width checks. Each names nothing but "a cap was
+// exceeded", and each has the same remedy: ask for less. Unclassified, a
+// caller that had simply asked for too much was told the server had faulted,
+// with nothing left to act on.
+//
+// The message-shape arm carries more weight here than it does for
+// ErrOperateArgs. A KV operate does not merely decode inside the FSM apply, it
+// APPLIES there, so every cap the ENGINE enforces is raised behind
+// shard.decodePBResult and reaches this classifier rebuilt with errors.New. On
+// a cluster the sentinel arm sees almost none of them.
+func TestMapResultOperateCapIsClientFacing(t *testing.T) {
+	disp := &fakeDispatcher{}
+	// A real production shape, not a hand-written sentinel: a call whose return
+	// list is one spec past OperateMaxRet, which AppendOperateArgs refuses.
+	_, encErr := wire.EncodeOperateArgs(&wire.OperateArgs{
+		Rets: make([]wire.OperateRet, wire.OperateMaxRet+1),
+	})
+	if !errors.Is(encErr, wire.ErrOperateCap) {
+		t.Fatalf("codec fixture drifted: err = %v, want wire.ErrOperateCap", encErr)
+	}
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", wire.ErrOperateCap},
+		{"wrapped (%w, exercises errors.Is identity)", fmt.Errorf("operate: %w", wire.ErrOperateCap)},
+		{"as the codec actually returns it", encErr},
+		// The clustered shape, and the one the sentinel arm cannot reach — the
+		// COMMON one for this sentinel, per the note above.
+		{"stringified across Raft, real bare shape", errors.New(wire.ErrOperateCap.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, payload := mapResult(disp, nil, tc.err, "")
+			if status != StatusError {
+				t.Fatalf("status = %d, want StatusError (%d)", status, StatusError)
+			}
+			msg, _ := DecodeErrorPayload(payload)
+			if msg == "internal error" {
+				t.Fatalf("a cap refusal was redacted to %q — the caller's own request shape reads as a server fault", msg)
+			}
+			if msg != tc.err.Error() {
+				t.Fatalf("payload = %q, want the verbatim message %q", msg, tc.err.Error())
+			}
+		})
+	}
+	// Negative control: an unrelated internal fault that merely mentions the
+	// sentinel text must STAY redacted. This is what an exact-equality matcher
+	// buys over a strings.Contains arm.
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix", func(t *testing.T) {
+		err := errors.New("apply: " + wire.ErrOperateCap.Error())
+		status, payload := mapResult(disp, nil, err, "")
+		if status != StatusError {
+			t.Fatalf("status = %d, want StatusError (%d)", status, StatusError)
+		}
+		if msg, _ := DecodeErrorPayload(payload); msg != "internal error" {
+			t.Fatalf("payload = %q, want the redacted message", msg)
+		}
+	})
+}
+
 // The kv_query refusals must cross the TCP edge unredacted.
 //
 // This edge is not only the client's: a kv_query fans out to every shard group,

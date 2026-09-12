@@ -565,6 +565,41 @@ func TestStatusForErrorTruncatedOperateFrame(t *testing.T) {
 	})
 }
 
+// TestStatusForErrorOperateCap is the parity guard for wire.ErrOperateCap: the
+// refusal every design doc §2.7 cap raises — too many ops, too many return
+// specs, returns over the byte budget, a record grown past the size backstop.
+// REST reaches it through vector_operate, which drives the same
+// applyRecordBytes the KV op does, so it answers 400 here, matching the binary
+// transport (server.TestMapResultOperateCapIsClientFacing) and gRPC's
+// InvalidArgument. Unclassified it was a redacted 500, which told a caller that
+// had simply asked for too much that the server had faulted.
+func TestStatusForErrorOperateCap(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", wire.ErrOperateCap},
+		{"wrapped (%w, exercises errors.Is identity)", fmt.Errorf("vector_operate: %w", wire.ErrOperateCap)},
+		// The clustered shape, and the one the sentinel arm cannot reach — the
+		// COMMON one for this sentinel, because a clustered operate APPLIES
+		// inside the FSM, so the engine's own caps are all raised behind
+		// shard.decodePBResult and come back rebuilt with errors.New.
+		{"stringified across Raft, real bare shape", errors.New(wire.ErrOperateCap.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := statusForError(tc.err); got != http.StatusBadRequest {
+				t.Errorf("statusForError = %d, want 400", got)
+			}
+		})
+	}
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix", func(t *testing.T) {
+		err := errors.New("apply: " + wire.ErrOperateCap.Error())
+		if got := statusForError(err); got != http.StatusInternalServerError {
+			t.Errorf("statusForError(%v) = %d, want 500", err, got)
+		}
+	})
+}
+
 // The kv_query refusals, kept in sync with server.clientFacingErr: permanent
 // ones are 400 (the caller must change the query), retryable ones are 503 (the
 // caller should come back). Unclassified they were a redacted 500, which tells

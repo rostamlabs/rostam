@@ -42,6 +42,26 @@ func IsOperateArgsMessage(s string) bool {
 	return s == ErrOperateArgs.Error()
 }
 
+// IsOperateCapMessage reports whether s is the EXACT serialised form of an
+// ErrOperateCap error. It is IsOperateArgsMessage's twin, for the same
+// boundary and by the same rule: a KV operate decodes AND applies inside the
+// FSM apply, so on a cluster a cap refusal comes back through
+// shard.decodePBResult rebuilt with errors.New, errors.Is identity is gone,
+// and a sentinel-only classifier redacts "you asked for more than the caps
+// allow" to "internal error".
+//
+// ErrOperateCap's text is fixed, with nothing interpolated into it and no
+// server-side site wrapping it: every producer — the wire codecs here, the
+// cell and math helpers, and every guard in ops (the op/ret count caps, the
+// return byte budget, the record-size backstop, and the engines' row, column
+// and width checks) — returns it bare. So exact equality is the whole
+// matcher. It is deliberately not a strings.Contains: a bare substring check
+// would make any internal fault that merely mentions the sentinel text
+// client-facing.
+func IsOperateCapMessage(s string) bool {
+	return s == ErrOperateCap.Error()
+}
+
 // OperateSeg addresses one hop of an OperatePath (design doc §2.4/§3.5): a
 // field or column identified by its schema position, or, for a record that
 // stores names, by name.

@@ -278,7 +278,23 @@ func grpcError(err error) error {
 		// unclassified, a truncated frame read as a server fault.
 		wire.IsOperateArgsMessage(err.Error()),
 		errIs(err, wire.ErrVectorArgsTruncated),
-		wire.IsVectorArgsTruncatedMessage(err.Error()):
+		wire.IsVectorArgsTruncatedMessage(err.Error()),
+		// wire.ErrOperateCap rides in the same bucket, by both arms: a call
+		// refused for exceeding one of the design doc §2.7 caps — too many ops,
+		// too many return specs, returns that would produce more bytes than
+		// OperateMaxRetBytes, or a record grown past the size backstop. The
+		// caller chose its own request shape and the remedy is to ask for less,
+		// so it is InvalidArgument like the malformed frame, matching HTTP's
+		// 400; the message names only "a cap was exceeded" — no key, no path,
+		// no size — so it is safe verbatim.
+		//
+		// gRPC reaches this through vector_operate, which drives the same
+		// applyRecordBytes the KV op does. The message-shape arm carries the
+		// clustered case: an operate APPLIES inside the FSM, so every cap the
+		// engine enforces comes back through shard.decodePBResult rebuilt with
+		// errors.New and the sentinel arm cannot see it.
+		errIs(err, wire.ErrOperateCap),
+		wire.IsOperateCapMessage(err.Error()):
 		// wire.ErrOperateArgs: a malformed operate frame — a vector_operate or a KV
 		// operate whose args do not decode, or which names a second target or a
 		// TTL the op does not carry (DecodeVectorOperateArgs /
@@ -287,9 +303,10 @@ func grpcError(err error) error {
 		// fault. The message names no key, no path and no size — only that the
 		// arguments are invalid — so it is safe verbatim.
 		//
-		// Sentinel only, no message-shape arm: this error is raised by the
-		// decoder the handler itself calls, so it reaches the classifier with its
-		// identity intact.
+		// Sentinel AND message shape, as every error in this case carries: the
+		// sentinel arm covers the direct path, where the decoder the handler
+		// itself calls hands the error back with its identity intact, and the
+		// message-shape arm covers the clustered one described above.
 		return status.Error(codes.InvalidArgument, err.Error())
 	case errIs(err, vector.ErrInvalidDim, vector.ErrInvalidMetric, vector.ErrInvalidM,
 		vector.ErrInvalidQuant, vector.ErrInvalidIVFPQ, vector.ErrInvalidIVFPQM,

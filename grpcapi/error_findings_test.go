@@ -327,3 +327,38 @@ func TestGrpcErrorTruncatedOperateFrameIsInvalidArgument(t *testing.T) {
 		}
 	})
 }
+
+// TestGrpcErrorOperateCapIsInvalidArgument is the parity guard for
+// wire.ErrOperateCap: the refusal every design doc §2.7 cap raises — too many
+// ops, too many return specs, returns over the byte budget, a record grown
+// past the size backstop. gRPC reaches it through vector_operate, which drives
+// the same applyRecordBytes the KV op does, so it answers InvalidArgument here,
+// matching HTTP's 400 and the binary transport's client-facing message.
+// Unclassified it fell to Internal, which reads as a server fault for a caller
+// that had simply asked for too much.
+func TestGrpcErrorOperateCapIsInvalidArgument(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", wire.ErrOperateCap},
+		{"wrapped (%w, exercises errIs identity)", fmt.Errorf("vector_operate: %w", wire.ErrOperateCap)},
+		// The clustered shape, and the one the sentinel arm cannot reach — the
+		// COMMON one for this sentinel, because a clustered operate APPLIES
+		// inside the FSM, so the engine's own caps are all raised behind
+		// shard.decodePBResult and come back rebuilt with errors.New.
+		{"stringified across replication, real bare shape", errors.New(wire.ErrOperateCap.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := status.Code(grpcError(tc.err)); got != codes.InvalidArgument {
+				t.Errorf("grpcError(%v) = %v, want InvalidArgument", tc.err, got)
+			}
+		})
+	}
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix", func(t *testing.T) {
+		err := errors.New("apply: " + wire.ErrOperateCap.Error())
+		if got := status.Code(grpcError(err)); got != codes.Internal {
+			t.Errorf("grpcError(%v) = %v, want Internal", err, got)
+		}
+	})
+}

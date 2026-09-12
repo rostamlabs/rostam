@@ -301,14 +301,25 @@ func clientFacingErr(err error) bool {
 		wire.IsVectorArgsTruncatedMessage(err.Error()),
 		errors.Is(err, wire.ErrVectorArgsTruncated),
 		// wire.ErrOperateCap: an operate call refused for exceeding one of the
-		// call-shape caps — too many ops, too many return specs, or returns
-		// that would produce more bytes than OperateMaxRetBytes. Every one of
-		// those is a fact about the request the caller itself built, with an
-		// obvious remedy (ask for less), and the message names only "a cap was
+		// design doc §2.7 caps — too many ops, too many return specs, returns
+		// that would produce more bytes than OperateMaxRetBytes, or a record
+		// the call would grow past the size backstop. Every one of those is a
+		// fact about the request the caller itself built, with an obvious
+		// remedy (ask for less), and the message names only "a cap was
 		// exceeded" — no key, no path, no size. Same bucket and same reasoning
 		// as the malformed frame above; unclassified, a caller asking for too
 		// much read back as a server fault.
-		errors.Is(err, wire.ErrOperateCap):
+		//
+		// Sentinel AND exact message shape, both arms load-bearing, for exactly
+		// the reason spelled out above — and MORE so than for ErrOperateArgs. A
+		// KV operate does not merely decode inside the FSM apply, it APPLIES
+		// there, so every cap the engine enforces (not just the frame-level
+		// ones) is raised behind shard.decodePBResult and reaches this
+		// classifier rebuilt with errors.New. On a cluster the sentinel arm
+		// covers almost none of them. wire.IsOperateCapMessage, not
+		// strings.Contains, for the usual reason.
+		errors.Is(err, wire.ErrOperateCap),
+		wire.IsOperateCapMessage(err.Error()):
 		return true
 	case errors.Is(err, ops.ErrOperateDuringReshard),
 		// ops.ErrOperateDuringReshard: a vector_operate against a collection a

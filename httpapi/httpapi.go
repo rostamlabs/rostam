@@ -701,7 +701,24 @@ func statusForError(err error) int {
 		wire.IsOperateArgsMessage(err.Error()),
 		errors.Is(err, wire.ErrOperateArgs),
 		wire.IsVectorArgsTruncatedMessage(err.Error()),
-		errors.Is(err, wire.ErrVectorArgsTruncated):
+		errors.Is(err, wire.ErrVectorArgsTruncated),
+		// wire.ErrOperateCap rides in the same bucket, by both arms: a call
+		// refused for exceeding one of the design doc §2.7 caps — too many ops,
+		// too many return specs, returns that would produce more bytes than
+		// OperateMaxRetBytes, or a record grown past the size backstop. The
+		// caller chose the shape of its own request and the remedy is to ask
+		// for less, so it is a 400 like the malformed frame above, not a server
+		// fault; the message names only "a cap was exceeded" — no key, no path,
+		// no size — so it is safe verbatim.
+		//
+		// REST reaches this through vector_operate, which drives the same
+		// applyRecordBytes the KV op does, and the message-shape arm matters
+		// MORE here than for ErrOperateArgs: a clustered operate APPLIES inside
+		// the FSM, so every cap the engine enforces (not just the frame-level
+		// ones) comes back through shard.decodePBResult rebuilt with
+		// errors.New, with no errors.Is identity left for the sentinel arm.
+		errors.Is(err, wire.ErrOperateCap),
+		wire.IsOperateCapMessage(err.Error()):
 		return http.StatusBadRequest
 	case errors.Is(err, ops.ErrVectorRecordAbsent),
 		// The clustered path stringifies the sentinel across the Raft boundary, so

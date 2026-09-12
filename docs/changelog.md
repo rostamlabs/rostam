@@ -19,8 +19,14 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   charged as each return is evaluated, so a call that would cross it is refused
   with `wire.ErrOperateCap` before the bytes are materialised — the peak a
   refused call reaches is the budget plus one value, not the whole list. The
-  refusal also reaches the client as the cap error it is rather than as
-  "internal error"; it was previously unclassified at the TCP edge.
+  Every `operate` cap refusal also reaches the client as the refusal it is,
+  on all three transports: `wire.ErrOperateCap` was unclassified at the TCP,
+  REST and gRPC edges alike, so a caller that had simply asked for too much was
+  answered "internal error" (500 / `Internal`) instead of a 400 /
+  `InvalidArgument` naming the cap. It is now matched both by sentinel and by
+  exact message shape, which is what makes it work on a cluster: an `operate`
+  APPLIES inside the Raft FSM, so the engine's own caps come back rebuilt and
+  lose `errors.Is` identity on the way out.
 
   **Behaviour change:** a call whose returns exceed 16 MiB in total now fails
   (with the record unchanged, like every other cap) where it previously
