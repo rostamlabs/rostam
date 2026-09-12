@@ -374,3 +374,140 @@ func TestFSObjectStorePutReclaimsStaleTemps(t *testing.T) {
 		t.Errorf("object = %q, want %q", got, want)
 	}
 }
+
+// TestFSObjectStoreRejectsReservedStagingKey asserts the putTempPrefix name
+// space is reserved. Nothing stops a caller from asking to publish an object
+// named like a staging file, and such an object would be silently deleted by
+// reclaimStaleTemps an hour later — so keyToPath refuses the key outright. The
+// refusal lives in keyToPath, so it covers Get and Delete as well as Put: a key
+// that can never be written must not be readable or deletable either.
+func TestFSObjectStoreRejectsReservedStagingKey(t *testing.T) {
+	root := t.TempDir()
+	store, err := NewFSObjectStore(root)
+	if err != nil {
+		t.Fatalf("NewFSObjectStore: %v", err)
+	}
+	ctx := context.Background()
+
+	for _, key := range []string{
+		"tenant/coll/" + putTempPrefix + "sneaky" + putTempSuffix,
+		"tenant/coll/" + putTempPrefix + "sneaky.snap",
+		putTempPrefix + "toplevel",
+	} {
+		if err := store.Put(ctx, key, strings.NewReader("payload"), 7); err == nil {
+			t.Errorf("Put(%q): expected the reserved name space to be refused, got nil", key)
+		}
+		if _, err := store.Get(ctx, key); err == nil {
+			t.Errorf("Get(%q): expected the reserved name space to be refused, got nil", key)
+		}
+		if err := store.Delete(ctx, key); err == nil {
+			t.Errorf("Delete(%q): expected the reserved name space to be refused, got nil", key)
+		}
+	}
+
+	// The refused Put must not have written anything — not even the directory
+	// tree, since keyToPath fails before MkdirAll.
+	if _, err := os.Stat(filepath.Join(root, "tenant")); !os.IsNotExist(err) {
+		t.Errorf("refused Put created files under root, stat err = %v", err)
+	}
+
+	// A key whose non-final segment shares the prefix is fine: the sweep skips
+	// directories and only ever inspects one directory's own entries.
+	ok := putTempPrefix + "dir/real.snap"
+	if err := store.Put(ctx, ok, strings.NewReader("payload"), 7); err != nil {
+		t.Errorf("Put(%q): a prefixed DIRECTORY segment must stay legal: %v", ok, err)
+	}
+}
+
+// TestFSObjectStoreSweepRequiresTempSuffix asserts the sweep matches on BOTH
+// halves of the staging name, not the prefix alone. A file carrying the prefix
+// but not putTempSuffix was never created by this Put (keyToPath reserves the
+// prefix, so it cannot be a published object either) — it is something else on
+// the volume, and the reclaimer must leave it alone however old it is.
+func TestFSObjectStoreSweepRequiresTempSuffix(t *testing.T) {
+	root := t.TempDir()
+	store, err := NewFSObjectStore(root)
+	if err != nil {
+		t.Fatalf("NewFSObjectStore: %v", err)
+	}
+
+	dir := filepath.Join(root, "tenant", "coll")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Both are ancient; only the one with the full staging name may be swept.
+	suffixed := filepath.Join(dir, putTempPrefix+"abandoned"+putTempSuffix)
+	bare := filepath.Join(dir, putTempPrefix+"not-a-staging-file")
+	old := time.Now().Add(-2 * staleTempAge)
+	for _, p := range []string{suffixed, bare} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatalf("write %q: %v", p, err)
+		}
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatalf("chtimes %q: %v", p, err)
+		}
+	}
+
+	const key = "tenant/coll/2026-07-08T00:00:00Z.snap"
+	if err := store.Put(context.Background(), key, strings.NewReader("payload"), 7); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	if _, err := os.Stat(suffixed); !os.IsNotExist(err) {
+		t.Errorf("a full staging name should have been reclaimed, stat err = %v", err)
+	}
+	if _, err := os.Stat(bare); err != nil {
+		t.Errorf("a file without %q must be left alone: %v", putTempSuffix, err)
+	}
+}
+
+// TestTempHeartbeatKeepsTempFresh asserts a running Put's staging file is kept
+// young, and stops being kept young once the Put is done. Without the heartbeat
+// a copy that stalls for longer than staleTempAge is indistinguishable from a
+// temp orphaned by a killed process, so a concurrent Put would unlink it and the
+// stalled Put's rename would fail. tempHeartbeat is shortened so the test is a
+// few milliseconds rather than a quarter of an hour.
+func TestTempHeartbeatKeepsTempFresh(t *testing.T) {
+	prev := tempHeartbeat
+	tempHeartbeat = 2 * time.Millisecond
+	t.Cleanup(func() { tempHeartbeat = prev })
+
+	path := filepath.Join(t.TempDir(), putTempPrefix+"inflight"+putTempSuffix)
+	if err := os.WriteFile(path, []byte("in-flight snapshot"), 0o600); err != nil {
+		t.Fatalf("write temp: %v", err)
+	}
+	backdate := func() {
+		old := time.Now().Add(-2 * staleTempAge)
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatalf("chtimes: %v", err)
+		}
+	}
+	// fresh reports whether the file would survive a sweep right now.
+	fresh := func() bool {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat: %v", err)
+		}
+		return !info.ModTime().Before(time.Now().Add(-staleTempAge))
+	}
+
+	backdate()
+	stop := startTempHeartbeat(path)
+	deadline := time.Now().Add(2 * time.Second)
+	for !fresh() {
+		if time.Now().After(deadline) {
+			stop()
+			t.Fatal("heartbeat never refreshed the staging file's mtime")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// After stop the refreshes must cease, or the file could never age out and an
+	// abandoned temp would leak forever.
+	stop()
+	backdate()
+	time.Sleep(20 * tempHeartbeat)
+	if fresh() {
+		t.Error("mtime still being refreshed after stop")
+	}
+}

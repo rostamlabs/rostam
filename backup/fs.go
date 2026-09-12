@@ -12,6 +12,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -41,8 +42,10 @@ var _ objstore.ObjectStore = (*FSObjectStore)(nil)
 // putTempPrefix is the fixed name prefix of every Put staging file. It is kept
 // OUT of the ".snap"/".cfg.json" key space (List/LatestKey/prune filter on
 // ".snap") so an in-flight staging file is never seen by retention as a
-// published object — and, since no published key can start with it, it is also
-// the marker that makes reclaiming leftovers safe (see reclaimStaleTemps).
+// published object — and it is the marker that makes reclaiming leftovers safe
+// (see reclaimStaleTemps). That only holds because the name space is RESERVED:
+// keyToPath rejects any key whose final segment starts with this prefix, so no
+// published object can ever wear a name the sweep is entitled to delete.
 //
 // A staging file left behind by a process killed mid-Put is NOT a small, inert
 // file: the very same Put stages the SNAPSHOT, so the leftover can be a partial
@@ -50,11 +53,24 @@ var _ objstore.ObjectStore = (*FSObjectStore)(nil)
 // leaked once per kill and never reclaimed on its own.
 const putTempPrefix = ".rostam-put-"
 
-// staleTempAge is how old a putTempPrefix staging file must be before a Put
-// reclaims it. It is the whole safety margin of the sweep: a CONCURRENT Put
-// created its staging file moments ago, so nothing an hour old can belong to a
-// live writer — only to a process that died mid-Put.
+// putTempSuffix is the fixed name suffix of every Put staging file, the second
+// half of the CreateTemp pattern below. The sweep requires BOTH this suffix and
+// putTempPrefix, so the two filters are declared here together and cannot drift
+// apart from the name Put actually creates.
+const putTempSuffix = ".tmp"
+
+// staleTempAge is how old a staging file must be before a Put reclaims it. It is
+// the outer safety margin of the sweep: a CONCURRENT Put created its staging
+// file moments ago, and a Put whose copy is still running keeps refreshing the
+// mtime (see tempHeartbeat), so nothing an hour old can belong to a live
+// writer — only to a process that died mid-Put.
 const staleTempAge = time.Hour
+
+// tempHeartbeat is how often a running Put refreshes its staging file's mtime.
+// It must be well inside staleTempAge so a single missed tick cannot expose a
+// live Put to the sweep. It is a var, not a const, purely so a test can shorten
+// it; nothing in production assigns to it.
+var tempHeartbeat = staleTempAge / 4
 
 // NewFSObjectStore returns an FSObjectStore rooted at root, creating root if it
 // does not exist.
@@ -70,7 +86,8 @@ func NewFSObjectStore(root string) (*FSObjectStore, error) {
 // key is path.Clean'd as an absolute path (collapsing ".."/"."), then the joined
 // destination is verified to stay within root. A key containing "../" segments,
 // a NUL byte, or one that resolves to root itself is an error — so Put cannot
-// overwrite, Get cannot read, and Delete cannot remove a file outside root.
+// overwrite, Get cannot read, and Delete cannot remove a file outside root. It
+// also rejects a key landing in the reserved staging name space (see below).
 func (f *FSObjectStore) keyToPath(key string) (string, error) {
 	if strings.ContainsRune(key, '\x00') {
 		return "", fmt.Errorf("fsstore: invalid key %q", key)
@@ -81,6 +98,20 @@ func (f *FSObjectStore) keyToPath(key string) (string, error) {
 	clean := path.Clean("/" + key)
 	if clean == "/" {
 		return "", fmt.Errorf("fsstore: invalid key %q (empty after clean)", key)
+	}
+	// The putTempPrefix name space is RESERVED for Put's staging files, which
+	// reclaimStaleTemps is entitled to delete once they age past staleTempAge. A
+	// key whose final segment lands in that name space would be published as a
+	// real object and then silently swept an hour later, so refuse it here.
+	//
+	// This sits in keyToPath, so the refusal applies uniformly to Get and Delete
+	// as well as Put. That is deliberate, not collateral: a key that can never be
+	// written must not be readable or deletable either, or the store would answer
+	// for names whose meaning it does not control. Only the FINAL segment is
+	// checked — a directory so named is harmless, since the sweep skips
+	// directories and only ever looks at one directory's own entries.
+	if strings.HasPrefix(path.Base(clean), putTempPrefix) {
+		return "", fmt.Errorf("fsstore: invalid key %q (the %q name space is reserved for staging files)", key, putTempPrefix)
 	}
 	dst := filepath.Join(f.root, filepath.FromSlash(clean))
 	rootAbs, err := filepath.Abs(f.root)
@@ -113,19 +144,22 @@ func (f *FSObjectStore) Put(_ context.Context, key string, r io.Reader, size int
 	// ours. Doing it here rather than at open is what makes it race-free on a root
 	// shared by several processes; it is best-effort and never fails the Put.
 	reclaimStaleTemps(filepath.Dir(dst))
-	// Reclaim staging files abandoned by a process killed mid-Put before staging
-	// ours. Doing it here rather than at open is what makes it race-free on a root
-	// shared by several processes; it is best-effort and never fails the Put.
 	// Staging name deliberately does NOT end in snapExt: List/LatestKey/prune
 	// filter on the ".snap" suffix, so a temp named "*.snap" would be visible to
 	// them mid-write — a concurrent prune could delete an in-flight Put's staging
 	// file (or the temp could inflate a retention count). A ".tmp" suffix keeps it
 	// invisible to those filters until the atomic rename publishes the real key.
-	tmp, err := os.CreateTemp(filepath.Dir(dst), putTempPrefix+"*.tmp")
+	tmp, err := os.CreateTemp(filepath.Dir(dst), putTempPrefix+"*"+putTempSuffix)
 	if err != nil {
 		return fmt.Errorf("fsstore: temp for %q: %w", key, err)
 	}
 	tmpName := tmp.Name()
+	// Keep this staging file's mtime fresh for as long as the copy runs, so a slow
+	// or wedged reader is not mistaken for an abandoned Put by a concurrent sweep
+	// (see startTempHeartbeat). Stopped explicitly before the rename; the deferred
+	// stop covers every error return in between.
+	stopHeartbeat := startTempHeartbeat(tmpName)
+	defer stopHeartbeat()
 	if _, err := io.Copy(tmp, r); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
@@ -145,6 +179,9 @@ func (f *FSObjectStore) Put(_ context.Context, key string, r io.Reader, size int
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("fsstore: close temp for %q: %w", key, err)
 	}
+	// The staging file is fully written and closed; nothing is left to protect from
+	// the sweep, and the path is about to stop existing under this name.
+	stopHeartbeat()
 	if err := os.Rename(tmpName, dst); err != nil {
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("fsstore: rename for %q: %w", key, err)
@@ -157,18 +194,65 @@ func (f *FSObjectStore) Put(_ context.Context, key string, r io.Reader, size int
 	return nil
 }
 
+// startTempHeartbeat refreshes path's mtime every tempHeartbeat until the
+// returned stop function is called. stop is idempotent and WAITS for the
+// refreshing goroutine to exit, so no stray Chtimes can trail a later rename.
+//
+// Why a heartbeat and not an inter-process lock: the sweep tells a live writer
+// from a dead one by age alone, and an mtime set once at create time cannot
+// express "alive but making no progress" — a Put whose reader stalls for longer
+// than staleTempAge looks exactly like a temp orphaned by a killed process, so a
+// concurrent Put would unlink it and the stalled Put's rename would then fail. A
+// lock is the wrong instrument: it would have to be held across a copy of
+// unbounded duration and released correctly by a process that may be killed at
+// any instant — which is the very failure the sweep exists to clean up after, so
+// the lock would need a staleness rule of its own and we would be back here. A
+// ticker dies with its process for free: while the Put lives its staging file
+// keeps getting younger, and the moment the process is killed the refreshes stop
+// and the file starts ageing toward the bound. That is exactly the signal the
+// sweep needs, held in the file itself with no extra state to reconcile.
+func startTempHeartbeat(path string) func() {
+	done := make(chan struct{})
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		tick := time.NewTicker(tempHeartbeat)
+		defer tick.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case now := <-tick.C:
+				// Ignored: the file may already be renamed away (a refresh racing
+				// stop), and a missed refresh only risks the temp being swept — it
+				// can never corrupt anything.
+				_ = os.Chtimes(path, now, now)
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(done)
+			<-exited
+		})
+	}
+}
+
 // reclaimStaleTemps removes abandoned Put staging files from dir. It is called
 // from Put — on the NEXT write to that directory — rather than from a sweep at
 // open: there is then no startup instant to reason about on a shared root, only
-// an age bound, and two filters keep it safe:
+// an age bound, and three filters keep it safe:
 //
-//   - the putTempPrefix name prefix. No PUBLISHED object can start with it (keys
-//     come from the backup layout <tenant>/<col>/<ts>.snap and its .cfg.json
-//     sibling, and List/LatestKey/prune select on the ".snap" suffix), so the
-//     sweep can never remove a real snapshot or config.
+//   - the putTempPrefix name prefix AND the putTempSuffix suffix, both of which
+//     Put's CreateTemp pattern gives every staging file. Requiring both, rather
+//     than the prefix alone, means an unrelated file that merely happens to share
+//     the prefix is not swept; and no PUBLISHED object can wear either name,
+//     because keyToPath reserves the prefix outright.
 //   - the staleTempAge modtime bound. A concurrent Put created its staging file
-//     moments ago, so a live writer's temp is never old enough to be swept; only
-//     a temp orphaned by a dead process ages past the bound.
+//     moments ago and a long-running Put keeps refreshing its mtime (see
+//     startTempHeartbeat), so a live writer's temp is never old enough to be
+//     swept; only a temp orphaned by a dead process ages past the bound.
 //
 // Every error is ignored, including the removal's: reclaiming dead space must
 // never fail a backup.
@@ -179,7 +263,7 @@ func reclaimStaleTemps(dir string) {
 	}
 	cutoff := time.Now().Add(-staleTempAge)
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasPrefix(e.Name(), putTempPrefix) {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), putTempPrefix) || !strings.HasSuffix(e.Name(), putTempSuffix) {
 			continue
 		}
 		info, ierr := e.Info()
