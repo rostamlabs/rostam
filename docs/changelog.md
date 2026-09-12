@@ -51,10 +51,12 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
   `entries` is the denominator the eviction counters previously lacked, and what
   to divide a memory budget by. Note what the ratio is and is not:
-  `bytes_used / entries` is occupancy per indexed key INCLUDING the superseded
-  copies each key leaves behind — the right figure for sizing a budget, but not
-  an average record size, since overwriting one key repeatedly raises it while
-  the record is unchanged. `tombstones` counts deleted slots not
+  `bytes_used / entries` is occupancy per indexed key INCLUDING every byte no
+  live key owns — superseded copies, TTL-expired entries not yet swept, and the
+  ghost bytes of deleted slots. It is the right figure for sizing a budget,
+  since all of that occupies the budget, but it is not an average record size:
+  overwriting, expiry and deletion each raise it while the records themselves
+  are unchanged. `tombstones` counts deleted slots not
   yet reclaimed — a large share of `entries` means the index wants compacting.
 
   Both come from counters the index already maintains, read under the same lock

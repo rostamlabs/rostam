@@ -42,12 +42,13 @@ type Stats struct {
 	// distinct keys only until the first eviction, after which an evicted key
 	// that returns misses again.
 	//
-	// BytesUsed/Entries is occupancy per indexed key, NOT the size of a record:
-	// BytesUsed counts superseded and expired copies too, so overwriting one key
-	// repeatedly raises the ratio while the record itself is unchanged. That is
-	// the right figure to divide a memory budget by -- the dead copies occupy
-	// the budget as surely as the live ones -- but it is not an average record
-	// size, and a dashboard should not label it one.
+	// BytesUsed/Entries is occupancy per indexed key, NOT the size of a record.
+	// BytesUsed counts every byte no live key owns: superseded copies, expired
+	// entries not yet swept, and the ghost bytes behind deleted slots. So
+	// overwriting, expiry and deletion each raise the ratio while the records
+	// are unchanged. It is the right figure to divide a memory budget by, since
+	// all of that occupies the budget, but a dashboard must not label it an
+	// average record size.
 	Entries          uint64
 	Tombstones       uint64
 	CorruptionErrors uint64 // CRC mismatches on read
@@ -168,7 +169,7 @@ func (s Stats) WritePrometheus(w io.Writer) error {
 		{"rostam_kv_pages_allocated", "cache pages currently allocated", s.PagesAllocated},
 		{"rostam_kv_bytes_allocated", "bytes backing those pages", s.BytesAllocated},
 		{"rostam_kv_bytes_used", "bytes occupied by entries in resident pages, INCLUDING superseded and expired entries not yet reclaimed - occupancy, not live data", s.BytesUsed},
-		{"rostam_kv_entries", "keys currently held in the index - the denominator the eviction counters lack, and what to divide a memory budget by; bytes_used/entries is occupancy per key INCLUDING superseded copies, not the size of one record", s.Entries},
+		{"rostam_kv_entries", "keys currently held in the index - the denominator the eviction counters lack, and what to divide a memory budget by; bytes_used/entries is occupancy per key INCLUDING superseded, expired and deleted-but-unreclaimed bytes, not the size of one record", s.Entries},
 		{"rostam_kv_tombstones", "index slots holding a deleted key that has not been reclaimed; a large share of entries means the index wants compacting", s.Tombstones},
 		{"rostam_kv_reclaimable_bytes", "page bytes held by entries no longer reachable", s.ReclaimableBytes},
 	}
