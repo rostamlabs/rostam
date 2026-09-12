@@ -61,6 +61,11 @@ const cfgExt = ".cfg.json"
 // retention can keep the newest N by a plain descending key sort.
 const tsLayout = time.RFC3339
 
+// ErrSnapshotExists is reported (wrapped, in BackupResult.Err) when a run's
+// snapshot key already exists in the store. Snapshot keys are WRITE-ONCE: a
+// backup never overwrites an existing backup. See backupOne for why.
+var ErrSnapshotExists = errors.New("backup: snapshot key already exists")
+
 // BackupOpts configures a single Backup run.
 type BackupOpts struct {
 	// Tenant is the top-level key prefix every object is written under (e.g.
@@ -185,6 +190,58 @@ func backupOne(ctx context.Context, store *vector.CollectionStore, obj objstore.
 	}
 	defer c.Release()
 
+	key := snapshotKey(opts.Tenant, name, opts.Timestamp)
+	cfgKey := cfgKeyFor(key)
+
+	// Snapshot keys are WRITE-ONCE. The two objects of a backup (config, snapshot)
+	// are independent Puts, and no ordering of two independent Puts can keep an
+	// EXISTING pair consistent through a re-run at the same timestamp: whichever
+	// Put fails second leaves the surviving old object paired with a new one
+	// (config-first tears on a failed snapshot Put, snapshot-first tears on a
+	// failed config Put). Refusing to touch an already-backed-up key removes the
+	// overwrite case entirely, so the config-first ordering below is then a TOTAL
+	// pairing guarantee, not just a fresh-key one. It also turns an accidental
+	// same-second collision (tsLayout is second-granularity) into a clean error
+	// instead of a silently overwritten backup. List with the exact key as prefix
+	// is the interface's cheapest existence probe (no body transfer on S3).
+	existing, err := obj.List(ctx, key)
+	if err != nil {
+		res.Err = fmt.Errorf("backup %q: probe %q: %w", name, key, err)
+		return res
+	}
+	for _, info := range existing {
+		if info.Key == key {
+			res.Err = fmt.Errorf("backup %q: %q: %w", name, key, ErrSnapshotExists)
+			return res
+		}
+	}
+
+	// Sibling config object FIRST, snapshot SECOND. The ordering is load-bearing:
+	// LatestKey/prune key off the <ts>.snap object, so writing the config before
+	// the snapshot means every snapshot that can ever be selected as "latest"
+	// already has its sibling config present. The snapshot stream does NOT carry
+	// quantization / IndexType / Vamana geometry / FullText, so a config-less
+	// restore of such a collection is silently degraded (wrong metric/geometry, or
+	// an empty BM25 index) or fails after already dropping the target. Were the
+	// snapshot written first, an interruption between the two Puts would leave a
+	// selectable snapshot with no config; this order can only ever leave an orphan
+	// config with no snapshot, which LatestKey/prune ignore (they filter on .snap)
+	// — harmless, though not self-healing: later runs use a distinct timestamp key,
+	// so an orphan config persists until a manual sweep (prune only deletes configs
+	// paired with a pruned snapshot; the write-once probe above keys off the
+	// snapshot, so a re-run at the orphan's timestamp is allowed and replaces it).
+	// We reuse the same JSON marshal the store uses for its on-disk <col>.json
+	// sidecar.
+	cfgData, err := json.Marshal(c.Config())
+	if err != nil {
+		res.Err = fmt.Errorf("backup %q: marshal config: %w", name, err)
+		return res
+	}
+	if err := obj.Put(ctx, cfgKey, strings.NewReader(string(cfgData)), int64(len(cfgData))); err != nil {
+		res.Err = fmt.Errorf("backup %q: put %q: %w", name, cfgKey, err)
+		return res
+	}
+
 	// Snapshot to a temp file so we know the exact byte size for Put's
 	// Content-Length (the object store streams the file; it does not buffer the
 	// whole snapshot in memory).
@@ -213,7 +270,6 @@ func backupOne(ctx context.Context, store *vector.CollectionStore, obj objstore.
 		return res
 	}
 
-	key := snapshotKey(opts.Tenant, name, opts.Timestamp)
 	if err := obj.Put(ctx, key, tmp, size); err != nil {
 		_ = tmp.Close()
 		res.Err = fmt.Errorf("backup %q: put %q: %w", name, key, err)
@@ -222,23 +278,6 @@ func backupOne(ctx context.Context, store *vector.CollectionStore, obj objstore.
 	_ = tmp.Close()
 	res.Key = key
 	res.Size = size
-
-	// Sibling config object: serialize the collection's Config to JSON and Put it
-	// at <ts>.cfg.json next to the snapshot. The snapshot stream does NOT carry
-	// quantization / IndexType / Vamana geometry, so this is what lets Restore
-	// re-create the collection with its EXACT original config before loading the
-	// snapshot on top (config-faithful restore). We reuse the same JSON marshal the
-	// store uses for its on-disk <col>.json sidecar.
-	cfgKey := cfgKeyFor(key)
-	cfgData, err := json.Marshal(c.Config())
-	if err != nil {
-		res.Err = fmt.Errorf("backup %q: marshal config: %w", name, err)
-		return res
-	}
-	if err := obj.Put(ctx, cfgKey, strings.NewReader(string(cfgData)), int64(len(cfgData))); err != nil {
-		res.Err = fmt.Errorf("backup %q: put %q: %w", name, cfgKey, err)
-		return res
-	}
 
 	if opts.Retention > 0 {
 		if err := prune(ctx, obj, collectionKeyPrefix(opts.Tenant, name), key, opts.Retention); err != nil {

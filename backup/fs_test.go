@@ -43,8 +43,8 @@ func TestFSObjectStorePutRoundTrip(t *testing.T) {
 	}
 
 	// After a successful Put the atomic temp file must be gone: it was either
-	// renamed onto dst or removed on an error path. A lingering ".tmp-*" file
-	// would signal a broken rename step.
+	// renamed onto dst or removed on an error path. A lingering putTempPrefix
+	// file would signal a broken rename step.
 	if tmps := listTempFiles(t, filepath.Join(root, "tenant", "coll")); len(tmps) != 0 {
 		t.Fatalf("temp files left behind after Put: %v", tmps)
 	}
@@ -78,8 +78,8 @@ type errReader struct{}
 
 func (errReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
 
-// listTempFiles returns the names of any ".tmp-*" atomic-write temp files under
-// dir. A missing dir yields none.
+// listTempFiles returns the names of any Put staging temp files (putTempPrefix…)
+// under dir. A missing dir yields none.
 func listTempFiles(t *testing.T, dir string) []string {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
@@ -91,7 +91,7 @@ func listTempFiles(t *testing.T, dir string) []string {
 	}
 	var tmps []string
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), ".tmp-") {
+		if strings.HasPrefix(e.Name(), putTempPrefix) {
 			tmps = append(tmps, e.Name())
 		}
 	}

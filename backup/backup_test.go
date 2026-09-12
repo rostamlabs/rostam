@@ -285,6 +285,81 @@ func TestBackupResilience(t *testing.T) {
 	}
 }
 
+// TestBackupRefusesExistingSnapshot pins the write-once rule: a second run at
+// a timestamp whose snapshot already exists must fail with ErrSnapshotExists
+// and leave BOTH existing objects (snapshot and sibling config) byte-identical,
+// even though the collection's config changed in between. An orphan config with
+// no snapshot (a run interrupted between the two Puts) must NOT block a re-run.
+func TestBackupRefusesExistingSnapshot(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t)
+	mustCreate(t, store, "c", 1, 2)
+	obj := objstore.NewMemStore()
+	ts := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	opts := BackupOpts{Tenant: "acme", Timestamp: ts}
+
+	first, err := Backup(ctx, store, obj, opts)
+	if err != nil {
+		t.Fatalf("first backup: %v", err)
+	}
+	key := first[0].Key
+	snapBefore := mustGet(t, obj, key)
+	cfgBefore := mustGet(t, obj, cfgKeyFor(key))
+
+	// Change what a re-run would write, so a silent overwrite would be visible.
+	if err := store.DropCollection("c"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateCollection("c", vector.Config{Dim: 2, M: 4, EfConstruction: 10, EfSearch: 10, Seed: 1, Metric: vector.Cosine}); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := Backup(ctx, store, obj, opts)
+	if err == nil {
+		t.Fatal("re-run at an existing timestamp must fail")
+	}
+	if !errors.Is(err, ErrSnapshotExists) || !errors.Is(second[0].Err, ErrSnapshotExists) {
+		t.Fatalf("err = %v / %v, want ErrSnapshotExists", err, second[0].Err)
+	}
+	if got := mustGet(t, obj, key); got != snapBefore {
+		t.Error("existing snapshot was modified by the refused re-run")
+	}
+	if got := mustGet(t, obj, cfgKeyFor(key)); got != cfgBefore {
+		t.Error("existing sibling config was modified by the refused re-run")
+	}
+
+	// Orphan config only (no snapshot) must not block: simulate a run that died
+	// between the config Put and the snapshot Put, then re-run at that timestamp.
+	if err := obj.Delete(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	third, err := Backup(ctx, store, obj, opts)
+	if err != nil {
+		t.Fatalf("re-run over an orphan config must succeed: %v", err)
+	}
+	if third[0].Key != key {
+		t.Fatalf("key = %q, want %q", third[0].Key, key)
+	}
+	if got := mustGet(t, obj, cfgKeyFor(key)); got == cfgBefore {
+		t.Error("orphan config was not replaced by the re-run")
+	}
+}
+
+// mustGet reads the whole object at key, failing the test on any error.
+func mustGet(t *testing.T, obj objstore.ObjectStore, key string) string {
+	t.Helper()
+	rc, err := obj.Get(context.Background(), key)
+	if err != nil {
+		t.Fatalf("get %q: %v", key, err)
+	}
+	defer rc.Close()
+	b, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read %q: %v", key, err)
+	}
+	return string(b)
+}
+
 // TestLatestKeyPicksNewest checks LatestKey returns the most recent timestamp's
 // key and ErrNotFound when nothing exists.
 func TestLatestKeyPicksNewest(t *testing.T) {

@@ -35,6 +35,19 @@ type FSObjectStore struct {
 // compile-time assertion that FSObjectStore satisfies objstore.ObjectStore.
 var _ objstore.ObjectStore = (*FSObjectStore)(nil)
 
+// putTempPrefix is the fixed name prefix of every Put staging file. It is kept
+// OUT of the ".snap"/".cfg.json" key space (List/LatestKey/prune filter on
+// ".snap") so an in-flight staging file is never seen by retention as a
+// published object. A staging file left behind by a process killed mid-Put is
+// not auto-reclaimed here — a startup sweep would race a concurrent writer on a
+// shared root and cannot tell a final key from a temp by prefix alone, so
+// reclaiming leftovers is left to maintenance (tracked in #115). Note what
+// accumulates: the same Put stages the SNAPSHOT, so a kill mid-copy leaves a
+// partial snapshot as large as whatever had been copied — potentially many GB
+// on a large collection — inert (never selectable as a snapshot) but not small,
+// and unbounded across repeated interrupted backups until reclaimed.
+const putTempPrefix = ".rostam-put-"
+
 // NewFSObjectStore returns an FSObjectStore rooted at root, creating root if it
 // does not exist.
 func NewFSObjectStore(root string) (*FSObjectStore, error) {
@@ -88,7 +101,12 @@ func (f *FSObjectStore) Put(_ context.Context, key string, r io.Reader, size int
 	if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
 		return fmt.Errorf("fsstore: mkdir for %q: %w", key, err)
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(dst), ".tmp-*"+snapExt)
+	// Staging name deliberately does NOT end in snapExt: List/LatestKey/prune
+	// filter on the ".snap" suffix, so a temp named "*.snap" would be visible to
+	// them mid-write — a concurrent prune could delete an in-flight Put's staging
+	// file (or the temp could inflate a retention count). A ".tmp" suffix keeps it
+	// invisible to those filters until the atomic rename publishes the real key.
+	tmp, err := os.CreateTemp(filepath.Dir(dst), putTempPrefix+"*.tmp")
 	if err != nil {
 		return fmt.Errorf("fsstore: temp for %q: %w", key, err)
 	}
