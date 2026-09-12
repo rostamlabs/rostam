@@ -461,6 +461,37 @@ func TestFSObjectStoreSweepRequiresTempSuffix(t *testing.T) {
 	}
 }
 
+// TestFSObjectStoreRejectsBackslashKeys pins the cross-platform hole in the
+// staging-name reservation. A backslash is an ordinary character in an object key
+// and to path.Base, but a SEPARATOR to filepath on Windows — so
+// "coll\.rostam-put-x.tmp" has a final segment of "coll\.rostam-put-x.tmp" by
+// the key's own rules and ".rostam-put-x.tmp" by the filesystem's, which let it
+// publish into the reserved name space and be swept an hour later. Keys carrying
+// the character are refused outright, on every platform, so one key always means
+// one path.
+func TestFSObjectStoreRejectsBackslashKeys(t *testing.T) {
+	root := t.TempDir()
+	store, err := NewFSObjectStore(root)
+	if err != nil {
+		t.Fatalf("NewFSObjectStore: %v", err)
+	}
+	for _, key := range []string{
+		`tenant/coll\` + putTempPrefix + `sneaky` + putTempSuffix, // the bypass itself
+		`tenant\coll/ts.snap`, // a plain separator swap
+	} {
+		if err := store.Put(context.Background(), key, strings.NewReader("x"), 1); err == nil {
+			t.Errorf("Put(%q): expected a backslash key to be refused, got nil", key)
+		}
+		if _, err := store.Get(context.Background(), key); err == nil {
+			t.Errorf("Get(%q): expected a backslash key to be refused, got nil", key)
+		}
+	}
+	// Nothing may have been created: keyToPath fails before MkdirAll.
+	if entries, rerr := os.ReadDir(root); rerr != nil || len(entries) != 0 {
+		t.Errorf("refused keys created %d entries under root (err %v), want none", len(entries), rerr)
+	}
+}
+
 // TestTempHeartbeatKeepsTempFresh asserts a running Put's staging file is kept
 // young, and stops being kept young once the Put is done. Without the heartbeat
 // a copy that stalls for longer than staleTempAge is indistinguishable from a

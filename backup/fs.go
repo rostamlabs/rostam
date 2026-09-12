@@ -92,6 +92,17 @@ func (f *FSObjectStore) keyToPath(key string) (string, error) {
 	if strings.ContainsRune(key, '\x00') {
 		return "", fmt.Errorf("fsstore: invalid key %q", key)
 	}
+	// Object keys are slash-separated by the ObjectStore contract, so a backslash
+	// is an ordinary character in a key — but NOT to filepath on Windows, where it
+	// is a separator. A key like "coll\.rostam-put-x.tmp" therefore has one final
+	// segment by the key's own rules and a DIFFERENT one by the filesystem's, which
+	// is how such a key could slip past the reservation below and publish a file the
+	// sweep would later delete. Refusing the character keeps one key meaning one
+	// path on every platform; the backup package's own keys never carry it
+	// (url.PathEscape encodes it).
+	if strings.ContainsRune(key, '\\') {
+		return "", fmt.Errorf("fsstore: invalid key %q (backslash is not a key separator)", key)
+	}
 	// path.Clean("/"+key) forces an absolute path and resolves away ".."/"." so a
 	// traversal key like "../../etc/passwd" cleans to "/etc/passwd" (a single
 	// rooted segment list) rather than escaping.
@@ -110,7 +121,11 @@ func (f *FSObjectStore) keyToPath(key string) (string, error) {
 	// for names whose meaning it does not control. Only the FINAL segment is
 	// checked — a directory so named is harmless, since the sweep skips
 	// directories and only ever looks at one directory's own entries.
-	if strings.HasPrefix(path.Base(clean), putTempPrefix) {
+	// filepath.Base over FromSlash, not path.Base: the check must see the final
+	// segment the FILESYSTEM will see, which on Windows means splitting on the
+	// separator filepath uses. The backslash rejection above already makes the two
+	// agree, so this is defence in depth against a future key shape that does not.
+	if strings.HasPrefix(filepath.Base(filepath.FromSlash(clean)), putTempPrefix) {
 		return "", fmt.Errorf("fsstore: invalid key %q (the %q name space is reserved for staging files)", key, putTempPrefix)
 	}
 	dst := filepath.Join(f.root, filepath.FromSlash(clean))
