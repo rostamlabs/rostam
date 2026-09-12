@@ -3,6 +3,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"io"
@@ -25,6 +26,13 @@ func (echoDisp) LeaderAddr() string { return "" }
 // plus a stop func. It waits until the listener accepts connections.
 func startEpoll(t *testing.T, idle time.Duration) (addr string, stop func()) {
 	t.Helper()
+	return startEpollWith(t, echoDisp{}, idle)
+}
+
+// startEpollWith is startEpoll with a caller-supplied dispatcher, so a test can
+// pick whether the loop takes the append path (canAppend) or the fallback.
+func startEpollWith(t *testing.T, disp Dispatcher, idle time.Duration) (addr string, stop func()) {
+	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0") // grab a free port, then hand it to gnet
 	if err != nil {
 		t.Fatal(err)
@@ -32,7 +40,7 @@ func startEpoll(t *testing.T, idle time.Duration) (addr string, stop func()) {
 	addr = l.Addr().String()
 	_ = l.Close()
 
-	es := NewEpollServer(echoDisp{}, nil, nil, 2, idle)
+	es := NewEpollServer(disp, nil, nil, 2, idle)
 	if err := es.Start(addr); err != nil { // returns once bound (or on bind failure)
 		t.Fatalf("epoll start: %v", err)
 	}
@@ -179,5 +187,153 @@ func TestEpollIdleTimeout(t *testing.T) {
 		t.Fatal("expected the idle connection to be closed, but Read returned data")
 	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
 		t.Fatalf("idle connection was NOT closed within 3s (got a read timeout): %v", err)
+	}
+}
+
+// appendEchoDisp is echoDisp that ALSO implements AppendDispatcher, so
+// NewEpollServer sets canAppend and the loop actually exercises the reply
+// buffer. echoDisp does not, which is why the plain epoll tests above never
+// reach that branch at all.
+//
+// Two ops, because the reply buffer's whole contract turns on the difference:
+//   - "echo" has an append variant. It writes into dst and reports appended, so
+//     the payload came out of the connection's buffer (or, once it outgrew that,
+//     out of the fresh array append gave it) and the transport may keep it.
+//   - "foreign" has none. It is served normally and hands back memory the
+//     dispatcher owns, standing in for the zero-copy page a read-only shard
+//     returns from tx.Get. appended is false and the transport must NOT keep it.
+type appendEchoDisp struct {
+	page []byte // "the store's own memory" — returned as is, never written after init
+}
+
+func newAppendEchoDisp() *appendEchoDisp {
+	d := &appendEchoDisp{page: make([]byte, 1024)}
+	for i := range d.page {
+		d.page[i] = 0xAA
+	}
+	return d
+}
+
+func (*appendEchoDisp) Call(name string, args []byte) ([]byte, error) {
+	return append([]byte("ok:"), args...), nil
+}
+func (*appendEchoDisp) LeaderAddr() string { return "" }
+
+func (d *appendEchoDisp) CallAppend(name string, args, dst []byte) ([]byte, bool, error) {
+	if name == "foreign" {
+		// No append handler: the reply is the dispatcher's own memory, returned
+		// untouched, and appended is false.
+		return d.page[:900], false, nil
+	}
+	return append(append(dst, "ok:"...), args...), true, nil
+}
+
+// Compile-time proof that appendEchoDisp really does trip canAppend. A method
+// set is structural, so a signature change would otherwise leave these tests
+// silently running the allocating fallback and covering nothing — which is
+// exactly how the signature change in this branch built cleanly while every
+// implementation had stopped satisfying the interface.
+var _ AppendDispatcher = (*appendEchoDisp)(nil)
+
+// TestEpollAppendPipelinedStraddlesBuffer pipelines frames on ONE connection
+// whose replies alternate around the 512-byte initial reply buffer — small (fits,
+// comes back in the buffer), large (outgrows it, so append returns a new array
+// the connection keeps), small, larger still — and checks every response byte for
+// byte. That is the invariant the buffer reuse rests on and which otherwise lives
+// only in comments: the loop copies each payload into its response frame before
+// dispatching the next request, so replacing the buffer between frames is safe.
+func TestEpollAppendPipelinedStraddlesBuffer(t *testing.T) {
+	addr, stop := startEpollWith(t, newAppendEchoDisp(), 0)
+	defer stop()
+
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// Reply length is len("ok:") + len(arg); the connection starts with a 512-byte
+	// buffer, so 8 fits and 900 / 2000 do not.
+	sizes := []int{8, 900, 16, 2000, 8, 900}
+	args := make([][]byte, len(sizes))
+	var batch []byte
+	for i, n := range sizes {
+		arg := make([]byte, n)
+		for j := range arg {
+			arg[j] = byte(i*7 + j) // a distinct pattern per frame
+		}
+		args[i] = arg
+		body := EncodeRequest("echo", arg)
+		var hdr [4]byte
+		binary.BigEndian.PutUint32(hdr[:], uint32(len(body)))
+		batch = append(append(batch, hdr[:]...), body...)
+	}
+	if _, err := c.Write(batch); err != nil { // all frames in one syscall
+		t.Fatal(err)
+	}
+	for i, arg := range args {
+		status, payload := readResp(t, c)
+		if status != StatusOK {
+			t.Fatalf("frame %d (arg %d bytes): status=%d", i, len(arg), status)
+		}
+		want := append([]byte("ok:"), arg...)
+		if !bytes.Equal(payload, want) {
+			t.Fatalf("frame %d (arg %d bytes): payload len=%d want %d", i, len(arg), len(payload), len(want))
+		}
+	}
+}
+
+// TestEpollDoesNotAdoptUnappendedReply is the safety property the appended flag
+// exists to enforce, and nothing else pins it.
+//
+// A reply from an op with no append variant is memory the STORE owns — here the
+// dispatcher's page, standing in for the zero-copy page a PolicyRejectWrites
+// shard returns from tx.Get. It is bigger than the connection's 512-byte buffer,
+// so a transport that keyed the buffer swap on size alone would adopt it; the
+// very next append would then write through into the store's own memory.
+//
+// So: ask for that reply, then ask for one big enough to be appended into
+// whatever buffer the connection is now holding, and check the page is still
+// untouched. Checked by mutation — keying the swap on `callErr == nil` instead of
+// `appended`, which is the bug this branch fixed, fails it.
+func TestEpollDoesNotAdoptUnappendedReply(t *testing.T) {
+	disp := newAppendEchoDisp()
+	addr, stop := startEpollWith(t, disp, 0)
+	defer stop()
+
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// 1. The foreign reply: 900 bytes of the dispatcher's own page, appended=false.
+	writeTestFrame(t, c, EncodeRequest("foreign", nil), false)
+	status, payload := readResp(t, c)
+	if status != StatusOK {
+		t.Fatalf("foreign: status=%d", status)
+	}
+	if len(payload) != 900 || !bytes.Equal(payload, bytes.Repeat([]byte{0xAA}, 900)) {
+		t.Fatalf("foreign: got %d bytes, want 900 of 0xAA", len(payload))
+	}
+
+	// 2. A reply the append path DOES build, long enough to overwrite the page had
+	// the connection adopted it.
+	arg := bytes.Repeat([]byte{0x5A}, 700)
+	writeTestFrame(t, c, EncodeRequest("echo", arg), false)
+	status, payload = readResp(t, c)
+	if status != StatusOK {
+		t.Fatalf("echo: status=%d", status)
+	}
+	if want := append([]byte("ok:"), arg...); !bytes.Equal(payload, want) {
+		t.Fatalf("echo: payload len=%d want %d", len(payload), len(want))
+	}
+
+	// 3. The page must be exactly as the dispatcher left it.
+	for i, b := range disp.page {
+		if b != 0xAA {
+			t.Fatalf("the connection adopted a reply it was not handed: store memory "+
+				"overwritten at byte %d (0x%02X, want 0xAA)", i, b)
+		}
 	}
 }

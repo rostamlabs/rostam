@@ -33,11 +33,19 @@ type Dispatcher interface {
 // nearly every op. When it does alias, it is valid only until dst is reused,
 // which is why this is opt-in rather than part of Dispatcher: only a transport
 // that copies the payload out before its next call on that connection may ask
-// for it. A caller reusing dst must therefore check (see sharesArray) rather
-// than assume.
+// for it. A caller reusing dst must therefore not ASSUME the result aliases it:
+// dispatchInto reports whether the append path ran, which is the signal to keep
+// the returned buffer — a payload that grew past dst is a new array and is the
+// one most worth keeping.
 // The epoll server qualifies — epollConn.encode copies the payload into the
 // response frame before the loop reads the next request. A dispatcher that does
 // not implement this is served through Call exactly as before.
 type AppendDispatcher interface {
-	CallAppend(name string, args, dst []byte) ([]byte, error)
+	// CallAppend serves the op, using dst when the op has an append handler.
+	// appended reports whether that handler actually ran: an op WITHOUT one is
+	// served normally and returns its own reply, which never came out of dst and
+	// must not be retained as the connection's buffer. Reporting it here rather
+	// than inferring it from success is what keeps a transport from adopting a
+	// buffer it cannot reuse.
+	CallAppend(name string, args, dst []byte) (payload []byte, appended bool, err error)
 }

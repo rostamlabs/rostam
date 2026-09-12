@@ -200,14 +200,6 @@ func (s *EpollServer) OnTick() (time.Duration, gnet.Action) {
 	return interval, gnet.None
 }
 
-// sharesArray reports whether a and b address the same backing array, which is
-// how the loop tells a reply that was appended into the connection's buffer from
-// one that was freshly allocated elsewhere. Guarded on cap rather than len: an
-// empty reply is a valid len-0 slice into the buffer.
-func sharesArray(a, b []byte) bool {
-	return cap(a) > 0 && cap(b) > 0 && &a[:1][0] == &b[:1][0]
-}
-
 // OnTraffic drains every COMPLETE frame currently buffered for c, dispatches each,
 // and queues its response. Partial frames stay in gnet's inbound buffer until the
 // rest arrives (OnTraffic fires again). Returning gnet.None keeps the connection;
@@ -250,13 +242,15 @@ func (s *EpollServer) OnTraffic(c gnet.Conn) gnet.Action {
 			}
 			dst = m.payloadBuf[:0]
 		}
-		status, payload := dispatchInto(s.disp, buf[4:4+n], s.auth, "", s.alog, dst)
-		// Adopt the payload only when it actually came out of dst. An error or
-		// not-leader frame (EncodeErrorPayload / EncodeLeaderAddrPayload) is freshly
-		// allocated and does NOT alias dst, so adopting it would throw away the
-		// grown buffer and make the next get or operate start from zero again.
-		if m != nil && dst != nil && sharesArray(payload, dst) && cap(payload) <= connBufRetainCap {
-			m.payloadBuf = payload // keep the grown array; bounded like respBuf
+		status, payload, appended := dispatchInto(s.disp, buf[4:4+n], s.auth, "", s.alog, dst)
+		// Keep the buffer the append path returned, whether or not it still
+		// aliases dst. A payload that had to GROW past dst is a NEW array, and it
+		// is exactly the one worth keeping: adopting only aliasing payloads left a
+		// connection whose records outgrow its buffer reallocating on every single
+		// request, forever. `appended` excludes the freshly built error and
+		// not-leader frames that aliasing used to screen out.
+		if m != nil && appended && cap(payload) > cap(m.payloadBuf) && cap(payload) <= connBufRetainCap {
+			m.payloadBuf = payload // keep the larger array; bounded like respBuf
 		}
 		status, payload = clampResponse(status, payload) // match Server.writeResponse's MaxFrameSize bound
 		var resp []byte

@@ -45,14 +45,22 @@ type Authenticator = authz.Authenticator
 // handshake — NEVER from a spoofable in-frame field. The authorizer uses it as
 // the cert principal only when the request carries no bearer token (token wins).
 func dispatch(disp Dispatcher, frame []byte, auth Authenticator, clientCN string, alog *rlog.AccessLog) (status uint8, payload []byte) {
-	return dispatchInto(disp, frame, auth, clientCN, alog, nil)
+	status, payload, _ = dispatchInto(disp, frame, auth, clientCN, alog, nil)
+	return status, payload
 }
 
 // dispatchInto is dispatch with a transport-owned reply buffer. When dst is
-// non-nil and disp implements AppendDispatcher, the payload is appended to dst
-// and allocates nothing; otherwise this is exactly dispatch. See
-// AppendDispatcher for the lifetime the caller must honour.
-func dispatchInto(disp Dispatcher, frame []byte, auth Authenticator, clientCN string, alog *rlog.AccessLog, dst []byte) (status uint8, payload []byte) {
+// non-nil and disp implements AppendDispatcher, the payload is served into dst;
+// otherwise this is exactly dispatch. See AppendDispatcher for the lifetime the
+// caller must honour.
+//
+// appended reports whether the append path actually ran. The caller needs it to
+// decide whether to KEEP the returned buffer: a payload that had to GROW past
+// dst no longer aliases it, and that is precisely the buffer worth keeping — so
+// aliasing cannot be used as the test. Without this signal a connection whose
+// records exceed its buffer never adopts the grown one and reallocates on every
+// single request.
+func dispatchInto(disp Dispatcher, frame []byte, auth Authenticator, clientCN string, alog *rlog.AccessLog, dst []byte) (status uint8, payload []byte, appended bool) {
 	// Access log (OPT-IN). When -access-log is off, alog is nil: no request id is
 	// generated, no timing is taken, and this path is byte-identical to the
 	// pre-access-log dispatch. When on, we generate a per-request id (the TCP
@@ -99,12 +107,12 @@ func dispatchInto(disp Dispatcher, frame []byte, auth Authenticator, clientCN st
 		var err error
 		token, body, err = DecodeRequestV2(frame)
 		if err != nil {
-			return StatusError, EncodeErrorPayload(err.Error())
+			return StatusError, EncodeErrorPayload(err.Error()), false
 		}
 	}
 	on, args, err := DecodeRequest(body)
 	if err != nil {
-		return StatusError, EncodeErrorPayload(err.Error())
+		return StatusError, EncodeErrorPayload(err.Error()), false
 	}
 	opName = on
 	// Authorize against the decoded (token, op, args). The fan-out dispatcher
@@ -115,16 +123,19 @@ func dispatchInto(disp Dispatcher, frame []byte, auth Authenticator, clientCN st
 	// HTTP/gRPC callWrite paths), so a raw __wc__ over TCP requiring admin is the
 	// correct conservative default.
 	if auth != nil && !auth(authz.AuthRequest{Token: token, ClientCN: clientCN, Op: opName, Args: args}) {
-		return StatusUnauthorized, nil
+		return StatusUnauthorized, nil, false
 	}
 	var result []byte
 	var callErr error
+	usedAppend := false
 	if ad, ok := disp.(AppendDispatcher); ok && dst != nil {
-		result, callErr = ad.CallAppend(opName, args, dst)
+		result, usedAppend, callErr = ad.CallAppend(opName, args, dst)
+		usedAppend = usedAppend && callErr == nil
 	} else {
 		result, callErr = disp.Call(opName, args)
 	}
-	return mapResult(disp, result, callErr, reqID)
+	st, pl := mapResult(disp, result, callErr, reqID)
+	return st, pl, usedAppend
 }
 
 // statusName renders a wire status code as a short label for the access log, so

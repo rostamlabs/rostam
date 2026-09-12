@@ -414,7 +414,9 @@ func uvarintLen(v uint64) int {
 // schema blob: [mode][blob][zeroed fixed-width fields][each tail field's
 // zero]. Every tail field's zero is a single 0x00 byte — a BYTES length of
 // zero, a varint zero, or a table with zero rows.
-func newSchemaRecord(schemaBlob []byte, cache *schemaCache) ([]byte, error) {
+// newSchemaRecordInto builds the record a create call starts from, using the
+// caller's buffer when it is large enough. A nil dst allocates.
+func newSchemaRecordInto(dst, schemaBlob []byte, cache *schemaCache) ([]byte, error) {
 	if len(schemaBlob) == 0 {
 		return nil, wire.ErrOperateSchema
 	}
@@ -426,7 +428,12 @@ func newSchemaRecord(schemaBlob []byte, cache *schemaCache) ([]byte, error) {
 	if size > maxOperateRecordBytes {
 		return nil, wire.ErrOperateCap
 	}
-	buf := make([]byte, size, size+64)
+	buf := dst[:0]
+	if cap(buf) < size+64 {
+		buf = make([]byte, 0, size+64)
+	}
+	buf = buf[:size]
+	clear(buf)
 	buf[0] = wire.OperateModeSchema
 	copy(buf[1:], ent.blob)
 	// The fixed area and every tail field's zero byte are already zero.

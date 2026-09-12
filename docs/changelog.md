@@ -62,6 +62,27 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   Both come from counters the index already maintains, read under the same lock
   `bytes_used` uses. No walk.
 
+- **Three allocation leaks on the KV path.** The append path landed in
+  v0.7.0-beta4, but profiling a write-heavy workload showed operations still
+  allocating in a minority of calls. All three causes are fixed:
+
+  - **A connection never kept a reply buffer it had to grow.** The epoll loop
+    adopted the payload only when it still aliased the buffer it handed down —
+    but a payload that outgrew that buffer is a NEW array, and is exactly the one
+    worth keeping. A connection whose records exceeded its buffer therefore
+    reallocated on every request, forever. `dispatchInto` now reports whether the
+    append path ran, and that is the signal to keep the buffer.
+  - **`copyRecord` reserved a flat 64 bytes of slack.** One row insert routinely
+    exceeds that on a record with growing tables, so `insertGap` reallocated —
+    the largest single allocation site in the profile. Slack now scales with the
+    record.
+  - **The create path ignored the caller's scratch**, allocating a fresh record
+    for every first write to a key, while the handler's pooled buffer sat idle.
+
+  Before the fix, `insertGap` and `newSchemaRecord` each allocated on roughly a
+  quarter of the calls that reach them, `copyRecord` on a sixth, and
+  `getIntoCore` on a seventh.
+
 - **`get` and `operate` can be served without allocating a reply at all.** The
   reply payload was the last per-call allocation on a KV node: `tx.Get` copies
   the stored value into a fresh slice for every read, and `operate` builds its
@@ -135,8 +156,8 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   reply still allocates its response buffer in `EncodeOperateResult`, and
   `vector_operate` still heap-allocates one result, because the mutation
   callback captures its address — unchanged in count there, just moved. Small in
-  bytes, since the struct is 32 of them, but on a production node this was the
-  largest single allocation site by object COUNT, and object count is what
+  bytes, since the struct is 32 of them, but in profiling this was the largest
+  single allocation site by object COUNT, and object count is what
   allocator and sweep work follow. It is not what paces GC — that is heap bytes
   against GOGC, and 32 bytes a call barely moves it — nor what mark cost
   follows, which is live pointer-bearing memory.

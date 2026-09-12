@@ -436,7 +436,7 @@ func (s *Server) handleConn(c net.Conn) {
 		// path: outstanding == 0 proves the writer goroutine is parked on its
 		// channel recv (it decrements only AFTER its final write), so the reader
 		// may safely use the shared bufio.Writer itself.
-		if outstanding.Load() > 0 || r.Buffered() > 0 {
+		if outstanding.Load() > 0 || r.Buffered() > int(n) {
 			reqBp := getConnReqBuf(int(n))
 			req := *reqBp
 			if _, err := io.ReadFull(r, req); err != nil {

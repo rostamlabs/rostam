@@ -280,10 +280,10 @@ type appendingInner struct {
 	appendCalled bool
 }
 
-func (a *appendingInner) CallAppend(name string, _, dst []byte) ([]byte, error) {
+func (a *appendingInner) CallAppend(name string, _, dst []byte) ([]byte, bool, error) {
 	a.appendCalled = true
 	a.lastOp = name
-	return append(dst, "INNER"...), nil
+	return append(dst, "INNER"...), true, nil
 }
 
 // The epoll transport takes the allocation-free path only when the dispatcher it
@@ -305,9 +305,12 @@ func TestWrapKeysDispatcherPreservesAppendCapability(t *testing.T) {
 		if !ok {
 			t.Fatal("wrapper dropped the inner dispatcher's append path; every get and operate would allocate its reply")
 		}
-		got, err := ad.CallAppend("get", []byte("args"), []byte("DST"))
+		got, appended, err := ad.CallAppend("get", []byte("args"), []byte("DST"))
 		if err != nil {
 			t.Fatal(err)
+		}
+		if !appended {
+			t.Error("wrapper did not report that the append handler ran")
 		}
 		if !inner.appendCalled {
 			t.Error("wrapper served the op itself instead of forwarding CallAppend")
@@ -337,9 +340,12 @@ func TestKeysAppendDispatcherKeepsKeysOpsLocal(t *testing.T) {
 		t.Fatal("expected an append-capable wrapper")
 	}
 
-	got, err := ad.CallAppend(ops.OpKeysList, nil, []byte("DST"))
+	got, appended, err := ad.CallAppend(ops.OpKeysList, nil, []byte("DST"))
 	if err != nil {
 		t.Fatalf("keys list: %v", err)
+	}
+	if appended {
+		t.Error("a keys op reported `appended`; its frame never came out of dst")
 	}
 	if inner.appendCalled {
 		t.Error("a keys op was forwarded to the inner dispatcher instead of being served locally")

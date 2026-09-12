@@ -153,7 +153,7 @@ func applyWithEngine(es engines, scratch, cur []byte, a *wire.OperateArgs, stamp
 // the bytes to apply the ops to.
 func openRecord(es engines, scratch, cur []byte, a *wire.OperateArgs) (modeEngine, error) {
 	if cur == nil {
-		return createRecord(es, a)
+		return createRecord(es, scratch, a)
 	}
 	if len(cur) < 1 {
 		return nil, wire.ErrOperateRecord
@@ -207,12 +207,15 @@ func openRecord(es engines, scratch, cur []byte, a *wire.OperateArgs) (modeEngin
 
 // createRecord builds the record a call creates when the key is absent
 // (design doc §3.5).
-func createRecord(es engines, a *wire.OperateArgs) (modeEngine, error) {
+// createRecord takes the caller's scratch for the same reason openRecord does:
+// a first write to a key allocated a fresh record every time, even though the
+// handler already holds a pooled buffer that is about to be idle.
+func createRecord(es engines, scratch []byte, a *wire.OperateArgs) (modeEngine, error) {
 	switch a.Create {
 	case wire.OperateCreateNone:
 		return nil, errOperateAbsent
 	case wire.OperateCreateSchema:
-		buf, err := newSchemaRecord(a.Schema, operateSchemas)
+		buf, err := newSchemaRecordInto(scratch, a.Schema, operateSchemas)
 		if err != nil {
 			return nil, err
 		}
@@ -221,8 +224,11 @@ func createRecord(es engines, a *wire.OperateArgs) (modeEngine, error) {
 		// An empty dynamic record: the mode byte and a field count of zero
 		// (design doc §2.9). The slack is what a first field's splice grows
 		// into without reallocating.
-		buf := append(make([]byte, 0, 64), wire.OperateModeDynamic, 0)
-		return openMode(es, buf, false)
+		buf := scratch[:0]
+		if cap(buf) < 64 {
+			buf = make([]byte, 0, 64)
+		}
+		return openMode(es, append(buf, wire.OperateModeDynamic, 0), false)
 	default:
 		return nil, wire.ErrOperateArgs
 	}
@@ -276,6 +282,24 @@ func openMode(es engines, buf []byte, existed bool) (modeEngine, error) {
 // The KV path may reuse one (applyRecordBytesInto, from handleOperate's pool)
 // for the opposite reason: tx.Put COPIES the record into the shard's page arena
 // (encodeEntry), so the store holds no reference once Put returns.
+// copyRecordNeed is the buffer size copyRecord wants for a record of n bytes:
+// the record, slack to grow into, and a floor. Exported to the package so the
+// allocation-budget tests size their scratch from the SAME expression rather
+// than re-encoding it — a test that guesses "big enough" stops pinning the
+// formula the moment the formula changes.
+//
+// Capped so the result stays POOLABLE: putOperateWriteBuf drops anything over
+// maxPooledReadBuf, so a record just under that ceiling must not be given slack
+// that pushes it over, or its buffer is dropped after every single update and
+// the pooling silently stops working for exactly the largest records.
+func copyRecordNeed(n int) int {
+	need := n + n/4 + 64
+	if need > maxPooledReadBuf && n <= maxPooledReadBuf {
+		return maxPooledReadBuf
+	}
+	return need
+}
+
 // copyRecord copies cur into dst, reusing dst's array when it is already large
 // enough and allocating only when it is not. The +64 of slack is what a first
 // splice or row insert grows into without reallocating (see insertGap).
@@ -288,8 +312,12 @@ func copyRecord(dst, cur []byte) ([]byte, error) {
 	if len(cur) > maxOperateRecordBytes {
 		return nil, wire.ErrOperateRecord
 	}
-	if cap(dst) < len(cur)+64 {
-		dst = make([]byte, 0, len(cur)+64)
+	// Slack scales with the record, not a flat +64. A record holding tables
+	// grows a row at a time, and a single insert routinely exceeds 64 bytes, so
+	// a flat reservation leaves insertGap no room and it reallocates. See
+	// copyRecordNeed for the size and why it is capped.
+	if need := copyRecordNeed(len(cur)); cap(dst) < need {
+		dst = make([]byte, 0, need)
 	}
 	return append(dst[:0], cur...), nil
 }
