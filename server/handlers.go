@@ -44,6 +44,14 @@ type Authenticator = authz.Authenticator
 // handshake — NEVER from a spoofable in-frame field. The authorizer uses it as
 // the cert principal only when the request carries no bearer token (token wins).
 func dispatch(disp Dispatcher, frame []byte, auth Authenticator, clientCN string, alog *rlog.AccessLog) (status uint8, payload []byte) {
+	return dispatchInto(disp, frame, auth, clientCN, alog, nil)
+}
+
+// dispatchInto is dispatch with a transport-owned reply buffer. When dst is
+// non-nil and disp implements AppendDispatcher, the payload is appended to dst
+// and allocates nothing; otherwise this is exactly dispatch. See
+// AppendDispatcher for the lifetime the caller must honour.
+func dispatchInto(disp Dispatcher, frame []byte, auth Authenticator, clientCN string, alog *rlog.AccessLog, dst []byte) (status uint8, payload []byte) {
 	// Access log (OPT-IN). When -access-log is off, alog is nil: no request id is
 	// generated, no timing is taken, and this path is byte-identical to the
 	// pre-access-log dispatch. When on, we generate a per-request id (the TCP
@@ -108,7 +116,13 @@ func dispatch(disp Dispatcher, frame []byte, auth Authenticator, clientCN string
 	if auth != nil && !auth(authz.AuthRequest{Token: token, ClientCN: clientCN, Op: opName, Args: args}) {
 		return StatusUnauthorized, nil
 	}
-	result, callErr := disp.Call(opName, args)
+	var result []byte
+	var callErr error
+	if ad, ok := disp.(AppendDispatcher); ok && dst != nil {
+		result, callErr = ad.CallAppend(opName, args, dst)
+	} else {
+		result, callErr = disp.Call(opName, args)
+	}
 	return mapResult(disp, result, callErr, reqID)
 }
 

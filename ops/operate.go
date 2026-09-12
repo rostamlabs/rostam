@@ -89,6 +89,14 @@ func putOperateReadBuf(bp *[]byte) {
 }
 
 func handleOperate(tx *TxContext, args []byte) ([]byte, error) {
+	return handleOperateAppend(tx, args, nil)
+}
+
+// handleOperateAppend is handleOperate's AppendHandler twin: identical work,
+// with the reply frame appended to the caller's buffer instead of a fresh one.
+// With a nil dst it allocates exactly as before, which is what handleOperate
+// passes.
+func handleOperateAppend(tx *TxContext, args, dst []byte) ([]byte, error) {
 	a, _ := operateArgsPool.Get().(*wire.OperateArgs)
 	defer func() {
 		// Clear before recycling: the ops hold Bytes/Name/path-Key slices into
@@ -206,5 +214,5 @@ func handleOperate(tx *TxContext, args []byte) ([]byte, error) {
 		}
 	}
 
-	return wire.EncodeOperateResult(&res)
+	return wire.AppendOperateResult(dst, &res)
 }

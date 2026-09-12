@@ -19,6 +19,7 @@ package ops
 // none of those need a *testing.T.
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 
@@ -233,4 +234,82 @@ func BenchmarkOperateHandlerExistingRow(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// BenchmarkOperateAppendHandler and BenchmarkGetAppendHandler measure the
+// AppendHandler twins against their allocating originals — the whole point of
+// the append path being that a transport-owned buffer removes the reply
+// allocation entirely.
+func BenchmarkOperateAppendHandler(b *testing.B) {
+	cfg := cache.DefaultConfig()
+	cfg.NumShards = 1
+	c, err := cache.New(cfg)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = c.Close() })
+	tx := NewTxContext(c)
+	args, err := wire.EncodeOperateArgs(addField0([]byte("bench-append-key")))
+	if err != nil {
+		b.Fatal(err)
+	}
+	if _, err := handleOperate(tx, args); err != nil {
+		b.Fatal(err)
+	}
+
+	b.Run("Handler", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if _, err := handleOperate(tx, args); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("AppendHandler", func(b *testing.B) {
+		dst := make([]byte, 0, 512)
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			out, err := handleOperateAppend(tx, args, dst[:0])
+			if err != nil {
+				b.Fatal(err)
+			}
+			dst = out
+		}
+	})
+}
+
+func BenchmarkGetAppendHandler(b *testing.B) {
+	cfg := cache.DefaultConfig()
+	cfg.NumShards = 1
+	c, err := cache.New(cfg)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = c.Close() })
+	tx := NewTxContext(c)
+	key := []byte("bench-get-key")
+	if err := tx.Put(key, bytes.Repeat([]byte("v"), 256), 0); err != nil {
+		b.Fatal(err)
+	}
+	args := wire.EncodeKeyArgs(key)
+
+	b.Run("Handler", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if _, err := handleGet(tx, args); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("AppendHandler", func(b *testing.B) {
+		dst := make([]byte, 0, 512)
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			out, err := handleGetAppend(tx, args, dst[:0])
+			if err != nil {
+				b.Fatal(err)
+			}
+			dst = out
+		}
+	})
 }

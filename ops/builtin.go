@@ -46,6 +46,15 @@ var vectorDenseBufPool = sync.Pool{New: func() any { s := make([]float32, 0); re
 // by wire.RegisterRoutableBuiltins, the client's routing-only counterpart) and
 // looks up each op's handler here, so the two registries can never drift apart
 // on an op's name, kind, or routing key — only on whether a handler is bound.
+// builtinAppendHandlers are the ops that ALSO have an allocation-free twin (see
+// AppendHandler). Only the two that dominate a KV node's reply allocations do:
+// "get", whose payload is the stored value itself, and "operate", whose payload
+// is the result frame. Every other op serves through its Handler unchanged.
+var builtinAppendHandlers = map[string]AppendHandler{
+	"get":     handleGetAppend,
+	"operate": handleOperateAppend,
+}
+
 var builtinHandlers = map[string]Handler{
 	"get":    handleGet,
 	"put":    handlePut,
@@ -230,6 +239,11 @@ func RegisterBuiltins(r *Registry) error {
 			return err
 		}
 	}
+	for name, fn := range builtinAppendHandlers {
+		if err := r.SetAppendVariant(name, fn); err != nil {
+			return err
+		}
+	}
 	if len(builtinHandlers) != len(wire.BuiltinOps) {
 		return fmt.Errorf("ops: builtinHandlers has %d entries but wire.BuiltinOps has %d; they must name the same set of ops", len(builtinHandlers), len(wire.BuiltinOps))
 	}
@@ -242,6 +256,20 @@ func handleGet(tx *TxContext, args []byte) ([]byte, error) {
 		return nil, err
 	}
 	return tx.Get(key)
+}
+
+// handleGetAppend is handleGet's AppendHandler twin. tx.Get copies the stored
+// value into a fresh slice on every read — the reply payload, and the single
+// biggest source of read-path allocations. Reading into the caller's buffer
+// removes both that allocation and one of the two copies the value otherwise
+// makes on its way to the wire.
+func handleGetAppend(tx *TxContext, args, dst []byte) ([]byte, error) {
+	key, err := wire.DecodeKeyArgs(args)
+	if err != nil {
+		return nil, err
+	}
+	v, _, err := tx.GetWithExpiryInto(dst, key)
+	return v, err
 }
 
 func handlePut(tx *TxContext, args []byte) ([]byte, error) {

@@ -186,9 +186,38 @@ func (d *directStore) PutBatch(_ context.Context, entries []ops.PutEntry) error 
 }
 
 func (d *directStore) Call(_ context.Context, op string, args []byte) ([]byte, error) {
+	return d.callWith(op, args, nil, false)
+}
+
+// CallAppend is Call for a caller that owns a reusable reply buffer: the payload
+// is appended to dst and the returned slice aliases it, valid only until dst is
+// reused. It is deliberately NOT on the Store interface — Store.Call is public
+// API whose bytes reach in-process callers that may retain them, and only a
+// transport that copies the payload out before the next call on that connection
+// can satisfy this contract. An op with no AppendHandler is served by its normal
+// handler and its result copied into dst, so the contract holds uniformly.
+func (d *directStore) CallAppend(_ context.Context, op string, args, dst []byte) ([]byte, error) {
+	return d.callWith(op, args, dst, true)
+}
+
+func (d *directStore) callWith(op string, args, dst []byte, appendMode bool) ([]byte, error) {
 	handler, kind, ke, crossShard, ok := d.registry.LookupEntry(op)
 	if !ok {
 		return nil, fmt.Errorf("rostam: op %q not registered", op)
+	}
+	invoke := func() ([]byte, error) { return handler(d.tx, args) }
+	if appendMode {
+		if af, has := d.registry.LookupAppend(op); has {
+			invoke = func() ([]byte, error) { return af(d.tx, args, dst) }
+		} else {
+			invoke = func() ([]byte, error) {
+				out, err := handler(d.tx, args)
+				if err != nil {
+					return nil, err
+				}
+				return append(dst, out...), nil
+			}
+		}
 	}
 	// Read-only ops run concurrently — the cache's per-shard RWMutex gives each
 	// read its atomicity. A read-write op serializes so a multi-step RMW handler
@@ -206,13 +235,13 @@ func (d *directStore) Call(_ context.Context, op string, args []byte) ([]byte, e
 				mu := &d.opMu[d.cache.ShardIndex(key)]
 				mu.Lock()
 				defer mu.Unlock()
-				return handler(d.tx, args)
+				return invoke()
 			}
 		}
 		d.lockAllShards()
 		defer d.unlockAllShards()
 	}
-	return handler(d.tx, args)
+	return invoke()
 }
 
 // lockAllShards acquires every per-shard op lock in ascending index order — a
@@ -1188,6 +1217,23 @@ func (a *directDispatcher) Call(name string, args []byte) ([]byte, error) {
 		return a.flatQuery(args, a.store.VectorMVQuery)
 	default:
 		return a.store.Call(context.Background(), name, args)
+	}
+}
+
+// CallAppend serves the KV ops through directStore.CallAppend so a transport
+// with a reusable buffer pays no reply allocation. The vector query ops keep the
+// allocating path: their encoders build whole result sets, which is a different
+// problem from a per-call reply frame.
+func (a *directDispatcher) CallAppend(name string, args, dst []byte) ([]byte, error) {
+	switch name {
+	case "vector_query", "vector_named_query", "vector_mv_query":
+		out, err := a.Call(name, args)
+		if err != nil {
+			return nil, err
+		}
+		return append(dst, out...), nil
+	default:
+		return a.store.CallAppend(context.Background(), name, args, dst)
 	}
 }
 

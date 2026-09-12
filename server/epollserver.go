@@ -60,6 +60,11 @@ type EpollServer struct {
 type epollConn struct {
 	lastActiveNanos atomic.Int64
 	respBuf         []byte
+	// payloadBuf is the reply buffer handed to dispatchInto, reused across every
+	// frame on this connection. encode() COPIES the payload into respBuf before
+	// the loop reads the next request, so overwriting it on the next iteration is
+	// safe; see AppendDispatcher.
+	payloadBuf []byte
 }
 
 // encode writes the response frame into the connection's reused buffer and returns
@@ -215,7 +220,22 @@ func (s *EpollServer) OnTraffic(c gnet.Conn) gnet.Action {
 		// valid until the next read on c — we finish with it (copy payload into the
 		// response) before looping.
 		buf, _ := c.Next(4 + n)
-		status, payload := dispatch(s.disp, buf[4:4+n], s.auth, "", s.alog)
+		var dst []byte
+		if m != nil {
+			if m.payloadBuf == nil {
+				// Allocated here rather than in OnOpen so a connection that never
+				// sends a frame costs nothing. Slicing a nil buffer to [:0] yields a
+				// nil slice, which dispatchInto reads as "no append buffer" - so
+				// without this the first frame on every connection would silently
+				// take the allocating path.
+				m.payloadBuf = make([]byte, 0, 512)
+			}
+			dst = m.payloadBuf[:0]
+		}
+		status, payload := dispatchInto(s.disp, buf[4:4+n], s.auth, "", s.alog, dst)
+		if m != nil && payload != nil && cap(payload) <= connBufRetainCap {
+			m.payloadBuf = payload // keep the grown array; bounded like respBuf
+		}
 		status, payload = clampResponse(status, payload) // match Server.writeResponse's MaxFrameSize bound
 		var resp []byte
 		if m != nil {

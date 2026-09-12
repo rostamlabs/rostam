@@ -615,6 +615,16 @@ func decodeOperateArgsN(dst *OperateArgs, b []byte) (int, error) {
 // the values behind it. A status outside OperateStatus* is rejected for the
 // same reason — DecodeOperateResult would not accept it back.
 func EncodeOperateResult(r *OperateResult) ([]byte, error) {
+	return AppendOperateResult(nil, r)
+}
+
+// AppendOperateResult appends the frame EncodeOperateResult builds to dst and
+// returns the extended slice, so a caller holding a reusable buffer encodes a
+// reply without allocating. Passing nil dst is exactly EncodeOperateResult.
+//
+// The returned slice aliases dst's array whenever it had room, so it is the
+// caller's to own and reuse — never hand it to something that retains it.
+func AppendOperateResult(dst []byte, r *OperateResult) ([]byte, error) {
 	if len(r.Values) > OperateMaxRet {
 		return nil, ErrOperateCap
 	}
@@ -632,7 +642,12 @@ func EncodeOperateResult(r *OperateResult) ([]byte, error) {
 	for _, v := range r.Values {
 		n += len(v)
 	}
-	buf := make([]byte, 0, n)
+	if cap(dst)-len(dst) < n {
+		grown := make([]byte, len(dst), len(dst)+n)
+		copy(grown, dst)
+		dst = grown
+	}
+	buf := dst
 	buf = append(buf, r.Status)
 	if r.Status == OperateStatusCheckFailed {
 		buf = binary.BigEndian.AppendUint16(buf, r.FailedOp)

@@ -47,6 +47,25 @@ const (
 // not import.
 type Handler func(tx *TxContext, args []byte) ([]byte, error)
 
+// AppendHandler is the allocation-free twin of Handler: instead of returning a
+// freshly allocated payload it APPENDS the payload to dst and returns the
+// extended slice, so a transport holding a reusable buffer can serve a call
+// without allocating a reply at all.
+//
+// It is OPTIONAL and per-op. An op without one is served by its Handler exactly
+// as before, so this costs nothing for the 90-odd ops that do not have it and
+// changes no existing behaviour.
+//
+// OWNERSHIP, AND WHY THIS IS NOT THE DEFAULT. The returned bytes alias the
+// CALLER's buffer and stay valid only until that caller reuses it. That is safe
+// for the TCP server, which copies the payload into its response frame before
+// reading the next request on the connection. It is NOT safe for Store.Call,
+// which is public API handing bytes to in-process application code that may
+// retain them indefinitely — the same hazard that keeps online compaction
+// opt-in (see cache/compact_online.go). So Store.Call keeps using Handler, and
+// only a transport that can prove the lifetime asks for the append form.
+type AppendHandler func(tx *TxContext, args, dst []byte) ([]byte, error)
+
 // ErrDuplicateOp is returned when registering a name that already exists.
 var ErrDuplicateOp = errors.New("ops: op name already registered")
 
@@ -57,7 +76,10 @@ const maxOpNameLen = 255
 type entry struct {
 	kind OpKind
 	fn   Handler
-	ke   KeyExtractor // nil = shardless
+	// appendFn is the optional allocation-free twin of fn (see AppendHandler).
+	// nil for every op that has not opted in, which is nearly all of them.
+	appendFn AppendHandler
+	ke       KeyExtractor // nil = shardless
 	// layout is the allocation-free routing twin of ke, set ONLY for built-in
 	// routable ops (registered from builtin.go via the shared wire table). RouteKeyInto
 	// on this layout extracts the exact same key as ke — same offsets, same
@@ -203,6 +225,33 @@ func (r *Registry) Lookup(name string) (Handler, OpKind, KeyExtractor, bool) {
 // built-in) — from ONE registry entry under ONE RLock. A router should prefer
 // RouteKeyInto(layout, ...) and fall back to ke when the layout is None; both yield
 // the same key.
+// SetAppendVariant attaches an allocation-free twin to an already-registered
+// op (see AppendHandler). It is separate from Register so the 90-odd ops that
+// do not want one keep their existing registration untouched.
+func (r *Registry) SetAppendVariant(name string, fn AppendHandler) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.m[name]
+	if !ok {
+		return fmt.Errorf("ops: op %q not registered", name)
+	}
+	e.appendFn = fn
+	r.m[name] = e
+	return nil
+}
+
+// LookupAppend returns the op's AppendHandler, if it has one. A false result
+// means "serve this op through Lookup", not "no such op".
+func (r *Registry) LookupAppend(name string) (AppendHandler, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	e, ok := r.m[name]
+	if !ok || e.appendFn == nil {
+		return nil, false
+	}
+	return e.appendFn, true
+}
+
 func (r *Registry) LookupRouting(name string) (kind OpKind, ke KeyExtractor, layout RouteLayout, ok bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
