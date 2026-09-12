@@ -202,7 +202,10 @@ func TestEntriesTracksLiveKeys(t *testing.T) {
 	if st.Entries != n-del {
 		t.Errorf("after %d deletes, entries = %d, want %d", del, st.Entries, n-del)
 	}
-	if st.Tombstones == 0 {
-		t.Error("deletes left no tombstones; the gauge cannot show when the index wants compacting")
+	// Exactly del: each delete removes a distinct present key and nothing here
+	// rehashes the slots away. Checking only for non-zero would pass for any
+	// positive value, including one that mistakenly returned Entries.
+	if st.Tombstones != del {
+		t.Errorf("after %d distinct deletes, tombstones = %d, want exactly %d", del, st.Tombstones, del)
 	}
 }

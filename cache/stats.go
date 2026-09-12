@@ -12,8 +12,10 @@ import (
 // Puts, Evictions, the Compaction* totals, …); sample and diff them for rates. The
 // exceptions are point-in-time GAUGES that RISE and FALL and must NOT be diffed as
 // counters (a decrease is not wraparound): PagesAllocated, BytesAllocated and BytesUsed
-// report current capacity/occupancy, and ReclaimableBytes reports current ghost-byte
-// pressure (which compaction actively drives back down).
+// report current capacity/occupancy, ReclaimableBytes reports current ghost-byte
+// pressure (which compaction actively drives back down), and Entries/Tombstones report
+// the index's current occupancy (both fall on delete, and Tombstones falls again when
+// a rehash reclaims the slots).
 type Stats struct {
 	Gets        uint64
 	Hits        uint64
@@ -36,10 +38,16 @@ type Stats struct {
 	// Entries is the number of keys the index currently holds, and Tombstones
 	// the deleted-but-not-yet-reclaimed slots beside them. Entries is the only
 	// way to answer "how many keys fit in this budget": every other gauge here
-	// is bytes, and bytes_used mixes live records with superseded copies. It
-	// cannot be derived from the counters either -- misses tracks distinct keys
-	// only until the first eviction, after which an evicted key that returns
-	// misses again.
+	// is bytes. It cannot be derived from the counters either -- misses tracks
+	// distinct keys only until the first eviction, after which an evicted key
+	// that returns misses again.
+	//
+	// BytesUsed/Entries is occupancy per indexed key, NOT the size of a record:
+	// BytesUsed counts superseded and expired copies too, so overwriting one key
+	// repeatedly raises the ratio while the record itself is unchanged. That is
+	// the right figure to divide a memory budget by -- the dead copies occupy
+	// the budget as surely as the live ones -- but it is not an average record
+	// size, and a dashboard should not label it one.
 	Entries          uint64
 	Tombstones       uint64
 	CorruptionErrors uint64 // CRC mismatches on read
@@ -160,7 +168,7 @@ func (s Stats) WritePrometheus(w io.Writer) error {
 		{"rostam_kv_pages_allocated", "cache pages currently allocated", s.PagesAllocated},
 		{"rostam_kv_bytes_allocated", "bytes backing those pages", s.BytesAllocated},
 		{"rostam_kv_bytes_used", "bytes occupied by entries in resident pages, INCLUDING superseded and expired entries not yet reclaimed - occupancy, not live data", s.BytesUsed},
-		{"rostam_kv_entries", "keys currently held in the index - divide bytes_used by this for the real average key size, and use it as the denominator the eviction counters lack", s.Entries},
+		{"rostam_kv_entries", "keys currently held in the index - the denominator the eviction counters lack, and what to divide a memory budget by; bytes_used/entries is occupancy per key INCLUDING superseded copies, not the size of one record", s.Entries},
 		{"rostam_kv_tombstones", "index slots holding a deleted key that has not been reclaimed; a large share of entries means the index wants compacting", s.Tombstones},
 		{"rostam_kv_reclaimable_bytes", "page bytes held by entries no longer reachable", s.ReclaimableBytes},
 	}

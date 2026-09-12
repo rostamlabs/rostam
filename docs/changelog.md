@@ -49,9 +49,12 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   eviction, after which an evicted key that comes back misses again and the
   inference breaks; that is precisely when the question matters.
 
-  `bytes_used / entries` gives the real average key size (`bytes_used` alone
-  mixes live records with superseded copies), and `entries` is the denominator
-  the eviction counters previously lacked. `tombstones` counts deleted slots not
+  `entries` is the denominator the eviction counters previously lacked, and what
+  to divide a memory budget by. Note what the ratio is and is not:
+  `bytes_used / entries` is occupancy per indexed key INCLUDING the superseded
+  copies each key leaves behind — the right figure for sizing a budget, but not
+  an average record size, since overwriting one key repeatedly raises it while
+  the record is unchanged. `tombstones` counts deleted slots not
   yet reclaimed — a large share of `entries` means the index wants compacting.
 
   Both come from counters the index already maintains, read under the same lock
