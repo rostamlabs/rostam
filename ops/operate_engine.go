@@ -431,11 +431,23 @@ func applyOps(e engine, ops []wire.OperateOp, stampMs int64) (uint8, uint16, err
 // applied uniformly across scalar, row, table, and record paths, and it is
 // the only absent-path mechanism an engine needs to support: value() and
 // count() are never asked to report absence themselves.
+//
+// Byte budget: wire.OperateMaxRet bounds how MANY specs a call may carry, and
+// nothing about how much they produce — a record-kind VALUE copies the whole
+// record, so a list at the count cap asks for OperateMaxRet record copies,
+// all held live in the returned slice at once (4096 specs against a 16 MiB
+// record is 64 GiB, from a request of a few kilobytes). So the bytes are
+// charged against wire.OperateMaxRetBytes here, INSIDE the loop, and the call
+// is refused the moment the next value would cross it: the peak this can
+// reach is the budget plus the single value that crossed it, never the whole
+// list. Counts are charged too — they are a handful of bytes each, but the
+// accounting is of what the returns really produce, not of a subset of it.
 func evalRets(e engine, rets []wire.OperateRet) ([][]byte, error) {
 	if len(rets) == 0 {
 		return nil, nil
 	}
 	out := make([][]byte, 0, len(rets))
+	total := 0
 	for i := range rets {
 		r := &rets[i]
 		if r.Mode != wire.OperateRetValue && r.Mode != wire.OperateRetCount {
@@ -449,26 +461,30 @@ func evalRets(e engine, rets []wire.OperateRet) ([][]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if !nd.present {
-			if r.Mode == wire.OperateRetCount {
-				out = append(out, appendCountValue(0))
-			} else {
-				out = append(out, []byte{wire.OperateTypeUnset})
+		var v []byte
+		switch {
+		case !nd.present && r.Mode == wire.OperateRetCount:
+			v = appendCountValue(0)
+		case !nd.present:
+			v = []byte{wire.OperateTypeUnset}
+		case r.Mode == wire.OperateRetCount:
+			n, cerr := e.count(nd)
+			if cerr != nil {
+				return nil, cerr
 			}
-			continue
-		}
-		if r.Mode == wire.OperateRetCount {
-			n, err := e.count(nd)
+			v = appendCountValue(n)
+		default:
+			v, err = e.value(nd)
 			if err != nil {
 				return nil, err
 			}
-			out = append(out, appendCountValue(n))
-			continue
 		}
-		v, err := e.value(nd)
-		if err != nil {
-			return nil, err
+		// Written as a subtraction so the running total cannot overflow: total
+		// never exceeds the budget, so the right-hand side is always >= 0.
+		if len(v) > wire.OperateMaxRetBytes-total {
+			return nil, wire.ErrOperateCap
 		}
+		total += len(v)
 		out = append(out, v)
 	}
 	return out, nil

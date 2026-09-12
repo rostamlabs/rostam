@@ -222,6 +222,17 @@ const (
 	// OperateMaxRet bounds a call's return-spec list, and with it the value
 	// count a result frame may carry; it bounds CPU per apply.
 	OperateMaxRet = 4096
+	// OperateMaxRetBytes bounds the TOTAL bytes a call's returns may produce,
+	// across the whole list rather than per value. OperateMaxRet alone does
+	// not: a return spec is a few bytes on the wire, but a record-kind VALUE
+	// copies the whole record, so a return list at the count cap can ask for
+	// OperateMaxRet * maxRecordBytes of live copies from a request of a few
+	// kilobytes. It is the same order as server.MaxFrameSize, so a reply above
+	// this could not be framed back to the caller whatever the engine built —
+	// the bytes would only be materialised to be thrown away. Charging it as
+	// the returns are evaluated is what makes the refusal happen BEFORE that,
+	// rather than after the memory is already spent.
+	OperateMaxRetBytes = 16 << 20
 )
 
 // Errors returned by the operate wire codec and, downstream, its apply engine.

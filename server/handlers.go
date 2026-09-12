@@ -299,7 +299,16 @@ func clientFacingErr(err error) bool {
 		wire.IsOperateArgsMessage(err.Error()),
 		errors.Is(err, wire.ErrOperateArgs),
 		wire.IsVectorArgsTruncatedMessage(err.Error()),
-		errors.Is(err, wire.ErrVectorArgsTruncated):
+		errors.Is(err, wire.ErrVectorArgsTruncated),
+		// wire.ErrOperateCap: an operate call refused for exceeding one of the
+		// call-shape caps — too many ops, too many return specs, or returns
+		// that would produce more bytes than OperateMaxRetBytes. Every one of
+		// those is a fact about the request the caller itself built, with an
+		// obvious remedy (ask for less), and the message names only "a cap was
+		// exceeded" — no key, no path, no size. Same bucket and same reasoning
+		// as the malformed frame above; unclassified, a caller asking for too
+		// much read back as a server fault.
+		errors.Is(err, wire.ErrOperateCap):
 		return true
 	case errors.Is(err, ops.ErrOperateDuringReshard),
 		// ops.ErrOperateDuringReshard: a vector_operate against a collection a

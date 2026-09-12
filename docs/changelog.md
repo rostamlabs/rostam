@@ -5,6 +5,28 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **`operate` now bounds the total BYTES its returns may produce, not just how
+  many of them there are.** `maxRet` capped the return-spec list at 4096, but a
+  spec is a few bytes on the wire and a record-kind `VALUE` copies the whole
+  record — so a 8 KiB request asking for 4096 record values against a 64 KiB
+  record returned 256 MiB and allocated 288 MiB of heap, a 32,701x
+  amplification, and against the 16 MiB record cap the worst case was ~64 GiB
+  from one small call. None of it could ever have reached the caller: a reply
+  that large is far past the 16 MiB frame limit, so the memory was spent only
+  to be thrown away.
+
+  A new cap, `maxRetBytes` (16 MiB, the same order as the frame limit), is
+  charged as each return is evaluated, so a call that would cross it is refused
+  with `wire.ErrOperateCap` before the bytes are materialised — the peak a
+  refused call reaches is the budget plus one value, not the whole list. The
+  refusal also reaches the client as the cap error it is rather than as
+  "internal error"; it was previously unclassified at the TCP edge.
+
+  **Behaviour change:** a call whose returns exceed 16 MiB in total now fails
+  (with the record unchanged, like every other cap) where it previously
+  allocated gigabytes and, on any real transport, failed to frame the reply
+  afterwards. Ask for fewer returns, or narrower paths than the whole record.
+
 - **`get` and `operate` can be served without allocating a reply at all.** The
   reply payload was the last per-call allocation on a KV node: `tx.Get` copies
   the stored value into a fresh slice for every read, and `operate` builds its
