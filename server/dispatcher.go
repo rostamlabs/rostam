@@ -41,5 +41,11 @@ type Dispatcher interface {
 // response frame before the loop reads the next request. A dispatcher that does
 // not implement this is served through Call exactly as before.
 type AppendDispatcher interface {
-	CallAppend(name string, args, dst []byte) ([]byte, error)
+	// CallAppend serves the op, using dst when the op has an append handler.
+	// appended reports whether that handler actually ran: an op WITHOUT one is
+	// served normally and returns its own reply, which never came out of dst and
+	// must not be retained as the connection's buffer. Reporting it here rather
+	// than inferring it from success is what keeps a transport from adopting a
+	// buffer it cannot reuse.
+	CallAppend(name string, args, dst []byte) (payload []byte, appended bool, err error)
 }

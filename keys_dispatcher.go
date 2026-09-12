@@ -6,6 +6,7 @@ import (
 	"errors"
 
 	"github.com/rostamlabs/rostam/ops"
+	"github.com/rostamlabs/rostam/server"
 	"github.com/rostamlabs/rostam/vector"
 )
 
@@ -72,7 +73,7 @@ func (k *keysDispatcher) Call(name string, args []byte) ([]byte, error) {
 // (the shape of server.AppendDispatcher, spelled here to avoid importing the
 // transport into this file).
 type appendCaller interface {
-	CallAppend(name string, args, dst []byte) ([]byte, error)
+	CallAppend(name string, args, dst []byte) ([]byte, bool, error)
 }
 
 // keysAppendDispatcher is keysDispatcher PLUS that optional path, and exists as a
@@ -82,6 +83,12 @@ type appendCaller interface {
 // then allocate a per-connection reply buffer AND copy the whole reply into it,
 // strictly worse than the plain Call path it replaced. wrapKeysDispatcher picks
 // the type that matches what the inner dispatcher can actually do.
+// Compile-time proof that the wrapper still satisfies the optional interface.
+// Go interfaces are structural, so a signature change elsewhere would otherwise
+// make this type quietly stop implementing AppendDispatcher and the fast path
+// would disappear at runtime with nothing failing to build.
+var _ server.AppendDispatcher = (*keysAppendDispatcher)(nil)
+
 type keysAppendDispatcher struct {
 	*keysDispatcher
 	inner appendCaller
@@ -91,12 +98,13 @@ type keysAppendDispatcher struct {
 // are administrative, not hot — and forwards everything else to the inner
 // dispatcher's append path. The returned payload may or may not alias dst; see
 // directStore.CallAppend.
-func (k *keysAppendDispatcher) CallAppend(name string, args, dst []byte) ([]byte, error) {
+func (k *keysAppendDispatcher) CallAppend(name string, args, dst []byte) ([]byte, bool, error) {
 	switch name {
 	case ops.OpKeysAdd, ops.OpKeysRevoke, ops.OpKeysList:
-		// Administrative and rare: served locally, and the frame is returned as
-		// is rather than copied into dst. The payload is allowed not to alias.
-		return k.Call(name, args)
+		// Administrative and rare: served locally, returning its own frame. Never
+		// `appended`, so the transport will not retain it.
+		out, err := k.Call(name, args)
+		return out, false, err
 	}
 	return k.inner.CallAppend(name, args, dst)
 }

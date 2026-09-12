@@ -129,8 +129,8 @@ func dispatchInto(disp Dispatcher, frame []byte, auth Authenticator, clientCN st
 	var callErr error
 	usedAppend := false
 	if ad, ok := disp.(AppendDispatcher); ok && dst != nil {
-		result, callErr = ad.CallAppend(opName, args, dst)
-		usedAppend = callErr == nil
+		result, usedAppend, callErr = ad.CallAppend(opName, args, dst)
+		usedAppend = usedAppend && callErr == nil
 	} else {
 		result, callErr = disp.Call(opName, args)
 	}

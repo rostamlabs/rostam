@@ -348,7 +348,8 @@ func (d *directStore) PutBatch(_ context.Context, entries []ops.PutEntry) error 
 }
 
 func (d *directStore) Call(_ context.Context, op string, args []byte) ([]byte, error) {
-	return d.callWith(op, args, nil, false)
+	out, _, err := d.callWith(op, args, nil, false)
+	return out, err
 }
 
 // CallAppend is Call for a caller that owns a reusable reply buffer. An op with
@@ -363,26 +364,30 @@ func (d *directStore) Call(_ context.Context, op string, args []byte) ([]byte, e
 // reach in-process callers that may retain them, and only a transport that
 // copies the payload out before its next call on that connection can satisfy
 // even the weaker contract.
-func (d *directStore) CallAppend(_ context.Context, op string, args, dst []byte) ([]byte, error) {
+func (d *directStore) CallAppend(_ context.Context, op string, args, dst []byte) ([]byte, bool, error) {
 	return d.callWith(op, args, dst, true)
 }
 
-func (d *directStore) callWith(op string, args, dst []byte, appendMode bool) ([]byte, error) {
+// callWith reports whether the op's AppendHandler ran, so the caller can tell a
+// reply that came out of dst from one the normal handler built itself.
+func (d *directStore) callWith(op string, args, dst []byte, appendMode bool) ([]byte, bool, error) {
 	// Registered as in-flight BEFORE anything reads the cache, and retired only
 	// once the handler has returned — so Close cannot unmap under a handler still
 	// holding page-backed bytes. Both Call and CallAppend funnel through here, so
 	// one registration covers both entry points. See the calls fields.
 	if !d.beginCall() {
-		return nil, ErrDirectClosed
+		return nil, false, ErrDirectClosed
 	}
 	defer d.endCall()
 	handler, kind, ke, crossShard, ok := d.registry.LookupEntry(op)
 	if !ok {
-		return nil, fmt.Errorf("rostam: op %q not registered", op)
+		return nil, false, fmt.Errorf("rostam: op %q not registered", op)
 	}
+	appended := false
 	invoke := func() ([]byte, error) { return handler(d.tx, args) }
 	if appendMode {
 		if af, has := d.registry.LookupAppend(op); has {
+			appended = true
 			invoke = func() ([]byte, error) { return af(d.tx, args, dst) }
 		}
 		// No append variant: serve through the normal handler and return its
@@ -407,13 +412,15 @@ func (d *directStore) callWith(op string, args, dst []byte, appendMode bool) ([]
 				mu := &d.opMu[d.cache.ShardIndex(key)]
 				mu.Lock()
 				defer mu.Unlock()
-				return invoke()
+				out, err := invoke()
+				return out, appended, err
 			}
 		}
 		d.lockAllShards()
 		defer d.unlockAllShards()
 	}
-	return invoke()
+	out, err := invoke()
+	return out, appended, err
 }
 
 // lockAllShards acquires every per-shard op lock in ascending index order — a
@@ -1409,13 +1416,13 @@ func (a *directDispatcher) Call(name string, args []byte) ([]byte, error) {
 // with a reusable buffer pays no reply allocation. The vector query ops keep the
 // allocating path: their encoders build whole result sets, which is a different
 // problem from a per-call reply frame.
-func (a *directDispatcher) CallAppend(name string, args, dst []byte) ([]byte, error) {
+func (a *directDispatcher) CallAppend(name string, args, dst []byte) ([]byte, bool, error) {
 	switch name {
 	case "vector_query", "vector_named_query", "vector_mv_query":
 		// Result-set encoders, not per-call reply frames: served through Call,
-		// and the (often large) result is returned as is rather than copied into
-		// the connection's buffer.
-		return a.Call(name, args)
+		// and the (often large) result is returned as is. Never `appended`.
+		out, err := a.Call(name, args)
+		return out, false, err
 	default:
 		return a.store.CallAppend(context.Background(), name, args, dst)
 	}

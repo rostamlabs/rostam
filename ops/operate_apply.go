@@ -282,6 +282,24 @@ func openMode(es engines, buf []byte, existed bool) (modeEngine, error) {
 // The KV path may reuse one (applyRecordBytesInto, from handleOperate's pool)
 // for the opposite reason: tx.Put COPIES the record into the shard's page arena
 // (encodeEntry), so the store holds no reference once Put returns.
+// copyRecordNeed is the buffer size copyRecord wants for a record of n bytes:
+// the record, slack to grow into, and a floor. Exported to the package so the
+// allocation-budget tests size their scratch from the SAME expression rather
+// than re-encoding it — a test that guesses "big enough" stops pinning the
+// formula the moment the formula changes.
+//
+// Capped so the result stays POOLABLE: putOperateWriteBuf drops anything over
+// maxPooledReadBuf, so a record just under that ceiling must not be given slack
+// that pushes it over, or its buffer is dropped after every single update and
+// the pooling silently stops working for exactly the largest records.
+func copyRecordNeed(n int) int {
+	need := n + n/4 + 64
+	if need > maxPooledReadBuf && n <= maxPooledReadBuf {
+		return maxPooledReadBuf
+	}
+	return need
+}
+
 // copyRecord copies cur into dst, reusing dst's array when it is already large
 // enough and allocating only when it is not. The +64 of slack is what a first
 // splice or row insert grows into without reallocating (see insertGap).
@@ -296,10 +314,9 @@ func copyRecord(dst, cur []byte) ([]byte, error) {
 	}
 	// Slack scales with the record, not a flat +64. A record holding tables
 	// grows a row at a time, and a single insert routinely exceeds 64 bytes, so
-	// a flat reservation leaves insertGap no room and it reallocates. A quarter
-	// of the record covers ordinary row growth; the pooled buffer then keeps
-	// that capacity for the next call.
-	if need := len(cur) + len(cur)/4 + 64; cap(dst) < need {
+	// a flat reservation leaves insertGap no room and it reallocates. See
+	// copyRecordNeed for the size and why it is capped.
+	if need := copyRecordNeed(len(cur)); cap(dst) < need {
 		dst = make([]byte, 0, need)
 	}
 	return append(dst[:0], cur...), nil
