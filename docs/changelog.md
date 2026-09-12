@@ -42,6 +42,26 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   CALL, not per key, so splitting an oversized read across several `operate`
   calls is the remedy.
 
+- **`rostam_kv_entries` and `rostam_kv_tombstones`: how many keys a node is
+  actually holding.** The KV metrics covered reads, writes, evictions and bytes,
+  but never the count of the thing being stored — so "how many keys fit in this
+  budget" had no answer. It could be inferred from `misses` only until the first
+  eviction, after which an evicted key that comes back misses again and the
+  inference breaks; that is precisely when the question matters.
+
+  `entries` is the denominator the eviction counters previously lacked, and what
+  to divide a memory budget by. Note what the ratio is and is not:
+  `bytes_used / entries` is occupancy per indexed key INCLUDING every byte no
+  live key owns — superseded copies, TTL-expired entries not yet swept, and the
+  ghost bytes of deleted slots. It is the right figure for sizing a budget,
+  since all of that occupies the budget, but it is not an average record size:
+  overwriting, expiry and deletion each raise it while the records themselves
+  are unchanged. `tombstones` counts deleted slots not
+  yet reclaimed — a large share of `entries` means the index wants compacting.
+
+  Both come from counters the index already maintains, read under the same lock
+  `bytes_used` uses. No walk.
+
 - **`get` and `operate` can be served without allocating a reply at all.** The
   reply payload was the last per-call allocation on a KV node: `tx.Get` copies
   the stored value into a fresh slice for every read, and `operate` builds its

@@ -1029,6 +1029,7 @@ func (s *shard) snapshot() Stats {
 	// always bumped first), never underflowing the subtraction.
 	misses := s.misses.Load()
 	gets := s.gets.Load()
+	live, tomb := s.entries()
 	return Stats{
 		Gets:             gets,
 		Hits:             gets - misses,
@@ -1042,6 +1043,8 @@ func (s *shard) snapshot() Stats {
 		PagesAllocated:   s.pagesAlloc.Load(),
 		BytesAllocated:   uint64(s.numPages()) * uint64(s.cfg.PageSize), //nolint:gosec // numPages and PageSize are always non-negative
 		BytesUsed:        s.bytesUsed(),
+		Entries:          live,
+		Tombstones:       tomb,
 		CorruptionErrors: s.corrupt.Load(),
 
 		Compactions:              s.compactions.Load(),
@@ -1055,6 +1058,19 @@ func (s *shard) snapshot() Stats {
 		OnlinePagesRetired:   s.relocatePagesGone.Load(),
 		OnlinePagesRecycled:  s.relocatePagesRecycled.Load(),
 	}
+}
+
+// entries reports the index's occupied and tombstoned slot counts. Both are
+// writer-only bookkeeping guarded by s.mu, so this takes the read lock the same
+// way bytesUsed does; it is a pair of int reads, not a walk.
+//
+// The table pointer is swapped atomically on rehash, and a rehash is a writer,
+// so holding the read lock is also what makes the Load stable for the duration.
+func (s *shard) entries() (live, tomb uint64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	t := s.tab.Load()
+	return uint64(t.live), uint64(t.tomb) //nolint:gosec // both are non-negative slot counts
 }
 
 func (s *shard) bytesUsed() uint64 {

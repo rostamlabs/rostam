@@ -12,8 +12,10 @@ import (
 // Puts, Evictions, the Compaction* totals, …); sample and diff them for rates. The
 // exceptions are point-in-time GAUGES that RISE and FALL and must NOT be diffed as
 // counters (a decrease is not wraparound): PagesAllocated, BytesAllocated and BytesUsed
-// report current capacity/occupancy, and ReclaimableBytes reports current ghost-byte
-// pressure (which compaction actively drives back down).
+// report current capacity/occupancy, ReclaimableBytes reports current ghost-byte
+// pressure (which compaction actively drives back down), and Entries/Tombstones report
+// the index's current occupancy (both fall on delete, and Tombstones falls again when
+// a rehash reclaims the slots).
 type Stats struct {
 	Gets        uint64
 	Hits        uint64
@@ -28,11 +30,27 @@ type Stats struct {
 	// EvictionsLive is the one to watch to decide whether a cache is sized for
 	// its working set. EvictionsLive > 0 with Expirations low means the budget,
 	// not the TTL, is deciding how long entries survive.
-	EvictionsLive    uint64
-	Rejects          uint64 // refused due to PolicyRejectWrites
-	PagesAllocated   uint64
-	BytesAllocated   uint64
-	BytesUsed        uint64
+	EvictionsLive  uint64
+	Rejects        uint64 // refused due to PolicyRejectWrites
+	PagesAllocated uint64
+	BytesAllocated uint64
+	BytesUsed      uint64
+	// Entries is the number of keys the index currently holds, and Tombstones
+	// the deleted-but-not-yet-reclaimed slots beside them. Entries is the only
+	// way to answer "how many keys fit in this budget": every other gauge here
+	// is bytes. It cannot be derived from the counters either -- misses tracks
+	// distinct keys only until the first eviction, after which an evicted key
+	// that returns misses again.
+	//
+	// BytesUsed/Entries is occupancy per indexed key, NOT the size of a record.
+	// BytesUsed counts every byte no live key owns: superseded copies, expired
+	// entries not yet swept, and the ghost bytes behind deleted slots. So
+	// overwriting, expiry and deletion each raise the ratio while the records
+	// are unchanged. It is the right figure to divide a memory budget by, since
+	// all of that occupies the budget, but a dashboard must not label it an
+	// average record size.
+	Entries          uint64
+	Tombstones       uint64
 	CorruptionErrors uint64 // CRC mismatches on read
 
 	// Cold compaction at shard open (mmap only; cache/compact.go). These are the
@@ -97,6 +115,8 @@ func (s *Stats) Add(o Stats) {
 	s.PagesAllocated += o.PagesAllocated
 	s.BytesAllocated += o.BytesAllocated
 	s.BytesUsed += o.BytesUsed
+	s.Entries += o.Entries
+	s.Tombstones += o.Tombstones
 	s.CorruptionErrors += o.CorruptionErrors
 	s.Compactions += o.Compactions
 	s.CompactionsAborted += o.CompactionsAborted
@@ -149,6 +169,8 @@ func (s Stats) WritePrometheus(w io.Writer) error {
 		{"rostam_kv_pages_allocated", "cache pages currently allocated", s.PagesAllocated},
 		{"rostam_kv_bytes_allocated", "bytes backing those pages", s.BytesAllocated},
 		{"rostam_kv_bytes_used", "bytes occupied by entries in resident pages, INCLUDING superseded and expired entries not yet reclaimed - occupancy, not live data", s.BytesUsed},
+		{"rostam_kv_entries", "keys currently held in the index - the denominator the eviction counters lack, and what to divide a memory budget by; bytes_used/entries is occupancy per key INCLUDING superseded, expired and deleted-but-unreclaimed bytes, not the size of one record", s.Entries},
+		{"rostam_kv_tombstones", "index slots holding a deleted key that has not been reclaimed; a large share of entries means the index wants compacting", s.Tombstones},
 		{"rostam_kv_reclaimable_bytes", "page bytes held by entries no longer reachable", s.ReclaimableBytes},
 	}
 
