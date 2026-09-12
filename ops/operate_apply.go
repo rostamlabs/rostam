@@ -153,7 +153,7 @@ func applyWithEngine(es engines, scratch, cur []byte, a *wire.OperateArgs, stamp
 // the bytes to apply the ops to.
 func openRecord(es engines, scratch, cur []byte, a *wire.OperateArgs) (modeEngine, error) {
 	if cur == nil {
-		return createRecord(es, a)
+		return createRecord(es, scratch, a)
 	}
 	if len(cur) < 1 {
 		return nil, wire.ErrOperateRecord
@@ -207,12 +207,15 @@ func openRecord(es engines, scratch, cur []byte, a *wire.OperateArgs) (modeEngin
 
 // createRecord builds the record a call creates when the key is absent
 // (design doc §3.5).
-func createRecord(es engines, a *wire.OperateArgs) (modeEngine, error) {
+// createRecord takes the caller's scratch for the same reason openRecord does:
+// a first write to a key allocated a fresh record every time, even though the
+// handler already holds a pooled buffer that is about to be idle.
+func createRecord(es engines, scratch []byte, a *wire.OperateArgs) (modeEngine, error) {
 	switch a.Create {
 	case wire.OperateCreateNone:
 		return nil, errOperateAbsent
 	case wire.OperateCreateSchema:
-		buf, err := newSchemaRecord(a.Schema, operateSchemas)
+		buf, err := newSchemaRecordInto(scratch, a.Schema, operateSchemas)
 		if err != nil {
 			return nil, err
 		}
@@ -221,8 +224,11 @@ func createRecord(es engines, a *wire.OperateArgs) (modeEngine, error) {
 		// An empty dynamic record: the mode byte and a field count of zero
 		// (design doc §2.9). The slack is what a first field's splice grows
 		// into without reallocating.
-		buf := append(make([]byte, 0, 64), wire.OperateModeDynamic, 0)
-		return openMode(es, buf, false)
+		buf := scratch[:0]
+		if cap(buf) < 64 {
+			buf = make([]byte, 0, 64)
+		}
+		return openMode(es, append(buf, wire.OperateModeDynamic, 0), false)
 	default:
 		return nil, wire.ErrOperateArgs
 	}
@@ -288,8 +294,13 @@ func copyRecord(dst, cur []byte) ([]byte, error) {
 	if len(cur) > maxOperateRecordBytes {
 		return nil, wire.ErrOperateRecord
 	}
-	if cap(dst) < len(cur)+64 {
-		dst = make([]byte, 0, len(cur)+64)
+	// Slack scales with the record, not a flat +64. A record holding tables
+	// grows a row at a time, and a single insert routinely exceeds 64 bytes, so
+	// a flat reservation leaves insertGap no room and it reallocates. A quarter
+	// of the record covers ordinary row growth; the pooled buffer then keeps
+	// that capacity for the next call.
+	if need := len(cur) + len(cur)/4 + 64; cap(dst) < need {
+		dst = make([]byte, 0, need)
 	}
 	return append(dst[:0], cur...), nil
 }

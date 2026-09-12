@@ -75,7 +75,10 @@ func TestApplyRecordBytesIntoWarmScratchIsZeroAlloc(t *testing.T) {
 		t.Skip("sync.Pool.Put randomly drops items under -race by design, which defeats this allocation budget; see race_detect_test.go")
 	}
 	rec, upd := seedScalarRecord(t)
-	scratch := make([]byte, 0, len(rec)+64)
+	// Comfortably larger than copyRecord needs, rather than its exact slack
+	// formula: this test is about reuse, and should not fail when that formula
+	// is tuned.
+	scratch := make([]byte, 0, 2*len(rec)+256)
 	if _, _, _, err := applyRecordBytesInto(scratch, rec, upd, 2); err != nil {
 		t.Fatalf("warm: %v", err)
 	}
@@ -110,7 +113,7 @@ func TestApplyRecordBytesIntoOutAliasesScratchWhileCapacityLasts(t *testing.T) {
 	}
 
 	// 1. In-place update into a scratch with room: aliases.
-	roomy := make([]byte, 0, len(rec)+64)
+	roomy := make([]byte, 0, 2*len(rec)+256)
 	out, _, _, err := applyRecordBytesInto(roomy, rec, upd, 1)
 	if err != nil {
 		t.Fatal(err)
