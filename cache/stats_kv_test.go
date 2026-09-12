@@ -152,3 +152,57 @@ func TestEvictionsLiveExcludesExpiredEntries(t *testing.T) {
 			grew, st.Evictions)
 	}
 }
+
+// Entries must track the live key count through the operations that change it,
+// not merely be non-zero: it is the only gauge that answers "how many keys fit
+// in this budget", and it is the one figure that cannot be derived from the
+// counters once eviction starts.
+func TestEntriesTracksLiveKeys(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.NumShards = 2
+	cfg.TTLSweepIntervalMs = 0
+	c, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	if got := c.Stats().Entries; got != 0 {
+		t.Errorf("fresh cache has %d entries, want 0", got)
+	}
+
+	const n = 300
+	for i := range n {
+		if err := c.Put(fmt.Appendf(nil, "k-%04d", i), []byte("v"), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := c.Stats().Entries; got != n {
+		t.Errorf("after %d distinct puts, entries = %d, want %d", n, got, n)
+	}
+
+	// Overwrites are not new keys.
+	for i := range n {
+		if err := c.Put(fmt.Appendf(nil, "k-%04d", i), []byte("vv"), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := c.Stats().Entries; got != n {
+		t.Errorf("after overwriting every key, entries = %d, want %d (overwrites are not new keys)", got, n)
+	}
+
+	// A delete removes a key and leaves a tombstone behind.
+	const del = 50
+	for i := range del {
+		if _, err := c.Del(fmt.Appendf(nil, "k-%04d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st := c.Stats()
+	if st.Entries != n-del {
+		t.Errorf("after %d deletes, entries = %d, want %d", del, st.Entries, n-del)
+	}
+	if st.Tombstones == 0 {
+		t.Error("deletes left no tombstones; the gauge cannot show when the index wants compacting")
+	}
+}
