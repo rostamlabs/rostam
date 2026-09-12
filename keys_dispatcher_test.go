@@ -288,54 +288,53 @@ func (a *appendingInner) CallAppend(name string, _, dst []byte) ([]byte, error) 
 
 // The epoll transport takes the allocation-free path only when the dispatcher it
 // is handed implements server.AppendDispatcher — and NewServer ALWAYS wraps the
-// store in newKeysDispatcher before handing it over. A decorator that does not
-// forward CallAppend therefore kills the append path in production while every
-// handler-level benchmark still looks green, which is exactly what happened
-// before this test existed.
-func TestKeysDispatcherForwardsCallAppend(t *testing.T) {
-	inner := &appendingInner{}
-	k := newKeysDispatcher(inner, nil)
+// store in the keys decorator before handing it over. The decorator therefore has
+// to PRESERVE the inner dispatcher's capability in both directions, and both
+// directions have bitten:
+//
+//   - dropping it killed the append path in production (single-node) while every
+//     handler-level benchmark still looked green;
+//   - faking it made the cluster path allocate a reply buffer AND copy the whole
+//     reply into it, which is worse than the plain Call path it replaced.
+func TestWrapKeysDispatcherPreservesAppendCapability(t *testing.T) {
+	t.Run("inner can append", func(t *testing.T) {
+		inner := &appendingInner{}
+		w := wrapKeysDispatcher(inner, nil)
 
-	var _ server.AppendDispatcher = k // the wrapper must satisfy the interface at all
+		ad, ok := w.(server.AppendDispatcher)
+		if !ok {
+			t.Fatal("wrapper dropped the inner dispatcher's append path; every get and operate would allocate its reply")
+		}
+		got, err := ad.CallAppend("get", []byte("args"), []byte("DST"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !inner.appendCalled {
+			t.Error("wrapper served the op itself instead of forwarding CallAppend")
+		}
+		if string(got) != "DSTINNER" {
+			t.Errorf("payload = %q, want the inner reply appended to dst", got)
+		}
+	})
 
-	got, err := k.CallAppend("get", []byte("args"), []byte("DST"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !inner.appendCalled {
-		t.Error("keysDispatcher served the op itself instead of forwarding CallAppend to its inner dispatcher")
-	}
-	if string(got) != "DSTINNER" {
-		t.Errorf("payload = %q, want the inner reply appended to dst", got)
-	}
+	t.Run("inner cannot append", func(t *testing.T) {
+		w := wrapKeysDispatcher(&passThroughInner{}, nil)
+		if _, ok := w.(server.AppendDispatcher); ok {
+			t.Error("wrapper advertises an append path its inner cannot serve; the transport would allocate a buffer and copy every reply into it for nothing")
+		}
+	})
 }
 
-// An inner WITHOUT the optional path must still be served, with the reply copied
-// into dst, so the append contract holds for every dispatcher.
-func TestKeysDispatcherCallAppendFallsBack(t *testing.T) {
-	inner := &passThroughInner{}
-	k := newKeysDispatcher(inner, nil)
-
-	got, err := k.CallAppend("get", []byte("args"), []byte("DST"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if inner.lastOp != "get" {
-		t.Errorf("inner saw op %q, want get", inner.lastOp)
-	}
-	if string(got) != "DST" {
-		t.Errorf("payload = %q, want dst preserved with an empty reply appended", got)
-	}
-}
-
-// The intercepted keys ops are administrative: they are served by the wrapper
-// itself, never forwarded, and their frame still lands in dst.
-func TestKeysDispatcherCallAppendKeepsKeysOpsLocal(t *testing.T) {
+// The intercepted keys ops are administrative: served by the wrapper itself,
+// never forwarded, and their frame still lands in dst.
+func TestKeysAppendDispatcherKeepsKeysOpsLocal(t *testing.T) {
 	inner := &appendingInner{}
-	k := newKeysDispatcher(inner, nil)
-
-	if _, err := k.CallAppend(ops.OpKeysList, nil, []byte("DST")); err == nil && inner.appendCalled {
-		t.Error("a keys op was forwarded to the inner dispatcher")
+	ad, ok := wrapKeysDispatcher(inner, nil).(server.AppendDispatcher)
+	if !ok {
+		t.Fatal("expected an append-capable wrapper")
+	}
+	if _, err := ad.CallAppend(ops.OpKeysList, nil, []byte("DST")); err == nil {
+		t.Log("keys op served without a registry error")
 	}
 	if inner.appendCalled {
 		t.Error("a keys op must be served by the wrapper, not forwarded")

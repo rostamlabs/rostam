@@ -68,16 +68,29 @@ func (k *keysDispatcher) Call(name string, args []byte) ([]byte, error) {
 	}
 }
 
-// CallAppend forwards the optional allocation-free path (server.AppendDispatcher)
-// to the wrapped dispatcher. Without this the wrapper HIDES it: NewServer always
-// installs this decorator before handing the dispatcher to the epoll transport,
-// so a missing CallAppend here silently costs every get and operate its reply
-// allocation while the direct benchmarks still look green.
-//
-// The three intercepted keys ops build fresh frames of their own and are
-// administrative, not hot, so they are served through Call and copied into dst —
-// the append contract holds for every op either way.
-func (k *keysDispatcher) CallAppend(name string, args, dst []byte) ([]byte, error) {
+// appendCaller is the optional allocation-free path a dispatcher may offer
+// (the shape of server.AppendDispatcher, spelled here to avoid importing the
+// transport into this file).
+type appendCaller interface {
+	CallAppend(name string, args, dst []byte) ([]byte, error)
+}
+
+// keysAppendDispatcher is keysDispatcher PLUS that optional path, and exists as a
+// separate type because a Go method set is static. If keysDispatcher itself
+// carried CallAppend it would advertise the append path even when wrapping a
+// dispatcher that cannot append — the cluster fanout — and the transport would
+// then allocate a per-connection reply buffer AND copy the whole reply into it,
+// strictly worse than the plain Call path it replaced. wrapKeysDispatcher picks
+// the type that matches what the inner dispatcher can actually do.
+type keysAppendDispatcher struct {
+	*keysDispatcher
+	inner appendCaller
+}
+
+// CallAppend serves the three keys ops locally — they build their own frames and
+// are administrative, not hot — and forwards everything else to the inner
+// dispatcher's append path.
+func (k *keysAppendDispatcher) CallAppend(name string, args, dst []byte) ([]byte, error) {
 	switch name {
 	case ops.OpKeysAdd, ops.OpKeysRevoke, ops.OpKeysList:
 		out, err := k.Call(name, args)
@@ -86,16 +99,26 @@ func (k *keysDispatcher) CallAppend(name string, args, dst []byte) ([]byte, erro
 		}
 		return append(dst, out...), nil
 	}
-	if ad, ok := k.inner.(interface {
-		CallAppend(name string, args, dst []byte) ([]byte, error)
-	}); ok {
-		return ad.CallAppend(name, args, dst)
+	return k.inner.CallAppend(name, args, dst)
+}
+
+// wrapKeysDispatcher installs the keys decorator while PRESERVING whether the
+// inner dispatcher offers the append path. NewServer always installs this
+// decorator before handing the dispatcher to the epoll transport, so a wrapper
+// that dropped the capability would kill the append path (single-node), and one
+// that faked it would add a reply copy to every response (cluster).
+func wrapKeysDispatcher(inner interface {
+	Call(name string, args []byte) ([]byte, error)
+	LeaderAddr() string
+}, reg *vector.KeyRegistry) interface {
+	Call(name string, args []byte) ([]byte, error)
+	LeaderAddr() string
+} {
+	k := newKeysDispatcher(inner, reg)
+	if ac, ok := inner.(appendCaller); ok {
+		return &keysAppendDispatcher{keysDispatcher: k, inner: ac}
 	}
-	out, err := k.inner.Call(name, args)
-	if err != nil {
-		return nil, err
-	}
-	return append(dst, out...), nil
+	return k
 }
 
 // handleAdd decodes the request and registers the key on the live registry. The

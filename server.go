@@ -318,7 +318,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	// static -api-key mode). Admin-gating is handled upstream by the authorize gate
 	// (authz classifies the three op names as admin), so this decorator only runs
 	// after the caller has passed the admin-scope check.
-	disp = newKeysDispatcher(disp, cfg.KeyRegistry)
+	disp = wrapKeysDispatcher(disp, cfg.KeyRegistry)
 	httpDisp = newKeysDispatcher(httpDisp, cfg.KeyRegistry)
 	grpcDisp = newKeysDispatcher(grpcDisp, cfg.KeyRegistry)
 	srv.httpDisp, srv.grpcDisp = httpDisp, grpcDisp
