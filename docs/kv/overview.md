@@ -335,7 +335,7 @@ until it has walked it, verifies ordering on read.
 | `maxNameBytes` | 4096 B | all names stored in one record |
 | `maxRecordBytes` | 16 MiB | the record's total encoded size after apply |
 | `maxOps`, `maxRet` | 4096 each | ops and return specs per call |
-| `maxRetBytes` | 16 MiB | total bytes one call's returns may produce |
+| `maxRetBytes` | 16,711,680 B | total bytes one call's returns may produce |
 
 Hitting any cap is an **error with the record left unchanged** — never an
 implicit eviction. Row and column growth is charged against these budgets

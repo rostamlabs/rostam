@@ -30,7 +30,37 @@ import (
 // the engine really emits.
 func retBudgetRecord(t *testing.T) ([]byte, int) {
 	t.Helper()
-	blob := bytes.Repeat([]byte{0xAB}, wire.OperateMaxBytesLen)
+	return retBudgetRecordWithBlob(t, wire.OperateMaxBytesLen)
+}
+
+// retBudgetRecordOfValueLen builds the same shape of record sized so that one
+// record-kind VALUE is EXACTLY want bytes. The blob length is solved for by
+// measuring, not computed from the encoding: the record framing around the
+// blob (mode byte, field count, name, type tag, length prefix) is the encoder's
+// business, and a test that re-derived it would pass while disagreeing with it.
+func retBudgetRecordOfValueLen(t *testing.T, want int) ([]byte, int) {
+	t.Helper()
+	blobLen := want
+	for range 8 {
+		rec, valLen := retBudgetRecordWithBlob(t, blobLen)
+		if valLen == want {
+			return rec, valLen
+		}
+		// The framing overhead is a handful of bytes and varies only where the
+		// blob's uvarint length prefix changes width, so correcting by the
+		// shortfall converges immediately.
+		blobLen += want - valLen
+		if blobLen < 1 || blobLen > wire.OperateMaxBytesLen {
+			t.Fatalf("cannot size a record to a %d-byte VALUE: blob would have to be %d bytes", want, blobLen)
+		}
+	}
+	t.Fatalf("record sizing did not converge on a %d-byte VALUE", want)
+	return nil, 0
+}
+
+func retBudgetRecordWithBlob(t *testing.T, blobLen int) ([]byte, int) {
+	t.Helper()
+	blob := bytes.Repeat([]byte{0xAB}, blobLen)
 	rec, deleted, res, err := applyRecordBytes(nil, &wire.OperateArgs{
 		Create: wire.OperateCreateDynamic,
 		Ops: []wire.OperateOp{
@@ -74,21 +104,37 @@ func TestOperateRetBytesBudgetRefusesAmplifiedReturns(t *testing.T) {
 	}
 }
 
-// The boundary: the largest return list that fits the budget still returns
-// every value intact, and one more identical spec is refused. Both counts are
-// derived from the constants, so widening either cap keeps the test honest.
+// The boundary, tested at EQUALITY rather than near it: a return list whose
+// bytes come to exactly wire.OperateMaxRetBytes is accepted with every value
+// intact, and one more identical spec is refused.
+//
+// Equality is the case worth pinning. A floored count would leave the accepted
+// call short of the cap, and an off-by-one that wrongly rejected an exactly-full
+// budget would sail through. So the record is sized so its VALUE divides the
+// budget exactly (4096 bytes into 16,711,680 = 4080 specs, inside the 4096
+// count cap) and the test FAILS LOUDLY if that stops holding, rather than
+// quietly falling back to a floor.
 func TestOperateRetBytesBudgetBoundary(t *testing.T) {
-	rec, valLen := retBudgetRecord(t)
-	fits := wire.OperateMaxRetBytes / valLen
-	if fits < 2 || fits > wire.OperateMaxRet {
-		t.Fatalf("budget %d / value %d = %d specs, which is not inside the count cap %d — the test needs a different record size",
-			wire.OperateMaxRetBytes, valLen, fits, wire.OperateMaxRet)
+	const valueSize = 4096
+	if wire.OperateMaxRetBytes%valueSize != 0 {
+		t.Fatalf("budget %d is no longer a multiple of %d, so this test can no longer hit the cap exactly — pick a value size that divides it",
+			wire.OperateMaxRetBytes, valueSize)
 	}
+	fits := wire.OperateMaxRetBytes / valueSize
+	if fits < 2 || fits > wire.OperateMaxRet {
+		t.Fatalf("budget %d / value %d = %d specs, which is not inside the count cap %d — the test needs a different value size",
+			wire.OperateMaxRetBytes, valueSize, fits, wire.OperateMaxRet)
+	}
+	rec, valLen := retBudgetRecordOfValueLen(t, valueSize)
 
 	_, _, res, err := applyRecordBytes(rec, &wire.OperateArgs{
 		Create: wire.OperateCreateNone, Rets: recordValueRets(fits)}, 0)
 	if err != nil {
-		t.Fatalf("%d rets (%d bytes, budget %d): %v", fits, fits*valLen, wire.OperateMaxRetBytes, err)
+		t.Fatalf("%d rets totalling exactly the budget (%d bytes): %v", fits, fits*valLen, err)
+	}
+	if fits*valLen != wire.OperateMaxRetBytes {
+		t.Fatalf("the accepted call produced %d bytes, not the budget's %d — this is meant to be the exactly-full case",
+			fits*valLen, wire.OperateMaxRetBytes)
 	}
 	if res.Status != wire.OperateStatusOK || len(res.Values) != fits {
 		t.Fatalf("status=%d values=%d, want OK and %d", res.Status, len(res.Values), fits)

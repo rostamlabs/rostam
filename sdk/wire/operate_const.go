@@ -227,12 +227,31 @@ const (
 	// not: a return spec is a few bytes on the wire, but a record-kind VALUE
 	// copies the whole record, so a return list at the count cap can ask for
 	// OperateMaxRet * maxRecordBytes of live copies from a request of a few
-	// kilobytes. It is the same order as server.MaxFrameSize, so a reply above
-	// this could not be framed back to the caller whatever the engine built —
-	// the bytes would only be materialised to be thrown away. Charging it as
-	// the returns are evaluated is what makes the refusal happen BEFORE that,
-	// rather than after the memory is already spent.
-	OperateMaxRetBytes = 16 << 20
+	// kilobytes. Charging the bytes as the returns are evaluated is what makes
+	// the refusal happen before the whole list is materialised, rather than
+	// after the memory is already spent.
+	//
+	// It is server.MaxFrameSize (16 MiB) MINUS room for everything that rides
+	// around the values in the reply, so that a call this cap ACCEPTS is one
+	// the transport can actually send. A budget of exactly MaxFrameSize would
+	// make the largest accepted call die at the edge as "response exceeds
+	// MaxFrameSize" instead of here, which is the same refusal arriving later
+	// and less usefully. What has to fit alongside the values:
+	//
+	//	5                    the response frame's own status + payloadLen
+	//	                     (server.clampResponse bounds 1+4+len(payload))
+	//	5 + 4*OperateMaxRet  the result envelope AppendOperateResult writes:
+	//	                     status, nRet, the CHECK_FAILED-only failedOp, and
+	//	                     a 4-byte length per value = 16,389 at the cap
+	//	13                   EncodeVectorOperateResult's wrapper on the vector
+	//	                     path: found, an inner length, a trailing version
+	//
+	// 16,407 bytes at the worst case, rounded up to a flat 64 KiB so the number
+	// stays legible and the caps above can move without re-deriving it.
+	// server.TestOperateRetBudgetFramesWithinMaxFrameSize encodes a reply at
+	// exactly this budget and pins that it frames, so the two constants cannot
+	// drift apart silently.
+	OperateMaxRetBytes = 16<<20 - 64<<10
 )
 
 // Errors returned by the operate wire codec and, downstream, its apply engine.

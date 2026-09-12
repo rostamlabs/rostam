@@ -5,33 +5,42 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
-- **`operate` now bounds the total BYTES its returns may produce, not just how
-  many of them there are.** `maxRet` capped the return-spec list at 4096, but a
-  spec is a few bytes on the wire and a record-kind `VALUE` copies the whole
-  record — so a 8 KiB request asking for 4096 record values against a 64 KiB
-  record returned 256 MiB and allocated 288 MiB of heap, a 32,701x
+- **Breaking: `operate` now bounds the total BYTES its returns may produce, not
+  just how many of them there are.** `maxRet` capped the return-spec list at
+  4096, but a spec is a few bytes on the wire and a record-kind `VALUE` copies
+  the whole record — so an 8 KiB request asking for 4096 record values against
+  a 64 KiB record returned 256 MiB and allocated 288 MiB of heap, a 32,701x
   amplification, and against the 16 MiB record cap the worst case was ~64 GiB
   from one small call. None of it could ever have reached the caller: a reply
   that large is far past the 16 MiB frame limit, so the memory was spent only
   to be thrown away.
 
-  A new cap, `maxRetBytes` (16 MiB, the same order as the frame limit), is
-  charged as each return is evaluated, so a call that would cross it is refused
-  with `wire.ErrOperateCap` before the bytes are materialised — the peak a
-  refused call reaches is the budget plus one value, not the whole list. The
-  Every `operate` cap refusal also reaches the client as the refusal it is,
-  on all three transports: `wire.ErrOperateCap` was unclassified at the TCP,
-  REST and gRPC edges alike, so a caller that had simply asked for too much was
+  A new cap, `maxRetBytes`, is charged as each return is evaluated, so a call
+  that would cross it is refused with `wire.ErrOperateCap` before the full
+  return list is materialised — the peak a refused call reaches is the budget
+  plus the one value that crossed it, not the whole list. Its value is
+  16,711,680 B: the 16 MiB frame limit less a flat 64 KiB, which is what the
+  reply's own framing and the result envelope (a length per value, plus the
+  status, count and `failedOp` fields) need alongside the values. A budget of
+  exactly 16 MiB would have made the largest ACCEPTED call fail at the
+  transport instead, which is the same refusal arriving later and naming the
+  wrong cause.
+
+  Every `operate` cap refusal also reaches the client as the refusal it is, on
+  all three transports: `wire.ErrOperateCap` was unclassified at the TCP, REST
+  and gRPC edges alike, so a caller that had simply asked for too much was
   answered "internal error" (500 / `Internal`) instead of a 400 /
   `InvalidArgument` naming the cap. It is now matched both by sentinel and by
   exact message shape, which is what makes it work on a cluster: an `operate`
   APPLIES inside the Raft FSM, so the engine's own caps come back rebuilt and
   lose `errors.Is` identity on the way out.
 
-  **Behaviour change:** a call whose returns exceed 16 MiB in total now fails
-  (with the record unchanged, like every other cap) where it previously
-  allocated gigabytes and, on any real transport, failed to frame the reply
-  afterwards. Ask for fewer returns, or narrower paths than the whole record.
+  **What to do about it:** a call whose returns come to more than 16,711,680 B
+  in total now fails with the record unchanged, like every other cap, where it
+  previously applied the ops and then failed to frame the reply. Ask for fewer
+  returns, or for narrower paths than the whole record — the budget is per
+  CALL, not per key, so splitting an oversized read across several `operate`
+  calls is the remedy.
 
 - **`get` and `operate` can be served without allocating a reply at all.** The
   reply payload was the last per-call allocation on a KV node: `tx.Get` copies
