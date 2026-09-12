@@ -11,6 +11,7 @@ import (
 
 	"github.com/rostamlabs/rostam/authz"
 	"github.com/rostamlabs/rostam/ops"
+	"github.com/rostamlabs/rostam/server"
 	"github.com/rostamlabs/rostam/vector"
 )
 
@@ -270,4 +271,73 @@ func TestKeysDispatcherConcurrentAuthReadsAndAddWrite(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
+}
+
+// appendingInner is a passThroughInner that also offers the optional
+// allocation-free path, so the wrapper's forwarding can be observed.
+type appendingInner struct {
+	passThroughInner
+	appendCalled bool
+}
+
+func (a *appendingInner) CallAppend(name string, _, dst []byte) ([]byte, error) {
+	a.appendCalled = true
+	a.lastOp = name
+	return append(dst, "INNER"...), nil
+}
+
+// The epoll transport takes the allocation-free path only when the dispatcher it
+// is handed implements server.AppendDispatcher — and NewServer ALWAYS wraps the
+// store in newKeysDispatcher before handing it over. A decorator that does not
+// forward CallAppend therefore kills the append path in production while every
+// handler-level benchmark still looks green, which is exactly what happened
+// before this test existed.
+func TestKeysDispatcherForwardsCallAppend(t *testing.T) {
+	inner := &appendingInner{}
+	k := newKeysDispatcher(inner, nil)
+
+	var _ server.AppendDispatcher = k // the wrapper must satisfy the interface at all
+
+	got, err := k.CallAppend("get", []byte("args"), []byte("DST"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inner.appendCalled {
+		t.Error("keysDispatcher served the op itself instead of forwarding CallAppend to its inner dispatcher")
+	}
+	if string(got) != "DSTINNER" {
+		t.Errorf("payload = %q, want the inner reply appended to dst", got)
+	}
+}
+
+// An inner WITHOUT the optional path must still be served, with the reply copied
+// into dst, so the append contract holds for every dispatcher.
+func TestKeysDispatcherCallAppendFallsBack(t *testing.T) {
+	inner := &passThroughInner{}
+	k := newKeysDispatcher(inner, nil)
+
+	got, err := k.CallAppend("get", []byte("args"), []byte("DST"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inner.lastOp != "get" {
+		t.Errorf("inner saw op %q, want get", inner.lastOp)
+	}
+	if string(got) != "DST" {
+		t.Errorf("payload = %q, want dst preserved with an empty reply appended", got)
+	}
+}
+
+// The intercepted keys ops are administrative: they are served by the wrapper
+// itself, never forwarded, and their frame still lands in dst.
+func TestKeysDispatcherCallAppendKeepsKeysOpsLocal(t *testing.T) {
+	inner := &appendingInner{}
+	k := newKeysDispatcher(inner, nil)
+
+	if _, err := k.CallAppend(ops.OpKeysList, nil, []byte("DST")); err == nil && inner.appendCalled {
+		t.Error("a keys op was forwarded to the inner dispatcher")
+	}
+	if inner.appendCalled {
+		t.Error("a keys op must be served by the wrapper, not forwarded")
+	}
 }

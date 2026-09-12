@@ -49,6 +49,10 @@ type EpollServer struct {
 	eng         gnet.Engine   // captured in OnBoot; used by Stop
 	booted      chan struct{} // closed once OnBoot has run (eng is valid)
 	conns       sync.Map      // gnet.Conn -> *epollConn, for the idle sweep (OnTick)
+	// canAppend caches whether disp implements AppendDispatcher, resolved once at
+	// construction rather than per frame. When false the loop allocates no reply
+	// buffer at all and every dispatch is byte-identical to before.
+	canAppend bool
 }
 
 // epollConn is per-connection state. lastActiveNanos is updated on every OnTraffic
@@ -91,7 +95,9 @@ func (m *epollConn) encode(status uint8, payload []byte) []byte {
 // disables the idle-connection sweep (accept indefinitely); pass a positive value
 // (e.g. 5 min) for slow-loris protection.
 func NewEpollServer(disp Dispatcher, auth Authenticator, alog *rlog.AccessLog, numLoops int, idleTimeout time.Duration) *EpollServer {
-	return &EpollServer{disp: disp, auth: auth, alog: alog, numLoops: numLoops, idleTimeout: idleTimeout, booted: make(chan struct{})}
+	_, canAppend := disp.(AppendDispatcher)
+	return &EpollServer{disp: disp, auth: auth, alog: alog, numLoops: numLoops, idleTimeout: idleTimeout,
+		booted: make(chan struct{}), canAppend: canAppend}
 }
 
 // Run binds addr ("host:port") and blocks serving until the engine stops.
@@ -194,6 +200,14 @@ func (s *EpollServer) OnTick() (time.Duration, gnet.Action) {
 	return interval, gnet.None
 }
 
+// sharesArray reports whether a and b address the same backing array, which is
+// how the loop tells a reply that was appended into the connection's buffer from
+// one that was freshly allocated elsewhere. Guarded on cap rather than len: an
+// empty reply is a valid len-0 slice into the buffer.
+func sharesArray(a, b []byte) bool {
+	return cap(a) > 0 && cap(b) > 0 && &a[:1][0] == &b[:1][0]
+}
+
 // OnTraffic drains every COMPLETE frame currently buffered for c, dispatches each,
 // and queues its response. Partial frames stay in gnet's inbound buffer until the
 // rest arrives (OnTraffic fires again). Returning gnet.None keeps the connection;
@@ -220,20 +234,28 @@ func (s *EpollServer) OnTraffic(c gnet.Conn) gnet.Action {
 		// valid until the next read on c — we finish with it (copy payload into the
 		// response) before looping.
 		buf, _ := c.Next(4 + n)
+		// The append buffer exists ONLY when the dispatcher can use it. Allocating
+		// it otherwise would put a 512-byte buffer on every connection to serve a
+		// path that never reads it, and would change the fallback this PR
+		// documents as untouched. s.canAppend is resolved once, at construction.
 		var dst []byte
-		if m != nil {
+		if m != nil && s.canAppend {
 			if m.payloadBuf == nil {
-				// Allocated here rather than in OnOpen so a connection that never
-				// sends a frame costs nothing. Slicing a nil buffer to [:0] yields a
-				// nil slice, which dispatchInto reads as "no append buffer" - so
-				// without this the first frame on every connection would silently
+				// Allocated on the first frame rather than in OnOpen so a connection
+				// that never sends one costs nothing. Slicing a nil buffer to [:0]
+				// yields a nil slice, which dispatchInto reads as "no append buffer" -
+				// so without this the first frame on every connection would silently
 				// take the allocating path.
 				m.payloadBuf = make([]byte, 0, 512)
 			}
 			dst = m.payloadBuf[:0]
 		}
 		status, payload := dispatchInto(s.disp, buf[4:4+n], s.auth, "", s.alog, dst)
-		if m != nil && payload != nil && cap(payload) <= connBufRetainCap {
+		// Adopt the payload only when it actually came out of dst. An error or
+		// not-leader frame (EncodeErrorPayload / EncodeLeaderAddrPayload) is freshly
+		// allocated and does NOT alias dst, so adopting it would throw away the
+		// grown buffer and make the next get or operate start from zero again.
+		if m != nil && dst != nil && sharesArray(payload, dst) && cap(payload) <= connBufRetainCap {
 			m.payloadBuf = payload // keep the grown array; bounded like respBuf
 		}
 		status, payload = clampResponse(status, payload) // match Server.writeResponse's MaxFrameSize bound

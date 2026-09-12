@@ -68,6 +68,36 @@ func (k *keysDispatcher) Call(name string, args []byte) ([]byte, error) {
 	}
 }
 
+// CallAppend forwards the optional allocation-free path (server.AppendDispatcher)
+// to the wrapped dispatcher. Without this the wrapper HIDES it: NewServer always
+// installs this decorator before handing the dispatcher to the epoll transport,
+// so a missing CallAppend here silently costs every get and operate its reply
+// allocation while the direct benchmarks still look green.
+//
+// The three intercepted keys ops build fresh frames of their own and are
+// administrative, not hot, so they are served through Call and copied into dst —
+// the append contract holds for every op either way.
+func (k *keysDispatcher) CallAppend(name string, args, dst []byte) ([]byte, error) {
+	switch name {
+	case ops.OpKeysAdd, ops.OpKeysRevoke, ops.OpKeysList:
+		out, err := k.Call(name, args)
+		if err != nil {
+			return nil, err
+		}
+		return append(dst, out...), nil
+	}
+	if ad, ok := k.inner.(interface {
+		CallAppend(name string, args, dst []byte) ([]byte, error)
+	}); ok {
+		return ad.CallAppend(name, args, dst)
+	}
+	out, err := k.inner.Call(name, args)
+	if err != nil {
+		return nil, err
+	}
+	return append(dst, out...), nil
+}
+
 // handleAdd decodes the request and registers the key on the live registry. The
 // raw token is consumed by AddKey and never echoed back: the ack is empty.
 // AddKey validates (non-empty token+tenant, no dup, known perms) and flushes the

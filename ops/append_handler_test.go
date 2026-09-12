@@ -42,46 +42,71 @@ func TestGetAppendHandlerIsZeroAlloc(t *testing.T) {
 }
 
 // The append twin must agree with the original byte for byte — it is the same
-// op, only the buffer differs. Checked for both registered variants, including
-// a miss and a non-empty result.
+// op, only the buffer differs. Each arm runs against its OWN key so both see
+// identical store state: operate MUTATES, so running the two arms in sequence
+// against one key would compare a create against an update and prove nothing.
 func TestAppendHandlersMatchTheirHandlers(t *testing.T) {
 	_, tx := newTestSetup(t)
-	if err := tx.Put([]byte("k"), []byte("value"), 0); err != nil {
-		t.Fatal(err)
-	}
-	opArgs, err := wire.EncodeOperateArgs(addField0([]byte("agree-key")))
-	if err != nil {
-		t.Fatal(err)
-	}
 
-	for _, tc := range []struct {
-		name string
-		h    Handler
-		a    AppendHandler
-		args []byte
-	}{
-		{"get/hit", handleGet, handleGetAppend, wire.EncodeKeyArgs([]byte("k"))},
-		{"operate", handleOperate, handleOperateAppend, opArgs},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			want, werr := tc.h(tx, tc.args)
-			// Prefill dst so the append genuinely appends rather than writing at 0.
-			dst := append(make([]byte, 0, 512), "PREFIX"...)
-			got, gerr := tc.a(tx, tc.args, dst)
-			if (werr == nil) != (gerr == nil) {
-				t.Fatalf("error mismatch: handler=%v append=%v", werr, gerr)
-			}
-			if werr != nil {
-				return
-			}
-			if !bytes.HasPrefix(got, []byte("PREFIX")) {
-				t.Fatalf("append overwrote the caller's existing bytes: %q", got)
-			}
-			if !bytes.Equal(got[len("PREFIX"):], want) {
-				t.Errorf("payload mismatch:\n got %x\nwant %x", got[len("PREFIX"):], want)
-			}
-		})
-	}
+	t.Run("get/hit", func(t *testing.T) {
+		// A read does not mutate, so one key serves both arms.
+		if err := tx.Put([]byte("k"), []byte("value"), 0); err != nil {
+			t.Fatal(err)
+		}
+		args := wire.EncodeKeyArgs([]byte("k"))
+		want, werr := handleGet(tx, args)
+		if werr != nil {
+			t.Fatal(werr)
+		}
+		dst := append(make([]byte, 0, 512), "PREFIX"...)
+		got, gerr := handleGetAppend(tx, args, dst)
+		if gerr != nil {
+			t.Fatal(gerr)
+		}
+		if !bytes.HasPrefix(got, []byte("PREFIX")) {
+			t.Fatalf("append overwrote the caller's existing bytes: %q", got)
+		}
+		if !bytes.Equal(got[len("PREFIX"):], want) {
+			t.Errorf("payload mismatch:\n got %x\nwant %x", got[len("PREFIX"):], want)
+		}
+	})
+
+	t.Run("operate/with returns", func(t *testing.T) {
+		// Separate keys, identical ops, and a RET so the frame carries a value —
+		// an empty frame would agree even if the value path were broken.
+		mk := func(key []byte) *wire.OperateArgs {
+			a := addField0(key)
+			a.Rets = []wire.OperateRet{{Mode: wire.OperateRetValue, Path: fieldPath(0)}}
+			return a
+		}
+		argsA, err := wire.EncodeOperateArgs(mk([]byte("agree-a")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		argsB, err := wire.EncodeOperateArgs(mk([]byte("agree-b")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, werr := handleOperate(tx, argsA)
+		if werr != nil {
+			t.Fatal(werr)
+		}
+		dst := append(make([]byte, 0, 512), "PREFIX"...)
+		got, gerr := handleOperateAppend(tx, argsB, dst)
+		if gerr != nil {
+			t.Fatal(gerr)
+		}
+		if !bytes.HasPrefix(got, []byte("PREFIX")) {
+			t.Fatalf("append overwrote the caller's existing bytes: %q", got)
+		}
+		frame := got[len("PREFIX"):]
+		if len(frame) <= 3 {
+			t.Fatalf("frame carries no return value (%d bytes); the arms would agree even if broken", len(frame))
+		}
+		if !bytes.Equal(frame, want) {
+			t.Errorf("payload mismatch:\n got %x\nwant %x", frame, want)
+		}
+	})
 }
 
 // Registration wiring: the two hot ops must actually carry their variants, and
