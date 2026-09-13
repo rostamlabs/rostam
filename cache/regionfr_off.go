@@ -24,7 +24,7 @@ const regionFRInstrumented = false
 // regionFRMaxK is the largest region size, in pages, the histograms resolve.
 const regionFRMaxK = 16
 
-func regionNoteGen(*shard, uint16) {}
+func regionNotePage(*shard, *page) {}
 
 func regionNoteHit(*shard, *page) {}
 
@@ -33,8 +33,6 @@ func regionNoteInPlace(*shard, *page) {}
 // regionFRCounts is the histogram pair a measurement window produces. See
 // regionfr_on.go for the meaning of each field.
 type regionFRCounts struct {
-	Hits      uint64
-	InPlace   uint64
 	HitDist   [regionFRMaxK]uint64
 	PlaceDist [regionFRMaxK]uint64
 }

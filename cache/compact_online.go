@@ -424,6 +424,7 @@ func (s *shard) compactRecycleRetiredLocked(now time.Time, quarantine time.Durat
 		fresh.gen = s.nextGen()      // bump generation so any stale ref into the old content misses.
 		s.pages[idx] = fresh
 		s.pageSlots[idx].Store(fresh) // publish atomically for the lock-free read path.
+		regionNotePage(s, fresh)      // compiled out unless the measurement build tag is set
 		s.relocatePagesRecycled.Add(1)
 		recycled++
 	}

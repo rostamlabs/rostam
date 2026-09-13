@@ -54,16 +54,17 @@ const regionFRInstrumented = true
 const regionFRMaxK = 16
 
 type regionFRCounts struct {
-	// Hits is every read that resolved to a record, whatever its page age;
-	// InPlace is every write that took the same-size overwrite path. They are the
-	// denominators the distributions below are shares of.
-	Hits    uint64
-	InPlace uint64
 	// HitDist[d] counts hits landing on a page d retirements behind the newest;
 	// PlaceDist[d] the same for in-place rewrite targets. A record older than
-	// regionFRMaxK pages is counted in the total and in neither array, so
-	// sum(HitDist[:K])/Hits is the residency share for a region of K pages and
-	// never over-counts.
+	// regionFRMaxK pages falls into neither array, so sum(HitDist[:K]) never
+	// over-counts the residency of a region of K pages.
+	//
+	// There is deliberately no running TOTAL beside these. The denominators the
+	// shares are taken over — gets and puts — are already counted by the shard
+	// itself, so a total here would be a second contended atomic per hit and per
+	// rewrite, paid inside the very window whose read/write interleaving is being
+	// measured. sum(HitDist)/Gets and the shard's own hit% are each other's check
+	// at K = the page count, which is what inPlaceRegionKs exists to report.
 	HitDist   [regionFRMaxK]uint64
 	PlaceDist [regionFRMaxK]uint64
 }
@@ -74,10 +75,8 @@ type regionFRCounts struct {
 // path instead of a per-shard map lookup.
 type regionProbe struct {
 	s      *shard
-	newest atomic.Uint32 // generation of the most recently created page on s
+	newest atomic.Uint32 // generation of the most recently PUBLISHED page on s
 	counts struct {
-		hits      atomic.Uint64
-		inPlace   atomic.Uint64
 		hitDist   [regionFRMaxK]atomic.Uint64
 		placeDist [regionFRMaxK]atomic.Uint64
 	}
@@ -104,11 +103,25 @@ func regionLive(s *shard) *regionProbe {
 	return pr
 }
 
-// regionNoteGen records a newly minted page generation as the shard's newest.
-// Called from shard.nextGen, which holds mu (or runs during construction).
-func regionNoteGen(s *shard, g uint16) {
-	if pr := regionLive(s); pr != nil {
-		pr.newest.Store(uint32(g))
+// regionNotePage records a page's generation as the shard's newest. It must be
+// called AFTER the page object is stored into pageSlots, never when the
+// generation is minted.
+//
+// Minting runs first and publication can follow several statements later — the
+// page is built, put into s.pages, and only then published — and a lock-free
+// reader takes no part in that. A reader landing in the gap would measure every
+// page it can actually resolve against a newest that no reader can reach yet,
+// making each of them look one retirement older than it is and shifting some of
+// them across a region boundary. The counters guarding the measurement's own
+// correctness would show nothing: the shares stay plausible, they are just
+// wrong. So the notification rides the publication store, on every path that
+// makes one — first allocation, both heap retirement paths, mmap attach and the
+// online-compaction recycle.
+//
+// Called with mu held (or during construction), like the store it follows.
+func regionNotePage(s *shard, p *page) {
+	if pr := regionLive(s); pr != nil && p != nil {
+		pr.newest.Store(uint32(p.gen))
 	}
 }
 
@@ -119,7 +132,6 @@ func regionNoteHit(s *shard, p *page) {
 	if pr == nil || p == nil {
 		return
 	}
-	pr.counts.hits.Add(1)
 	if d := pr.age(p.gen); d >= 0 {
 		pr.counts.hitDist[d].Add(1)
 	}
@@ -132,7 +144,6 @@ func regionNoteInPlace(s *shard, p *page) {
 	if pr == nil || p == nil {
 		return
 	}
-	pr.counts.inPlace.Add(1)
 	if d := pr.age(p.gen); d >= 0 {
 		pr.counts.placeDist[d].Add(1)
 	}
@@ -142,12 +153,25 @@ func regionNoteInPlace(s *shard, p *page) {
 // The counters are cumulative from here, so a caller measuring a window takes a
 // regionFRSnapshot at each end and subtracts.
 //
-// It seeds newest from the shard's generation counter so a shard attached after
-// its pages were built classifies correctly from the first hit.
+// It seeds newest from the newest page the shard has actually PUBLISHED, not
+// from its generation counter, for the reason in regionNotePage: a shard caught
+// mid-allocation has minted a generation no reader can resolve yet, and starting
+// from it would mis-age every hit until the next publication.
 func regionFRAttach(s *shard) func() {
 	pr := &regionProbe{s: s}
 	s.mu.Lock()
-	pr.newest.Store(uint32(s.genCounter - 1)) // genCounter is the NEXT generation
+	var newest uint16
+	first := true
+	for i := range s.pageSlots {
+		p := s.pageSlots[i].Load()
+		if p == nil {
+			continue
+		}
+		if first || p.gen-newest < 1<<15 { // modular "is ahead of", as in age
+			newest, first = p.gen, false
+		}
+	}
+	pr.newest.Store(uint32(newest))
 	s.mu.Unlock()
 	regionActive.Store(pr)
 	return func() { regionActive.Store(nil) }
@@ -159,7 +183,7 @@ func regionFRSnapshot() regionFRCounts {
 	if pr == nil {
 		return regionFRCounts{}
 	}
-	out := regionFRCounts{Hits: pr.counts.hits.Load(), InPlace: pr.counts.inPlace.Load()}
+	var out regionFRCounts
 	for i := range out.HitDist {
 		out.HitDist[i] = pr.counts.hitDist[i].Load()
 		out.PlaceDist[i] = pr.counts.placeDist[i].Load()

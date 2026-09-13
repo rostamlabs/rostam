@@ -695,19 +695,90 @@ func BenchmarkReadLockFraction(b *testing.B) {
 		}
 		for _, pct := range inPlaceReadLockPercents {
 			b.Run(fmt.Sprintf("%s/frac%03d", sh.name, pct), func(b *testing.B) {
-				// modeAppend: in-place OFF, so the shard's own read path is the lock-free
-				// one and every locked read in this arm is there because the coin said so.
-				readLockArm(b, modeAppend, pct, sh.readOnly, sh.value)
+				readLockArm(b, readLockSweepMode, pct, sh.readOnly, sh.value)
 			})
 		}
 	}
 }
 
+// readLockSweepMode is the ONE shard configuration every point of the sweep runs
+// on, references excepted.
+//
+// The curve is meant to isolate the read lock, so every arm it is drawn from has
+// to agree about everything else — and the write path is the everything else that
+// bites. A shard with in-place updates enabled runs the same-size eligibility
+// probe on EVERY write (a table probe, a page read, a key compare, a live-band
+// check) whether or not the overwrite goes ahead. Sweeping on a shard without
+// that probe while comparing against references that have it mixes a write-path
+// difference into what is supposed to be a read-path curve, and the crossover
+// that comes out is contaminated by a term that has nothing to do with locking.
+//
+// modeSeqlock is the configuration chosen because the crossover is measured
+// against the seqlock, so the seqlock reference is the one that must share the
+// curve's write path exactly. The modeAppend and modeLocked references remain,
+// deliberately on their own configurations: they are the PRODUCTION read paths,
+// and the gap between ref_append and frac000 is no longer an explanation but a
+// measurement of exactly the write-path difference described above.
+const readLockSweepMode = modeSeqlock
+
+// benchGetLockFree is the lock-free branch of shard.getCore, called explicitly:
+// count the get, probe the live table, apply the corrupt/miss and expiry
+// accounting, and hand back an owned copy as the ringbuf contract requires.
+//
+// It exists because getCore cannot be asked for that branch on a shard whose
+// configuration selects another one, and the sweep needs exactly this branch on a
+// shard configured for in-place writes — the combination the cache itself refuses
+// to offer, because in-place rewriting is precisely what the plain lock-free read
+// is not safe against.
+//
+// THAT IS DELIBERATE AND IT IS A COST INSTRUMENT ONLY. A read here can observe a
+// value mid-rewrite and hand back torn bytes, which the benchmark discards. It
+// cannot do worse than that: a same-size overwrite stores the same key at the
+// same length, so the framing a reader decodes is byte-for-byte what was already
+// there and the slice bounds derived from it stay in range — the argument written
+// out in indexTable.getSeq. Nothing here may be read as a claim that the
+// combination is safe to ship; the seqlock exists because it is not.
+func benchGetLockFree(s *shard, key []byte, h uint64) []byte {
+	s.gets.Add(1)
+	t := s.tab.Load()
+	v, exp, ref, st := t.get(s, key, h)
+	out, _, err := s.resolveLookup(v, key, h, exp, ref, st, s.now(), !s.cfg.Replicated)
+	if err != nil {
+		return nil
+	}
+	cp := make([]byte, len(out))
+	copy(cp, out)
+	return cp
+}
+
 // readLockArm runs one arm of BenchmarkReadLockFraction. lockPct < 0 is a
-// REFERENCE arm: no coin, every read goes through s.Get and therefore through
-// whatever path the shard's own configuration selects. Otherwise every read
-// flips, and a win routes it through getLockedCore — which, with the gets counter
-// bumped first, is exactly what s.Get does on a shard that needs the read lock.
+// REFERENCE arm: the coin can never be won, so every read goes through s.Get and
+// therefore through whatever path the shard's own configuration selects.
+// Otherwise every read flips, and the two outcomes are the two paths a region
+// design would choose between — getLockedCore with the gets counter bumped first,
+// which is exactly what s.Get does on a shard that needs the read lock, and the
+// plain lock-free probe it would use outside the region.
+//
+// REUSING THIS AS A YARDSTICK. mode stays a parameter on purpose, so a caller
+// pricing something else in units of "this share of reads takes the read lock"
+// can sweep on its OWN configuration and share one write path end to end. Two
+// conditions travel with that.
+//
+// A sweep arm must never reach the shard's own Get. If it did, the base's
+// configuration would decide what a coin-LOSS costs, and on a base that already
+// locks its reads — modeLocked is the one here — every read would take the lock
+// whatever the coin said, while the arm went on reporting the coin's share. The
+// instrument would be broken and would still produce a smooth, plausible curve.
+// That is why the losing branch calls benchGetLockFree explicitly rather than
+// s.Get: the constraint is now discharged by construction instead of by picking a
+// mode, which is what frees the base to be chosen for its WRITE path alone. Only
+// reference arms route through s.Get, which is their whole point.
+//
+// The base must be heap-backed, which inPlaceShard guarantees for every mode. A
+// plain lock-free read of an mmap ringbuf shard is not torn-value-safe the way
+// benchGetLockFree's note argues the heap case is — those reads hand back
+// zero-copy aliases that outlive the read, and eviction rewrites the region in
+// place.
 func readLockArm(b *testing.B, mode inPlaceMode, lockPct int, readOnly bool, value func(r *rand.Rand, base []byte) []byte) {
 	s := inPlaceShard(b, mode)
 	base := benchValue()
@@ -743,12 +814,18 @@ func readLockArm(b *testing.B, mode inPlaceMode, lockPct int, readOnly bool, val
 	}
 	before := s.snapshot()
 	var seed atomic.Int64
-	var lockedReads, totalReads atomic.Uint64
+	var lockedReads, totalReads, sunk atomic.Uint64
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
-		r := rand.New(rand.NewSource(seed.Add(1)))                 //nolint:gosec // deterministic per-goroutine shape, not security
-		x := benchRand(uint64(seed.Load())*0x9e3779b97f4a7c15 + 1) //nolint:gosec // a nonzero xorshift seed, not security
-		var locked, reads uint64
+		// ONE draw from the counter, used for both generators. Taking a second draw
+		// — even a bare Load after the Add — lets a sibling goroutine land in
+		// between, so two workers can be handed the same coin stream and replay each
+		// other's lock decisions. The arms would still report the right locked share
+		// while resting on fewer independent streams than they claim.
+		id := uint64(seed.Add(1)) //nolint:gosec // a positive counter, not security
+		r := rand.New(rand.NewSource(int64(id)))
+		x := benchRand(id*0x9e3779b97f4a7c15 + 1)
+		var locked, reads, sink uint64
 		n := 0
 		for pb.Next() {
 			if !readOnly && n%3 == 2 { // two reads per write, as in BenchmarkInPlaceRead
@@ -764,21 +841,33 @@ func readLockArm(b *testing.B, mode inPlaceMode, lockPct int, readOnly bool, val
 			// by the instrument rather than by the thing being compared — which is the
 			// one difference the endpoint check cannot tolerate, since that check is
 			// the only evidence the middle of the curve means anything.
-			if x.next() < thresh {
+			var got []byte
+			switch {
+			case x.next() < thresh:
 				// What getCore does on a shard that needs the read lock: count the get,
 				// then probe and copy under it.
 				s.gets.Add(1)
-				_, _, _ = s.getLockedCore(key, hashKey(key), s.now(), !s.cfg.Replicated)
+				got, _, _ = s.getLockedCore(key, hashKey(key), s.now(), !s.cfg.Replicated)
 				locked++
-			} else {
-				_, _ = s.Get(key)
+			case lockPct < 0:
+				got, _ = s.Get(key) // reference: the shard's own path
+			default:
+				got = benchGetLockFree(s, key, hashKey(key))
 			}
+			// The value is consumed, cheaply, so neither branch's copy can be dropped
+			// as dead — the copy is real work the read path does and an arm that
+			// skipped it would look faster for no reason.
+			sink += uint64(len(got))
 			n++
 		}
 		lockedReads.Add(locked)
 		totalReads.Add(reads)
+		sunk.Add(sink)
 	})
 	b.StopTimer()
+	if sunk.Load() == 1 {
+		b.Fatal("unreachable: keeps the value copies live")
+	}
 	after := s.snapshot()
 	puts := after.Puts - before.Puts
 	b.ReportMetric(float64(lockedReads.Load())/float64(max(totalReads.Load(), 1))*100, "%locked")
