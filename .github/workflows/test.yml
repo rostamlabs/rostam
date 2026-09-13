@@ -438,6 +438,20 @@ jobs:
         id: tree-snapshot
         run: git status --porcelain --ignored=traditional --untracked-files=all | sort > /tmp/tree-before.txt
 
+      - name: Vet (32-bit int, whole module)
+        # WIDER THAN THE TEST STEP BELOW, AND CHEAPER. vet type-checks every
+        # package INCLUDING its _test.go files without building a test binary or
+        # allocating anything, so it covers the packages the test step has to skip
+        # — cache/ among them, whose page budget cannot fit a 32-bit address space.
+        #
+        # What it catches is the compile-time half of the widening class: an
+        # untyped constant that does not fit a 32-bit int is a COMPILE error, so
+        # the package simply cannot be built for 386 and no test lane ever reaches
+        # it. Nothing else in CI compiles test files under GOARCH=386 — the
+        # cross-compile matrix runs `go build`, which ignores them — so before this
+        # step that breakage could only be found by hand.
+        run: go vet ./...
+
       - name: Test (32-bit int)
         run: go test -count=1 -short -timeout 25m ./ops/... ./vector/... ./httpapi/... ./server/...
       - name: Tests must not write into the checkout

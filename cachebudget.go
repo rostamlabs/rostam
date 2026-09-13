@@ -3,7 +3,9 @@
 package rostam
 
 import (
+	"errors"
 	"fmt"
+	"math"
 	"math/bits"
 
 	"github.com/rostamlabs/rostam/cache"
@@ -91,6 +93,13 @@ func floorPow2(n int64) int64 {
 	return int64(1) << (bits.Len64(uint64(n)) - 1)
 }
 
+// ErrBudgetExceedsPlatformInt reports a per-shard budget that cannot be held in
+// an int on this platform. It is its own error so a caller — and the test — can
+// distinguish it from the other geometry rejections by identity rather than by
+// matching message text, which matters because the failure it replaces was a
+// SILENT truncation that surfaced later as an unrelated validation error.
+var ErrBudgetExceedsPlatformInt = errors.New("per-shard cache budget exceeds the platform's maximum int")
+
 // cacheGeometry derives (MaxMemoryPerShard, PageSize) from a TOTAL byte budget
 // spread over numShards. It aims for targetPagesPerShard pages per shard and
 // clamps PageSize to cache.Config.Validate's [1 MiB, 1 GiB] range.
@@ -126,6 +135,18 @@ func cacheGeometry(totalBytes int64, numShards int) (maxMemPerShard, pageSize in
 				"raise the budget to at least %d bytes or lower NumShards",
 			totalBytes, numShards, perShard, int64(minPagesPerShard)*ps,
 			minPagesPerShard, ps, int64(minPagesPerShard)*ps*int64(numShards))
+	}
+
+	// perShard is an int64 but the cache config field is an int, so on a 32-bit
+	// build a budget whose per-shard share exceeds MaxInt would wrap silently —
+	// 32 GiB truncates to 0, which Validate then rejects with an error naming the
+	// wrong cause. Refuse it here, where the real reason can be stated.
+	if perShard > math.MaxInt {
+		return 0, 0, fmt.Errorf(
+			"rostam: cache budget %d bytes over %d shards leaves %d bytes per shard, "+
+				"which exceeds the %d-byte maximum addressable on this platform "+
+				"(lower the budget or raise NumShards): %w",
+			totalBytes, numShards, perShard, int64(math.MaxInt), ErrBudgetExceedsPlatformInt)
 	}
 
 	return int(perShard), int(ps), nil
