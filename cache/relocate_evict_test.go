@@ -36,6 +36,10 @@ func relocConfig(pages int, on bool) Config {
 	cfg.InitialPagesPerShard = 0
 	cfg.AtCapPolicy = PolicyRingbufEvict
 	cfg.TTLSweepIntervalMs = 0
+	// Both background tickers off: every test on this config drives the passes by hand,
+	// so a tick landing mid-assertion could only make them flaky. DefaultConfig sets a
+	// reserve interval, so this has to be explicit.
+	cfg.RelocateReserveIntervalMs = 0
 	cfg.RelocatingEviction = on
 	return cfg
 }
@@ -696,16 +700,59 @@ func TestRelocatingEvictionConcurrentReadersNeverMiss(t *testing.T) {
 //	evict/op       page entries dropped per write
 //	evict_live/op  of those, the ones that were still the live copy for their key —
 //	               the loss relocation is meant to remove
-//	reloc/op       records copied forward per write
-//	reloc_B/op     bytes those copies moved per write — the price of the saves
+//	reloc/op       records copied forward per write BY THE WRITE ITSELF — the cost the
+//	               background arm exists to remove, so this is the column to read the
+//	               three arms against each other on
+//	reloc_B/op     bytes those write-path copies moved per write
+//	bg_reloc/op    records the background free-page reserve copied forward per write —
+//	               the same work, done by the sweeper instead (cache/relocate_reserve.go)
+//	bg_pages       pages that reserve fully evacuated and retired over the run
 func BenchmarkRelocatingEvictionAB(b *testing.B) {
 	relocABArms(b, false)
 }
 
-// relocABArms runs the off/on pair over one storage mode, selected by mmap. Both arms
-// of a pair get the same seed and the same key population, so the only difference
-// between the two rows is the flag. Each arm makes its OWN pages directory, so the
-// caller passes a mode rather than a path.
+// relocABArms runs the arms over one storage mode, selected by mmap. Each arm makes
+// its OWN pages directory. Every arm gets the same seed and the same key population, so the only
+// difference between two rows is the configuration named in the row.
+//
+// FOUR arms on heap and two on mmap, because the background reserve is heap-only (see the
+// HEAP RINGBUF ONLY note in cache/relocate_reserve.go):
+//
+//	off              neither pass, no ticker — positional eviction on its own
+//	swept-fast       TTL sweeper ticking at relocABSweepMs, no relocation
+//	swept-default    TTL sweeper ticking at the reserve's default interval, no relocation
+//	sync             relocation on the write path, no ticker — #127 as it stands
+//	background-fast  relocation plus the reserve, reserve ticker at relocABSweepMs
+//	background       relocation plus the reserve at its SHIPPED default interval — the row
+//	                 to judge the layer by
+//
+// THE SWEPT ROWS ARE CONTROLS AND ARE NOT OPTIONAL. They tick the TTL sweeper, whose
+// sweepIndex takes the shard WRITE lock for sweepBatchSize slots at a time and decodes
+// every live entry it passes, once per tick per shard — a cost with nothing to do with
+// relocation that scales with both the cadence and the shard count. off -> swept prices a
+// ticker at that cadence, which is what made the first cut of this measurement readable:
+// it is how "the background arm is slow" became "a millisecond per-shard tick is slow".
+//
+// THE TWO TICKERS ARE SEPARATE SETTINGS, which they were not when this benchmark was
+// first written. A background row now runs the reserve's ticker with the TTL sweeper OFF,
+// so the row prices the reserve and nothing else; that separation is the whole point of
+// Config.RelocateReserveIntervalMs and the reason the fast rows are kept — they are what
+// it cost when the reserve had to ride the TTL sweeper's interval.
+//
+// A background row still keeps the write-path pass as its fallback, which is the
+// configuration the feature ships as, so reloc/op falling while bg_reloc/op rises is the
+// claim, in two columns.
+//
+// READ THE BACKGROUND ARM'S ns/op WITH THE HARNESS IN MIND, because this harness is the
+// worst case for that arm and the figure is not a prediction about a server. There is ONE
+// shard here and ONE goroutine writing to it flat out, so the shard's sweeper has no idle
+// lock time to work in: every lock hold it takes to move a record stalls the write stream
+// directly, and the CPU it burns is CPU the writer wanted. A cadence slow enough not to
+// contend is also too slow to take a meaningful share of the copying on a shard being
+// written at memory speed — the two cannot be separated here, and the arm is set to
+// relocABSweepMs precisely to show the work moving rather than to show a latency win.
+// NumShards > 1 spreads the same write stream over shards that each have their own lock
+// and their own sweeper, which is the regime the layer is for; nothing here measures it.
 func relocABArms(b *testing.B, mmap bool) {
 	keys := make([][]byte, relocABKeyspace)
 	for i := range keys {
@@ -716,10 +763,14 @@ func relocABArms(b *testing.B, mmap bool) {
 		val[i] = byte(i)
 	}
 
-	for _, arm := range []struct {
-		name string
-		on   bool
-	}{{"off", false}, {"on", true}} {
+	arms := relocABArmList()
+	if mmap {
+		// The reserve is heap-only, and so are the controls that exist to price it
+		// against; on mmap the pair that remains is the one #127 is about.
+		arms = arms[:1:1]
+		arms = append(arms, relocABArm{name: "sync", on: true})
+	}
+	for _, arm := range arms {
 		b.Run("reloc="+arm.name, func(b *testing.B) {
 			cfg := DefaultConfig()
 			cfg.NumShards = 1
@@ -727,7 +778,8 @@ func relocABArms(b *testing.B, mmap bool) {
 			cfg.MaxMemoryPerShard = relocABPages << 20
 			cfg.InitialPagesPerShard = 0
 			cfg.AtCapPolicy = PolicyRingbufEvict
-			cfg.TTLSweepIntervalMs = 0
+			cfg.TTLSweepIntervalMs = arm.ttlMs
+			cfg.RelocateReserveIntervalMs = arm.reserveMs
 			cfg.RelocatingEviction = arm.on
 			dir := ""
 			if mmap {
@@ -763,23 +815,9 @@ func relocABArms(b *testing.B, mmap bool) {
 					hits++
 				}
 			}
-			perOp := func(d uint64) float64 {
-				if ops == 0 {
-					return 0
-				}
-				return float64(d) / float64(ops)
-			}
-			bytesPerKey := 0.0
-			if st.Entries > 0 {
-				bytesPerKey = float64(st.BytesUsed) / float64(st.Entries)
-			}
-			b.ReportMetric(float64(hits)/float64(relocABKeyspace), "hit_rate")
-			b.ReportMetric(float64(st.Entries), "entries")
-			b.ReportMetric(bytesPerKey, "B/live_key")
-			b.ReportMetric(perOp(st.Evictions-warm.Evictions), "evict/op")
-			b.ReportMetric(perOp(st.EvictionsLive-warm.EvictionsLive), "evict_live/op")
-			b.ReportMetric(perOp(st.EvictionRelocations-warm.EvictionRelocations), "reloc/op")
-			b.ReportMetric(perOp(st.EvictionBytesRelocated-warm.EvictionBytesRelocated), "reloc_B/op")
+			// Shared with the sharded harness, so a row there means the same thing field
+			// for field as a row here.
+			relocABReport(b, warm, st, int64(ops), relocABKeyspace, hits)
 		})
 	}
 }
@@ -793,6 +831,13 @@ const (
 	relocABZipfS    = 1.3
 	relocABSeed     = 0x5EED
 	relocABWarmOps  = 400_000
+	// relocABSweepMs is the tightest cadence a ticker will take: a background pass's best
+	// chance of keeping up with a loop writing as fast as it can, and also its most
+	// expensive setting. The rows that use it are kept as the counter-example — they are
+	// what the reserve cost when it had to ride the TTL sweeper's interval. The other
+	// cadence in the table is defaultRelocateReserveIntervalMs itself, so the headline row
+	// is the shipped configuration rather than a benchmark-only tuning.
+	relocABSweepMs = 1
 )
 
 // pageObjects snapshots the shard's page object identities. A heap eviction RETIRES

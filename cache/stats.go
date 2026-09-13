@@ -102,6 +102,23 @@ type Stats struct {
 	//     feature is charging for those saves.
 	EvictionRelocations    uint64
 	EvictionBytesRelocated uint64
+
+	// The BACKGROUND half of the same feature (cache/relocate_reserve.go): the
+	// per-shard sweeper keeping a small reserve of free pages so a write at capacity
+	// finds room instead of evicting and relocating inline. Counted separately from
+	// the write-path pair above precisely so the split is visible — on a shard whose
+	// sweeper is keeping up these climb while EvictionRelocations stays flat, and the
+	// ratio between them is how much of the relocation cost is still being charged to
+	// writes.
+	//   - ReserveRelocations: live records the reserve pass copied forward;
+	//   - ReserveBytesRelocated: their framed byte total — background copying, not
+	//     write-path copying;
+	//   - ReservePagesFreed: pages it fully evacuated and retired, i.e. the free pages
+	//     it actually produced. Zero while it is doing work but never finishing a page
+	//     means the shard is too dense to evacuate and the write path is carrying it.
+	ReserveRelocations    uint64
+	ReserveBytesRelocated uint64
+	ReservePagesFreed     uint64
 }
 
 // HitRate returns Hits / Gets, or 0 when Gets == 0.
@@ -142,6 +159,9 @@ func (s *Stats) Add(o Stats) {
 	s.OnlinePagesRecycled += o.OnlinePagesRecycled
 	s.EvictionRelocations += o.EvictionRelocations
 	s.EvictionBytesRelocated += o.EvictionBytesRelocated
+	s.ReserveRelocations += o.ReserveRelocations
+	s.ReserveBytesRelocated += o.ReserveBytesRelocated
+	s.ReservePagesFreed += o.ReservePagesFreed
 }
 
 // WritePrometheus renders s in the Prometheus text exposition format. Counters
@@ -167,6 +187,9 @@ func (s Stats) WritePrometheus(w io.Writer) error {
 		{"rostam_kv_evictions_live_total", "entries displaced by ringbuf eviction that were still the live record for their key - lost to capacity, not TTL", s.EvictionsLive},
 		{"rostam_kv_eviction_relocations_total", "live records copied forward by relocating eviction instead of being dropped with the dead versions sharing their page - the saves that did NOT become evictions_live", s.EvictionRelocations},
 		{"rostam_kv_eviction_bytes_relocated_total", "bytes copied by those relocations - the write-path cost of the saves", s.EvictionBytesRelocated},
+		{"rostam_kv_reserve_relocations_total", "live records copied forward by the background free-page reserve instead of by a write - read against eviction_relocations to see how much of the copying the write path is still paying for", s.ReserveRelocations},
+		{"rostam_kv_reserve_bytes_relocated_total", "bytes copied by the background reserve - background work, not write-path cost", s.ReserveBytesRelocated},
+		{"rostam_kv_reserve_pages_freed_total", "pages the background reserve fully evacuated and retired - the free pages it produced for the write path", s.ReservePagesFreed},
 		{"rostam_kv_rejects_total", "writes refused under PolicyRejectWrites", s.Rejects},
 		{"rostam_kv_corruption_errors_total", "CRC mismatches seen on read", s.CorruptionErrors},
 		{"rostam_kv_compactions_total", "page files rewritten live-only at shard open (mmap)", s.Compactions},
