@@ -35,7 +35,15 @@
 //     machinery a byte-recycling ring would need. Reads still return an owned
 //     copy (callers may mutate it).
 //
-//   - Mmap mode takes the shard read lock. An mmap page object wraps a fixed
+//     Config.InPlaceSameSizeUpdate gives that up deliberately. It lets a write
+//     overwrite the entry already stored for its key when the new one is framed
+//     identically, which stops updates from stranding a dead copy apiece — but
+//     live bytes then change under readers, so those shards move to the
+//     read-locked path below. The flag is off by default and the lock-free path
+//     is what a heap ringbuf shard uses without it.
+//
+//   - Mmap mode — and any shard with in-place same-size updates enabled — takes
+//     the shard read lock. An mmap page object wraps a fixed
 //     region of the persisted file and cannot be swapped for a fresh allocation,
 //     so eviction overwrites its bytes in place; a lock-free read would risk a
 //     torn value and race the writer's overwrite at the byte level (which the

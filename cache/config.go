@@ -281,6 +281,95 @@ type Config struct {
 	// everywhere else.
 	ServerWriteTimeout time.Duration
 
+	// InPlaceSameSizeUpdate lets a write OVERWRITE the entry already stored for its
+	// key instead of appending a new copy after it, when the two are framed
+	// identically — same key, same value LENGTH. Default false.
+	//
+	// WHAT IT BUYS. Every update appends today, so the previous copy stays framed
+	// and dead in the pages. Under PolicyRingbufEvict those dead versions are what
+	// carry a shard to capacity and start it evicting LIVE keys, so a workload that
+	// rewrites the same keys at a roughly constant record size spends its budget on
+	// garbage it never had to create. An entry is [header][key][value] with a
+	// fixed-width header, so for the same key and an identical value length the new
+	// bytes fit exactly where the old ones are — and because the index keeps
+	// pointing at the same page, offset and generation, the write also skips the
+	// slot upsert, the page allocation, and any eviction that would have followed.
+	//
+	// WHERE IT APPLIES. Only on a HEAP-backed PolicyRingbufEvict shard, and only
+	// for a write whose key is index-current at a copy of exactly the new size;
+	// every other write takes the append path unchanged. It is a no-op — not an
+	// error — on a shard that does not qualify:
+	//
+	//   - PolicyRejectWrites shards hand out ZERO-COPY ALIASES into page bytes, and
+	//     an alias may outlive the read that produced it (it escapes to a network
+	//     response writer). Overwriting live bytes under it would change a value a
+	//     caller is still holding.
+	//   - MMAP shards are the DURABLE copy. Overwriting destroys the old version, so
+	//     a write torn by a crash loses the KEY OUTRIGHT, where an append leaves the
+	//     previous version framed and recoverable. Heap pages are not persisted, so
+	//     there is nothing to recover and the concern does not arise.
+	//
+	// WHAT IT ALSO COSTS: WRITE RECENCY, and this is a change in EVICTION
+	// SEMANTICS, not only in locking. Eviction here reclaims whole pages in
+	// rotation, so which records survive is decided by which PAGE they sit on. An
+	// appending rewrite moves its key to the newest page, so a key touched often
+	// drifts ahead of the rotation and outlives one touched rarely — recency the
+	// ring buffer gets for free, without tracking anything. An in-place rewrite
+	// keeps the key on whatever page it was first written to, so the rotation
+	// reaches it on schedule however hot it is.
+	//
+	// It only bites on a shard whose live set EXCEEDS its budget, because that is
+	// the only regime where in-place cannot simply stop evicting. There it is a
+	// genuine trade rather than a win, and BenchmarkInPlaceWriteRecency exists to
+	// put numbers on both halves: against the append path it retained about a
+	// quarter more keys in total and evicted about a fifth less often, while
+	// holding roughly ten percent less of the frequently-rewritten subset.
+	//
+	// Relocating eviction does NOT remedy it — it makes the recency loss somewhat
+	// worse, not better, while raising the eviction rate. Carrying a record off a
+	// drained page preserves the record, but it does not restore the ordering that
+	// decides which page is drained next, which is the thing recency was.
+	//
+	// So: if a shard is sized for its working set, this is close to pure gain — it
+	// is the garbage that drove eviction, and removing it removes the evictions.
+	// If a shard is deliberately run over capacity as a ring buffer AND leans on
+	// rewrite frequency to decide what stays, leave it off.
+	//
+	// WHAT IT COSTS. Heap ringbuf reads are lock-free today only because pages are
+	// append-only and frozen: eviction retires a page by swapping in a fresh object,
+	// never by rewriting live bytes, so the bytes behind a hit are immutable for the
+	// read's lifetime. Writing in place breaks exactly that. So enabling this makes
+	// heap ringbuf reads take the shard READ LOCK for the probe and value copy — the
+	// same path mmap ringbuf has always used (see needsReadLockForGet). That is the
+	// trade: writes stop creating garbage, reads stop being lock-free.
+	InPlaceSameSizeUpdate bool
+
+	// InPlaceSeqlockReads makes a shard with InPlaceSameSizeUpdate keep its reads
+	// LOCK-FREE, validating each one against a per-stripe version counter instead
+	// of taking the shard read lock. Default false. Ignored unless in-place
+	// updates are enabled — it protects against exactly one hazard, a writer
+	// rewriting an entry's bytes underneath a reader, which only in-place updates
+	// create.
+	//
+	// It exists because the read lock is what in-place updates otherwise cost, and
+	// the cost is large: an RWMutex read acquisition is a read-modify-write on one
+	// cache line every reader shares, so read throughput stops scaling with cores.
+	//
+	// IT IS OFF BY DEFAULT AND SHOULD STAY OFF UNLESS THE READ:WRITE RATIO PAYS FOR
+	// IT, for two reasons that are not tuning preferences:
+	//
+	//   - A seqlock's payload access is a DATA RACE by construction — validating
+	//     after the fact is what it does instead of preventing the access — so the
+	//     race detector reports it, and the protocol rests on how Go compiles its
+	//     atomics rather than on a guarantee the memory model extends to racing
+	//     plain accesses. cache/seqlock.go sets out the ordering argument and its
+	//     limits in full. Accessing the payload atomically would close both gaps and
+	//     costs more than the read lock it replaces (measured there).
+	//   - It is only a win when reads outnumber writes by enough. The version bump
+	//     is two atomic read-modify-writes on the WRITE path; below roughly six
+	//     reads per write the read lock is the cheaper of the two.
+	InPlaceSeqlockReads bool
+
 	// NowFn overrides the WALL-CLOCK source for the non-apply expiry sites (client
 	// read filter, sweeper, warm-restart rebuild, Iterate). nil ⇒ the real clock
 	// (nowMs / time.Now) — the production default, byte-identical to pre-B1

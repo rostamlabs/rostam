@@ -34,11 +34,35 @@ type Stats struct {
 	// EvictionsLive is the one to watch to decide whether a cache is sized for
 	// its working set. EvictionsLive > 0 with Expirations low means the budget,
 	// not the TTL, is deciding how long entries survive.
-	EvictionsLive  uint64
-	Rejects        uint64 // refused due to PolicyRejectWrites
-	PagesAllocated uint64
-	BytesAllocated uint64
-	BytesUsed      uint64
+	EvictionsLive uint64
+	Rejects       uint64 // refused due to PolicyRejectWrites
+	// InPlaceUpdates counts the writes that OVERWROTE the copy already stored for
+	// their key instead of appending a new one after it and leaving the old one
+	// framed and dead — the writes that created no garbage. It requires
+	// Config.InPlaceSameSizeUpdate and a heap-backed PolicyRingbufEvict shard, and
+	// stays 0 everywhere else (see that flag for why those are the limits).
+	//
+	// InPlaceUpdates/Puts is the share of the write stream that is pure same-size
+	// rewriting. On a ringbuf shard dead versions are what carry the shard to
+	// capacity and start it evicting live keys, so on a workload with
+	// roughly-constant record sizes that ratio is also, near enough, the share of
+	// eviction pressure the shard was inflicting on itself. Watch it beside
+	// EvictionsLive: the two should move in opposite directions.
+	InPlaceUpdates uint64
+	// SeqlockRetries and SeqlockFallbacks report the health of the lock-free read
+	// protocol a shard uses when Config.InPlaceSeqlockReads is on: read attempts
+	// discarded because a rewrite moved the bytes mid-read, and reads that spent
+	// their retry budget and fell back to taking the shard read lock. Both are 0
+	// on every other shard.
+	//
+	// Retries should be a small fraction of Gets and fallbacks near zero. A
+	// fallback rate that is not near zero means reads are serialising after all,
+	// and the answer is the stripe mapping or the workload, not the lock.
+	SeqlockRetries   uint64
+	SeqlockFallbacks uint64
+	PagesAllocated   uint64
+	BytesAllocated   uint64
+	BytesUsed        uint64
 	// Entries is the number of keys the index currently holds, and Tombstones
 	// the deleted-but-not-yet-reclaimed slots beside them. Entries is the only
 	// way to answer "how many keys fit in this budget": every other gauge here
@@ -146,6 +170,9 @@ func (s *Stats) Add(o Stats) {
 	s.Evictions += o.Evictions
 	s.EvictionsLive += o.EvictionsLive
 	s.Rejects += o.Rejects
+	s.InPlaceUpdates += o.InPlaceUpdates
+	s.SeqlockRetries += o.SeqlockRetries
+	s.SeqlockFallbacks += o.SeqlockFallbacks
 	s.PagesAllocated += o.PagesAllocated
 	s.BytesAllocated += o.BytesAllocated
 	s.BytesUsed += o.BytesUsed
@@ -195,6 +222,9 @@ func (s Stats) WritePrometheus(w io.Writer) error {
 		{"rostam_kv_reserve_bytes_relocated_total", "bytes copied by the background reserve - background work, not write-path cost", s.ReserveBytesRelocated},
 		{"rostam_kv_reserve_pages_freed_total", "pages the background reserve fully evacuated and retired - the free pages it produced for the write path", s.ReservePagesFreed},
 		{"rostam_kv_rejects_total", "writes refused under PolicyRejectWrites", s.Rejects},
+		{"rostam_kv_seqlock_retries_total", "lock-free read attempts discarded because a same-size update moved the bytes mid-read", s.SeqlockRetries},
+		{"rostam_kv_seqlock_fallbacks_total", "reads that spent their retry budget and took the shard read lock instead - should be near zero", s.SeqlockFallbacks},
+		{"rostam_kv_inplace_updates_total", "writes that overwrote the stored copy of their key where it lay, instead of appending a new copy and leaving the old one framed and dead - the writes that created no garbage; requires a heap ringbuf shard with in-place same-size updates enabled", s.InPlaceUpdates},
 		{"rostam_kv_corruption_errors_total", "CRC mismatches seen on read", s.CorruptionErrors},
 		{"rostam_kv_compactions_total", "page files rewritten live-only at shard open (mmap)", s.Compactions},
 		{"rostam_kv_compactions_aborted_total", "compactions decided against or abandoned; the original file was kept", s.CompactionsAborted},

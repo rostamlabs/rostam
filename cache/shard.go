@@ -151,6 +151,30 @@ type shard struct {
 	pagesAlloc    atomic.Uint64
 	corrupt       atomic.Uint64
 
+	// inPlaceUpdates counts the writes that overwrote their key's stored copy where
+	// it lay instead of appending a new one and stranding the old — the writes that
+	// created no garbage (see Config.InPlaceSameSizeUpdate). It stays 0 on every
+	// shard the feature is not enabled for, because those shards never run the
+	// eligibility probe at all.
+	//
+	// With the feature on, inPlaceUpdates/puts is also the measured share of the
+	// write stream that is pure same-size rewriting, which is the figure that says
+	// whether the reader-side cost is buying anything on this workload.
+	inPlaceUpdates atomic.Uint64
+
+	// seqlockRetries and seqlockFallbacks measure the lock-free read protocol
+	// (cache/seqlock.go): how many read attempts were thrown away because a
+	// rewrite moved the bytes underneath them, and how many reads exhausted the
+	// retry budget and took the read lock instead. Both stay 0 unless
+	// Config.InPlaceSeqlockReads is on.
+	//
+	// They are the protocol's health check. Retries should be a small fraction of
+	// Gets and fallbacks near zero; a fallback rate that is not near zero means
+	// reads are being serialised after all, and the stripe mapping or the workload
+	// — not the lock — is what to look at.
+	seqlockRetries   atomic.Uint64
+	seqlockFallbacks atomic.Uint64
+
 	// cold-compaction counters (cache/compact.go). Written once, at open, before
 	// the shard is published; atomic only so Stats can read them from any
 	// goroutine afterwards. compactAborts covers every path that decided against
@@ -561,13 +585,40 @@ func (s *shard) Get(key []byte) ([]byte, error) {
 }
 
 // needsReadLockForGet reports whether the read path must take the shard read
-// lock. Only mmap-backed ringbuf shards do: eviction overwrites their fixed
-// persisted region in place, so a lock-free read could race the writer at the
-// byte level. Heap ringbuf retires pages by swapping in a fresh frozen object
-// (no in-place overwrite), and every reject-writes shard never overwrites live
-// bytes at all, so both read lock-free.
+// lock. The rule is one question: CAN A WRITER OVERWRITE LIVE PAGE BYTES ON THIS
+// SHARD? Where it can, a lock-free read could both observe a torn value and race
+// the writer at the byte level; where it cannot, the bytes behind a hit are
+// immutable for the read's lifetime and the read needs no lock.
+//
+// A reject-writes shard never overwrites live bytes at all — at cap it rejects —
+// so it always reads lock-free. Under PolicyRingbufEvict two things can rewrite
+// live bytes:
+//
+//   - MMAP EVICTION. An mmap page object wraps a fixed region of the persisted
+//     file and cannot be swapped for a fresh allocation, so eviction drains it in
+//     place. Heap eviction does not: it RETIRES the page by swapping in a fresh
+//     object, leaving the old one frozen, which is what lets heap ringbuf read
+//     lock-free by default.
+//   - SAME-SIZE UPDATES (Config.InPlaceSameSizeUpdate). A write overwrites the
+//     entry already stored for its key — on a page that is live, not retired, and
+//     under an index slot readers are actively resolving. That is precisely the
+//     frozen-page invariant the lock-free heap path rests on, so enabling the
+//     feature moves those shards onto the read-locked path — UNLESS they also
+//     validate each read against a per-stripe version counter
+//     (Config.InPlaceSeqlockReads), which detects the same hazard without
+//     serialising every reader on one shared cache line. See cache/seqlock.go.
+//
+// mmap ringbuf is NOT released by the seqlock. Its reads hand back zero-copy
+// aliases that outlive the read, and validating bytes DURING a read says nothing
+// about overwriting them afterwards.
 func (s *shard) needsReadLockForGet() bool {
-	return s.cfg.AtCapPolicy == PolicyRingbufEvict && s.isMmap
+	if s.cfg.AtCapPolicy != PolicyRingbufEvict {
+		return false
+	}
+	if s.isMmap {
+		return true
+	}
+	return s.cfg.InPlaceSameSizeUpdate && !s.seqlockReads()
 }
 
 // nextGen returns the next page generation. Called under mu or during
@@ -631,6 +682,76 @@ func (s *shard) getAtH(key []byte, h, nowMs uint64) ([]byte, error) {
 	return v, err
 }
 
+// getLockedCore is the read-locked probe: it takes the shard read lock for the
+// probe AND the value copy, so the bytes cannot move underneath either.
+//
+// It serves the two configurations that can rewrite live page bytes and are not
+// validating reads against a version counter: mmap ringbuf, whose eviction
+// drains its fixed persisted region in place, and a heap ringbuf shard doing
+// in-place same-size updates with the seqlock off. It is ALSO where a seqlock
+// read lands when its retry budget is spent — taking the lock excludes the
+// writer outright instead of racing it, which is what makes that read terminate.
+//
+// A lock-free read of these shards could both observe a torn value AND race the
+// writer at the byte level; a seqlock addresses the first and not the second,
+// which is why this path exists at all (see cache/seqlock.go).
+func (s *shard) getLockedCore(key []byte, h, now uint64, allowPhysicalRemove bool) ([]byte, uint64, error) {
+	s.mu.RLock()
+	t := s.tab.Load()
+	v, exp, ref, st := t.get(s, key, h)
+	var vCopy []byte
+	if st == lkHit {
+		// Copy while the lock is held so a later overwrite can't tear it.
+		vCopy = make([]byte, len(v))
+		copy(vCopy, v)
+	}
+	s.mu.RUnlock()
+	return s.resolveLookup(vCopy, key, h, exp, ref, st, now, allowPhysicalRemove)
+}
+
+// getIntoLockedCore is getLockedCore appending into the caller's buffer. On any
+// non-hit it returns dst at its original length, matching getIntoCore.
+func (s *shard) getIntoLockedCore(dst, key []byte, h, now uint64, allowPhysicalRemove bool) ([]byte, uint64, error) {
+	s.mu.RLock()
+	t := s.tab.Load()
+	v, exp, ref, st := t.get(s, key, h)
+	var out []byte
+	if st == lkHit {
+		out = append(dst, v...) // copy while the lock is held
+	}
+	s.mu.RUnlock()
+	out, exp, err := s.resolveLookup(out, key, h, exp, ref, st, now, allowPhysicalRemove)
+	if err != nil {
+		return dst, 0, err
+	}
+	return out, exp, nil
+}
+
+// resolveLookup turns a completed probe into the caller's answer: it applies the
+// corrupt/miss accounting and the expiry filter that every read path owes,
+// whichever protocol produced the probe. v must already be an owned copy on the
+// paths that require one — this runs after the lock (or the version check) has
+// been released, so it must not touch page bytes.
+func (s *shard) resolveLookup(v, key []byte, h, exp uint64, ref slabRef, st lookupStatus, now uint64, allowPhysicalRemove bool) ([]byte, uint64, error) {
+	switch st {
+	case lkCorrupt:
+		s.corrupt.Add(1)
+		s.misses.Add(1)
+		return nil, 0, ErrNotFound
+	case lkMiss:
+		s.misses.Add(1)
+		return nil, 0, ErrNotFound
+	}
+	if isExpired(exp, now) {
+		if allowPhysicalRemove {
+			s.dropExpiredLocked(key, h, ref, now)
+		}
+		s.misses.Add(1)
+		return nil, 0, ErrNotFound
+	}
+	return v, exp, nil
+}
+
 // getCore is the shared Get implementation. now is the clock expiry is judged
 // against; allowPhysicalRemove gates whether an expired-on-read entry's index
 // slot is tombstoned (client path on a replicated shard passes false — filter
@@ -647,40 +768,18 @@ func (s *shard) getAtH(key []byte, h, nowMs uint64) ([]byte, error) {
 func (s *shard) getCore(key []byte, h, now uint64, allowPhysicalRemove bool) ([]byte, uint64, error) {
 	s.gets.Add(1)
 
+	if s.seqlockReads() {
+		if out, exp, ref, st, ok := s.getSeqRetry(nil, key, h); ok {
+			return s.resolveLookup(out, key, h, exp, ref, st, now, allowPhysicalRemove)
+		}
+		// Retry budget spent. Fall through to the read-locked probe below, which
+		// excludes the writer outright rather than racing it, so the read always
+		// terminates. See seqlockMaxRetries.
+		return s.getLockedCore(key, h, now, allowPhysicalRemove)
+	}
+
 	if s.needsReadLockForGet() {
-		// mmap ringbuf overwrites live page bytes in place on eviction, so a
-		// lock-free read could both observe a torn value AND race the writer's
-		// overwrite at the byte level (the race detector flags the latter
-		// regardless of any seqlock, which only *detects* torn values after the
-		// fact). Take the read lock for the probe and value copy: writers hold the
-		// write lock while overwriting, so under RLock the bytes are stable.
-		s.mu.RLock()
-		t := s.tab.Load()
-		v, exp, ref, st := t.get(s, key, h)
-		var vCopy []byte
-		if st == lkHit {
-			// Copy while the lock is held so a later evict+Write can't tear it.
-			vCopy = make([]byte, len(v))
-			copy(vCopy, v)
-		}
-		s.mu.RUnlock()
-		switch st {
-		case lkCorrupt:
-			s.corrupt.Add(1)
-			s.misses.Add(1)
-			return nil, 0, ErrNotFound
-		case lkMiss:
-			s.misses.Add(1)
-			return nil, 0, ErrNotFound
-		}
-		if isExpired(exp, now) {
-			if allowPhysicalRemove {
-				s.dropExpiredLocked(key, h, ref)
-			}
-			s.misses.Add(1)
-			return nil, 0, ErrNotFound
-		}
-		return vCopy, exp, nil
+		return s.getLockedCore(key, h, now, allowPhysicalRemove)
 	}
 
 	// Lock-free path: reject-writes (heap+mmap) and heap-mode ringbuf. For heap
@@ -700,7 +799,7 @@ func (s *shard) getCore(key []byte, h, now uint64, allowPhysicalRemove bool) ([]
 	}
 	if isExpired(exp, now) {
 		if allowPhysicalRemove {
-			s.dropExpiredLocked(key, h, ref)
+			s.dropExpiredLocked(key, h, ref, now)
 		}
 		s.misses.Add(1)
 		return nil, 0, ErrNotFound
@@ -751,32 +850,19 @@ func (s *shard) getIntoWithExpiryAtH(dst, key []byte, h, nowMs uint64) ([]byte, 
 func (s *shard) getIntoCore(dst, key []byte, h, now uint64, allowPhysicalRemove bool) ([]byte, uint64, error) {
 	s.gets.Add(1)
 
-	if s.needsReadLockForGet() {
-		s.mu.RLock()
-		t := s.tab.Load()
-		v, exp, ref, st := t.get(s, key, h)
-		var out []byte
-		if st == lkHit {
-			out = append(dst, v...) // copy while the lock is held
-		}
-		s.mu.RUnlock()
-		switch st {
-		case lkCorrupt:
-			s.corrupt.Add(1)
-			s.misses.Add(1)
-			return dst, 0, ErrNotFound
-		case lkMiss:
-			s.misses.Add(1)
-			return dst, 0, ErrNotFound
-		}
-		if isExpired(exp, now) {
-			if allowPhysicalRemove {
-				s.dropExpiredLocked(key, h, ref)
+	if s.seqlockReads() {
+		if out, exp, ref, st, ok := s.getSeqRetry(dst, key, h); ok {
+			v, e, err := s.resolveLookup(out, key, h, exp, ref, st, now, allowPhysicalRemove)
+			if err != nil {
+				return dst, 0, err // miss/expiry leaves dst at its original length
 			}
-			s.misses.Add(1)
-			return dst, 0, ErrNotFound
+			return v, e, nil
 		}
-		return out, exp, nil
+		return s.getIntoLockedCore(dst, key, h, now, allowPhysicalRemove)
+	}
+
+	if s.needsReadLockForGet() {
+		return s.getIntoLockedCore(dst, key, h, now, allowPhysicalRemove)
 	}
 
 	// Lock-free path: reject-writes (heap+mmap) and heap-mode ringbuf. The value
@@ -794,7 +880,7 @@ func (s *shard) getIntoCore(dst, key []byte, h, now uint64, allowPhysicalRemove 
 	}
 	if isExpired(exp, now) {
 		if allowPhysicalRemove {
-			s.dropExpiredLocked(key, h, ref)
+			s.dropExpiredLocked(key, h, ref, now)
 		}
 		s.misses.Add(1)
 		return dst, 0, ErrNotFound
@@ -802,23 +888,61 @@ func (s *shard) getIntoCore(dst, key []byte, h, now uint64, allowPhysicalRemove 
 	return append(dst, v...), exp, nil
 }
 
-// dropExpiredLocked removes the entry for h if it still points at ref (i.e. the
-// entry a reader just saw expire has not been overwritten by a newer Put).
-// Mirrors the cur == ref guard the map path used.
+// dropExpiredLocked removes the entry for h that a reader just saw expire at
+// `now`, unless it has been replaced in the meantime. Every read path reaches it
+// AFTER releasing the lock (or the version check), so a writer can run in
+// between, and the whole job of this function is to decide whether the entry it
+// is about to tombstone is still the one the reader judged.
 //
-// `key` is the CALLER'S key — the one it just resolved through the index and
-// found expired — and is used only to notify the derived-index removal hook. It
-// is passed rather than re-read off the page because the caller already holds it
-// and the cur == ref guard has already proved the slot is that key's.
-func (s *shard) dropExpiredLocked(key []byte, h uint64, ref slabRef) {
+// cur == ref IS NO LONGER THAT DECISION ON ITS OWN. It was, for as long as every
+// Put allocated a new copy: an overwrite always moved the entry, so a matching
+// ref proved nothing had replaced it. A same-size in-place update
+// (Config.InPlaceSameSizeUpdate) keeps the page, the offset AND the generation,
+// so the ref is byte-identical after a rewrite and the comparison can no longer
+// tell "untouched" from "replaced where it lay". A Put that refreshes an expired
+// key's TTL would otherwise be undone by a read that saw the PREVIOUS value
+// expire: the key vanishes though Put returned nil, and — worse, because nothing
+// repairs it — onRemove fires for a key that is live, dropping its postings from
+// every derived index.
+//
+// So the entry is RE-READ under the lock and only removed if it is STILL expired
+// against the same `now` the reader judged it by. Re-reading is what makes this
+// independent of how the replacement was written, so it also holds for any future
+// write path that preserves a ref. The clock is the CALLER'S, deliberately: a
+// reader that decided "expired" at its own clock reading must not have that
+// decision re-litigated against a later one, or a sweeper-style drop could remove
+// an entry the reader would have returned.
+//
+// `key` is the CALLER'S key. It is compared against the stored one rather than
+// trusted, because the re-read can land on a different key's entry: the index is
+// keyed by 64-bit hash, and a slot can be taken over between the probe and here.
+func (s *shard) dropExpiredLocked(key []byte, h uint64, ref slabRef, now uint64) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	t := s.tab.Load()
-	if slot, cur, ok := t.findSlot(h); ok && cur == ref {
-		t.tombstone(slot)
-		s.expirations.Add(1)
-		s.fireOnRemove(key)
+	slot, cur, ok := t.findSlot(h)
+	if !ok || cur != ref {
+		return // gone, or replaced by a copy somewhere else
 	}
-	s.mu.Unlock()
+	idx := int(cur.pageIdx())
+	if idx >= len(s.pages) {
+		return
+	}
+	p := s.pages[idx]
+	if p == nil || p.gen != cur.gen() {
+		return // the page was retired under this ref
+	}
+	storedKey, _, storedExp, err := p.Read(cur.offset())
+	if err != nil || !bytes.Equal(storedKey, key) {
+		return // unreadable, or this slot is somebody else's now
+	}
+	if !isExpired(storedExp, now) {
+		return // a writer refreshed it in place; it is live and must be kept
+	}
+	t.tombstone(slot)
+	s.expirations.Add(1)
+	s.fireOnRemove(key)
 }
 
 // Put inserts or replaces the entry for key with the given value and TTL.
@@ -872,6 +996,117 @@ func (s *shard) putAbsH(key, value []byte, expiryMs uint64, h uint64) error {
 	return s.putAtExpLocked(key, value, expiryMs, h)
 }
 
+// inPlaceEligible reports whether this SHARD may overwrite a live entry where it
+// lies. It is the per-shard half of the same-size update's guards; the per-write
+// half is inPlaceTargetLocked. Both must pass, and neither subsumes the other.
+//
+// Immutable for the shard's life — the config and the storage mode are both
+// fixed at construction — so this is three field loads and safe to call from
+// anywhere, lock or no lock.
+func (s *shard) inPlaceEligible() bool {
+	// GUARD 1 — OPT-IN. Off by default. Enabling it costs every read on the shard
+	// the read lock (see needsReadLockForGet), which is not a price to impose on a
+	// workload that would not get the write-side benefit back.
+	if !s.cfg.InPlaceSameSizeUpdate {
+		return false
+	}
+	// GUARD 2 — RINGBUF ONLY. A PolicyRejectWrites shard's reads return a ZERO-COPY
+	// ALIAS into the page bytes, and that alias outlives the read: it escapes to a
+	// network response writer, which is why online compaction has to quarantine a
+	// retired extent for twice the write deadline before recycling it. Overwriting
+	// live bytes under such an alias would change a value a caller is still
+	// holding. Ringbuf reads hand back an owned copy, so no alias survives.
+	if s.cfg.AtCapPolicy != PolicyRingbufEvict {
+		return false
+	}
+	// GUARD 3 — HEAP BACKING. An mmap page is the DURABLE copy. Overwriting
+	// destroys the old version, so a write torn by a crash loses the KEY OUTRIGHT,
+	// where an append leaves the previous version framed and recoverable by the
+	// rebuild. Heap pages are not persisted, so there is nothing a torn write could
+	// cost that the process dying has not already cost.
+	return !s.isMmap
+}
+
+// inPlaceTargetLocked resolves the entry a same-size update of (key, value)
+// would overwrite: the page object and offset of the copy the index currently
+// points at, when that copy's framing is byte-identical to what the new write
+// would produce. ok=false means the write has no such target and must append.
+//
+// An entry is [entryHeaderSize][key][value] and the header is fixed-width, so
+// for the SAME key and an identical value LENGTH the new framing occupies
+// exactly the same bytes as the stored one. Everything the index holds — page,
+// offset, generation — therefore stays correct across the overwrite, which is
+// what makes the slot upsert, the page allocation and any eviction behind it
+// unnecessary.
+//
+// Must be called with s.mu held for writing. It is the per-WRITE half of the
+// guards (inPlaceEligible is the per-shard half). GUARD 4 — the index slot still
+// points at this exact copy — is guards 4a..4d together: a ref that survives all
+// four IS the current copy of this key, which is what makes the overwrite safe
+// without touching the index. GUARD 5 is the size equality the whole scheme rests
+// on.
+//
+//	4a. the key is indexed at all;
+//	4b. its ref lands on an allocated page slot that is still the GENERATION the
+//	    ref was minted against — heap ringbuf eviction retires a page by swapping
+//	    in a fresh object, so a stale ref would otherwise resolve against a slab
+//	    under active append;
+//	4c. the framed entry decodes, and its key EQUALS the caller's — the index is
+//	    keyed by 64-bit hash, so a collision resolves to a DIFFERENT key's entry
+//	    and overwriting it would destroy an unrelated live record;
+//	4d. the entry lies wholly inside the page's live band [head, tail). Outside it
+//	    the bytes are either already evicted or unwritten free space, neither of
+//	    which an index-current entry can occupy; refusing is cheaper than
+//	    reasoning about how a violation could arise.
+func (s *shard) inPlaceTargetLocked(key, value []byte, h uint64) (*page, uint32, bool) {
+	t := s.tab.Load()
+	_, ref, found := t.findSlot(h)
+	if !found {
+		return nil, 0, false // (4a) key absent
+	}
+	idx := int(ref.pageIdx())
+	if idx >= len(s.pages) {
+		return nil, 0, false // (4b) ref outside the allocated page list
+	}
+	p := s.pages[idx]
+	if p == nil || p.gen != ref.gen() {
+		return nil, 0, false // (4b) page retired and replaced since the ref was minted
+	}
+	off := ref.offset()
+	storedKey, storedVal, storedExp, err := p.Read(off)
+	if err != nil {
+		return nil, 0, false // (4c) unreadable framing
+	}
+	if !bytes.Equal(storedKey, key) {
+		return nil, 0, false // (4c) hash collision: a different key's entry
+	}
+	if len(storedVal) != len(value) {
+		return nil, 0, false // (5) different size: the framing would not line up
+	}
+	if int(off) < p.head() || int(off)+entrySize(len(key), len(value)) > p.tail() {
+		return nil, 0, false // (4d) not inside the page's live band
+	}
+	// GUARD 6 — the stored copy must still be LIVE. An expired copy is dead
+	// weight, and rewriting it where it lies pins those bytes instead of letting
+	// the append path leave them behind to be reclaimed. Appending also gives the
+	// refreshed key a NEW ref, which is what a concurrent expired-on-read drop
+	// compares against.
+	//
+	// That second effect is hygiene, NOT the guarantee. This shard has an
+	// injectable clock and an apply path stamped by a leader, so a writer can
+	// judge the stored copy live at the very moment a reader judges it expired,
+	// and no test here can rule that skew out. dropExpiredLocked re-reads the
+	// entry under the lock for exactly that reason; this guard only keeps the
+	// common case from reaching it.
+	//
+	// The clock is read ONLY when the stored copy actually carries an expiry, so
+	// the ordinary no-TTL write pays nothing for it.
+	if storedExp != 0 && isExpired(storedExp, s.now()) {
+		return nil, 0, false // (6) the stored copy is already dead
+	}
+	return p, off, true
+}
+
 // putAtExpLocked is the shared write body: it takes the already-resolved
 // absolute expiry (exp) and performs the page write + index upsert. putH,
 // putAtH, and putAbsH differ ONLY in how they derive exp — the storage path is
@@ -881,6 +1116,36 @@ func (s *shard) putAtExpLocked(key, value []byte, exp uint64, h uint64) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// SAME-SIZE UPDATE. When this shard is eligible and the new entry would be
+	// framed byte-identically to the copy already stored for the key, overwrite
+	// that copy where it lies. Nothing else changes: the index slot still names
+	// the same page, offset and generation, so there is no upsert, no page
+	// allocation, no eviction — and, the point of the exercise, no dead previous
+	// version left behind. Any refusal falls through to the append path below,
+	// which is unchanged.
+	if s.inPlaceEligible() {
+		if p, off, ok := s.inPlaceTargetLocked(key, value, h); ok {
+			// Stamp the next sequence exactly as the append path does — one per
+			// STORED write — but only commit it once the bytes are down, so a
+			// refused overwrite leaves the shard's sequence untouched.
+			seq := s.writeSeq + 1
+			// The version bump brackets the payload stores so a lock-free reader can
+			// tell that it saw them half-done. It is a no-op on a shard whose readers
+			// take the read lock instead, which the write lock already excludes.
+			werr := s.bumpVersionLocked(p, off, func() error {
+				return p.WriteAt(off, key, value, exp, makeMeta(seq, false))
+			})
+			if werr == nil {
+				s.writeSeq = seq
+				s.inPlaceUpdates.Add(1)
+				// NO fireOnRemove: nothing was removed. The key is still live, at the
+				// same address, and the hook reports REMOVALS — firing it here would
+				// drop a live key's postings from every derived index.
+				return nil
+			}
+		}
+	}
 
 	// Find a page with enough tail room; lazily allocate or evict as needed.
 	pageIdx, err := s.findOrMakePageLocked(entrySize(len(key), len(value)))
@@ -1082,6 +1347,9 @@ func (s *shard) snapshot() Stats {
 		Evictions:        s.evictions.Load(),
 		EvictionsLive:    s.evictionsLive.Load(),
 		Rejects:          s.rejects.Load(),
+		InPlaceUpdates:   s.inPlaceUpdates.Load(),
+		SeqlockRetries:   s.seqlockRetries.Load(),
+		SeqlockFallbacks: s.seqlockFallbacks.Load(),
 		PagesAllocated:   s.pagesAlloc.Load(),
 		BytesAllocated:   uint64(s.numPages()) * uint64(s.cfg.PageSize), //nolint:gosec // numPages and PageSize are always non-negative
 		BytesUsed:        s.bytesUsed(),
@@ -1419,12 +1687,26 @@ func (s *shard) maxEntryBytes() int {
 	return s.cfg.PageSize
 }
 
+// freshHeapPageLocked allocates a heap page carrying the generation and, when
+// the shard reads through the seqlock, the version counters its readers will
+// validate against. EVERY heap page reaches its shard through here — the initial
+// allocation and both retirement paths — so a page cannot be published to a
+// reader missing the state that protocol needs. Must hold mu for writing (or run
+// during construction, before the shard is shared).
+func (s *shard) freshHeapPageLocked() *page {
+	p := newHeapPage(s.cfg.PageSize)
+	p.gen = s.nextGen()
+	if s.seqlockReads() {
+		p.enableVersions()
+	}
+	return p
+}
+
 // allocHeapPageLocked appends a fresh heap-backed page and returns its index.
 // Must be called with s.mu held for writing (or from the constructor before
 // the shard is shared).
 func (s *shard) allocHeapPageLocked() int {
-	p := newHeapPage(s.cfg.PageSize)
-	p.gen = s.nextGen()
+	p := s.freshHeapPageLocked()
 	idx := len(s.pages)
 	s.pages = append(s.pages, p)
 	s.pageSlots[idx].Store(p) // publish for the lock-free read path
@@ -1620,8 +1902,7 @@ func (s *shard) retirePageLocked(idx int) {
 		s.evictions.Add(1)
 		cursor += entrySize(len(key), len(value))
 	}
-	fresh := newHeapPage(s.cfg.PageSize)
-	fresh.gen = s.nextGen()
+	fresh := s.freshHeapPageLocked()
 	s.pages[idx] = fresh
 	s.pageSlots[idx].Store(fresh) // publish so readers resolve the new generation
 }
@@ -1985,8 +2266,7 @@ func (s *shard) tryRetireExpiredPageLocked(idx int, stamp uint64) {
 		// copy of its key — dead duplicates never reach the slice.
 		s.fireOnRemoveAt(p, es.off)
 	}
-	fresh := newHeapPage(s.cfg.PageSize)
-	fresh.gen = s.nextGen()
+	fresh := s.freshHeapPageLocked()
 	s.pages[idx] = fresh
 	s.pageSlots[idx].Store(fresh) // publish so readers resolve the new generation
 }
