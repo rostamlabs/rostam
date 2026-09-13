@@ -187,8 +187,14 @@ const relocateMaxBytesPerEvictionDivisor = 2
 // eviction. need is the triggering write's byte requirement, reserved before anything
 // is relocated.
 //
+// Returns what it moved, for the CALLER to account: the write path charges it to
+// Stats.EvictionRelocations, and the background free-page reserve
+// (cache/relocate_reserve.go), which runs this same pass for the page it has just
+// retired, charges it to Stats.Reserve* instead. Keeping the counting outside is what
+// makes "who paid for this copy" answerable at all.
+//
 // Ringbuf only, and only under Config.RelocatingEviction. Must hold mu for writing.
-func (s *shard) relocateIntoFreedPageLocked(freedIdx, need int) {
+func (s *shard) relocateIntoFreedPageLocked(freedIdx, need int) (uint64, uint64) {
 	dst := s.pages[freedIdx]
 	// Room left AFTER the triggering write. The write that summoned this eviction is
 	// served out of exactly this page, so its requirement comes off the top before any
@@ -198,7 +204,7 @@ func (s *shard) relocateIntoFreedPageLocked(freedIdx, need int) {
 		budget = maxBytes
 	}
 	if budget <= 0 {
-		return
+		return 0, 0
 	}
 	// The page the NEXT eviction will select, which is what makes every record moved
 	// below one that was about to be dropped anyway. Skipping the freed page is what
@@ -206,7 +212,7 @@ func (s *shard) relocateIntoFreedPageLocked(freedIdx, need int) {
 	// equality is load-bearing and what breaks if the two callers ever drift.
 	src := s.nextNonEmptyPageLocked(freedIdx)
 	if src < 0 {
-		return
+		return 0, 0
 	}
 	p := s.pages[src]
 	entries := p.entries()
@@ -283,12 +289,32 @@ func (s *shard) relocateIntoFreedPageLocked(freedIdx, need int) {
 		moved++
 		cursor += size
 	}
+	// Charged to the SOURCE page, for the reserve pass's per-page spend cap: these are
+	// bytes of room spent carrying records off that page, and the reserve's accounting
+	// must see them whichever pass spent them (see page.relocatedOut).
+	p.relocatedOut += int(movedBytes) //nolint:gosec // bounded by budget ≤ PageSize
+	return moved, movedBytes
+}
+
+// noteEvictRelocation records a relocation charged to the WRITE path.
+//
+// Bytes BEFORE the count: snapshot() loads them in the opposite order, so a scrape
+// landing between these two can only see bytes that run ahead of the count, never the
+// impossible pair of records relocated with nothing moved.
+func (s *shard) noteEvictRelocation(moved, movedBytes uint64) {
 	if moved == 0 {
 		return
 	}
-	// Bytes BEFORE the count: snapshot() loads them in the opposite order, so a scrape
-	// landing between these two can only see bytes that run ahead of the count, never
-	// the impossible pair of records relocated with nothing moved.
 	s.evictRelocatedBytes.Add(movedBytes)
 	s.evictRelocations.Add(moved)
+}
+
+// noteReserveRelocation records a relocation charged to the SWEEPER. Same ordering
+// discipline, same reason.
+func (s *shard) noteReserveRelocation(moved, movedBytes uint64) {
+	if moved == 0 {
+		return
+	}
+	s.reserveRelocatedBytes.Add(movedBytes)
+	s.reserveRelocations.Add(moved)
 }
