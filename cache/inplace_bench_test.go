@@ -296,12 +296,12 @@ func BenchmarkInPlaceWrite(b *testing.B) {
 // it throughout — the read share and the write share move together exactly:
 //
 //	write share    fr1/fr8   fw1/fw8   fr4/fr8   fw4/fw8
-//	1.00           0.069     0.070     0.468     0.468
-//	0.50           0.073     0.073     0.466     0.467
-//	0.25           0.072     0.073     0.463     0.461
-//	0.10           0.068     0.068     0.472     0.474
-//	0.05           0.070     0.071     0.479     0.478
-//	0.01           0.108     0.110     0.501     0.504
+//	1.00           0.070     0.069     0.469     0.468
+//	0.50           0.073     0.073     0.468     0.469
+//	0.25           0.073     0.073     0.463     0.464
+//	0.10           0.069     0.069     0.475     0.475
+//	0.05           0.079     0.079     0.488     0.487
+//	0.01           0.113     0.114     0.506     0.506
 //
 // Shrinking the region hands back read protection and takes away rewrites in the
 // same proportion, at every K and at every degree of decoupling, so the region is
@@ -312,7 +312,7 @@ func BenchmarkInPlaceWrite(b *testing.B) {
 // fr(K)/hit% equals fw(K)/%inplace to three digits at every point in the table.
 //
 // The raw shares DO differ, and only one thing separates them: the miss rate. At
-// a hundredth of the span fr4 is 2.3% of gets against fw4 at 35.0% of puts — but
+// a twentieth of the span fr4 is 2.4% of gets against fw4 at 36.1% of puts — but
 // hit% there is 4.9%. f_r is the residency ratio times the hit rate, so it drops
 // below any interesting threshold only on a cache that is missing almost
 // everything it is asked for.
@@ -644,38 +644,44 @@ func (x *benchRand) next() uint64 {
 // repeats:
 //
 //	locked share   no writer   with a writer
-//	0.05           0.06        0.59
-//	0.10           0.08        0.59
-//	0.20           0.15        0.90
-//	0.30           0.25        0.74
-//	0.50           0.45        1.14
-//	0.75           0.69        1.05
+//	0.05           0.06        0.55
+//	0.10           0.09        0.60
+//	0.20           0.12        0.71
+//	0.30           0.20        0.79
+//	0.50           0.45        0.88
+//	0.75           0.76        0.78
 //
-// With no writer the cost is mildly SUBLINEAR — locking a fifth of reads costs
-// about three quarters of what scaling the all-reads figure linearly would
-// predict. Real, but small, and nowhere near enough on its own to move a
-// crossover by much.
+// With no writer the cost is SUBLINEAR — locking a fifth of reads costs about
+// three fifths of what scaling the all-reads figure linearly would predict. Real,
+// but small.
 //
 // With a writer it inverts, and far more violently: a twentieth of reads taking
-// the lock already costs three fifths of what locking every read costs, and past
-// a fifth the curve is flat inside its own noise (which is why that column is not
-// monotone — the writer shape's arms span up to 1.9x across repeats, so only its
-// ordering and its medians are claimed, not its individual points). A waiting
-// writer blocks new readers outright, so every locked read pays a queueing
-// penalty that being rare does not dilute.
+// the lock already costs more than half of what locking every read costs, and
+// from a fifth onward the curve is nearly flat (the last two rows invert, both
+// inside arms that span up to 1.8x across repeats, so only the column's ordering
+// and its medians are claimed, not its individual points). A waiting writer
+// blocks new readers outright, so every locked read pays a queueing penalty that
+// being rare does not dilute.
 //
-// The crossover against the seqlock arm therefore sits at a locked share of
-// roughly 0.02 to 0.05 in BOTH shapes, because the seqlock arm sits essentially
-// on the lock-free floor and there is very little room beneath it to trade into.
+// WHAT THE SEQLOCK LEAVES TO TRADE INTO, now that the sweep and the seqlock share
+// a write configuration and the difference between them is read-path only: 1.6%
+// with no writer, 9.4% with one. That gap is the ENTIRE budget any design which
+// locks a share of reads has to buy its way out of — and locking a twentieth of
+// them already spends several times it. The crossover against the seqlock arm is
+// therefore at a locked share of 0.019 with no writer and 0.013 with one.
 //
-// ENDPOINT REPRODUCTION. In the no-writer shape frac000 lands within about 2% of
-// ref_append and frac100 within about 2% of ref_locked, inside both arms' own
-// spread. In the writer shape frac000 matches ref_append and frac100 runs about
-// 8% UNDER ref_locked — expected rather than a failure, because ref_locked's
-// shard has in-place updates enabled and so runs the same-size eligibility probe
-// on every write, work the swept shard does not do. That shape's endpoint check
-// is therefore approximate, and the no-writer shape is the one the instrument
-// rests on.
+// ENDPOINT REPRODUCTION. With no writer frac000 lands 1.2% above ref_append and
+// frac100 2.0% under ref_locked, inside both arms' own spread. With a writer
+// frac100 lands 0.6% under ref_locked — an exact reproduction, where before the
+// two configurations were equalised the same comparison was off by 8.5%.
+//
+// The remaining cross-configuration gap is now a measurement rather than an
+// explanation: with a writer, frac000 runs 18.8% ABOVE ref_append, and since the
+// two differ only in that the swept shard enables in-place updates, that figure
+// IS the cost of running the same-size eligibility probe on every write. It is
+// much larger than it looks from the read side, which is why leaving it inside
+// the curve mattered: it inflated the apparent room beneath the seqlock and made
+// the crossover look two to three times more generous than it is.
 func BenchmarkReadLockFraction(b *testing.B) {
 	shapes := []struct {
 		name     string
