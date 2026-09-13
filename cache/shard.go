@@ -1503,9 +1503,9 @@ func (s *shard) nextNonEmptyPageLocked(skip int) int {
 // under the write lock (see drainPageLocked), because mmap page objects wrap the
 // file and cannot be swapped for a fresh allocation. Must hold mu for writing.
 //
-// `need` is the byte requirement of the write that triggered this eviction. It is
-// reserved out of the freed page before relocating eviction may spend any of it
-// (cache/relocate_evict.go); the mmap path ignores it.
+// `need` is the byte requirement of the write that triggered this eviction. Both
+// modes reserve it out of the freed page before relocating eviction may spend any
+// of what is left (cache/relocate_evict.go).
 func (s *shard) evictVictimLocked(victim, need int) error {
 	if !s.isMmap {
 		s.retirePageLocked(victim)
