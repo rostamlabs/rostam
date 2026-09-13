@@ -32,7 +32,7 @@ func (f fakeEmbedder) Embed(_ context.Context, texts []string) ([][]float32, err
 			for _, b := range []byte(t) {
 				h = (h ^ uint32(b)) * 16777619
 			}
-			h ^= uint32(j * 2654435761)
+			h ^= uint32(j) * 2654435761
 			v[j] = float32(int32(h)) / float32(math.MaxInt32)
 		}
 		normalizeVec(v)

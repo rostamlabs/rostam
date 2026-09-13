@@ -208,7 +208,7 @@ func TestMVScrollPaginationStableAcrossPartitions(t *testing.T) {
 		}
 		// Shuffle the combined seed order so core/volatile interleave across partitions.
 		for i := range seedIDs {
-			j := (i*2654435761 + 12345) % len(seedIDs)
+			j := int((uint64(i)*2654435761 + 12345) % uint64(len(seedIDs)))
 			seedIDs[i], seedIDs[j] = seedIDs[j], seedIDs[i]
 		}
 		for _, id := range seedIDs {

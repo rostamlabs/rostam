@@ -3,6 +3,7 @@
 package rostam
 
 import (
+	"math"
 	"testing"
 
 	"github.com/rostamlabs/rostam/cache"
@@ -36,7 +37,7 @@ func TestCacheGeometry(t *testing.T) {
 		name         string
 		total        int64
 		shards       int
-		wantPerShard int
+		wantPerShard int64
 		wantPageSize int
 		wantPages    int
 	}{
@@ -75,10 +76,20 @@ func TestCacheGeometry(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			perShard, pageSize, err := cacheGeometry(tc.total, tc.shards)
+			// A per-shard share that does not fit an int is unrepresentable in the
+			// cache config, so cacheGeometry owes a refusal rather than a truncation.
+			// Never taken on a 64-bit build, where every case here fits.
+			if tc.wantPerShard > int64(math.MaxInt) {
+				if err == nil {
+					t.Fatalf("cacheGeometry(%d, %d) = %d bytes per shard, want a refusal: %d does not fit an int on this platform",
+						tc.total, tc.shards, perShard, tc.wantPerShard)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("cacheGeometry(%d, %d): %v", tc.total, tc.shards, err)
 			}
-			if perShard != tc.wantPerShard {
+			if int64(perShard) != tc.wantPerShard {
 				t.Errorf("perShard = %d, want %d", perShard, tc.wantPerShard)
 			}
 			if pageSize != tc.wantPageSize {

@@ -4,6 +4,7 @@ package rostam
 
 import (
 	"fmt"
+	"math"
 	"math/bits"
 
 	"github.com/rostamlabs/rostam/cache"
@@ -126,6 +127,18 @@ func cacheGeometry(totalBytes int64, numShards int) (maxMemPerShard, pageSize in
 				"raise the budget to at least %d bytes or lower NumShards",
 			totalBytes, numShards, perShard, int64(minPagesPerShard)*ps,
 			minPagesPerShard, ps, int64(minPagesPerShard)*ps*int64(numShards))
+	}
+
+	// perShard is an int64 but the cache config field is an int, so on a 32-bit
+	// build a budget whose per-shard share exceeds MaxInt would wrap silently —
+	// 32 GiB truncates to 0, which Validate then rejects with an error naming the
+	// wrong cause. Refuse it here, where the real reason can be stated.
+	if perShard > math.MaxInt {
+		return 0, 0, fmt.Errorf(
+			"rostam: cache budget %d bytes over %d shards leaves %d bytes per shard, "+
+				"which exceeds the %d-byte maximum addressable on this platform: "+
+				"lower the budget or raise NumShards",
+			totalBytes, numShards, perShard, int64(math.MaxInt))
 	}
 
 	return int(perShard), int(ps), nil
