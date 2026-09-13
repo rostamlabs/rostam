@@ -170,6 +170,18 @@ type shard struct {
 	relocatePagesGone     atomic.Uint64 // source pages fully evacuated and marked retired
 	relocatePagesRecycled atomic.Uint64 // retired pages whose quarantine elapsed and were reset back into writable space
 
+	// relocating-EVICTION counters (cache/relocate_evict.go) — a different mechanism
+	// from the online compactor above, on the other storage mode: these count live
+	// records a heap RINGBUF shard copied forward out of a page it was about to
+	// drain. Written under s.mu on the eviction path; atomic so Stats can read them
+	// from any goroutine. Zero unless Config.RelocatingEviction is set.
+	//
+	// WRITE THEM BYTES-FIRST, COUNT-SECOND. snapshot() loads them in the opposite
+	// order, which is what keeps a concurrent scrape from ever reporting records
+	// relocated with no bytes moved. See the note in snapshot().
+	evictRelocations    atomic.Uint64 // live records copied forward instead of dropped
+	evictRelocatedBytes atomic.Uint64 // their framed byte total
+
 	// reclaimableCache holds the last-published ghost-byte snapshot (figure + the
 	// wall-clock nanos it was taken), so Stats() stays O(1) under frequent scraping: the
 	// O(entries) liveness walk (liveAndUsedBytes) runs at most once per reclaimableStatsTTL,
@@ -1029,6 +1041,15 @@ func (s *shard) snapshot() Stats {
 	// always bumped first), never underflowing the subtraction.
 	misses := s.misses.Load()
 	gets := s.gets.Load()
+	// Same discipline for the relocation pair, which the write path publishes
+	// bytes-first: load the COUNT first so a relocation in flight between the two
+	// loads can only leave bytes >= what the count implies, never the impossible
+	// pair (records relocated, zero bytes moved). Note the Evictions/EvictionsLive
+	// pair below does NOT hold to this — it is read in the order the struct lists
+	// it, against a write path that bumps evictionsLive first — so copy the
+	// gets/misses shape here, not that one.
+	relocations := s.evictRelocations.Load()
+	relocatedBytes := s.evictRelocatedBytes.Load()
 	live, tomb := s.entries()
 	return Stats{
 		Gets:             gets,
@@ -1057,6 +1078,9 @@ func (s *shard) snapshot() Stats {
 		OnlineBytesRelocated: s.relocatedBytes.Load(),
 		OnlinePagesRetired:   s.relocatePagesGone.Load(),
 		OnlinePagesRecycled:  s.relocatePagesRecycled.Load(),
+
+		EvictionRelocations:    relocations,
+		EvictionBytesRelocated: relocatedBytes,
 	}
 }
 
@@ -1425,25 +1449,52 @@ func (s *shard) evictUntilFitsLocked(need int) (int, error) {
 		}
 		// Pick the next non-empty page in rotation order and drain it fully; only
 		// emptying it (Reset) restores tail room.
-		n := len(s.pages)
-		victim := -1
-		for off := 0; off < n; off++ {
-			i := (s.nextVictim + off) % n
-			if !s.pages[i].Empty() {
-				victim = i
-				break
-			}
-		}
+		victim := s.nextNonEmptyPageLocked(-1)
 		if victim < 0 {
 			return 0, ErrCannotEvict
 		}
 		// Advance the rotation cursor past this victim so the next eviction moves
 		// on to the following page rather than re-selecting a just-refilled one.
-		s.nextVictim = (victim + 1) % n
-		if err := s.evictVictimLocked(victim); err != nil {
+		s.nextVictim = (victim + 1) % len(s.pages)
+		if err := s.evictVictimLocked(victim, need); err != nil {
 			return 0, err
 		}
 	}
+}
+
+// nextNonEmptyPageLocked returns the first non-empty page at or after the
+// rotation cursor (nextVictim), wrapping, or -1 if every page is empty — the
+// order eviction picks victims in. `skip` is one page index to pass over, or -1
+// for none: relocating eviction uses it to keep the page it has just freshened
+// out of the search. Must hold mu for writing.
+//
+// ITS TWO CALLERS MUST STAY ALIGNED, and the alignment is load-bearing rather than
+// incidental. evictUntilFitsLocked calls it with skip = -1 to CHOOSE a victim and
+// then advances nextVictim past that victim; relocating eviction calls it moments
+// later with skip = the page just freed, to choose the page to EVACUATE. Both scan
+// from the same cursor in the same order, and the freed page sorts LAST from that
+// cursor (the scan starts just past it), so the page relocation evacuates is exactly
+// the page the next eviction will select.
+//
+// That equality is the whole point of the pass. Break it — by advancing nextVictim
+// somewhere other than immediately before evictVictimLocked, by giving one caller a
+// different scan order, or by dropping the skip — and relocation copies records out
+// of a page that is NOT about to be drained: pure write amplification, and the
+// crash-consistency argument in cache/relocate_evict.go loses its premise along with
+// it, because that argument rests on every moved record being one the next drain was
+// going to delete anyway.
+func (s *shard) nextNonEmptyPageLocked(skip int) int {
+	n := len(s.pages)
+	for off := 0; off < n; off++ {
+		i := (s.nextVictim + off) % n
+		if i == skip {
+			continue
+		}
+		if !s.pages[i].Empty() {
+			return i
+		}
+	}
+	return -1
 }
 
 // evictVictimLocked frees page `victim` in full. In heap mode it retires the
@@ -1451,12 +1502,36 @@ func (s *shard) evictUntilFitsLocked(need int) (int, error) {
 // retirePageLocked). In mmap mode it drains the fixed persisted region in place
 // under the write lock (see drainPageLocked), because mmap page objects wrap the
 // file and cannot be swapped for a fresh allocation. Must hold mu for writing.
-func (s *shard) evictVictimLocked(victim int) error {
+//
+// `need` is the byte requirement of the write that triggered this eviction. Both
+// modes reserve it out of the freed page before relocating eviction may spend any
+// of what is left (cache/relocate_evict.go).
+func (s *shard) evictVictimLocked(victim, need int) error {
 	if !s.isMmap {
 		s.retirePageLocked(victim)
+		// The freed page is the only page with room at this point in an eviction, so
+		// this is where relocation gets to run at all. It evacuates the page the
+		// rotation cursor will drain NEXT — not this one, whose live records the
+		// retire walk above has already tombstoned, and which for reader-safety
+		// reasons could never have rescued its own (see cache/relocate_evict.go).
+		if s.cfg.RelocatingEviction {
+			s.relocateIntoFreedPageLocked(victim, need)
+		}
 		return nil
 	}
-	return s.drainPageLocked(victim)
+	if err := s.drainPageLocked(victim); err != nil {
+		return err
+	}
+	// Same placement, same reason, on the in-place drain: the page the walk above
+	// just emptied is the only one with room, and the records moved into it come off
+	// the page the NEXT eviction drains — so they stop being index-current before
+	// that drain reaches them. Readers are excluded here rather than raced
+	// (needsReadLockForGet), and the crash-consistency argument for appending
+	// without a sync is in cache/relocate_evict.go.
+	if s.cfg.RelocatingEviction {
+		s.relocateIntoFreedPageLocked(victim, need)
+	}
+	return nil
 }
 
 // retirePageLocked (heap ringbuf) frees page idx by dropping every index slot
