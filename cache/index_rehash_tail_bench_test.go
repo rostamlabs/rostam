@@ -51,11 +51,15 @@ import (
 // result. A tail that is the rehash shows a no-rehash p999 far below the overall one; a
 // tail that is something else shows the two the same.
 //
-// The classification is exact rather than statistical: the harness reads the shard's
-// rehash counter either side of the write, so a write is attributed to a rehash only if
-// one actually ran inside it. This is a single-writer arm, so unlike the eviction-hold
-// classification in BenchmarkRelocatingEvictionTail there is no blocked-on-someone-else
-// case to fold in.
+// THE CLASSIFICATION HERE IS EXACT, and this is the only benchmark in the package where
+// that is true, so it is where the step's own cost should be read from. The harness reads
+// the shard's rehash counter either side of the write; nothing else in the process can
+// move that counter, because the arm runs ONE writer against ONE shard with the TTL
+// sweeper off and asserts afterwards that the shard neither evicted nor refused anything —
+// and eviction and the sweeper are the only other things that tombstone. A parallel
+// harness cannot make that claim: with several writers on a shard the same counter turns
+// into an interval-overlap test, which is what BenchmarkRelocatingEvictionTail documents
+// at its own split.
 //
 // RUN IT WITH A FIXED OP COUNT, e.g. -benchtime=500000x. A p999 needs samples behind it,
 // and the shard is deliberately never allowed to evict, so the op count also sets how
@@ -79,9 +83,10 @@ import (
 // few L writes: rehash_frac measures near 1e-4 at the smallest live set and near 1e-5 at the
 // largest. The step cannot reach a quantile more common than its own rate, so there is no
 // live set at which it is BOTH frequent enough to touch a p999 and large enough to matter
-// there — make it frequent and it is small, make it large and it is rare. In every arm
-// norehash_p999_ns equals p999_ns bucket for bucket: removing every rehashing write from the
-// sample changes nothing.
+// there — make it frequent and it is small, make it large and it is rare. Removing every
+// rehashing write from the sample shows it: norehash_p999_ns comes out equal to p999_ns, or
+// at most ONE histogram bucket below it, in every arm and every repeat. One bucket here is a
+// few per cent. The hypothesis needed a thousandfold.
 //
 // AND THE SWEEP ANSWERS IT WITHOUT ANY ATTRIBUTION AT ALL, which is the cleanest form of the
 // result. p999 is FLAT across the live sets — the same couple of microseconds at four thousand
@@ -178,8 +183,14 @@ func indexRehashTailArm(b *testing.B, live int, presized bool) {
 			rehashed.add(ns)
 		}
 		// Retire the oldest key so the live set stays flat and each write leaves a
-		// tombstone behind. Outside the timed region: the delete is the workload's
-		// shape, not the thing being measured.
+		// tombstone behind: the delete is the workload's shape, not the thing being
+		// measured. It sits outside the MANUAL timing region and so contributes to no
+		// reported quantile — but it is still inside the BENCHMARK timer, so Go's own
+		// ns/op covers the put and the delete together. put_mean_ns is the mean of the
+		// timed operation; ns/op is the loop's aggregate throughput. The two are
+		// different figures, and reading ns/op against the reported quantiles — or
+		// across the grow and presized arms, whose delete costs differ — compares
+		// things that were never measuring the same thing.
 		indexRehashKey(&kbuf, uint64(i))
 		if _, err := c.Del(kbuf[:]); err != nil {
 			b.Fatalf("del %d: %v", i, err)
@@ -201,20 +212,25 @@ func indexRehashTailArm(b *testing.B, live int, presized bool) {
 	}
 
 	b.ReportMetric(float64(all.n), "samples")
-	b.ReportMetric(float64(all.quantile(0.50)), "p50_ns")
-	b.ReportMetric(float64(all.quantile(0.99)), "p99_ns")
-	b.ReportMetric(float64(all.quantile(0.999)), "p999_ns")
-	b.ReportMetric(float64(all.max), "max_ns")
+	b.ReportMetric(all.mean(), "put_mean_ns")
+	b.ReportMetric(emptyAsNaN(&all, all.quantile(0.50)), "p50_ns")
+	b.ReportMetric(emptyAsNaN(&all, all.quantile(0.99)), "p99_ns")
+	b.ReportMetric(emptyAsNaN(&all, all.quantile(0.999)), "p999_ns")
+	b.ReportMetric(emptyAsNaN(&all, all.max), "max_ns")
 	b.ReportMetric(float64(rehashes), "rehashes")
 	frac := 0.0
 	if all.n > 0 {
 		frac = float64(rehashed.n) / float64(all.n)
 	}
 	b.ReportMetric(frac, "rehash_frac")
-	b.ReportMetric(float64(rehashed.quantile(0.50)), "rehash_p50_ns")
-	b.ReportMetric(float64(rehashed.max), "rehash_max_ns")
-	b.ReportMetric(float64(clean.quantile(0.999)), "norehash_p999_ns")
-	b.ReportMetric(float64(clean.max), "norehash_max_ns")
+	// The rehash columns are NaN, not 0, when no rehash fired — which is the whole point
+	// of the presized arm. A quantile or max over an empty sample is zero, and a zero in
+	// a latency column reads as a rehash that took no time rather than as a rehash that
+	// never happened. Those are opposite findings.
+	b.ReportMetric(emptyAsNaN(&rehashed, rehashed.quantile(0.50)), "rehash_p50_ns")
+	b.ReportMetric(emptyAsNaN(&rehashed, rehashed.max), "rehash_max_ns")
+	b.ReportMetric(emptyAsNaN(&clean, clean.quantile(0.999)), "norehash_p999_ns")
+	b.ReportMetric(emptyAsNaN(&clean, clean.max), "norehash_max_ns")
 }
 
 // newIndexRehashShard builds a single-shard heap cache that can hold `entries` entries

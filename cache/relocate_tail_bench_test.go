@@ -4,6 +4,7 @@ package cache
 
 import (
 	"fmt"
+	"math"
 	"math/bits"
 	"math/rand"
 	"sync"
@@ -57,12 +58,17 @@ import (
 //
 // IT IS NOT THE INDEX REHASH, which this comment used to name as the leading suspect and
 // which is now measured rather than guessed. The clean class is split a second time on
-// whether the write performed a table rehash, and clean_norehash_p999_ns comes out EQUAL
-// to clean_p999_ns, bucket for bucket, in every arm: take every rehashing write out of the
-// class and its p999 does not move. The reason is FREQUENCY, not size. A rehash is genuinely
+// whether a rehash OVERLAPPED the write (see the split itself for why overlap, not
+// authorship, is what a shard-global counter can honestly report here), and
+// clean_norehashoverlap_p999_ns comes out EQUAL to clean_p999_ns, bucket for bucket, in
+// every arm. The no-overlap class provably contains no write that rehashed — a write that
+// rehashed incremented the counter itself and so cannot land outside the overlap class —
+// so that equality says a class with every rehash removed has the same p999 as the class
+// with them left in. The reason is FREQUENCY, not size. A rehash is genuinely
 // expensive and it owns the max — but the threshold is met only once per live-set's worth of
-// accumulated tombstones, so clean_rehash_frac lands around 1e-5 or below — orders of
-// magnitude too rare to reach a p999 at all. In the relocating arms it is 0 for whole runs, because relocation repoints
+// accumulated tombstones, so clean_rehashoverlap_frac lands around 1e-5 or below — orders
+// of magnitude too rare to reach a p999 at all, and that figure is an OVER-count, so the
+// true rate is lower still. In the relocating arms it is 0 for whole runs, because relocation repoints
 // a surviving entry's slot in place (see relocateIntoFreedPageLocked) and leaves no tombstone
 // behind, so those arms rehash barely at all — and their clean p999 is the same as the arm
 // that rehashes. BenchmarkIndexRehashTail drives the step directly, sweeps the live set it
@@ -183,10 +189,10 @@ func relocTailArms(b *testing.B, shards int) {
 		}
 
 		var (
-			mu                         sync.Mutex
-			clean, held                latHist
-			cleanRehash, cleanNoRehash latHist
-			workers                    int64
+			mu                           sync.Mutex
+			clean, held                  latHist
+			cleanOverlap, cleanNoOverlap latHist
+			workers                      int64
 		)
 		b.Run("reloc="+arm.name, func(b *testing.B) {
 			b.ReportAllocs()
@@ -198,7 +204,7 @@ func relocTailArms(b *testing.B, shards int) {
 				mu.Unlock()
 				rng := rand.New(rand.NewSource(seed))                       //nolint:gosec // benchmark RNG
 				z := rand.NewZipf(rng, relocABZipfS, 1, uint64(keyspace-1)) //nolint:gosec // keyspace > 1
-				var myClean, myHeld, myCleanRehash, myCleanNoRehash latHist
+				var myClean, myHeld, myOverlap, myNoOverlap latHist
 				for pb.Next() {
 					k := keys[z.Uint64()]
 					_, s := c.shardForH(k)
@@ -214,18 +220,43 @@ func relocTailArms(b *testing.B, shards int) {
 					// Clean writes split again on the index rehash, the step the clean
 					// class's own tail was once suspected of being. Both loads sit
 					// outside the timed region, exactly as the eviction pair does.
+					//
+					// THIS IS AN OVERLAP TEST, NOT PER-WRITE ATTRIBUTION, and the
+					// distinction is not pedantic. The counter is shard-global and
+					// several writers share a shard here, so a write lands in the
+					// overlap class whenever ANY writer rehashed inside its window —
+					// including a write that merely waited on s.mu behind the one that
+					// did. That is the same deliberate breadth as the eviction
+					// classification above, adopted for the same reason: a write that
+					// queued behind a rehash paid for it just as surely as the write
+					// that performed it. The single-writer arms in
+					// index_rehash_tail_bench_test.go are where attribution IS exact,
+					// because there is no second writer to fold in.
+					//
+					// WHAT MAKES THE BROAD CLASSIFIER STILL LOAD-BEARING is which way it
+					// errs. A write that actually performed a rehash incremented the
+					// counter itself, between its own two loads, so it CANNOT be missed:
+					// the overlap class is a strict superset of the writes that rehashed,
+					// and the no-overlap class therefore contains none of them at all.
+					// So clean_norehashoverlap_p999_ns is the p999 of a class provably
+					// free of rehashes, and clean_rehashoverlap_frac is an UPPER bound on
+					// how often one occurs. Both are the conservative direction for the
+					// question being asked. What the breadth does spoil is
+					// clean_rehashoverlap_max_ns, which may be a blocked write rather
+					// than a rehashing one — read the step's own cost off the exact
+					// single-writer arm, never off this column.
 					myClean.add(ns)
 					if s.indexRehashes.Load() == beforeRehash {
-						myCleanNoRehash.add(ns)
+						myNoOverlap.add(ns)
 					} else {
-						myCleanRehash.add(ns)
+						myOverlap.add(ns)
 					}
 				}
 				mu.Lock()
 				clean.merge(&myClean)
 				held.merge(&myHeld)
-				cleanRehash.merge(&myCleanRehash)
-				cleanNoRehash.merge(&myCleanNoRehash)
+				cleanOverlap.merge(&myOverlap)
+				cleanNoOverlap.merge(&myNoOverlap)
 				mu.Unlock()
 			})
 			b.StopTimer()
@@ -245,13 +276,13 @@ func relocTailArms(b *testing.B, shards int) {
 			b.ReportMetric(frac, "held_frac")
 			b.ReportMetric(float64(clean.quantile(0.999)), "clean_p999_ns")
 			b.ReportMetric(float64(held.quantile(0.999)), "held_p999_ns")
-			rehashFrac := 0.0
+			overlapFrac := 0.0
 			if clean.n > 0 {
-				rehashFrac = float64(cleanRehash.n) / float64(clean.n)
+				overlapFrac = float64(cleanOverlap.n) / float64(clean.n)
 			}
-			b.ReportMetric(rehashFrac, "clean_rehash_frac")
-			b.ReportMetric(float64(cleanNoRehash.quantile(0.999)), "clean_norehash_p999_ns")
-			b.ReportMetric(float64(cleanRehash.max), "clean_rehash_max_ns")
+			b.ReportMetric(overlapFrac, "clean_rehashoverlap_frac")
+			b.ReportMetric(emptyAsNaN(&cleanNoOverlap, cleanNoOverlap.quantile(0.999)), "clean_norehashoverlap_p999_ns")
+			b.ReportMetric(emptyAsNaN(&cleanOverlap, cleanOverlap.max), "clean_rehashoverlap_max_ns")
 		})
 		_ = c.Close()
 	}
@@ -310,11 +341,18 @@ type latHist struct {
 	b   [latBuckets]uint64
 	n   uint64
 	max uint64
+	// sum is the exact total of every sample, kept alongside the bucketed counts so a
+	// harness can report the mean of the operation it actually timed. Go's own ns/op
+	// covers everything between ResetTimer and StopTimer — in these harnesses that
+	// includes the workload shaping around the timed call — so it is NOT the same
+	// figure as the reported quantiles and must not be read against them.
+	sum uint64
 }
 
 func (h *latHist) add(ns uint64) {
 	h.b[latIndex(ns)]++
 	h.n++
+	h.sum += ns
 	if ns > h.max {
 		h.max = ns
 	}
@@ -325,9 +363,30 @@ func (h *latHist) merge(o *latHist) {
 		h.b[i] += o.b[i]
 	}
 	h.n += o.n
+	h.sum += o.sum
 	if o.max > h.max {
 		h.max = o.max
 	}
+}
+
+// mean returns the average of the timed samples, or NaN when there are none. NaN
+// rather than zero: an empty histogram must not be reportable as a zero latency.
+func (h *latHist) mean() float64 {
+	if h.n == 0 {
+		return math.NaN()
+	}
+	return float64(h.sum) / float64(h.n)
+}
+
+// emptyAsNaN converts a statistic drawn from a possibly-empty histogram into a value
+// that cannot be mistaken for a measurement. A quantile or max over zero samples is
+// zero, which reads in a benchmark table as a zero-nanosecond operation; NaN reads as
+// what it is.
+func emptyAsNaN(h *latHist, v uint64) float64 {
+	if h.n == 0 {
+		return math.NaN()
+	}
+	return float64(v)
 }
 
 // quantile returns the lower bound of the bucket holding the q-th value, or 0 when the
