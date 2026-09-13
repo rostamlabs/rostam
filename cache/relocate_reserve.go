@@ -2,6 +2,8 @@
 
 package cache
 
+import "time"
+
 // The FREE-PAGE RESERVE — relocating eviction paid for by the sweeper, not by a write.
 //
 // ==========================================================================
@@ -192,7 +194,55 @@ const (
 	// Examining an entry is a decode plus one index probe, roughly what sweepIndex does
 	// per slot, so it is bounded like sweepBatchSize rather than like a copy.
 	relocateChunkScanEntries = 512
+
+	// defaultRelocateReserveIntervalMs is DefaultConfig's Config.RelocateReserveIntervalMs
+	// — the cadence at which the reserve was measured to earn more than it costs
+	// (cache/relocate_sharded_bench_test.go, whose doc has the numbers). It is inert
+	// unless RelocatingEviction is also set, which is off by default, so this is the
+	// cadence an opt-in gets rather than a cost every cache pays.
+	//
+	// The two directions it is wrong in are not symmetric, which is why it sits where it
+	// does. Faster and the per-shard ticker cost overtakes the copying it moves — a
+	// millisecond tick across sixty-four shards was more than twice the cost of no ticker
+	// at all, before relocation was even enabled. Slower and the reserve cannot keep a
+	// page in hand against the write stream: it is not harmful, it simply does nothing,
+	// and the write path takes every eviction exactly as it does with the reserve off.
+	defaultRelocateReserveIntervalMs = 50
 )
+
+// startReserveSweeper starts the per-shard free-page reserve ticker, which is SEPARATE
+// from the TTL sweeper's (startSweeper) and calls only topUpFreeReserve — never
+// sweepIndex. The two jobs want different cadences by an order of magnitude or more, and
+// sharing one ticker forced whichever ran on the other's setting; Config.
+// RelocateReserveIntervalMs has the argument in full.
+//
+// Runs only when that interval is non-zero AND this shard is one the reserve applies to,
+// so a shard that could never use it does not carry a goroutine and a timer for nothing.
+// With no ticker the layer degrades to the write-path pass alone, which is its fallback
+// in every case anyway.
+func (s *shard) startReserveSweeper() {
+	if s.cfg.RelocateReserveIntervalMs > 0 && s.reserveRelocationEligible() {
+		s.sweepWG.Add(1)
+		go s.runReserveSweeper()
+	}
+}
+
+// runReserveSweeper tops the free-page reserve up on a fixed cadence. It shares
+// stopSweeper and sweepWG with the TTL sweeper, so shard.Close drains both with the one
+// close-and-wait it already performs.
+func (s *shard) runReserveSweeper() {
+	defer s.sweepWG.Done()
+	ticker := time.NewTicker(time.Duration(s.cfg.RelocateReserveIntervalMs) * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stopSweeper:
+			return
+		case <-ticker.C:
+			s.topUpFreeReserve()
+		}
+	}
+}
 
 // topUpFreeReserve is the sweeper's half of relocating eviction. Called from
 // sweepOnce's non-replicated branch. It takes and releases s.mu itself, many times;

@@ -39,34 +39,38 @@ import (
 // what the swept control rows are for, and it is why every arm is run at both cadences.
 //
 // ==========================================================================
-// WHAT THIS MEASURED, so the next person does not have to rediscover it. The reserve does
-// take the copying off the write path, and what that is worth depends on the shard count
-// and on the cadence, in that order:
+// WHAT THIS MEASURED, so the next person does not have to rediscover it. Every figure
+// below is the `background` row — the reserve on its OWN ticker at its shipped default
+// interval, with the TTL sweeper off — against `sync`, medians of five attempts.
 //
-//   - At the SLOW cadence and a moderate shard count the reserve wins, modestly. Eight
-//     shards: background-slow is a few per cent faster per write than sync with its
-//     distribution barely overlapping sync's, at equal or better retention, with about a
-//     third of the relocation moved off the write path.
-//   - At the SLOW cadence and a high shard count the two become indistinguishable. Sixty-
-//     four shards: background-slow's median sits below sync's, but sync's spread is wide
-//     enough to swallow the gap — and this is where the reserve moves the MOST work (about
-//     two thirds), because each shard sees a smaller share of the write stream and its
-//     sweeper keeps up easily. Moving more of the copying did not make the writes faster,
-//     which says the sweeper's copy is not cheaper per byte than the write path's: it pays
-//     for extra lock acquisitions and the re-validation after each one.
-//   - At the FAST cadence the reserve loses badly, and the swept control shows most of that
-//     is not the reserve at all: at sixty-four shards a sweeper ticking every millisecond
-//     costs over twice the no-sweeper arm before relocation is enabled. At EIGHT shards
-//     background-fast is over three times sync. At sixty-four it was ABANDONED rather than
-//     measured: it had not finished a single attempt after more than an hour of wall clock,
-//     which is a number of a kind — the arm is not slow, it is unusable — and the swept-fast
-//     row at the same shard count already prices where that comes from.
+//   - EIGHT shards: the reserve wins, modestly and repeatably. Around eight per cent
+//     faster per write, at better retention rather than at retention's expense, with
+//     roughly a third of the relocation moved off the write path.
+//   - SIXTY-FOUR shards: per-write time is a WASH — the two medians land within a per
+//     cent of each other, well inside the spread. Retention is not a wash: the reserve
+//     holds five to seven points more of the key population at every attempt, and it
+//     takes about HALF the write-path copying rather than a third, because each shard
+//     sees a smaller share of the write stream and its ticker keeps up more easily.
+//     Moving more of the copying did not make the writes faster, which says the
+//     sweeper's copy is not cheaper per byte than the write path's: it pays for extra
+//     lock acquisitions and the re-validation after each one.
 //
-// THE CADENCE THAT WINS IS NOT THE ONE ANYTHING RUNS AT. Both slow rows above use
-// relocABSweepSlowMs; TTLSweepIntervalMs defaults to 1s, roughly twenty times slower, at
-// which the reserve takes a fraction of a per cent of the copying and is effectively
-// inert. The reserve has no cadence of its own — it rides the TTL sweeper's ticker — and
-// that coupling, not the reserve's mechanism, is what bounds what this layer can do.
+// So the honest summary is a single-digit latency win at moderate shard counts, a wash at
+// high ones, and a real retention gain at both. It is not a large result.
+//
+// THE FAST ROWS ARE THE COUNTER-EXAMPLE, and they are kept because they are why the
+// reserve has its own interval at all. When it rode the TTL sweeper's ticker, the cadence
+// it needed dragged sweepIndex along at the same rate: at sixty-four shards a
+// millisecond tick cost over TWICE the no-ticker arm before relocation was even enabled
+// (that is the swept-fast row, not the background one), and at eight shards the
+// background arm came out over three times sync. At sixty-four shards background-fast was
+// ABANDONED rather than measured — it had not finished one attempt after more than an
+// hour of wall clock, which is a number of a kind: the arm is not slow, it is unusable.
+//
+// READING THE COLUMNS ACROSS ATTEMPTS. The cache is warmed once per arm and shared by the
+// attempts, so it keeps evolving: hit_rate climbs monotonically down a run in BOTH arms.
+// Compare like-for-like attempt indices, or medians across the same number of attempts —
+// never the first attempt of one arm against the last of another.
 func BenchmarkRelocatingEvictionABSharded(b *testing.B) {
 	for _, shards := range relocABShardCounts {
 		b.Run(fmt.Sprintf("shards=%d", shards), func(b *testing.B) {
@@ -95,18 +99,7 @@ func relocABShardedArms(b *testing.B, shards int) {
 		val[i] = byte(i)
 	}
 
-	for _, arm := range []struct {
-		name    string
-		on      bool
-		sweepMs int
-	}{
-		{"off", false, 0},
-		{"swept-fast", false, relocABSweepMs},
-		{"swept-slow", false, relocABSweepSlowMs},
-		{"sync", true, 0},
-		{"background-fast", true, relocABSweepMs},
-		{"background-slow", true, relocABSweepSlowMs},
-	} {
+	for _, arm := range relocABArmList() {
 		// The cache is built and warmed OUTSIDE b.Run, and that is not a tidiness choice.
 		// Go calls a benchmark body repeatedly with a growing b.N until it fills the time
 		// budget, so a warm-up written inside the body runs once per attempt — and this
@@ -121,7 +114,8 @@ func relocABShardedArms(b *testing.B, shards int) {
 		cfg.MaxMemoryPerShard = relocABPages << 20
 		cfg.InitialPagesPerShard = 0
 		cfg.AtCapPolicy = PolicyRingbufEvict
-		cfg.TTLSweepIntervalMs = arm.sweepMs
+		cfg.TTLSweepIntervalMs = arm.ttlMs
+		cfg.RelocateReserveIntervalMs = arm.reserveMs
 		cfg.RelocatingEviction = arm.on
 		c, err := New(cfg)
 		if err != nil {
@@ -183,6 +177,30 @@ func relocABShardedFill(c *Cache, keys [][]byte, val []byte, total int) {
 		}(relocABSeed + int64(w))
 	}
 	wg.Wait()
+}
+
+// relocABArm is one row of the A/B: a relocation setting and the two INDEPENDENT ticker
+// intervals, which is what the arm table looked like once the reserve stopped riding the
+// TTL sweeper's interval. Zero for either means that ticker does not run.
+type relocABArm struct {
+	name      string
+	on        bool
+	ttlMs     int
+	reserveMs int
+}
+
+// relocABArmList is the arm table both harnesses run, so a sharded row and a single-shard
+// row are the same configuration measured in two regimes. See relocABArms for what each
+// arm is for and why the controls are not optional.
+func relocABArmList() []relocABArm {
+	return []relocABArm{
+		{name: "off"},
+		{name: "swept-fast", ttlMs: relocABSweepMs},
+		{name: "swept-default", ttlMs: defaultRelocateReserveIntervalMs},
+		{name: "sync", on: true},
+		{name: "background-fast", on: true, reserveMs: relocABSweepMs},
+		{name: "background", on: true, reserveMs: defaultRelocateReserveIntervalMs},
+	}
 }
 
 // relocABReport emits the A/B columns. Shared by both harnesses so a sharded row and a

@@ -530,6 +530,10 @@ func (s *shard) startSweeper() {
 		s.sweepWG.Add(1)
 		go s.runSweeper()
 	}
+	// The free-page reserve keeps its own ticker on its own interval, started here so
+	// both background passes have one launch site and one shutdown (Close closes
+	// stopSweeper and waits on sweepWG, which covers both).
+	s.startReserveSweeper()
 }
 
 func (s *shard) numPages() int {
@@ -1745,12 +1749,11 @@ func (s *shard) sweepOnce() {
 		return
 	}
 	s.sweepIndex(s.now())
-	// Then top the free-page reserve up, so a write on a shard at its page cap finds
-	// room instead of evicting and relocating inline (cache/relocate_reserve.go). A
-	// no-op on every shard that has not opted into Config.RelocatingEviction, and on
-	// mmap ones that have. It takes and releases the write lock per CHUNK, never for a
-	// whole page, so it cannot stall the write path for an unbounded pass.
-	s.topUpFreeReserve()
+	// The free-page reserve is NOT run from here. It used to be, and the two jobs want
+	// cadences an order of magnitude apart: this pass walks the whole index and wants to
+	// run rarely, the reserve walks one page and earns nothing unless it runs often. One
+	// ticker forced whichever ran on the other's setting. It has its own now — see
+	// Config.RelocateReserveIntervalMs and runReserveSweeper.
 }
 
 // pageCapacityBytes is the total ENTRY capacity of the shard's pages: the bytes

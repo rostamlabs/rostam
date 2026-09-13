@@ -36,6 +36,10 @@ func relocConfig(pages int, on bool) Config {
 	cfg.InitialPagesPerShard = 0
 	cfg.AtCapPolicy = PolicyRingbufEvict
 	cfg.TTLSweepIntervalMs = 0
+	// Both background tickers off: every test on this config drives the passes by hand,
+	// so a tick landing mid-assertion could only make them flaky. DefaultConfig sets a
+	// reserve interval, so this has to be explicit.
+	cfg.RelocateReserveIntervalMs = 0
 	cfg.RelocatingEviction = on
 	return cfg
 }
@@ -714,28 +718,30 @@ func BenchmarkRelocatingEvictionAB(b *testing.B) {
 // FOUR arms on heap and two on mmap, because the background reserve is heap-only (see the
 // HEAP RINGBUF ONLY note in cache/relocate_reserve.go):
 //
-//	off              neither pass, no sweeper — positional eviction on its own
-//	swept-fast       no relocation, sweeper ticking at relocABSweepMs
-//	swept-slow       no relocation, sweeper ticking at relocABSweepSlowMs
-//	sync             relocation on the write path, sweeper off — #127 as it stands
-//	background-fast  relocation plus the reserve, sweeper at relocABSweepMs
-//	background-slow  relocation plus the reserve, sweeper at relocABSweepSlowMs
+//	off              neither pass, no ticker — positional eviction on its own
+//	swept-fast       TTL sweeper ticking at relocABSweepMs, no relocation
+//	swept-default    TTL sweeper ticking at the reserve's default interval, no relocation
+//	sync             relocation on the write path, no ticker — #127 as it stands
+//	background-fast  relocation plus the reserve, reserve ticker at relocABSweepMs
+//	background       relocation plus the reserve at its SHIPPED default interval — the row
+//	                 to judge the layer by
 //
-// THE SWEPT ROWS ARE CONTROLS AND ARE NOT OPTIONAL, because without them a background row
-// is unreadable. A ticking sweeper also runs sweepIndex, which takes the shard WRITE lock
-// for sweepBatchSize slots at a time and decodes every live entry it passes, once per tick
-// per shard — a cost with nothing to do with relocation that nonetheless scales with both
-// the cadence and the shard count. off -> swept prices it, so sync -> background can be
-// read net of it.
+// THE SWEPT ROWS ARE CONTROLS AND ARE NOT OPTIONAL. They tick the TTL sweeper, whose
+// sweepIndex takes the shard WRITE lock for sweepBatchSize slots at a time and decodes
+// every live entry it passes, once per tick per shard — a cost with nothing to do with
+// relocation that scales with both the cadence and the shard count. off -> swept prices a
+// ticker at that cadence, which is what made the first cut of this measurement readable:
+// it is how "the background arm is slow" became "a millisecond per-shard tick is slow".
 //
-// TWO CADENCES, because one number hides the whole trade. The sweeper can only take
-// relocation off the write path by running often, and running often is itself what it
-// costs; a single row cannot show a curve. Each background row has the swept row at its
-// own cadence to be read against.
+// THE TWO TICKERS ARE SEPARATE SETTINGS, which they were not when this benchmark was
+// first written. A background row now runs the reserve's ticker with the TTL sweeper OFF,
+// so the row prices the reserve and nothing else; that separation is the whole point of
+// Config.RelocateReserveIntervalMs and the reason the fast rows are kept — they are what
+// it cost when the reserve had to ride the TTL sweeper's interval.
 //
-// A background row is relocation with the sweeper running, which installs the free-page
-// reserve AND keeps the write-path pass as its fallback — the configuration the feature
-// ships as — so reloc/op falling while bg_reloc/op rises is the claim, in two columns.
+// A background row still keeps the write-path pass as its fallback, which is the
+// configuration the feature ships as, so reloc/op falling while bg_reloc/op rises is the
+// claim, in two columns.
 //
 // READ THE BACKGROUND ARM'S ns/op WITH THE HARNESS IN MIND, because this harness is the
 // worst case for that arm and the figure is not a prediction about a server. There is ONE
@@ -757,26 +763,12 @@ func relocABArms(b *testing.B, mmap bool) {
 		val[i] = byte(i)
 	}
 
-	arms := []struct {
-		name    string
-		on      bool
-		sweepMs int
-	}{
-		{"off", false, 0},
-		{"swept-fast", false, relocABSweepMs},
-		{"swept-slow", false, relocABSweepSlowMs},
-		{"sync", true, 0},
-		{"background-fast", true, relocABSweepMs},
-		{"background-slow", true, relocABSweepSlowMs},
-	}
+	arms := relocABArmList()
 	if mmap {
-		// The reserve is heap-only, and so is the control that exists to price it against;
-		// on mmap the pair that remains is the one #127 is about.
-		arms = []struct {
-			name    string
-			on      bool
-			sweepMs int
-		}{{"off", false, 0}, {"sync", true, 0}}
+		// The reserve is heap-only, and so are the controls that exist to price it
+		// against; on mmap the pair that remains is the one #127 is about.
+		arms = arms[:1:1]
+		arms = append(arms, relocABArm{name: "sync", on: true})
 	}
 	for _, arm := range arms {
 		b.Run("reloc="+arm.name, func(b *testing.B) {
@@ -786,7 +778,8 @@ func relocABArms(b *testing.B, mmap bool) {
 			cfg.MaxMemoryPerShard = relocABPages << 20
 			cfg.InitialPagesPerShard = 0
 			cfg.AtCapPolicy = PolicyRingbufEvict
-			cfg.TTLSweepIntervalMs = arm.sweepMs
+			cfg.TTLSweepIntervalMs = arm.ttlMs
+			cfg.RelocateReserveIntervalMs = arm.reserveMs
 			cfg.RelocatingEviction = arm.on
 			dir := ""
 			if mmap {
@@ -838,14 +831,13 @@ const (
 	relocABZipfS    = 1.3
 	relocABSeed     = 0x5EED
 	relocABWarmOps  = 400_000
-	// The two sweeper cadences the arms are run at. relocABSweepMs is the tightest the
-	// ticker will take — the sweeper's best chance of keeping up with a loop writing as
-	// fast as it can, and also its most expensive setting. relocABSweepSlowMs is a
-	// cadence at which the sweeper's own cost is small enough to disappear into the
-	// noise, and it takes correspondingly less of the copying. Neither is the shipped
-	// default (TTLSweepIntervalMs, 1s); they bracket the trade rather than predict it.
-	relocABSweepMs     = 1
-	relocABSweepSlowMs = 50
+	// relocABSweepMs is the tightest cadence a ticker will take: a background pass's best
+	// chance of keeping up with a loop writing as fast as it can, and also its most
+	// expensive setting. The rows that use it are kept as the counter-example — they are
+	// what the reserve cost when it had to ride the TTL sweeper's interval. The other
+	// cadence in the table is defaultRelocateReserveIntervalMs itself, so the headline row
+	// is the shipped configuration rather than a benchmark-only tuning.
+	relocABSweepMs = 1
 )
 
 // pageObjects snapshots the shard's page object identities. A heap eviction RETIRES
