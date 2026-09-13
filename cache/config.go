@@ -281,6 +281,43 @@ type Config struct {
 	// everywhere else.
 	ServerWriteTimeout time.Duration
 
+	// InPlaceSameSizeUpdate lets a write OVERWRITE the entry already stored for its
+	// key instead of appending a new copy after it, when the two are framed
+	// identically — same key, same value LENGTH. Default false.
+	//
+	// WHAT IT BUYS. Every update appends today, so the previous copy stays framed
+	// and dead in the pages. Under PolicyRingbufEvict those dead versions are what
+	// carry a shard to capacity and start it evicting LIVE keys, so a workload that
+	// rewrites the same keys at a roughly constant record size spends its budget on
+	// garbage it never had to create. An entry is [header][key][value] with a
+	// fixed-width header, so for the same key and an identical value length the new
+	// bytes fit exactly where the old ones are — and because the index keeps
+	// pointing at the same page, offset and generation, the write also skips the
+	// slot upsert, the page allocation, and any eviction that would have followed.
+	//
+	// WHERE IT APPLIES. Only on a HEAP-backed PolicyRingbufEvict shard, and only
+	// for a write whose key is index-current at a copy of exactly the new size;
+	// every other write takes the append path unchanged. It is a no-op — not an
+	// error — on a shard that does not qualify:
+	//
+	//   - PolicyRejectWrites shards hand out ZERO-COPY ALIASES into page bytes, and
+	//     an alias may outlive the read that produced it (it escapes to a network
+	//     response writer). Overwriting live bytes under it would change a value a
+	//     caller is still holding.
+	//   - MMAP shards are the DURABLE copy. Overwriting destroys the old version, so
+	//     a write torn by a crash loses the KEY OUTRIGHT, where an append leaves the
+	//     previous version framed and recoverable. Heap pages are not persisted, so
+	//     there is nothing to recover and the concern does not arise.
+	//
+	// WHAT IT COSTS. Heap ringbuf reads are lock-free today only because pages are
+	// append-only and frozen: eviction retires a page by swapping in a fresh object,
+	// never by rewriting live bytes, so the bytes behind a hit are immutable for the
+	// read's lifetime. Writing in place breaks exactly that. So enabling this makes
+	// heap ringbuf reads take the shard READ LOCK for the probe and value copy — the
+	// same path mmap ringbuf has always used (see needsReadLockForGet). That is the
+	// trade: writes stop creating garbage, reads stop being lock-free.
+	InPlaceSameSizeUpdate bool
+
 	// NowFn overrides the WALL-CLOCK source for the non-apply expiry sites (client
 	// read filter, sweeper, warm-restart rebuild, Iterate). nil ⇒ the real clock
 	// (nowMs / time.Now) — the production default, byte-identical to pre-B1

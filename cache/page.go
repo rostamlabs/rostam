@@ -13,6 +13,10 @@ import (
 // by allocating a new page (slab pool).
 var errPageFull = errors.New("page: full")
 
+// errPageNotOverwritable is returned by WriteAt on a page whose bytes may not be
+// rewritten where they lie — every mmap-backed page. See WriteAt.
+var errPageNotOverwritable = errors.New("page: backing does not permit in-place overwrite")
+
 // pageBacking tags how page storage is allocated.
 type pageBacking uint8
 
@@ -172,6 +176,40 @@ func (p *page) Write(key, value []byte, expiryMs, meta uint64) (offset uint32, s
 	off := uint32(tail) //nolint:gosec // tail < PageSize which is validated ≤ MaxInt32
 	p.setTail(tail + n)
 	return off, uint32(n), nil //nolint:gosec // n = entrySize which fits in uint32
+}
+
+// WriteAt overwrites the entry framed at offset with a new one of the SAME size,
+// leaving head and tail untouched. It is the write half of the same-size update
+// (Config.InPlaceSameSizeUpdate): the caller has already established that the
+// stored entry is the index-current copy of this key and that the new framing
+// occupies exactly the same bytes, so nothing outside [offset, offset+size) moves
+// and no index slot changes.
+//
+// HEAP BACKING ONLY, refused otherwise. An mmap page is the DURABLE copy of the
+// data, and overwriting destroys the old version: a write torn by a crash loses
+// the KEY OUTRIGHT, where an append leaves the previous version framed and
+// recoverable by the rebuild. Heap pages are never persisted, so that failure
+// mode does not exist for them. shard.inPlaceEligible already forbids the mmap
+// case; refusing here as well keeps the invariant with the bytes it protects
+// rather than resting on a caller staying correct.
+//
+// The destination is sliced to EXACTLY the entry size, so encodeEntryNoCRC's own
+// length check is the backstop against a mis-sized write spilling into the next
+// entry. An error means nothing was written (the encoder validates before it
+// copies) and the caller may fall back to appending.
+func (p *page) WriteAt(offset uint32, key, value []byte, expiryMs, meta uint64) error {
+	if p.backing != backingHeap {
+		return errPageNotOverwritable
+	}
+	need := entrySize(len(key), len(value))
+	// The entry must lie wholly inside the page's LIVE band. Below head it has been
+	// evicted; at or past tail it is free space a future append owns. Either way it
+	// is not an entry anyone may overwrite.
+	if int(offset) < p.head() || int(offset)+need > p.tail() {
+		return errEntryTruncated
+	}
+	_, err := encodeEntryNoCRC(p.entries()[offset:int(offset)+need], key, value, expiryMs, meta)
+	return err
 }
 
 // Read returns key, value, and expiry for the entry at the given offset.
