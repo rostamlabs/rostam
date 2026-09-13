@@ -1467,6 +1467,22 @@ func (s *shard) evictUntilFitsLocked(need int) (int, error) {
 // order eviction picks victims in. `skip` is one page index to pass over, or -1
 // for none: relocating eviction uses it to keep the page it has just freshened
 // out of the search. Must hold mu for writing.
+//
+// ITS TWO CALLERS MUST STAY ALIGNED, and the alignment is load-bearing rather than
+// incidental. evictUntilFitsLocked calls it with skip = -1 to CHOOSE a victim and
+// then advances nextVictim past that victim; relocating eviction calls it moments
+// later with skip = the page just freed, to choose the page to EVACUATE. Both scan
+// from the same cursor in the same order, and the freed page sorts LAST from that
+// cursor (the scan starts just past it), so the page relocation evacuates is exactly
+// the page the next eviction will select.
+//
+// That equality is the whole point of the pass. Break it — by advancing nextVictim
+// somewhere other than immediately before evictVictimLocked, by giving one caller a
+// different scan order, or by dropping the skip — and relocation copies records out
+// of a page that is NOT about to be drained: pure write amplification, and the
+// crash-consistency argument in cache/relocate_evict.go loses its premise along with
+// it, because that argument rests on every moved record being one the next drain was
+// going to delete anyway.
 func (s *shard) nextNonEmptyPageLocked(skip int) int {
 	n := len(s.pages)
 	for off := 0; off < n; off++ {
@@ -1503,7 +1519,19 @@ func (s *shard) evictVictimLocked(victim, need int) error {
 		}
 		return nil
 	}
-	return s.drainPageLocked(victim)
+	if err := s.drainPageLocked(victim); err != nil {
+		return err
+	}
+	// Same placement, same reason, on the in-place drain: the page the walk above
+	// just emptied is the only one with room, and the records moved into it come off
+	// the page the NEXT eviction drains — so they stop being index-current before
+	// that drain reaches them. Readers are excluded here rather than raced
+	// (needsReadLockForGet), and the crash-consistency argument for appending
+	// without a sync is in cache/relocate_evict.go.
+	if s.cfg.RelocatingEviction {
+		s.relocateIntoFreedPageLocked(victim, need)
+	}
+	return nil
 }
 
 // retirePageLocked (heap ringbuf) frees page idx by dropping every index slot

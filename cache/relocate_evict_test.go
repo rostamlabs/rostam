@@ -689,19 +689,18 @@ func TestRelocatingEvictionConcurrentReadersNeverMiss(t *testing.T) {
 //	reloc/op       records copied forward per write
 //	reloc_B/op     bytes those copies moved per write — the price of the saves
 func BenchmarkRelocatingEvictionAB(b *testing.B) {
-	const (
-		keyspace = 12_000
-		valLen   = 400
-		pages    = 8
-		zipfS    = 1.3
-		abSeed   = 0x5EED
-		warmOps  = 400_000
-	)
-	keys := make([][]byte, keyspace)
+	relocABArms(b, "")
+}
+
+// relocABArms runs the off/on pair over one storage mode: dataDir "" is heap, a
+// directory is mmap. Both arms of a pair get the same seed and the same key
+// population, so the only difference between the two rows is the flag.
+func relocABArms(b *testing.B, dataDir string) {
+	keys := make([][]byte, relocABKeyspace)
 	for i := range keys {
 		keys[i] = fmt.Appendf(nil, "ab-%08d", i)
 	}
-	val := make([]byte, valLen)
+	val := make([]byte, relocABValueLen)
 	for i := range val {
 		val[i] = byte(i)
 	}
@@ -714,20 +713,25 @@ func BenchmarkRelocatingEvictionAB(b *testing.B) {
 			cfg := DefaultConfig()
 			cfg.NumShards = 1
 			cfg.PageSize = 1 << 20
-			cfg.MaxMemoryPerShard = pages << 20
+			cfg.MaxMemoryPerShard = relocABPages << 20
 			cfg.InitialPagesPerShard = 0
 			cfg.AtCapPolicy = PolicyRingbufEvict
 			cfg.TTLSweepIntervalMs = 0
 			cfg.RelocatingEviction = arm.on
-			s, err := newShard(cfg, "", nil)
+			dir := dataDir
+			if dir != "" {
+				dir = b.TempDir() // a fresh pages file per arm
+				cfg.DataDir = dir
+			}
+			s, err := newShard(cfg, dir, nil)
 			if err != nil {
 				b.Fatal(err)
 			}
 			defer func() { _ = s.Close() }()
 
-			rng := rand.New(rand.NewSource(abSeed)) //nolint:gosec // benchmark RNG
-			z := rand.NewZipf(rng, zipfS, 1, keyspace-1)
-			for range warmOps {
+			rng := rand.New(rand.NewSource(relocABSeed)) //nolint:gosec // benchmark RNG
+			z := rand.NewZipf(rng, relocABZipfS, 1, relocABKeyspace-1)
+			for range relocABWarmOps {
 				_ = s.Put(keys[z.Uint64()], val, 0)
 			}
 			warm := s.snapshot()
@@ -758,7 +762,7 @@ func BenchmarkRelocatingEvictionAB(b *testing.B) {
 			if st.Entries > 0 {
 				bytesPerKey = float64(st.BytesUsed) / float64(st.Entries)
 			}
-			b.ReportMetric(float64(hits)/float64(keyspace), "hit_rate")
+			b.ReportMetric(float64(hits)/float64(relocABKeyspace), "hit_rate")
 			b.ReportMetric(float64(st.Entries), "entries")
 			b.ReportMetric(bytesPerKey, "B/live_key")
 			b.ReportMetric(perOp(st.Evictions-warm.Evictions), "evict/op")
@@ -766,5 +770,129 @@ func BenchmarkRelocatingEvictionAB(b *testing.B) {
 			b.ReportMetric(perOp(st.EvictionRelocations-warm.EvictionRelocations), "reloc/op")
 			b.ReportMetric(perOp(st.EvictionBytesRelocated-warm.EvictionBytesRelocated), "reloc_B/op")
 		})
+	}
+}
+
+// Shared A/B geometry, so the heap and mmap rows are the same experiment run over
+// two storage modes rather than two experiments.
+const (
+	relocABKeyspace = 12_000
+	relocABValueLen = 400
+	relocABPages    = 8
+	relocABZipfS    = 1.3
+	relocABSeed     = 0x5EED
+	relocABWarmOps  = 400_000
+)
+
+// pageObjects snapshots the shard's page object identities. A heap eviction RETIRES
+// its victim — swapping in a fresh object — so comparing two snapshots names exactly
+// which page an eviction drained, without the test having to predict it.
+func pageObjects(s *shard) []*page {
+	out := make([]*page, len(s.pages))
+	copy(out, s.pages)
+	return out
+}
+
+// changedPage returns the single index whose page object was replaced between two
+// snapshots, or -1 if none was.
+func changedPage(before, after []*page) int {
+	for i := range before {
+		if before[i] != after[i] {
+			return i
+		}
+	}
+	return -1
+}
+
+// indexPagesByHash snapshots which PAGE each live index slot currently resolves to,
+// keyed by the slot's full key hash so the snapshot survives a rehash. Comparing two
+// of these is how the test below observes which page relocation actually read from,
+// rather than recomputing the selection it was supposed to make.
+func indexPagesByHash(s *shard) map[uint64]uint16 {
+	t := s.tab.Load()
+	out := make(map[uint64]uint16, t.live)
+	for i := range t.ctrl {
+		c := t.ctrl[i].Load()
+		if c == ctrlEmpty || c == ctrlTombstone {
+			continue
+		}
+		out[t.hashes[i]] = slabRef(t.refs[i].Load()).pageIdx()
+	}
+	return out
+}
+
+// TestRelocatingEvictionEvacuatesThePageTheNextEvictionDrains pins the alignment the
+// whole pass rests on: the page relocation evacuates at one eviction must be the page
+// the NEXT eviction drains. Both selections come from nextNonEmptyPageLocked over the
+// same cursor — eviction with skip = -1, relocation with skip = the page just freed,
+// which sorts last from that cursor — so today they agree by construction.
+//
+// If they ever stop agreeing, nothing fails loudly: relocation quietly copies records
+// out of a page that is not about to be drained, which is write amplification that
+// saves nothing, and the crash-consistency argument in cache/relocate_evict.go loses
+// its premise (every moved record being one the next drain was going to delete
+// anyway). This test is the alarm for that, so it observes both halves rather than
+// deriving either: the source by watching which page the relocated slots were
+// repointed AWAY from, and the drained page by page-object identity.
+func TestRelocatingEvictionEvacuatesThePageTheNextEvictionDrains(t *testing.T) {
+	c, err := New(relocConfig(4, true))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	s := c.shards[0]
+	hot := relocKey(900)
+	hotHash := hashKey(hot)
+
+	// Distinct live records on every page, so each eviction has something to move.
+	for i := range 4 * relocPerPage {
+		mustPut(t, c, relocKey(i), relocValue(i%256))
+	}
+	putUntilEviction(t, c, hot, 0)
+
+	checked := 0
+	for round := range 4 {
+		// Eviction N. Watch which page the records that landed on the freed page were
+		// repointed away from: that page IS relocation's source.
+		beforeObjs, beforePages := pageObjects(s), indexPagesByHash(s)
+		putUntilEviction(t, c, hot, 10*round)
+		freed := changedPage(beforeObjs, pageObjects(s))
+		if freed < 0 {
+			t.Fatalf("round %d: no page was retired by an eviction", round)
+		}
+		sources := map[uint16]int{}
+		for h, now := range indexPagesByHash(s) {
+			if int(now) != freed || h == hotHash {
+				continue // not moved here, or the triggering write itself
+			}
+			if was, ok := beforePages[h]; ok && int(was) != freed {
+				sources[was]++
+			}
+		}
+		if len(sources) == 0 {
+			continue // nothing was relocated this round; it proves nothing either way
+		}
+		if len(sources) != 1 {
+			t.Fatalf("round %d: relocation drew from %d pages (%v); it must evacuate exactly one",
+				round, len(sources), sources)
+		}
+		var evacuated int
+		for p := range sources {
+			evacuated = int(p)
+		}
+
+		// Eviction N+1 must drain exactly that page.
+		beforeObjs = pageObjects(s)
+		putUntilEviction(t, c, hot, 10*round+5)
+		drained := changedPage(beforeObjs, pageObjects(s))
+		if drained != evacuated {
+			t.Fatalf("round %d: relocation evacuated page %d but the next eviction drained page %d; "+
+				"the victim cursor and the relocation source have drifted apart",
+				round, evacuated, drained)
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Fatal("no round observed a relocation; the alignment was never actually checked")
 	}
 }

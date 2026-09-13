@@ -167,7 +167,7 @@ type Config struct {
 	// relocate+recycle ACTION.
 	OnlineCompaction bool
 
-	// RelocatingEviction opts a HEAP RINGBUF shard into RELOCATING eviction
+	// RelocatingEviction opts a RINGBUF shard into RELOCATING eviction
 	// (cache/relocate_evict.go): before the rotation cursor drains a page, the live
 	// records on it are COPIED FORWARD into the space the previous eviction freed and
 	// their index slots repointed, so a record that is still the live copy for its key
@@ -176,9 +176,14 @@ type Config struct {
 	// picks the next non-empty page and drains it in full — so without this the page's
 	// dead versions and its live records go together.
 	//
-	// It is a no-op on every other shard (mmap, reject-writes): the pass is gated on
-	// !isMmap && AtCapPolicy == PolicyRingbufEvict, and an mmap ringbuf shard drains
-	// its fixed region in place (drainPageLocked) instead of retiring page objects.
+	// It applies to BOTH ringbuf storage modes: heap shards, which free a page by
+	// retiring it, and single-node mmap shards, which drain the fixed region in place.
+	// On mmap a relocated copy is appended through the ordinary write path, so it
+	// carries a higher write sequence than the original it leaves framed on the source
+	// page and warm restart resolves the pair to the relocated copy. It is a no-op
+	// under PolicyRejectWrites (nothing is ever evicted), which is what replication
+	// forces — a replicated shard reclaims through the online compactor instead
+	// (Config.OnlineCompaction).
 	//
 	// WHAT IT COSTS. Relocation runs on the WRITE PATH, inside the Put that triggered
 	// the eviction, and copies entry bytes. It is bounded so that cost stays a

@@ -90,9 +90,9 @@ type Stats struct {
 	OnlinePagesRetired   uint64
 	OnlinePagesRecycled  uint64
 
-	// Relocating eviction (heap ringbuf shards with Config.RelocatingEviction;
-	// cache/relocate_evict.go). A DIFFERENT mechanism from the online compactor
-	// above, on the other storage mode:
+	// Relocating eviction (ringbuf shards with Config.RelocatingEviction, heap and
+	// single-node mmap alike; cache/relocate_evict.go). A DIFFERENT mechanism from
+	// the online compactor above, on the other at-cap policy:
 	//   - EvictionRelocations: live records copied forward out of a page about to be
 	//     drained, instead of being dropped with the dead versions sharing it. Read
 	//     it next to EvictionsLive: relocation is what moves losses out of that
