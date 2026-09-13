@@ -42,6 +42,11 @@ const (
 	tagPresentBit uint64 = 1 << 16
 	// minIndexSlots is the smallest table (must be a power of two).
 	minIndexSlots = 8
+	// relocateProbeRetries bounds how many times one probe re-resolves a SINGLE
+	// slot whose ref failed the page-generation gate (see rechaseSlot). A reader
+	// takes no lock, so without a ceiling a writer relocating the same key over
+	// and over could hold it on one slot indefinitely.
+	relocateProbeRetries = 4
 )
 
 // tagFor derives the non-zero control tag for a hash. The tag prunes most
@@ -95,11 +100,15 @@ func (t *indexTable) get(s *shard, key []byte, h uint64) (v []byte, exp uint64, 
 		// observed points at a populated slot.
 		p := s.pageSlots[r.pageIdx()].Load()
 		if p == nil || p.gen != r.gen() {
-			// Slot unpopulated, or the page was retired (heap ringbuf eviction) and
-			// replaced by a fresh generation → this physical entry is gone. Do NOT
-			// read bytes: a freshly-swapped page may be under active append by a
-			// writer. The generation gate makes this a miss without touching it.
-			continue
+			// Slot unpopulated, or the page's generation does not match the ref. Do
+			// NOT read bytes: a freshly-swapped page may be under active append by a
+			// writer. A mismatch has TWO meanings now — the entry was evicted, or it
+			// MOVED (relocating eviction copied it forward and repointed this very
+			// slot) — and rechaseSlot tells them apart. A nil page answers "gone".
+			p, r = t.rechaseSlot(s, i, r)
+			if p == nil {
+				continue
+			}
 		}
 		k, val, e, err := p.Read(r.offset())
 		if err != nil {
@@ -110,6 +119,39 @@ func (t *indexTable) get(s *shard, key []byte, h uint64) (v []byte, exp uint64, 
 		}
 		return val, e, r, lkHit
 	}
+}
+
+// rechaseSlot re-resolves slot i after its ref failed the page-generation gate in
+// get. Before relocating eviction a mismatch meant exactly one thing — the entry
+// was evicted — and advancing to the next probe slot was the right answer.
+// Relocation adds a second meaning: the entry MOVED, and this slot was repointed
+// at the copy. Reloading the ref separates them. A CHANGED ref is a relocation, so
+// the SAME slot is retried against the new page; an UNCHANGED ref is an eviction,
+// so the caller advances exactly as it always did. Walking on past a relocated
+// key's own slot would end the probe run somewhere else and report lkMiss — a
+// wrong answer for a live key that was deliberately kept.
+//
+// The retry is bounded by relocateProbeRetries so no amount of churn can hold a
+// lock-free reader on one slot. EXHAUSTING THE BOUND degrades to today's
+// behaviour: it reports "gone" and the caller advances, which for a live key is a
+// miss. The bound is therefore a ceiling nothing realistic reaches (a relocation
+// needs a full eviction between repoints), not a tuning knob.
+//
+// Returns (nil, r) when the caller should advance to the next probe slot, or the
+// resolved page and the ref that resolved against it.
+func (t *indexTable) rechaseSlot(s *shard, i uint64, r slabRef) (*page, slabRef) {
+	for range relocateProbeRetries {
+		cur := slabRef(t.refs[i].Load())
+		if cur == r {
+			return nil, r // unchanged: the entry really is gone.
+		}
+		r = cur
+		p := s.pageSlots[r.pageIdx()].Load()
+		if p != nil && p.gen == r.gen() {
+			return p, r
+		}
+	}
+	return nil, r
 }
 
 // lookupStatus is the outcome of a table probe.
