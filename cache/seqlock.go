@@ -32,9 +32,24 @@ import "sync/atomic"
 // So each heap page carries a small array of version counters and an entry maps
 // to one by its offset. That makes the protection per-STRIPE rather than
 // per-entry: a reader retries when any entry sharing its stripe is rewritten,
-// not only its own. The cost of that is a retry, never a wrong answer, and with
-// seqlockStripesPerPage stripes the collision odds are a fraction of a percent
-// (see BenchmarkInPlaceRead's reported retry rate).
+// not only its own. The cost of that is a RETRY, never a wrong answer.
+//
+// PER-ENTRY IS NOT WORTH BUYING, and the retry rate is what says so rather than
+// an argument. Measured on the 2:1 read/write mix (BenchmarkInPlaceRead reports
+// %retry and %fallback, so this is reproducible):
+//
+//	stripes/page      1        8       64      512
+//	retried reads   3.81%    0.51%   0.063%   0.0085%
+//	fell back       0.098%   0.009%  0.0007%  0.0002%
+//	throughput       flat across all four, differences inside the noise
+//
+// Even ONE counter per page — the coarsest possible choice — costs nothing
+// measurable, because the window a writer holds a stripe odd is a few
+// nanoseconds. 64 is kept because it is free insurance (512 bytes against a page
+// of at least 1 MiB) for shards with fewer pages or heavier write rates than the
+// benchmark, where one-per-page would start to bite. Going finer than a stripe
+// would mean a word inside the entry, which is where the alignment problem above
+// begins, and this table is the reason that work is not worth doing.
 //
 // # Ordering
 //
@@ -86,8 +101,8 @@ import "sync/atomic"
 const (
 	// seqlockStripesPerPage is the number of version counters a heap page carries
 	// when the seqlock is enabled. 64 words is 512 bytes against a page of at least
-	// 1 MiB — under 0.05% — and spreads a page's entries thinly enough that two
-	// readers of unrelated keys almost never share one.
+	// 1 MiB — under 0.05% — and holds the measured retry rate at 0.06% of reads.
+	// See the table above for what the alternatives cost.
 	seqlockStripesPerPage = 64
 	seqlockStripeMask     = seqlockStripesPerPage - 1
 

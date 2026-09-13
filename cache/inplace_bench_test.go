@@ -28,15 +28,18 @@ const (
 type inPlaceMode int
 
 const (
-	modeAppend  inPlaceMode = iota // no in-place updates; reads lock-free
-	modeLocked                     // in-place updates; reads take the read lock
-	modeSeqlock                    // in-place updates; reads lock-free via the seqlock
+	modeAppend      inPlaceMode = iota // no in-place updates; reads lock-free
+	modeAppendReloc                    // append path + relocating eviction
+	modeLocked                         // in-place updates; reads take the read lock
+	modeSeqlock                        // in-place updates; reads lock-free via the seqlock
 )
 
 func (m inPlaceMode) String() string {
 	switch m {
 	case modeAppend:
 		return "append"
+	case modeAppendReloc:
+		return "append+reloc"
 	case modeLocked:
 		return "locked"
 	default:
@@ -44,7 +47,7 @@ func (m inPlaceMode) String() string {
 	}
 }
 
-var inPlaceModes = []inPlaceMode{modeAppend, modeLocked, modeSeqlock}
+var inPlaceModes = []inPlaceMode{modeAppend, modeAppendReloc, modeLocked, modeSeqlock}
 
 // inPlaceShard builds a single heap ringbuf shard in the requested mode, with
 // nothing else differing between the arms.
@@ -55,8 +58,15 @@ func inPlaceShard(tb testing.TB, mode inPlaceMode) *shard {
 	cfg.PageSize = 1 << 20
 	cfg.MaxMemoryPerShard = inPlacePages << 20
 	cfg.TTLSweepIntervalMs = 0 // no background sweeper in the measurement
-	cfg.InPlaceSameSizeUpdate = mode != modeAppend
+	cfg.InPlaceSameSizeUpdate = mode == modeLocked || mode == modeSeqlock
 	cfg.InPlaceSeqlockReads = mode == modeSeqlock
+	// Relocating eviction is the other way a ringbuf shard keeps live records it
+	// would otherwise drop, so it is the baseline in-place has to beat rather than
+	// an unrelated question. Its background reserve ticker stays off: these
+	// benchmarks drive every pass through Put, and a tick landing mid-measurement
+	// would only add variance.
+	cfg.RelocatingEviction = mode == modeAppendReloc
+	cfg.RelocateReserveIntervalMs = 0
 	s, err := newShard(cfg, "", nil)
 	if err != nil {
 		tb.Fatal(err)
@@ -130,6 +140,7 @@ func BenchmarkInPlaceOccupancy(b *testing.B) {
 					b.ReportMetric(float64(hits)/float64(inPlaceKeySpan)*100, "hit%")
 					b.ReportMetric(float64(st.Evictions)/float64(max(st.Puts, 1)), "evict/put")
 					b.ReportMetric(float64(st.InPlaceUpdates)/float64(max(st.Puts, 1))*100, "%inplace")
+					b.ReportMetric(float64(st.EvictionRelocations), "relocs")
 					b.StartTimer()
 				}
 			})
