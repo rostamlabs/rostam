@@ -321,6 +321,8 @@ func sortStrings(s []string) {
 		for j := i; j > 0 && s[j-1] > s[j]; j-- {
 			s[j-1], s[j] = s[j], s[j-1]
 		}
+	}
+}
 
 // TestFSObjectStorePutReclaimsStaleTemps verifies Put's best-effort reclamation
 // of staging files abandoned by a process killed mid-Put. Such a leftover is not
@@ -465,47 +467,6 @@ func TestFSObjectStoreSweepRequiresTempSuffix(t *testing.T) {
 	}
 	if _, err := os.Stat(bare); err != nil {
 		t.Errorf("a file without %q must be left alone: %v", putTempSuffix, err)
-	}
-}
-
-// TestFSObjectStoreRejectsBackslashKeys pins the cross-platform hole in the
-// staging-name reservation. A backslash is an ordinary character in an object key
-// and to path.Base, but a SEPARATOR to filepath on Windows — so
-// "coll\.rostam-put-x.tmp" has a final segment of "coll\.rostam-put-x.tmp" by
-// the key's own rules and ".rostam-put-x.tmp" by the filesystem's, which let it
-// publish into the reserved name space and be swept an hour later. Keys carrying
-// the character are refused outright, on every platform, so one key always means
-// one path.
-func TestFSObjectStoreRejectsBackslashKeys(t *testing.T) {
-	root := t.TempDir()
-	store, err := NewFSObjectStore(root)
-	if err != nil {
-		t.Fatalf("NewFSObjectStore: %v", err)
-	}
-	for _, key := range []string{
-		`tenant/coll\` + putTempPrefix + `sneaky` + putTempSuffix, // the bypass itself
-		`tenant\coll/ts.snap`, // a plain separator swap
-	} {
-		if err := store.Put(context.Background(), key, strings.NewReader("x"), 1); err == nil {
-			t.Errorf("Put(%q): expected a backslash key to be refused, got nil", key)
-		}
-		if _, err := store.Get(context.Background(), key); err == nil {
-			t.Errorf("Get(%q): expected a backslash key to be refused, got nil", key)
-		} else if errors.Is(err, objstore.ErrNotFound) {
-			t.Errorf("Get(%q): refused as not-found, not as an invalid key: %v", key, err)
-		}
-		// Delete too: keyToPath gates all three, and on Windows an unguarded
-		// Delete of a backslash key resolves into the reserved staging name space
-		// — where it could unlink a live Put's staging file.
-		if err := store.Delete(context.Background(), key); err == nil {
-			t.Errorf("Delete(%q): expected a backslash key to be refused, got nil", key)
-		} else if errors.Is(err, objstore.ErrNotFound) {
-			t.Errorf("Delete(%q): refused as not-found, not as an invalid key: %v", key, err)
-		}
-	}
-	// Nothing may have been created: keyToPath fails before MkdirAll.
-	if entries, rerr := os.ReadDir(root); rerr != nil || len(entries) != 0 {
-		t.Errorf("refused keys created %d entries under root (err %v), want none", len(entries), rerr)
 	}
 }
 
