@@ -194,12 +194,41 @@ func TestReserveRelocationPreparesTheNextVictim(t *testing.T) {
 	if before == 0 {
 		t.Fatal("the successor holds nothing live; the test would pass for the wrong reason")
 	}
+	// Every page, not just the successor: `before - after` on page 1 alone would be
+	// wrong the moment relocation routed a record back ONTO page 1, and it would be
+	// wrong quietly — fewer bytes counted as moved, so the assertion below fails for a
+	// reason that has nothing to do with what it tests. Today the destination scan
+	// happens to prefer a later page; that is a detail of destination selection this
+	// test should not depend on, so it asserts it instead of assuming it.
+	beforeAll := make([]int, len(s.pages))
+	for i := range beforeAll {
+		beforeAll[i] = livePageBytes(s, i)
+	}
 
 	s.topUpFreeReserve()
 	if c.Stats().ReservePagesFreed == 0 {
 		t.Fatal("the pass freed no page, so there was never a successor to prepare")
 	}
-	moved := before - livePageBytes(s, 1)
+	afterAll := make([]int, len(s.pages))
+	for i := range afterAll {
+		afterAll[i] = livePageBytes(s, i)
+	}
+	if afterAll[1] > beforeAll[1] {
+		t.Fatalf("relocation routed records back onto the successor (page 1 live bytes %d -> %d); "+
+			"this test's arithmetic assumes page 1 only loses, so fix the test before reading its verdict",
+			beforeAll[1], afterAll[1])
+	}
+	moved := beforeAll[1] - afterAll[1]
+	gained := 0
+	for i := range afterAll {
+		if d := afterAll[i] - beforeAll[i]; d > 0 {
+			gained += d
+		}
+	}
+	if gained != moved {
+		t.Fatalf("the successor lost %d live bytes but %d arrived elsewhere; the pass is not "+
+			"conserving what it moves", moved, gained)
+	}
 
 	// What a write-path eviction of page 0 would have carried off page 1.
 	want := relocPageSize / relocateMaxBytesPerEvictionDivisor
