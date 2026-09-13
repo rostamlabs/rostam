@@ -407,11 +407,15 @@ func (s *shard) reserveMoveVictim(victim int, p *page, budget int, retire bool) 
 	chunkByteBudget := s.cfg.PageSize / relocateChunkBytesDivisor
 	minGain := s.maxEntryBytes() / relocateReserveMinGainDivisor
 	cursor, spent := -1, 0
+	// Set when a live record is stepped over, and scoped to the WHOLE victim walk rather
+	// than to a chunk. The page still holds that record, so it must not be retired however
+	// cleanly a LATER chunk finishes — and the chunk that steps over a record is very
+	// often not the chunk that reaches the end of the page. Declared per chunk this reset
+	// to false at every lock re-acquisition, which put the retire back exactly where the
+	// flag was added to stop it: dropping a live record, one chunk later.
+	skippedLive := false
 	for {
 		chunkEntries, chunkBytes, scanned, stop := 0, 0, 0, false
-		// Set when a live record is stepped over: the page still holds it, so it must not
-		// be retired however cleanly the rest of the walk finishes.
-		skippedLive := false
 		s.mu.Lock()
 		if !s.reserveValidateVictimLocked(victim, p) {
 			s.mu.Unlock()
@@ -444,14 +448,6 @@ func (s *shard) reserveMoveVictim(victim int, p *page, budget int, retire bool) 
 				break
 			}
 			size := entrySize(len(key), len(value))
-			if budget-spent < entryHeaderSize {
-				// Not even an empty entry could fit in what is left of the tick, and no
-				// later record can change that. This is the ONLY budget test that ends
-				// the walk; the one against a PARTICULAR record's size belongs after
-				// that record is classified, below.
-				stop = true
-				break
-			}
 			ref := makeSlabRef(uint16(victim), p.gen, uint32(cursor)) //nolint:gosec // victim bounded by MaxPagesPerShard (≤65535); cursor < PageSize ≤ MaxInt32
 			h := hashKey(key)
 			_, cur, ok := t.findSlot(h)
@@ -467,6 +463,19 @@ func (s *shard) reserveMoveVictim(victim int, p *page, budget int, retire bool) 
 				// forward would spend budget to keep nothing.
 				cursor += size
 				continue
+			}
+			// EVERY test from here down is about a record that is LIVE, and that ordering
+			// is the point: a budget exhausted by earlier moves must not stop a walk whose
+			// remaining entries are all dead, because such a page is exactly the one worth
+			// retiring and stopping early defers it to a later tick for no reason. Nothing
+			// above this line consults the budget.
+			if budget-spent < entryHeaderSize {
+				// Not even an empty entry fits in what is left of the tick, so no later
+				// LIVE record can be moved either — but this one is still on the page, so
+				// stopping (rather than stepping over) is also what keeps it from being
+				// retired out from under that record.
+				stop = true
+				break
 			}
 			// Moving this record has to leave the page still worth retiring, and that is
 			// checked BEFORE the copy: afterwards the bytes are spent whether or not they

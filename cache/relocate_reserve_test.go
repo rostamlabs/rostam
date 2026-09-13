@@ -143,6 +143,11 @@ func TestReserveRelocationEvacuatesTheNextEvictionVictim(t *testing.T) {
 func livePageBytes(s *shard, idx int) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return livePageBytesLocked(s, idx)
+}
+
+// livePageBytesLocked is livePageBytes for a caller that already holds the lock.
+func livePageBytesLocked(s *shard, idx int) int {
 	p := s.pages[idx]
 	tab := s.tab.Load()
 	entries, tail := p.entries(), p.tail()
@@ -219,15 +224,22 @@ func TestReserveRelocationPreparesTheNextVictim(t *testing.T) {
 			beforeAll[1], afterAll[1])
 	}
 	moved := beforeAll[1] - afterAll[1]
-	gained := 0
+	// CONSERVATION, stated over the whole shard rather than per page. Summing only the
+	// pages that GAINED and comparing that to the successor's loss conflates two different
+	// movements: the victim is also a destination, so its own outgoing record is netted
+	// against its larger incoming gain and the two sums happen to balance. They balance
+	// here by arithmetic accident, not by any property of the pass, and the check would
+	// break the moment that netting stopped holding. What the pass actually guarantees is
+	// that relocation MOVES live bytes and never creates or destroys them, which is a
+	// statement about the total.
+	totalBefore, totalAfter := 0, 0
 	for i := range afterAll {
-		if d := afterAll[i] - beforeAll[i]; d > 0 {
-			gained += d
-		}
+		totalBefore += beforeAll[i]
+		totalAfter += afterAll[i]
 	}
-	if gained != moved {
-		t.Fatalf("the successor lost %d live bytes but %d arrived elsewhere; the pass is not "+
-			"conserving what it moves", moved, gained)
+	if totalBefore != totalAfter {
+		t.Fatalf("live bytes across the shard went %d -> %d; relocation moves records, it "+
+			"neither creates nor destroys them", totalBefore, totalAfter)
 	}
 
 	// What a write-path eviction of page 0 would have carried off page 1.

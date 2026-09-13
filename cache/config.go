@@ -377,6 +377,10 @@ func (c Config) Validate() error {
 	if c.Mlock && c.DataDir == "" {
 		return errors.New("cache.Config: Mlock requires DataDir")
 	}
+	if int64(c.MsyncIntervalMs) > maxIntervalMs {
+		return fmt.Errorf("config: MsyncIntervalMs=%d overflows a duration; must be <= %d",
+			c.MsyncIntervalMs, maxIntervalMs)
+	}
 	if c.MsyncIntervalMs < 1 {
 		return errors.New("cache.Config: MsyncIntervalMs must be >= 1")
 	}

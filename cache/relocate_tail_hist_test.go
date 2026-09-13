@@ -86,20 +86,53 @@ func TestLatHistQuantilesTrackTheTruth(t *testing.T) {
 	sort.Slice(raw, func(i, j int) bool { return raw[i] < raw[j] })
 
 	for _, q := range []float64{0.5, 0.9, 0.99, 0.999} {
-		want := raw[int(q*float64(len(raw)))]
+		// RANK, computed exactly as quantile does, and then indexed one back. quantile
+		// returns the bucket whose CUMULATIVE count first reaches rank, which is the
+		// rank-th sample counting from one — raw[rank-1] zero-indexed. Indexing raw[rank]
+		// instead compares against the sample one PAST the one the histogram answered
+		// with, which straddles a bucket edge often enough to fail a correct
+		// implementation: an off-by-one in the assertion, in the assertion written to
+		// catch off-by-ones.
+		rank := int(q * float64(len(raw)))
+		if rank < 1 {
+			rank = 1
+		}
+		want := raw[rank-1]
 		got := h.quantile(q)
 		// The histogram reports a bucket LOWER BOUND, so the exact answer must sit in the
 		// bucket it named: at or above what it reported, and below the next bucket's
-		// floor. Stating it that way rather than as a tolerance is what makes it exact —
-		// a tolerance of want/latSub is the bucket width at `want`, not at `got`, and the
-		// two differ across a bucket edge, which is precisely where an off-by-one would
-		// hide.
+		// floor. Stated that way rather than as a tolerance it is exact — a tolerance of
+		// want/latSub is the bucket width at `want` rather than at `got`, and those differ
+		// across a bucket edge.
 		idx := latIndex(got)
 		if got > want || (idx+1 < latBuckets && want >= latValue(idx+1)) {
-			t.Fatalf("q%.3f: histogram says %d (bucket [%d,%d)), exact is %d",
-				q, got, latValue(idx), latValue(idx+1), want)
+			t.Fatalf("q%.3f (rank %d of %d): histogram says %d (bucket [%d,%d)), exact is %d",
+				q, rank, len(raw), got, latValue(idx), latValue(idx+1), want)
 		}
 	}
+	// ONE SAMPLE PER BUCKET, so rank and bucket correspond exactly and a quantile that is
+	// off by a single RANK moves the answer by a whole bucket. The dense sample above
+	// cannot see that: with thousands of samples sharing a bucket, shifting the rank by
+	// one lands in the same bucket and reports the same number, so a rank error hides in
+	// it. This case is small and deliberately sparse for that reason.
+	var sparse latHist
+	exact := make([]uint64, 0, 64)
+	for i := range 64 {
+		v := latValue(latSub*4 + i) // distinct, strictly increasing buckets
+		exact = append(exact, v)
+		sparse.add(v)
+	}
+	for _, q := range []float64{0.25, 0.5, 0.75, 1.0} {
+		rank := int(q * float64(len(exact)))
+		if rank < 1 {
+			rank = 1
+		}
+		if got := sparse.quantile(q); got != exact[rank-1] {
+			t.Fatalf("sparse q%.2f (rank %d of %d): got %d, want exactly %d",
+				q, rank, len(exact), got, exact[rank-1])
+		}
+	}
+
 	if h.max != raw[len(raw)-1] {
 		t.Fatalf("max = %d, exact is %d", h.max, raw[len(raw)-1])
 	}
