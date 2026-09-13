@@ -36,14 +36,40 @@ const (
 // today's append path, that path with relocating eviction, in-place updates
 // paying the read lock for them, in-place updates validating reads against a
 // version counter instead, and that last one with relocation as well.
+//
+// The last two arms cross the SIEVE reference hint (Config.SieveVisitedBit,
+// cache/sieve.go) over the relocation axis, because the hint only changes what a
+// RELOCATION rescues: with relocation off it does nothing but pay its read-path
+// cost, which is exactly why that cell is worth measuring rather than assuming.
+// Taking the four in-place cells together — {sieve off, sieve on} x {reloc off,
+// reloc on} — is what says whether the hint recovers relocation's recency loss and
+// what it charges the read path for it.
+//
+// HOW TO READ THE SIEVE ARMS IN BenchmarkInPlaceRead, which is where the cost side
+// is priced. Setting the hint is a read-modify-write, which is the scaling hazard
+// this whole line of work is about: the read lock is a read-modify-write on ONE line
+// every reader shares, and that is what makes it unaffordable. Two things may make
+// the hint behave differently, and neither is a reason to assume it does — the word
+// is per-SLOT rather than one word for the shard, and a load-test-then-store means
+// only the first read after a drain cleared a mark performs a store at all.
+//
+// READ THE PAIRS, NOT THE COLUMN, and prefer the pairs with a WRITER PRESENT. A
+// read-only shard makes the hint look free twice over: nothing clears a mark, so
+// every slot is marked once and every later read is a load and a compare, and there
+// is no writer to contend with either. inplace+sieve against seqlock is therefore
+// the floor, not the price. inplace+reloc+sieve against inplace+reloc is the honest
+// pair: relocation clears marks continuously, so reads keep paying the store, and
+// the lockcost and samesize shapes put a writer alongside them.
 type inPlaceMode int
 
 const (
-	modeAppend       inPlaceMode = iota // no in-place updates; reads lock-free
-	modeAppendReloc                     // append path + relocating eviction
-	modeLocked                          // in-place updates; reads take the read lock
-	modeSeqlock                         // in-place updates; reads lock-free via the seqlock
-	modeSeqlockReloc                    // in-place updates + seqlock + relocating eviction
+	modeAppend            inPlaceMode = iota // no in-place updates; reads lock-free
+	modeAppendReloc                          // append path + relocating eviction
+	modeLocked                               // in-place updates; reads take the read lock
+	modeSeqlock                              // in-place updates; reads lock-free via the seqlock
+	modeSeqlockReloc                         // in-place updates + seqlock + relocating eviction
+	modeSeqlockSieve                         // in-place + seqlock + the SIEVE hint, no relocation
+	modeSeqlockRelocSieve                    // in-place + seqlock + relocation choosing by the hint
 )
 
 func (m inPlaceMode) String() string {
@@ -54,6 +80,10 @@ func (m inPlaceMode) String() string {
 		return "append+reloc"
 	case modeSeqlockReloc:
 		return "inplace+reloc"
+	case modeSeqlockSieve:
+		return "inplace+sieve"
+	case modeSeqlockRelocSieve:
+		return "inplace+reloc+sieve"
 	case modeLocked:
 		return "locked"
 	default:
@@ -61,7 +91,10 @@ func (m inPlaceMode) String() string {
 	}
 }
 
-var inPlaceModes = []inPlaceMode{modeAppend, modeAppendReloc, modeLocked, modeSeqlock, modeSeqlockReloc}
+var inPlaceModes = []inPlaceMode{
+	modeAppend, modeAppendReloc, modeLocked,
+	modeSeqlock, modeSeqlockReloc, modeSeqlockSieve, modeSeqlockRelocSieve,
+}
 
 // inPlaceShard builds a single heap ringbuf shard in the requested mode, with
 // nothing else differing between the arms.
@@ -72,14 +105,19 @@ func inPlaceShard(tb testing.TB, mode inPlaceMode) *shard {
 	cfg.PageSize = 1 << 20
 	cfg.MaxMemoryPerShard = inPlacePages << 20
 	cfg.TTLSweepIntervalMs = 0 // no background sweeper in the measurement
-	cfg.InPlaceSameSizeUpdate = mode == modeLocked || mode == modeSeqlock || mode == modeSeqlockReloc
-	cfg.InPlaceSeqlockReads = mode == modeSeqlock || mode == modeSeqlockReloc
+	cfg.InPlaceSameSizeUpdate = mode != modeAppend && mode != modeAppendReloc
+	cfg.InPlaceSeqlockReads = mode != modeAppend && mode != modeAppendReloc && mode != modeLocked
+	// The SIEVE hint (cache/sieve.go). It is crossed with relocation rather than
+	// bundled into it: with relocation off nothing consumes the hint, so that arm
+	// prices the READ-PATH cost of maintaining it with none of the retention it can
+	// return — which is the honest way to see what it charges.
+	cfg.SieveVisitedBit = mode == modeSeqlockSieve || mode == modeSeqlockRelocSieve
 	// Relocating eviction is the other way a ringbuf shard keeps live records it
 	// would otherwise drop, so it is the baseline in-place has to beat rather than
 	// an unrelated question. Its background reserve ticker stays off: these
 	// benchmarks drive every pass through Put, and a tick landing mid-measurement
 	// would only add variance.
-	cfg.RelocatingEviction = mode == modeAppendReloc || mode == modeSeqlockReloc
+	cfg.RelocatingEviction = mode == modeAppendReloc || mode == modeSeqlockReloc || mode == modeSeqlockRelocSieve
 	cfg.RelocateReserveIntervalMs = 0
 	s, err := newShard(cfg, "", nil)
 	if err != nil {
@@ -308,6 +346,15 @@ func BenchmarkInPlaceRead(b *testing.B) {
 // Reported per arm: hot% (the hot set'"'"'s survival, the figure under test), the
 // index'"'"'s total occupancy, evictions per write, and the share of writes that took
 // the in-place path.
+//
+// THE FOUR IN-PLACE ARMS ARE A 2x2 and should be read as one. Relocating eviction
+// made hot% WORSE here, not better — it rescues by position, and an in-place rewrite
+// leaves no positional trace of itself, so the budget goes on whatever the walk meets
+// first. The SIEVE hint (Config.SieveVisitedBit) is the answer to exactly that, and
+// the cell that decides whether it works is inplace+reloc+sieve against inplace+reloc.
+// The inplace+sieve cell is the control: nothing consumes the hint there, so it should
+// land on inplace, and a difference would mean the hint is perturbing something it
+// has no business touching.
 func BenchmarkInPlaceWriteRecency(b *testing.B) {
 	const (
 		hotKeys   = 2_000

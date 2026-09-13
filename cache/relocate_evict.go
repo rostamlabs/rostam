@@ -241,7 +241,7 @@ func (s *shard) relocateIntoFreedPageLocked(freedIdx, need int) (uint64, uint64)
 		}
 		ref := makeSlabRef(uint16(src), p.gen, uint32(cursor)) //nolint:gosec // src bounded by MaxPagesPerShard (≤65535); cursor < PageSize ≤ MaxInt32
 		h := hashKey(key)
-		_, cur, ok := t.findSlot(h)
+		slot, cur, ok := t.findSlot(h)
 		if !ok || cur != ref {
 			// A superseded copy, a hash-collision loser, or an already-tombstoned slot:
 			// no read path can reach it, so there is nothing here to keep.
@@ -250,6 +250,25 @@ func (s *shard) relocateIntoFreedPageLocked(freedIdx, need int) (uint64, uint64)
 		}
 		if isExpired(expiryMs, now) {
 			// The retire walk's to tombstone, exactly as today.
+			cursor += size
+			continue
+		}
+		// SIEVE'S HAND (cache/sieve.go). A live record earns its rescue by having been
+		// READ or REWRITTEN since a drain last passed it; an unreferenced one is left
+		// for the retire walk to drop, which is what a non-relocating eviction would
+		// have done to it anyway.
+		//
+		// The test CLEARS the mark — SIEVE's hand clearing as it passes — so a rescued
+		// copy starts its next rotation unvisited and has to earn the next rescue
+		// afresh. It clears for a record the budget then REFUSES too, which is
+		// deliberate and costs nothing: the page this walk is reading is by construction
+		// the next eviction's victim, so a record left on it ceases to exist before its
+		// mark could be consulted again.
+		//
+		// UNMARKED RECORDS ARE OUT BEFORE THE BUDGET IS CONSULTED, exactly as the dead
+		// and expired ones above are: not consulting it is what stops the budget being
+		// spent on records nothing is using, which is the whole point of the pass.
+		if s.sieve && !t.takeVisited(slot, tagFor(h)) {
 			cursor += size
 			continue
 		}

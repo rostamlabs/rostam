@@ -114,6 +114,13 @@ type shard struct {
 	// waiting to be scheduled. Mode never changes; the region behind it may.
 	isMmap bool
 
+	// sieve caches sieveVisited() (cache/sieve.go): whether this shard maintains the
+	// SIEVE reference hint in its index control words. Set once in newShard, before
+	// the shard is published, and never mutated — so the lock-free read path tests it
+	// with no lock, and pays one bool load per hit for a feature that is off by
+	// default.
+	sieve bool
+
 	// mmap-only state (nil/zero in heap mode). Guarded by mu.
 	file         *os.File
 	region       []byte
@@ -352,6 +359,7 @@ func newShard(cfg Config, dataDir string, onRemove *atomic.Pointer[func([]byte)]
 		fn := cfg.NowFn
 		s.nowFn.Store(&fn)
 	}
+	s.sieve = s.sieveVisited()
 	s.tab.Store(newIndexTable(0))
 	// Fixed-length read-path page table (see the pageSlots field). Sized to the
 	// shard's hard page cap so every reachable page index is a valid slot.
@@ -1092,33 +1100,38 @@ func (s *shard) inPlaceEligible() bool {
 //	    the bytes are either already evicted or unwritten free space, neither of
 //	    which an index-current entry can occupy; refusing is cheaper than
 //	    reasoning about how a violation could arise.
-func (s *shard) inPlaceTargetLocked(key, value []byte, h uint64) (*page, uint32, bool) {
+//
+// It also returns the index SLOT the target was resolved through, which the caller
+// needs for nothing but the SIEVE reference hint (cache/sieve.go): an in-place
+// rewrite is the one write that leaves no other trace of having happened, so the
+// slot is the only place it can record that the key is in use.
+func (s *shard) inPlaceTargetLocked(key, value []byte, h uint64) (*page, uint32, uint64, bool) {
 	t := s.tab.Load()
-	_, ref, found := t.findSlot(h)
+	slot, ref, found := t.findSlot(h)
 	if !found {
-		return nil, 0, false // (4a) key absent
+		return nil, 0, 0, false // (4a) key absent
 	}
 	idx := int(ref.pageIdx())
 	if idx >= len(s.pages) {
-		return nil, 0, false // (4b) ref outside the allocated page list
+		return nil, 0, 0, false // (4b) ref outside the allocated page list
 	}
 	p := s.pages[idx]
 	if p == nil || p.gen != ref.gen() {
-		return nil, 0, false // (4b) page retired and replaced since the ref was minted
+		return nil, 0, 0, false // (4b) page retired and replaced since the ref was minted
 	}
 	off := ref.offset()
 	storedKey, storedVal, storedExp, err := p.Read(off)
 	if err != nil {
-		return nil, 0, false // (4c) unreadable framing
+		return nil, 0, 0, false // (4c) unreadable framing
 	}
 	if !bytes.Equal(storedKey, key) {
-		return nil, 0, false // (4c) hash collision: a different key's entry
+		return nil, 0, 0, false // (4c) hash collision: a different key's entry
 	}
 	if len(storedVal) != len(value) {
-		return nil, 0, false // (5) different size: the framing would not line up
+		return nil, 0, 0, false // (5) different size: the framing would not line up
 	}
 	if int(off) < p.head() || int(off)+entrySize(len(key), len(value)) > p.tail() {
-		return nil, 0, false // (4d) not inside the page's live band
+		return nil, 0, 0, false // (4d) not inside the page's live band
 	}
 	// GUARD 6 — the stored copy must still be LIVE. An expired copy is dead
 	// weight, and rewriting it where it lies pins those bytes instead of letting
@@ -1136,9 +1149,9 @@ func (s *shard) inPlaceTargetLocked(key, value []byte, h uint64) (*page, uint32,
 	// The clock is read ONLY when the stored copy actually carries an expiry, so
 	// the ordinary no-TTL write pays nothing for it.
 	if storedExp != 0 && isExpired(storedExp, s.now()) {
-		return nil, 0, false // (6) the stored copy is already dead
+		return nil, 0, 0, false // (6) the stored copy is already dead
 	}
-	return p, off, true
+	return p, off, slot, true
 }
 
 // putAtExpLocked is the shared write body: it takes the already-resolved
@@ -1159,7 +1172,7 @@ func (s *shard) putAtExpLocked(key, value []byte, exp uint64, h uint64) error {
 	// version left behind. Any refusal falls through to the append path below,
 	// which is unchanged.
 	if s.inPlaceEligible() {
-		if p, off, ok := s.inPlaceTargetLocked(key, value, h); ok {
+		if p, off, slot, ok := s.inPlaceTargetLocked(key, value, h); ok {
 			// Stamp the next sequence exactly as the append path does — one per
 			// STORED write — but only commit it once the bytes are down, so a
 			// refused overwrite leaves the shard's sequence untouched.
@@ -1173,6 +1186,15 @@ func (s *shard) putAtExpLocked(key, value []byte, exp uint64, h uint64) error {
 			if werr == nil {
 				s.writeSeq = seq
 				s.inPlaceUpdates.Add(1)
+				// AN UPDATE IS AN ACCESS (cache/sieve.go). It is also the ONLY signal
+				// this write leaves: the record does not move, so its page age is
+				// unchanged and the rotation reaches it on schedule however hot it is.
+				// Marking here restores exactly the standing an APPENDING rewrite gets
+				// for free by landing on the newest page — it does not grant anything
+				// the append path never had.
+				if s.sieve {
+					s.tab.Load().setVisited(slot, tagFor(h))
+				}
 				// NO fireOnRemove: nothing was removed. The key is still live, at the
 				// same address, and the hook reports REMOVALS — firing it here would
 				// drop a live key's postings from every derived index.
@@ -1195,7 +1217,15 @@ func (s *shard) putAtExpLocked(key, value []byte, exp uint64, h uint64) error {
 		return werr
 	}
 	t := s.tab.Load()
-	t.upsert(h, makeSlabRef(uint16(pageIdx), s.pages[pageIdx].gen, off)) //nolint:gosec // pageIdx bounded by MaxPagesPerShard (≤65535)
+	slot, inserted := t.upsert(h, makeSlabRef(uint16(pageIdx), s.pages[pageIdx].gen, off)) //nolint:gosec // pageIdx bounded by MaxPagesPerShard (≤65535)
+	// AN UPDATE MARKS, A FIRST INSERTION DOES NOT (cache/sieve.go). The asymmetry is
+	// the whole discrimination: a key written once and never touched again must arrive
+	// unvisited, or a write-once stream marks everything it inserts and the hint stops
+	// distinguishing anything. Marking BEFORE the rehash, so a hint earned by this
+	// write is one rehashed() carries across rather than one it never sees.
+	if s.sieve && !inserted {
+		t.setVisited(slot, tagFor(h))
+	}
 	s.rehashIfOverThresholdLocked(t)
 	return nil
 }
