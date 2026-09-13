@@ -744,7 +744,7 @@ func (s *shard) resolveLookup(v, key []byte, h, exp uint64, ref slabRef, st look
 	}
 	if isExpired(exp, now) {
 		if allowPhysicalRemove {
-			s.dropExpiredLocked(key, h, ref)
+			s.dropExpiredLocked(key, h, ref, now)
 		}
 		s.misses.Add(1)
 		return nil, 0, ErrNotFound
@@ -799,7 +799,7 @@ func (s *shard) getCore(key []byte, h, now uint64, allowPhysicalRemove bool) ([]
 	}
 	if isExpired(exp, now) {
 		if allowPhysicalRemove {
-			s.dropExpiredLocked(key, h, ref)
+			s.dropExpiredLocked(key, h, ref, now)
 		}
 		s.misses.Add(1)
 		return nil, 0, ErrNotFound
@@ -880,7 +880,7 @@ func (s *shard) getIntoCore(dst, key []byte, h, now uint64, allowPhysicalRemove 
 	}
 	if isExpired(exp, now) {
 		if allowPhysicalRemove {
-			s.dropExpiredLocked(key, h, ref)
+			s.dropExpiredLocked(key, h, ref, now)
 		}
 		s.misses.Add(1)
 		return dst, 0, ErrNotFound
@@ -888,23 +888,61 @@ func (s *shard) getIntoCore(dst, key []byte, h, now uint64, allowPhysicalRemove 
 	return append(dst, v...), exp, nil
 }
 
-// dropExpiredLocked removes the entry for h if it still points at ref (i.e. the
-// entry a reader just saw expire has not been overwritten by a newer Put).
-// Mirrors the cur == ref guard the map path used.
+// dropExpiredLocked removes the entry for h that a reader just saw expire at
+// `now`, unless it has been replaced in the meantime. Every read path reaches it
+// AFTER releasing the lock (or the version check), so a writer can run in
+// between, and the whole job of this function is to decide whether the entry it
+// is about to tombstone is still the one the reader judged.
 //
-// `key` is the CALLER'S key — the one it just resolved through the index and
-// found expired — and is used only to notify the derived-index removal hook. It
-// is passed rather than re-read off the page because the caller already holds it
-// and the cur == ref guard has already proved the slot is that key's.
-func (s *shard) dropExpiredLocked(key []byte, h uint64, ref slabRef) {
+// cur == ref IS NO LONGER THAT DECISION ON ITS OWN. It was, for as long as every
+// Put allocated a new copy: an overwrite always moved the entry, so a matching
+// ref proved nothing had replaced it. A same-size in-place update
+// (Config.InPlaceSameSizeUpdate) keeps the page, the offset AND the generation,
+// so the ref is byte-identical after a rewrite and the comparison can no longer
+// tell "untouched" from "replaced where it lay". A Put that refreshes an expired
+// key's TTL would otherwise be undone by a read that saw the PREVIOUS value
+// expire: the key vanishes though Put returned nil, and — worse, because nothing
+// repairs it — onRemove fires for a key that is live, dropping its postings from
+// every derived index.
+//
+// So the entry is RE-READ under the lock and only removed if it is STILL expired
+// against the same `now` the reader judged it by. Re-reading is what makes this
+// independent of how the replacement was written, so it also holds for any future
+// write path that preserves a ref. The clock is the CALLER'S, deliberately: a
+// reader that decided "expired" at its own clock reading must not have that
+// decision re-litigated against a later one, or a sweeper-style drop could remove
+// an entry the reader would have returned.
+//
+// `key` is the CALLER'S key. It is compared against the stored one rather than
+// trusted, because the re-read can land on a different key's entry: the index is
+// keyed by 64-bit hash, and a slot can be taken over between the probe and here.
+func (s *shard) dropExpiredLocked(key []byte, h uint64, ref slabRef, now uint64) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	t := s.tab.Load()
-	if slot, cur, ok := t.findSlot(h); ok && cur == ref {
-		t.tombstone(slot)
-		s.expirations.Add(1)
-		s.fireOnRemove(key)
+	slot, cur, ok := t.findSlot(h)
+	if !ok || cur != ref {
+		return // gone, or replaced by a copy somewhere else
 	}
-	s.mu.Unlock()
+	idx := int(cur.pageIdx())
+	if idx >= len(s.pages) {
+		return
+	}
+	p := s.pages[idx]
+	if p == nil || p.gen != cur.gen() {
+		return // the page was retired under this ref
+	}
+	storedKey, _, storedExp, err := p.Read(cur.offset())
+	if err != nil || !bytes.Equal(storedKey, key) {
+		return // unreadable, or this slot is somebody else's now
+	}
+	if !isExpired(storedExp, now) {
+		return // a writer refreshed it in place; it is live and must be kept
+	}
+	t.tombstone(slot)
+	s.expirations.Add(1)
+	s.fireOnRemove(key)
 }
 
 // Put inserts or replaces the entry for key with the given value and TTL.
@@ -1035,7 +1073,7 @@ func (s *shard) inPlaceTargetLocked(key, value []byte, h uint64) (*page, uint32,
 		return nil, 0, false // (4b) page retired and replaced since the ref was minted
 	}
 	off := ref.offset()
-	storedKey, storedVal, _, err := p.Read(off)
+	storedKey, storedVal, storedExp, err := p.Read(off)
 	if err != nil {
 		return nil, 0, false // (4c) unreadable framing
 	}
@@ -1047,6 +1085,24 @@ func (s *shard) inPlaceTargetLocked(key, value []byte, h uint64) (*page, uint32,
 	}
 	if int(off) < p.head() || int(off)+entrySize(len(key), len(value)) > p.tail() {
 		return nil, 0, false // (4d) not inside the page's live band
+	}
+	// GUARD 6 — the stored copy must still be LIVE. An expired copy is dead
+	// weight, and rewriting it where it lies pins those bytes instead of letting
+	// the append path leave them behind to be reclaimed. Appending also gives the
+	// refreshed key a NEW ref, which is what a concurrent expired-on-read drop
+	// compares against.
+	//
+	// That second effect is hygiene, NOT the guarantee. This shard has an
+	// injectable clock and an apply path stamped by a leader, so a writer can
+	// judge the stored copy live at the very moment a reader judges it expired,
+	// and no test here can rule that skew out. dropExpiredLocked re-reads the
+	// entry under the lock for exactly that reason; this guard only keeps the
+	// common case from reaching it.
+	//
+	// The clock is read ONLY when the stored copy actually carries an expiry, so
+	// the ordinary no-TTL write pays nothing for it.
+	if storedExp != 0 && isExpired(storedExp, s.now()) {
+		return nil, 0, false // (6) the stored copy is already dead
 	}
 	return p, off, true
 }

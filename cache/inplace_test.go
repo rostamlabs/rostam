@@ -519,6 +519,11 @@ func TestInPlaceConcurrentReadersSeeNoTornValue(t *testing.T) {
 				var err error
 				if useInto {
 					v, err = s.getIntoH(buf[:0], key, hashKey(key))
+					// Keep the returned slice as the buffer. Without this buf stays nil
+					// and buf[:0] hands getIntoH a zero-capacity destination every time,
+					// so the "reuse a buffer" reader allocates on every read and the
+					// path it is meant to exercise is never actually exercised.
+					buf = v
 				} else {
 					v, err = s.Get(key)
 				}

@@ -19,6 +19,15 @@ const (
 	inPlaceKeySpan = 20_000   // working set
 	inPlacePages   = 8        // 8 MiB per shard; benchValue() gives ~295 B records
 	inPlaceKeyFmt  = "k%012d" // 13 bytes
+
+	// The lockcost arm's length jitter. Lengths run over
+	// [inPlaceJitterLo, inPlaceJitterLo+inPlaceJitterSpan), centred on benchValSz
+	// so the mean record size matches the fixed shapes'. The SPAN is what matters:
+	// two successive writes of a key collide on a length with probability 1/span,
+	// and every collision leaks a same-size rewrite into an arm whose entire
+	// purpose is to have none.
+	inPlaceJitterLo   = benchValSz / 2 // 128
+	inPlaceJitterSpan = benchValSz + 1 // 257 lengths, 128..384, mean 256
 )
 
 // The three arms every benchmark here reports, which are the three states this
@@ -189,11 +198,19 @@ func BenchmarkInPlaceWrite(b *testing.B) {
 //	           floor: what the lock costs when nothing is competing for it.
 //	lockcost   two reads per write, with value lengths JITTERED so a write is
 //	           almost never a same-size rewrite and the in-place path stays
-//	           essentially idle in both arms. Both arms therefore do the same work
-//	           and reach the same occupancy, and the delta is the lock's cost under
-//	           a real writer — the price, with nothing subsidising it. Watch the
+//	           essentially idle in every arm. They therefore do the same work and
+//	           reach the same occupancy, and the delta is the lock's cost under a
+//	           real writer — the price, with nothing subsidising it. Watch the
 //	           reported %inplace: if it is not near zero the isolation has failed
 //	           and the comparison is not one.
+//
+//	           The jitter spans inPlaceJitterSpan lengths, not a handful. Two
+//	           successive writes of one key collide on a length with probability
+//	           1/span, and that collision rate IS the leaked in-place rate — a
+//	           sixteen-length jitter leaks 6%, which fails the arm's own guard and
+//	           quietly makes it price something other than the lock. The span is
+//	           centred so the MEAN record size matches the fixed one the samesize
+//	           arm writes, which keeps the two shapes comparable.
 //	samesize   two reads per write at a constant record size — the real workload.
 //	           Here the flag-on arm also stops evicting, so the delta is the NET
 //	           effect: the lock's cost minus what not thrashing the pages returns.
@@ -209,14 +226,24 @@ func BenchmarkInPlaceRead(b *testing.B) {
 		value    func(r *rand.Rand, base []byte) []byte
 	}{
 		{"readonly", true, func(_ *rand.Rand, base []byte) []byte { return base }},
-		{"lockcost", false, func(r *rand.Rand, base []byte) []byte { return base[:len(base)-r.Intn(16)] }},
+		{"lockcost", false, func(r *rand.Rand, base []byte) []byte {
+			return base[:inPlaceJitterLo+r.Intn(inPlaceJitterSpan)]
+		}},
 		{"samesize", false, func(_ *rand.Rand, base []byte) []byte { return base }},
 	}
 	for _, sh := range shapes {
 		for _, mode := range inPlaceModes {
 			b.Run(fmt.Sprintf("%s/%s", sh.name, mode), func(b *testing.B) {
 				s := inPlaceShard(b, mode)
+				// The jittered shape needs a base long enough to slice its whole range
+				// out of; the fixed shapes keep the standard record size.
 				base := benchValue()
+				if !sh.readOnly && sh.name == "lockcost" {
+					base = make([]byte, inPlaceJitterLo+inPlaceJitterSpan)
+					for i := range base {
+						base[i] = byte(i)
+					}
+				}
 				warm := rand.New(rand.NewSource(1)) //nolint:gosec // deterministic shape, not security
 				if sh.readOnly {
 					// Just the live set, well inside the budget: no eviction, no garbage,
