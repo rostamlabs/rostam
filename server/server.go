@@ -140,8 +140,12 @@ type Server struct {
 	connSem chan struct{}
 	wg      sync.WaitGroup
 
-	mu    sync.Mutex
-	conns map[net.Conn]struct{} // tracks active conns so Close can force-close them
+	// mu guards conns AND closing, and is the fence between admitting a
+	// connection and shutting down. wg.Add for a handler happens under it (see
+	// startConn), so it cannot run concurrently with the wg.Wait in Close.
+	mu      sync.Mutex
+	conns   map[net.Conn]struct{} // tracks active conns so Close can force-close them
+	closing bool                  // set by Close; no handler may start after it
 
 	closeOnce sync.Once
 	closeCh   chan struct{}
@@ -174,10 +178,32 @@ func New(cfg Config) (*Server, error) {
 	}, nil
 }
 
-func (s *Server) trackConn(c net.Conn) {
+// startConn admits one accepted connection: it counts the handler in wg and
+// publishes the conn so Close can force-close it. It reports false when Close
+// has already begun, in which case the caller must close the conn itself and
+// start no handler.
+//
+// Both steps happen under mu, the same lock Close holds while it marks the
+// server closing and walks conns — and it takes that lock BEFORE wg.Wait. That
+// is what makes the two orderings the only possible ones: either the handler is
+// counted and its conn is in the map before Close's critical section (so Close
+// force-closes it and Wait covers it), or admission loses the race and is
+// refused outright. Counting outside this lock leaves a window where a conn is
+// live but uncounted: Wait would then see a zero counter and return while the
+// handler is only just starting — breaking Close's "waits for their handler
+// goroutines to return" contract, and, when another handler drains to zero at
+// the same moment, tripping the runtime's own "WaitGroup is reused before
+// previous Wait has returned" / "Add called concurrently with Wait" check
+// inside Close.
+func (s *Server) startConn(c net.Conn) bool {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing {
+		return false
+	}
+	s.wg.Add(1)
 	s.conns[c] = struct{}{}
-	s.mu.Unlock()
+	return true
 }
 
 func (s *Server) untrackConn(c net.Conn) {
@@ -207,8 +233,14 @@ func (s *Server) Serve() error {
 			_ = conn.Close()
 			continue
 		}
-		s.trackConn(conn)
-		s.wg.Add(1)
+		if !s.startConn(conn) {
+			// Close is already draining. This conn was accepted after it walked
+			// conns, so nothing would ever force-close it; drop it here rather
+			// than hand it a handler Close cannot wait for.
+			_ = conn.Close()
+			<-s.connSem
+			return nil
+		}
 		go func(c net.Conn) {
 			defer s.wg.Done()
 			defer func() { <-s.connSem }()
@@ -229,6 +261,11 @@ func (s *Server) Close() error {
 		close(s.closeCh)
 		closeErr = s.ln.Close()
 		s.mu.Lock()
+		// Marking closing and force-closing every tracked conn in one critical
+		// section is what lets the Wait below be exhaustive: after this unlock,
+		// startConn refuses every further admission, so the counter can only
+		// fall. See startConn.
+		s.closing = true
 		for c := range s.conns {
 			_ = c.Close()
 		}
