@@ -304,10 +304,12 @@ type Config struct {
 	//     an alias may outlive the read that produced it (it escapes to a network
 	//     response writer). Overwriting live bytes under it would change a value a
 	//     caller is still holding.
-	//   - MMAP shards are the DURABLE copy. Overwriting destroys the old version, so
-	//     a write torn by a crash loses the KEY OUTRIGHT, where an append leaves the
-	//     previous version framed and recoverable. Heap pages are not persisted, so
-	//     there is nothing to recover and the concern does not arise.
+	//   - MMAP shards are the DURABLE copy. Overwriting destroys the old version,
+	//     and the loss is not limited to the key being written: an append can only
+	//     tear at the page TAIL, while an in-place write tears mid-page, and
+	//     recovery answers a torn entry by truncating the page there and abandoning
+	//     the rest of it. Keys that were durable long before the torn write are lost
+	//     with it. Heap pages are not persisted, so the concern does not arise.
 	//
 	// WHAT IT ALSO COSTS: WRITE RECENCY, and this is a change in EVICTION
 	// SEMANTICS, not only in locking. Eviction here reclaims whole pages in

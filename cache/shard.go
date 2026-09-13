@@ -1019,11 +1019,22 @@ func (s *shard) inPlaceEligible() bool {
 	if s.cfg.AtCapPolicy != PolicyRingbufEvict {
 		return false
 	}
-	// GUARD 3 — HEAP BACKING. An mmap page is the DURABLE copy. Overwriting
-	// destroys the old version, so a write torn by a crash loses the KEY OUTRIGHT,
-	// where an append leaves the previous version framed and recoverable by the
-	// rebuild. Heap pages are not persisted, so there is nothing a torn write could
-	// cost that the process dying has not already cost.
+	// GUARD 3 — HEAP BACKING. An mmap page is the DURABLE copy, and the cost of a
+	// torn write is NOT confined to the key being written.
+	//
+	// An append can only ever tear at the page TAIL, so recovery discards the torn
+	// write and nothing beyond it. An in-place write tears at an arbitrary offset
+	// INSIDE a live page, and rebuildIndexFromPages answers a CRC failure by
+	// truncating the page at that offset and abandoning the rest of it — it cannot
+	// simply skip the bad entry, because EvictFront frames entries from raw bytes
+	// with no CRC, so the torn region has to be excluded from every future eviction
+	// walk. The loss is therefore every entry AFTER the tear on that page:
+	// unrelated keys, durable long before the write that tore.
+	//
+	// That is also why the boundary cannot be redefined to make this safe — read
+	// rebuildIndexFromPages before concluding otherwise. Heap pages are not
+	// persisted, so there is nothing a torn write could cost that the process
+	// dying has not already cost.
 	return !s.isMmap
 }
 
