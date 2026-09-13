@@ -89,6 +89,19 @@ type Stats struct {
 	OnlineBytesRelocated uint64
 	OnlinePagesRetired   uint64
 	OnlinePagesRecycled  uint64
+
+	// Relocating eviction (heap ringbuf shards with Config.RelocatingEviction;
+	// cache/relocate_evict.go). A DIFFERENT mechanism from the online compactor
+	// above, on the other storage mode:
+	//   - EvictionRelocations: live records copied forward out of a page about to be
+	//     drained, instead of being dropped with the dead versions sharing it. Read
+	//     it next to EvictionsLive: relocation is what moves losses out of that
+	//     counter, so the two together say how much of the eviction pressure on this
+	//     shard is landing on records that were still live.
+	//   - EvictionBytesRelocated: their framed byte total — the write-path copy the
+	//     feature is charging for those saves.
+	EvictionRelocations    uint64
+	EvictionBytesRelocated uint64
 }
 
 // HitRate returns Hits / Gets, or 0 when Gets == 0.
@@ -127,6 +140,8 @@ func (s *Stats) Add(o Stats) {
 	s.OnlineBytesRelocated += o.OnlineBytesRelocated
 	s.OnlinePagesRetired += o.OnlinePagesRetired
 	s.OnlinePagesRecycled += o.OnlinePagesRecycled
+	s.EvictionRelocations += o.EvictionRelocations
+	s.EvictionBytesRelocated += o.EvictionBytesRelocated
 }
 
 // WritePrometheus renders s in the Prometheus text exposition format. Counters
@@ -150,6 +165,8 @@ func (s Stats) WritePrometheus(w io.Writer) error {
 		{"rostam_kv_expirations_total", "entries retired because their TTL elapsed", s.Expirations},
 		{"rostam_kv_evictions_total", "entries displaced by ringbuf eviction, live or already superseded", s.Evictions},
 		{"rostam_kv_evictions_live_total", "entries displaced by ringbuf eviction that were still the live record for their key - lost to capacity, not TTL", s.EvictionsLive},
+		{"rostam_kv_eviction_relocations_total", "live records copied forward by relocating eviction instead of being dropped with the dead versions sharing their page - the saves that did NOT become evictions_live", s.EvictionRelocations},
+		{"rostam_kv_eviction_bytes_relocated_total", "bytes copied by those relocations - the write-path cost of the saves", s.EvictionBytesRelocated},
 		{"rostam_kv_rejects_total", "writes refused under PolicyRejectWrites", s.Rejects},
 		{"rostam_kv_corruption_errors_total", "CRC mismatches seen on read", s.CorruptionErrors},
 		{"rostam_kv_compactions_total", "page files rewritten live-only at shard open (mmap)", s.Compactions},

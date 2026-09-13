@@ -167,6 +167,29 @@ type Config struct {
 	// relocate+recycle ACTION.
 	OnlineCompaction bool
 
+	// RelocatingEviction opts a HEAP RINGBUF shard into RELOCATING eviction
+	// (cache/relocate_evict.go): before the rotation cursor drains a page, the live
+	// records on it are COPIED FORWARD into the space the previous eviction freed and
+	// their index slots repointed, so a record that is still the live copy for its key
+	// is no longer dropped merely because it shares a page with superseded versions of
+	// OTHER keys. Default false. Eviction under PolicyRingbufEvict is positional — it
+	// picks the next non-empty page and drains it in full — so without this the page's
+	// dead versions and its live records go together.
+	//
+	// It is a no-op on every other shard (mmap, reject-writes): the pass is gated on
+	// !isMmap && AtCapPolicy == PolicyRingbufEvict, and an mmap ringbuf shard drains
+	// its fixed region in place (drainPageLocked) instead of retiring page objects.
+	//
+	// WHAT IT COSTS. Relocation runs on the WRITE PATH, inside the Put that triggered
+	// the eviction, and copies entry bytes. It is bounded so that cost stays a
+	// fraction of the eviction it rides on: it may spend only the room left in the
+	// freed page AFTER the triggering write's own requirement, and at most
+	// PageSize/relocateMaxBytesPerEvictionDivisor bytes per eviction. It never
+	// allocates a page, never triggers another eviction, and never fails a write — a
+	// record that does not fit the budget is simply left to be dropped as it is today.
+	// Stats.EvictionRelocations / EvictionBytesRelocated report what it moved.
+	RelocatingEviction bool
+
 	// AliasQuarantine is how long online relocating compaction must let a RETIRED
 	// mmap page sit — bytes mapped and immutable — before it may RECYCLE that page
 	// (reset head/tail to 0 and hand its extent back to the write path). It is the
