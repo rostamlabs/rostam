@@ -5,6 +5,31 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **`Server.Close` could panic the process, or return while a connection handler
+  was still running.** The accept loop published a connection into the tracked
+  set and only then counted its handler goroutine, while `Close` walked that set
+  and then waited on the counter. Nothing ordered those two steps, so a
+  connection could be visible to `Close` but not yet counted.
+
+  That produced two failures. `Close` could observe a zero counter and return
+  while a handler was only starting, making its documented promise to wait for
+  handler goroutines false — and since shutdown closes the TCP server before the
+  store, a handler could then still be dispatching against a closing store. Or,
+  when other handlers drained the counter to zero at that moment, `sync.WaitGroup`
+  detected the misuse itself and panicked inside `Close` with "WaitGroup is
+  reused before previous Wait has returned". A connection accepted after
+  `Close`'s walk was also never force-closed, so nothing ended it but the idle
+  timeout.
+
+  Admission now counts and publishes the connection under the same lock `Close`
+  holds before it waits, and refuses once `Close` has begun. A connection is
+  therefore either fully admitted before that critical section — so it is
+  force-closed and its handler is waited for — or refused, and the accept loop
+  drops it rather than starting a handler `Close` cannot wait for. Ordering the
+  two steps differently, or checking a shutdown flag in the accept path, does not
+  close the window: `Close` can run to completion between the accept and the
+  count either way.
+
 - **Breaking: `operate` now bounds the total BYTES its returns may produce, not
   just how many of them there are.** `maxRet` capped the return-spec list at
   4096, but a spec is a few bytes on the wire and a record-kind `VALUE` copies
