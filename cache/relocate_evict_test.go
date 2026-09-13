@@ -711,12 +711,31 @@ func BenchmarkRelocatingEvictionAB(b *testing.B) {
 // its OWN pages directory. Every arm gets the same seed and the same key population, so the only
 // difference between two rows is the configuration named in the row.
 //
-// THREE arms on heap — off, synchronous, background — and two on mmap, because the
-// background reserve is heap-only (see the HEAP RINGBUF ONLY note in
-// cache/relocate_reserve.go). The background arm is the synchronous arm plus a running
-// sweeper: the write-path pass is still installed as its fallback, which is exactly the
-// configuration it ships as, so reloc/op falling while bg_reloc/op rises is the whole
-// claim in two columns.
+// FOUR arms on heap and two on mmap, because the background reserve is heap-only (see the
+// HEAP RINGBUF ONLY note in cache/relocate_reserve.go):
+//
+//	off              neither pass, no sweeper — positional eviction on its own
+//	swept-fast       no relocation, sweeper ticking at relocABSweepMs
+//	swept-slow       no relocation, sweeper ticking at relocABSweepSlowMs
+//	sync             relocation on the write path, sweeper off — #127 as it stands
+//	background-fast  relocation plus the reserve, sweeper at relocABSweepMs
+//	background-slow  relocation plus the reserve, sweeper at relocABSweepSlowMs
+//
+// THE SWEPT ROWS ARE CONTROLS AND ARE NOT OPTIONAL, because without them a background row
+// is unreadable. A ticking sweeper also runs sweepIndex, which takes the shard WRITE lock
+// for sweepBatchSize slots at a time and decodes every live entry it passes, once per tick
+// per shard — a cost with nothing to do with relocation that nonetheless scales with both
+// the cadence and the shard count. off -> swept prices it, so sync -> background can be
+// read net of it.
+//
+// TWO CADENCES, because one number hides the whole trade. The sweeper can only take
+// relocation off the write path by running often, and running often is itself what it
+// costs; a single row cannot show a curve. Each background row has the swept row at its
+// own cadence to be read against.
+//
+// A background row is relocation with the sweeper running, which installs the free-page
+// reserve AND keeps the write-path pass as its fallback — the configuration the feature
+// ships as — so reloc/op falling while bg_reloc/op rises is the claim, in two columns.
 //
 // READ THE BACKGROUND ARM'S ns/op WITH THE HARNESS IN MIND, because this harness is the
 // worst case for that arm and the figure is not a prediction about a server. There is ONE
@@ -744,11 +763,20 @@ func relocABArms(b *testing.B, mmap bool) {
 		sweepMs int
 	}{
 		{"off", false, 0},
+		{"swept-fast", false, relocABSweepMs},
+		{"swept-slow", false, relocABSweepSlowMs},
 		{"sync", true, 0},
-		{"background", true, relocABSweepMs},
+		{"background-fast", true, relocABSweepMs},
+		{"background-slow", true, relocABSweepSlowMs},
 	}
 	if mmap {
-		arms = arms[:2] // the reserve is heap-only; a third mmap row would be the second
+		// The reserve is heap-only, and so is the control that exists to price it against;
+		// on mmap the pair that remains is the one #127 is about.
+		arms = []struct {
+			name    string
+			on      bool
+			sweepMs int
+		}{{"off", false, 0}, {"sync", true, 0}}
 	}
 	for _, arm := range arms {
 		b.Run("reloc="+arm.name, func(b *testing.B) {
@@ -794,25 +822,9 @@ func relocABArms(b *testing.B, mmap bool) {
 					hits++
 				}
 			}
-			perOp := func(d uint64) float64 {
-				if ops == 0 {
-					return 0
-				}
-				return float64(d) / float64(ops)
-			}
-			bytesPerKey := 0.0
-			if st.Entries > 0 {
-				bytesPerKey = float64(st.BytesUsed) / float64(st.Entries)
-			}
-			b.ReportMetric(float64(hits)/float64(relocABKeyspace), "hit_rate")
-			b.ReportMetric(float64(st.Entries), "entries")
-			b.ReportMetric(bytesPerKey, "B/live_key")
-			b.ReportMetric(perOp(st.Evictions-warm.Evictions), "evict/op")
-			b.ReportMetric(perOp(st.EvictionsLive-warm.EvictionsLive), "evict_live/op")
-			b.ReportMetric(perOp(st.EvictionRelocations-warm.EvictionRelocations), "reloc/op")
-			b.ReportMetric(perOp(st.EvictionBytesRelocated-warm.EvictionBytesRelocated), "reloc_B/op")
-			b.ReportMetric(perOp(st.ReserveRelocations-warm.ReserveRelocations), "bg_reloc/op")
-			b.ReportMetric(float64(st.ReservePagesFreed-warm.ReservePagesFreed), "bg_pages")
+			// Shared with the sharded harness, so a row there means the same thing field
+			// for field as a row here.
+			relocABReport(b, warm, st, int64(ops), relocABKeyspace, hits)
 		})
 	}
 }
@@ -826,11 +838,14 @@ const (
 	relocABZipfS    = 1.3
 	relocABSeed     = 0x5EED
 	relocABWarmOps  = 400_000
-	// The tightest cadence the sweeper's ticker will take, so the background arm gets
-	// the best chance of keeping up with a benchmark loop that writes as fast as it
-	// can. A real shard ticks at TTLSweepIntervalMs (default 1s) against a real write
-	// rate; this is the arm's upper bound, not its typical setting.
-	relocABSweepMs = 1
+	// The two sweeper cadences the arms are run at. relocABSweepMs is the tightest the
+	// ticker will take — the sweeper's best chance of keeping up with a loop writing as
+	// fast as it can, and also its most expensive setting. relocABSweepSlowMs is a
+	// cadence at which the sweeper's own cost is small enough to disappear into the
+	// noise, and it takes correspondingly less of the copying. Neither is the shipped
+	// default (TTLSweepIntervalMs, 1s); they bracket the trade rather than predict it.
+	relocABSweepMs     = 1
+	relocABSweepSlowMs = 50
 )
 
 // pageObjects snapshots the shard's page object identities. A heap eviction RETIRES
