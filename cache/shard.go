@@ -175,6 +175,16 @@ type shard struct {
 	seqlockRetries   atomic.Uint64
 	seqlockFallbacks atomic.Uint64
 
+	// indexRehashes / indexRehashNanos measure the index table's growth step: how
+	// many times a write (or the warm-restart rebuild) replaced the table with a
+	// freshly-sized one, and how long those rebuilds took in total. The rebuild
+	// re-inserts every live entry and runs under s.mu, so it is the one write-path
+	// step whose cost scales with the shard's entry count rather than the entry
+	// being written; these two counters are what make its frequency and its cost
+	// separable instead of a guess.
+	indexRehashes    atomic.Uint64
+	indexRehashNanos atomic.Uint64
+
 	// cold-compaction counters (cache/compact.go). Written once, at open, before
 	// the shard is published; atomic only so Stats can read them from any
 	// goroutine afterwards. compactAborts covers every path that decided against
@@ -1162,9 +1172,7 @@ func (s *shard) putAtExpLocked(key, value []byte, exp uint64, h uint64) error {
 	}
 	t := s.tab.Load()
 	t.upsert(h, makeSlabRef(uint16(pageIdx), s.pages[pageIdx].gen, off)) //nolint:gosec // pageIdx bounded by MaxPagesPerShard (≤65535)
-	if t.overThreshold() {
-		s.tab.Store(t.rehashed())
-	}
+	s.rehashIfOverThresholdLocked(t)
 	return nil
 }
 
@@ -1538,9 +1546,7 @@ func (s *shard) rebuildIndexFromPages() {
 				p.gen,
 				uint32(cursor), //nolint:gosec // cursor < PageSize
 			))
-			if t.overThreshold() {
-				s.tab.Store(t.rehashed())
-			}
+			s.rehashIfOverThresholdLocked(t)
 			cursor += esize
 		}
 	}
@@ -2269,4 +2275,27 @@ func (s *shard) tryRetireExpiredPageLocked(idx int, stamp uint64) {
 	fresh := s.freshHeapPageLocked()
 	s.pages[idx] = fresh
 	s.pageSlots[idx].Store(fresh) // publish so readers resolve the new generation
+}
+
+// rehashIfOverThresholdLocked replaces t with a freshly-sized table when its fill
+// (live entries plus tombstones) has reached the resize threshold. Call under
+// s.mu with t the table the caller just mutated.
+//
+// The rebuild re-inserts every live entry one by one, so its cost is proportional
+// to the shard's entry count, not to the write that tripped it. That is worth
+// counting separately from the write path it sits in: the pair of counters says
+// how OFTEN the step runs and how much time it takes in total, which is what
+// separates a step that is rare and expensive from one that is merely expensive.
+//
+// Time first, count second, as the other paired counters in this file do: a reader
+// that sees the count has necessarily already seen the time it belongs to, so the
+// pair can never report rehashes that took no time.
+func (s *shard) rehashIfOverThresholdLocked(t *indexTable) {
+	if !t.overThreshold() {
+		return
+	}
+	t0 := time.Now()
+	s.tab.Store(t.rehashed())
+	s.indexRehashNanos.Add(uint64(time.Since(t0))) //nolint:gosec // a duration here is never negative
+	s.indexRehashes.Add(1)
 }
