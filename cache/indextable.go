@@ -76,40 +76,102 @@ func newIndexTable(entries int) *indexTable {
 // in place (PolicyRingbufEvict) — see the shard read path.
 func (t *indexTable) get(s *shard, key []byte, h uint64) (v []byte, exp uint64, ref slabRef, st lookupStatus) {
 	tag := tagFor(h)
-	for i := h & t.mask; ; i = (i + 1) & t.mask {
-		c := t.ctrl[i].Load()
-		if c == ctrlEmpty {
-			return nil, 0, 0, lkMiss // probe run ended: key absent
+	// The table this probe is running against. It is t until a rehash is discovered
+	// mid-probe, at which point the probe restarts on the live table — see rechaseSlot.
+	tab := t
+probe:
+	for {
+		for i := h & tab.mask; ; i = (i + 1) & tab.mask {
+			c := tab.ctrl[i].Load()
+			if c == ctrlEmpty {
+				return nil, 0, 0, lkMiss // probe run ended: key absent
+			}
+			if c != tag {
+				continue // tombstone or different tag
+			}
+			// Load the ref AFTER the control word: the writer stores ref before
+			// publishing ctrl, so observing this tag guarantees a ref at least as new.
+			r := slabRef(tab.refs[i].Load())
+			// Resolve the page OBJECT pointer atomically (never an index into a mutable
+			// slice). Once loaded, p keeps that exact object GC-alive for the rest of
+			// this read. pageSlots has fixed length MaxPagesPerShard and its header
+			// never changes, so this single atomic load is race-free; the writer stores
+			// the page into the slot before publishing the entry's ctrl, so a ref we
+			// observed points at a populated slot.
+			p := s.pageSlots[r.pageIdx()].Load()
+			if p == nil || p.gen != r.gen() {
+				// Slot unpopulated, or the page's generation does not match the ref. Do
+				// NOT read bytes: a freshly-swapped page may be under active append by a
+				// writer. A mismatch has TWO meanings now — the entry was evicted, or it
+				// MOVED (relocating eviction copied it forward and repointed its slot) —
+				// and rechaseSlot tells them apart, on the table that can actually answer.
+				var live *indexTable
+				p, r, live = tab.rechaseSlot(s, i, r)
+				if live != nil {
+					tab = live
+					continue probe // this table is frozen; start over on the live one.
+				}
+				if p == nil {
+					continue
+				}
+			}
+			k, val, e, err := p.Read(r.offset())
+			if err != nil {
+				return nil, 0, 0, lkCorrupt
+			}
+			if !bytes.Equal(k, key) {
+				continue // false-tag or stale ref → keep probing
+			}
+			return val, e, r, lkHit
 		}
-		if c != tag {
-			continue // tombstone or different tag
-		}
-		// Load the ref AFTER the control word: the writer stores ref before
-		// publishing ctrl, so observing this tag guarantees a ref at least as new.
-		r := slabRef(t.refs[i].Load())
-		// Resolve the page OBJECT pointer atomically (never an index into a mutable
-		// slice). Once loaded, p keeps that exact object GC-alive for the rest of
-		// this read. pageSlots has fixed length MaxPagesPerShard and its header
-		// never changes, so this single atomic load is race-free; the writer stores
-		// the page into the slot before publishing the entry's ctrl, so a ref we
-		// observed points at a populated slot.
-		p := s.pageSlots[r.pageIdx()].Load()
-		if p == nil || p.gen != r.gen() {
-			// Slot unpopulated, or the page was retired (heap ringbuf eviction) and
-			// replaced by a fresh generation → this physical entry is gone. Do NOT
-			// read bytes: a freshly-swapped page may be under active append by a
-			// writer. The generation gate makes this a miss without touching it.
-			continue
-		}
-		k, val, e, err := p.Read(r.offset())
-		if err != nil {
-			return nil, 0, 0, lkCorrupt
-		}
-		if !bytes.Equal(k, key) {
-			continue // false-tag or stale ref → keep probing
-		}
-		return val, e, r, lkHit
 	}
+}
+
+// rechaseSlot re-resolves slot i after its ref failed the page-generation gate in
+// get. Before relocating eviction a mismatch meant exactly one thing — the entry
+// was evicted — and advancing to the next probe slot was the right answer.
+// Relocation adds a second meaning: the entry MOVED, and its slot was repointed at
+// the copy. Walking on past a relocated key's own slot would end the probe run
+// somewhere else and report lkMiss — a wrong answer for a live key the cache
+// deliberately kept — so the slot has to be re-read before that conclusion is drawn.
+//
+// THE TABLE MUST BE RE-CHECKED FIRST, and a mismatch there is not recoverable in
+// place. A rehash publishes a FRESH table (s.tab.Store(t.rehashed())) and the old one
+// is never written again, so every repoint after that lands somewhere this table
+// cannot see: re-reading a slot in it would find the ref unchanged and wrongly report
+// the record gone. The only correct answer is to hand the live table back and have the
+// probe start over on it, which is what a non-nil third return means. That restart is
+// not a spin — each one requires a rehash to have actually happened, and a rehash
+// costs a table's worth of inserts.
+//
+// WITHIN ONE TABLE, A SINGLE RE-READ IS AUTHORITATIVE — there is no retry budget here
+// and none is needed. A slot always holds the LATEST ref for its key, so one re-read
+// gets the end of the chain, never an intermediate hop: a record relocated twice is
+// found at its second destination, not its first. That leaves exactly two outcomes,
+// and both are final. An UNCHANGED ref means no relocation ever repointed this slot,
+// so the record was evicted and the miss is correct (a tombstone store leaves refs
+// alone, which is why the ref is the thing to compare). A CHANGED ref that STILL fails
+// the generation gate means the latest copy is itself on a page that has been freed —
+// and relocation repoints a record's slot BEFORE the page holding it is freed, which
+// is the ordering the whole design rests on, so a latest ref pointing into a freed page
+// is a record that was dropped rather than moved. The miss is correct there too.
+//
+// Returns (nil, r, nil) when the caller should advance to the next probe slot,
+// (page, ref, nil) when the record was found, or (nil, r, live) when the caller must
+// restart its probe against the returned table.
+func (t *indexTable) rechaseSlot(s *shard, i uint64, r slabRef) (*page, slabRef, *indexTable) {
+	if live := s.tab.Load(); live != t {
+		return nil, r, live // frozen table: nothing it says about this slot is current.
+	}
+	cur := slabRef(t.refs[i].Load())
+	if cur == r {
+		return nil, r, nil // unchanged: the entry really is gone.
+	}
+	p := s.pageSlots[cur.pageIdx()].Load()
+	if p == nil || p.gen != cur.gen() {
+		return nil, cur, nil // latest copy is on a freed page: dropped, not moved.
+	}
+	return p, cur, nil
 }
 
 // lookupStatus is the outcome of a table probe.

@@ -5,9 +5,16 @@ package cache
 import (
 	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"time"
 )
+
+// maxIntervalMs is the largest millisecond figure that still converts to a
+// time.Duration: beyond it, ms * time.Millisecond wraps. Every interval field in this
+// Config is validated against it, because each one is multiplied out exactly that way
+// when its ticker starts.
+const maxIntervalMs = int64(math.MaxInt64) / int64(time.Millisecond)
 
 // AtCapPolicy controls behavior when a shard is at MaxPages and all pages are full.
 type AtCapPolicy uint8
@@ -167,6 +174,81 @@ type Config struct {
 	// relocate+recycle ACTION.
 	OnlineCompaction bool
 
+	// RelocatingEviction opts a RINGBUF shard into RELOCATING eviction
+	// (cache/relocate_evict.go): before the rotation cursor drains a page, the live
+	// records on it are COPIED FORWARD into the space the previous eviction freed and
+	// their index slots repointed, so a record that is still the live copy for its key
+	// is no longer dropped merely because it shares a page with superseded versions of
+	// OTHER keys. Default false. Eviction under PolicyRingbufEvict is positional — it
+	// picks the next non-empty page and drains it in full — so without this the page's
+	// dead versions and its live records go together.
+	//
+	// It applies to BOTH ringbuf storage modes: heap shards, which free a page by
+	// retiring it, and single-node mmap shards, which drain the fixed region in place.
+	// On mmap a relocated copy is appended through the ordinary write path, so it
+	// carries a higher write sequence than the original it leaves framed on the source
+	// page and warm restart resolves the pair to the relocated copy. It is a no-op
+	// under PolicyRejectWrites (nothing is ever evicted), which is what replication
+	// forces — a replicated shard reclaims through the online compactor instead
+	// (Config.OnlineCompaction).
+	//
+	// WHAT IT COSTS. Relocation runs on the WRITE PATH, inside the Put that triggered
+	// the eviction, and copies entry bytes. It is bounded so that cost stays a
+	// fraction of the eviction it rides on: it may spend only the room left in the
+	// freed page AFTER the triggering write's own requirement, and at most
+	// PageSize/relocateMaxBytesPerEvictionDivisor bytes per eviction. It never
+	// allocates a page, never triggers another eviction, and never fails a write — a
+	// record that does not fit the budget is simply left to be dropped as it is today.
+	// Stats.EvictionRelocations / EvictionBytesRelocated report what it moved.
+	//
+	// WHO ACTUALLY PAYS IT. On a HEAP ringbuf shard with the sweeper running
+	// (TTLSweepIntervalMs > 0) most of that copying moves OFF the write path: the
+	// sweeper keeps a small reserve of free pages by evacuating and retiring rotation
+	// victims ahead of time (cache/relocate_reserve.go), so a write at capacity finds
+	// room in an already-free page and never evicts. The write-path pass above stays as
+	// the fallback for when a burst outruns the sweeper or the shard is too dense to
+	// evacuate. Stats.ReserveRelocations / ReserveBytesRelocated / ReservePagesFreed
+	// report the background half, and reading them next to the Eviction* pair says how
+	// much of the cost writes are still carrying. The reserve costs a page or two of
+	// capacity held empty and MORE total copying than the write-path pass alone (it
+	// moves records on a clock, so it copies some that would have been superseded
+	// before their page came round); it buys a steady-state write paying none of it.
+	// Mmap ringbuf shards keep the write-path pass alone — see the HEAP RINGBUF ONLY
+	// note in cache/relocate_reserve.go for why.
+	RelocatingEviction bool
+
+	// RelocateReserveIntervalMs is how often each shard tops up its free-page reserve
+	// (cache/relocate_reserve.go). Zero — the value a zero Config carries — runs no
+	// reserve ticker at all, which leaves RelocatingEviction as exactly the write-path
+	// pass and nothing else. DefaultConfig sets it; see below for the value and why.
+	//
+	// It is a CADENCE, not a second on/off switch: RelocatingEviction remains the gate,
+	// and this field does nothing at all while that is false.
+	//
+	// WHY IT IS NOT TTLSweepIntervalMs, which is the ticker the reserve first rode. Those
+	// are two different jobs with two different right answers. A tick of the TTL sweeper
+	// runs sweepIndex, which takes the shard write lock for sweepBatchSize slots at a
+	// time and decodes every live entry it passes; a tick of this one calls only
+	// topUpFreeReserve, which walks at most the rotation victim and usually returns at
+	// once. The reserve earns nothing at a cadence measured in seconds — it cannot get
+	// ahead of the write stream — but running sweepIndex at the cadence the reserve wants
+	// costs far more than the reserve saves. One interval forces one of the two onto the
+	// other's setting, so they are separate and the TTL sweeper keeps its own.
+	//
+	// THE COST IS PER SHARD, which is the thing to hold on to when changing it. Every
+	// shard runs its own ticker, so at a fixed interval the work the cache does per unit
+	// time scales with NumShards while the write stream does not: an interval that is
+	// free on a handful of shards is not the same setting on hundreds. Tick work is
+	// bounded (see topUpFreeReserve) but it is not zero, and a shard below its page cap
+	// still costs a lock acquisition and a length check per tick to discover it has
+	// nothing to do.
+	//
+	// THE DEFAULT is the value the A/B measured as earning more than it costs
+	// (cache/relocate_sharded_bench_test.go). Read that benchmark's doc before changing
+	// it: the figure is the outcome of a measurement, not a round number, and the two
+	// directions it is wrong in are not symmetric.
+	RelocateReserveIntervalMs int
+
 	// AliasQuarantine is how long online relocating compaction must let a RETIRED
 	// mmap page sit — bytes mapped and immutable — before it may RECYCLE that page
 	// (reset head/tail to 0 and hand its extent back to the write path). It is the
@@ -219,6 +301,8 @@ func DefaultConfig() Config {
 		AtCapPolicy:          PolicyRingbufEvict,
 		TTLSweepIntervalMs:   1000,
 		MsyncIntervalMs:      100,
+		// Inert unless RelocatingEviction is set, which is off by default.
+		RelocateReserveIntervalMs: defaultRelocateReserveIntervalMs,
 	}
 }
 
@@ -266,8 +350,23 @@ func (c Config) Validate() error {
 	default:
 		return fmt.Errorf("config: AtCapPolicy=%d invalid", c.AtCapPolicy)
 	}
+	// Both intervals become time.Duration(ms) * time.Millisecond when their ticker
+	// starts, which overflows silently past maxIntervalMs and hands time.NewTicker a
+	// negative period — a panic on a background goroutine, at start-up, from a value
+	// that passed validation. Reject it here instead.
 	if c.TTLSweepIntervalMs < 0 {
 		return errors.New("config: TTLSweepIntervalMs must be >= 0")
+	}
+	if int64(c.TTLSweepIntervalMs) > maxIntervalMs {
+		return fmt.Errorf("config: TTLSweepIntervalMs=%d overflows a duration; must be <= %d",
+			c.TTLSweepIntervalMs, maxIntervalMs)
+	}
+	if c.RelocateReserveIntervalMs < 0 {
+		return errors.New("config: RelocateReserveIntervalMs must be >= 0")
+	}
+	if int64(c.RelocateReserveIntervalMs) > maxIntervalMs {
+		return fmt.Errorf("config: RelocateReserveIntervalMs=%d overflows a duration; must be <= %d",
+			c.RelocateReserveIntervalMs, maxIntervalMs)
 	}
 	if c.DataDir != "" && !mmapSupported {
 		return fmt.Errorf("cache.Config: DataDir set but mmap not supported on %s; use DataDir=\"\"", runtime.GOOS)
@@ -277,6 +376,10 @@ func (c Config) Validate() error {
 	}
 	if c.Mlock && c.DataDir == "" {
 		return errors.New("cache.Config: Mlock requires DataDir")
+	}
+	if int64(c.MsyncIntervalMs) > maxIntervalMs {
+		return fmt.Errorf("config: MsyncIntervalMs=%d overflows a duration; must be <= %d",
+			c.MsyncIntervalMs, maxIntervalMs)
 	}
 	if c.MsyncIntervalMs < 1 {
 		return errors.New("cache.Config: MsyncIntervalMs must be >= 1")

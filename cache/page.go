@@ -70,6 +70,21 @@ type page struct {
 	// the alias-hold bound is a real network-write duration. Zero on a non-retired
 	// page and on every heap / single-node / ringbuf shard. Guarded by shard.mu.
 	retiredAt time.Time
+
+	// relocatedOut is the framed bytes EITHER relocating pass has copied OFF this page
+	// since this object was created — the background reserve
+	// (cache/relocate_reserve.go) and the synchronous write-path pass
+	// (relocateIntoFreedPageLocked) both charge it, because both spend room carrying
+	// records off a page and the figure is meaningless if only one of them is counted.
+	//
+	// It is what lets the reserve tell room it can RECLAIM from room it has already PAID
+	// FOR: a page whose remaining entries are all dead only because relocation moved the
+	// live ones out hands nothing back when it is retired, and retiring it would be a
+	// page of copying for no room. Without this the two are indistinguishable — the page
+	// looks equally dead either way. Only the RESERVE reads it; the synchronous pass
+	// contributes to it without consulting it, since its own budget is per-eviction.
+	// WRITE-PATH-ONLY state, guarded by shard.mu; zero on a shard neither pass runs on.
+	relocatedOut int
 }
 
 // newHeapPage allocates a heap-backed page of size bytes.
@@ -247,4 +262,5 @@ func (p *page) EvictFront() ([]byte, uint32, error) {
 func (p *page) Reset() {
 	p.setHead(0)
 	p.setTail(0)
+	p.relocatedOut = 0
 }

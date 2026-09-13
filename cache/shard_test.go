@@ -176,6 +176,16 @@ func TestShardRingbufEvictionIsFIFOAcrossPages(t *testing.T) {
 		t.Fatal("expected eviction after all pages full")
 	}
 
+	// Page generations after the fill: draining a page replaces it with a fresh
+	// object carrying a new generation, so a page whose generation never moves is
+	// a page the rotation never reached.
+	s.mu.RLock()
+	genBefore := make([]uint16, pages)
+	for i := range genBefore {
+		genBefore[i] = s.pages[i].gen
+	}
+	s.mu.RUnlock()
+
 	// Drive well past a single full wrap.
 	for i := perPage*pages + 1; i < 1000; i++ {
 		if err := s.Put(key(i), val, 0); err != nil {
@@ -183,13 +193,29 @@ func TestShardRingbufEvictionIsFIFOAcrossPages(t *testing.T) {
 		}
 	}
 
-	// FIFO across pages: entries from the first fill — including page 1 (keys
-	// 5..9) and page 2 (keys 10..14) — must all be evicted, not just page 0's.
-	// The bug (always draining the lowest-index page) freezes pages 1 and 2
-	// forever, so keys 5..14 would survive.
-	for _, i := range []int{0, 5, 9, 10, 14, 500} {
-		if _, err := s.Get(key(i)); err != ErrNotFound {
-			t.Errorf("key %d should be evicted (FIFO), got err=%v", i, err)
+	// FIFO across pages, stated as what the rotation does rather than as what
+	// survives: EVERY page must have been drained, not just page 0. The bug this
+	// guards — always draining the lowest-index page — freezes pages 1 and 2
+	// forever, and their generations would not move.
+	s.mu.RLock()
+	for i := range genBefore {
+		if s.pages[i].gen == genBefore[i] {
+			s.mu.RUnlock()
+			t.Fatalf("page %d was never drained across %d wraps (generation still %d); "+
+				"the rotation is not reaching every page", i, 1000/(perPage*pages), genBefore[i])
+		}
+	}
+	s.mu.RUnlock()
+
+	// With plain eviction, a drained page's records are gone. Relocating eviction
+	// deliberately breaks that — it carries live records forward — so the key-level
+	// assertion belongs to the default configuration only. Draining every page (above)
+	// is what both modes owe.
+	if !s.cfg.RelocatingEviction {
+		for _, i := range []int{0, 5, 9, 10, 14, 500} {
+			if _, err := s.Get(key(i)); err != ErrNotFound {
+				t.Errorf("key %d should be evicted (FIFO), got err=%v", i, err)
+			}
 		}
 	}
 	// The most recent key is always present.
