@@ -138,11 +138,16 @@ func TestRelocatingEvictionKeepsLiveRecordOnADeadPage(t *testing.T) {
 				t.Fatalf("hot key: value not the newest copy")
 			}
 
-			// Fill the rest of the freed page and write once more, draining page 1.
+			// Refill the freed page and keep writing until page 1 — the page the hot key's
+			// live copy was on — has been drained. WHICH write does that differs by arm,
+			// which is why the loop and the write after it are not labelled individually:
+			// with the flag ON the freed page already holds the relocated copy, so it
+			// fills one write sooner and the drain happens inside the loop; with the flag
+			// OFF the freed page starts empty and the drain is the write after it. Both
+			// arms have drained page 1 by the time the assertions below run.
 			for i := range relocPerPage - 1 {
 				mustPut(t, c, relocKey(500+i), relocValue(i))
 			}
-			// Page 1 is drained by this write.
 			mustPut(t, c, relocKey(600), relocValue(9))
 
 			v, gerr := c.Get(hot)
@@ -211,7 +216,9 @@ func TestRelocatingEvictionPreservesTriple(t *testing.T) {
 	for i := range relocPerPage {
 		mustPut(t, c, relocKey(i), relocValue(i))
 	}
-	// Page 1 holds one key with a live TTL, then dead copies of another key.
+	// Page 1: the key under test, carrying a live TTL, followed by distinct live keys
+	// that pad the page out. None of them is a duplicate — what matters here is only
+	// that the TTL key is on the page the first eviction evacuates.
 	ttlKey := relocKey(100)
 	ttlVal := relocValue(42)
 	const ttl = 10 * time.Minute
@@ -519,7 +526,10 @@ func TestRelocatedKeyResolvesFromAStaleRef(t *testing.T) {
 	if !ok {
 		t.Fatal("relocated key lost its index slot")
 	}
-	p, cur := tab.rechaseSlot(s, slot, staleRef)
+	p, cur, live := tab.rechaseSlot(s, slot, staleRef)
+	if live != nil {
+		t.Fatal("the live table is the one being probed; rechaseSlot should not ask for a restart")
+	}
 	if p == nil {
 		t.Fatal("a relocated live record resolved as gone: the probe would walk past its own slot and report ErrNotFound")
 	}
@@ -689,13 +699,14 @@ func TestRelocatingEvictionConcurrentReadersNeverMiss(t *testing.T) {
 //	reloc/op       records copied forward per write
 //	reloc_B/op     bytes those copies moved per write — the price of the saves
 func BenchmarkRelocatingEvictionAB(b *testing.B) {
-	relocABArms(b, "")
+	relocABArms(b, false)
 }
 
-// relocABArms runs the off/on pair over one storage mode: dataDir "" is heap, a
-// directory is mmap. Both arms of a pair get the same seed and the same key
-// population, so the only difference between the two rows is the flag.
-func relocABArms(b *testing.B, dataDir string) {
+// relocABArms runs the off/on pair over one storage mode, selected by mmap. Both arms
+// of a pair get the same seed and the same key population, so the only difference
+// between the two rows is the flag. Each arm makes its OWN pages directory, so the
+// caller passes a mode rather than a path.
+func relocABArms(b *testing.B, mmap bool) {
 	keys := make([][]byte, relocABKeyspace)
 	for i := range keys {
 		keys[i] = fmt.Appendf(nil, "ab-%08d", i)
@@ -718,8 +729,8 @@ func relocABArms(b *testing.B, dataDir string) {
 			cfg.AtCapPolicy = PolicyRingbufEvict
 			cfg.TTLSweepIntervalMs = 0
 			cfg.RelocatingEviction = arm.on
-			dir := dataDir
-			if dir != "" {
+			dir := ""
+			if mmap {
 				dir = b.TempDir() // a fresh pages file per arm
 				cfg.DataDir = dir
 			}
@@ -894,5 +905,219 @@ func TestRelocatingEvictionEvacuatesThePageTheNextEvictionDrains(t *testing.T) {
 	}
 	if checked == 0 {
 		t.Fatal("no round observed a relocation; the alignment was never actually checked")
+	}
+}
+
+// Budget-charging layout. The page under test is laid out by hand so the ORDER of its
+// records is known, which is what the two tests below turn on: a record the walk must
+// step over comes FIRST, and the record that must still be relocated comes after it.
+//
+// relocBigLen is deliberately larger than one eviction's whole budget
+// (PageSize/relocateMaxBytesPerEvictionDivisor), so a size test applied to it stops the
+// pass dead; relocSmallLen fits many times over.
+const (
+	relocBigLen   = 600_000
+	relocSmallLen = 1_000
+	relocBigSize  = entryHeaderSize + relocKeyLen + relocBigLen
+)
+
+// relocBytes returns an n-byte value of byte(tag).
+func relocBytes(n, tag int) []byte {
+	v := make([]byte, n)
+	for i := range v {
+		v[i] = byte(tag)
+	}
+	return v
+}
+
+func relocUniformN(v []byte, n, tag int) bool {
+	if len(v) != n {
+		return false
+	}
+	for _, b := range v {
+		if b != byte(tag) {
+			return false
+		}
+	}
+	return true
+}
+
+// seedBudgetOrderingShard builds a 3-page heap shard whose page 1 — the page the first
+// eviction will evacuate — holds a large record FIRST and a small live record after it,
+// and returns the cache plus the small record's key. bigStaysLive selects which defect
+// the layout exercises: false supersedes the large record (so it is dead bytes, which
+// must not be charged to the budget at all), true leaves it live (so it is over budget,
+// and the walk must step over it rather than abandon the page).
+//
+// The geometry is pinned: one relocBig per page leaves less room than another needs, so
+// every write lands where the comment says it does.
+func seedBudgetOrderingShard(t *testing.T, bigStaysLive bool) (*Cache, []byte) {
+	t.Helper()
+	c, err := New(relocConfig(3, true))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	// Page 0: filler, and the first eviction's victim.
+	mustPut(t, c, relocKey(1), relocBytes(relocBigLen, 1))
+	// Page 1: the large record, then the small live one behind it.
+	big, small := relocKey(2), relocKey(3)
+	mustPut(t, c, big, relocBytes(relocBigLen, 2))
+	mustPut(t, c, small, relocBytes(relocSmallLen, 3))
+	if !bigStaysLive {
+		// Supersede it: the new copy does not fit page 0 or 1, so it lands on page 2 and
+		// the copy on page 1 becomes dead bytes.
+		mustPut(t, c, big, relocBytes(relocBigLen, 4))
+	} else {
+		mustPut(t, c, relocKey(4), relocBytes(relocBigLen, 5)) // fill page 2 instead
+	}
+
+	s := c.shards[0]
+	if got := s.numPages(); got != 3 {
+		t.Fatalf("expected 3 pages, got %d", got)
+	}
+	if got := s.pages[1].tail(); got != relocBigSize+entryHeaderSize+relocKeyLen+relocSmallLen {
+		t.Fatalf("page 1 layout is not [big, small]: tail=%d", got)
+	}
+	return c, small
+}
+
+// TestRelocatingEvictionBudgetIgnoresDeadRecords pins that dead bytes never consume the
+// relocation budget. The page the eviction evacuates leads with a SUPERSEDED record
+// larger than the entire budget; charging the budget before classifying it would stop
+// the pass there and abandon the live record sitting behind it — on a page the next
+// eviction drains, which is exactly the loss this feature exists to prevent.
+func TestRelocatingEvictionBudgetIgnoresDeadRecords(t *testing.T) {
+	c, small := seedBudgetOrderingShard(t, false)
+
+	// Trigger the eviction. Its budget is smaller than the dead record leading page 1.
+	mustPut(t, c, relocKey(9), relocBytes(relocBigLen, 9))
+
+	st := c.Stats()
+	budget := uint64(relocPageSize / relocateMaxBytesPerEvictionDivisor)
+	if uint64(relocBigSize) <= budget {
+		t.Fatalf("test is not set up: the dead record (%d) must exceed one eviction's budget (%d)",
+			relocBigSize, budget)
+	}
+	if st.EvictionRelocations != 1 {
+		t.Fatalf("EvictionRelocations = %d, want 1: the dead record ahead of it consumed the budget",
+			st.EvictionRelocations)
+	}
+	if want := uint64(entryHeaderSize + relocKeyLen + relocSmallLen); st.EvictionBytesRelocated != want {
+		t.Fatalf("EvictionBytesRelocated = %d, want %d (only the small live record)",
+			st.EvictionBytesRelocated, want)
+	}
+	// And it really survives the drain of the page it came off.
+	mustPut(t, c, relocKey(10), relocBytes(relocBigLen, 10))
+	v, gerr := c.Get(small)
+	if gerr != nil {
+		t.Fatalf("the live record behind the dead one was dropped: %v", gerr)
+	}
+	if !relocUniformN(v, relocSmallLen, 3) {
+		t.Fatal("relocated record came back with the wrong value")
+	}
+}
+
+// TestRelocatingEvictionBudgetStepsOverOversizedRecords pins the second half: a LIVE
+// record too large for what is left of the budget must be stepped over, not treated as
+// the end of the page. A smaller live record behind it can still be saved with the
+// budget that remains.
+func TestRelocatingEvictionBudgetStepsOverOversizedRecords(t *testing.T) {
+	c, small := seedBudgetOrderingShard(t, true)
+
+	mustPut(t, c, relocKey(9), relocBytes(relocBigLen, 9))
+
+	st := c.Stats()
+	if st.EvictionRelocations != 1 {
+		t.Fatalf("EvictionRelocations = %d, want 1: the oversized live record ended the walk",
+			st.EvictionRelocations)
+	}
+	if want := uint64(entryHeaderSize + relocKeyLen + relocSmallLen); st.EvictionBytesRelocated != want {
+		t.Fatalf("EvictionBytesRelocated = %d, want %d (only the small live record fits)",
+			st.EvictionBytesRelocated, want)
+	}
+	mustPut(t, c, relocKey(10), relocBytes(relocBigLen, 10))
+	v, gerr := c.Get(small)
+	if gerr != nil {
+		t.Fatalf("the live record behind the oversized one was dropped: %v", gerr)
+	}
+	if !relocUniformN(v, relocSmallLen, 3) {
+		t.Fatal("relocated record came back with the wrong value")
+	}
+}
+
+// TestRelocatedKeyResolvesAcrossATableSwap is the control for the other half of the
+// reader fix. A reader snapshots s.tab once per Get; a rehash publishes a FRESH table
+// and never writes the old one again, so every repoint after that — relocation's
+// included — is invisible in the table the reader is holding. Re-reading a slot there
+// finds the ref unchanged and concludes the record is gone, which is the same false
+// miss the generation gate produced before any of this, just reached a different way.
+//
+// The test puts a reader in exactly that position: it probes the PRE-rehash table after
+// the record has been relocated and after a rehash has replaced that table. Revert the
+// table re-check at the top of rechaseSlot — keep the slot re-read — and it fails.
+func TestRelocatedKeyResolvesAcrossATableSwap(t *testing.T) {
+	// Small records, so one eviction's budget holds the whole live set many times over
+	// and the record under test is relocated rather than legitimately dropped while the
+	// test waits for a rehash.
+	const valLen = 40_000
+	c, err := New(relocConfig(4, true))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	s := c.shards[0]
+
+	// Filler for the first page, which is drained unevacuated.
+	perPage := relocPageSize/(entryHeaderSize+relocKeyLen+valLen) + 1
+	for i := range perPage {
+		mustPut(t, c, relocKey(500+i), relocBytes(valLen, i%256))
+	}
+	cold := relocKey(100)
+	mustPut(t, c, cold, relocBytes(valLen, 42))
+	h := hashKey(cold)
+
+	// The table the reader is holding, and the ref it read out of it.
+	oldTab := s.tab.Load()
+	_, staleRef, ok := oldTab.findSlot(h)
+	if !ok {
+		t.Fatal("seeded key is not in the index")
+	}
+
+	// Churn until all three conditions hold together: the record has been relocated, the
+	// page its stale ref points into has been freed, and a rehash has replaced the
+	// reader's table. Only then is the reader in the state this test is about.
+	//
+	// The churn writes DISTINCT keys, which is what provokes the rehash: a rehash fires
+	// on the table's FILL (live + tombstones), and neither overwriting a key nor
+	// tombstoning one moves that number — only a key the table has not seen before does.
+	for n := 0; ; n++ {
+		if n > 50_000 {
+			t.Fatal("never reached relocated + freed + rehashed")
+		}
+		mustPut(t, c, relocKey(1000+n), relocBytes(valLen, n%256))
+		if _, err := c.Get(cold); err != nil {
+			t.Fatalf("the record under test was dropped after %d writes, before the state under "+
+				"test was reached; the relocation budget is not holding the live set", n)
+		}
+		if s.tab.Load() == oldTab {
+			continue // no rehash yet
+		}
+		if p := s.pageSlots[staleRef.pageIdx()].Load(); p != nil && p.gen == staleRef.gen() {
+			continue // the stale ref still resolves
+		}
+		if _, cur, found := s.tab.Load().findSlot(h); found && cur != staleRef {
+			break
+		}
+	}
+
+	// Probe as that reader would: holding the obsolete table.
+	v, _, _, st := oldTab.get(s, cold, h)
+	if st != lkHit {
+		t.Fatalf("probe on the pre-rehash table returned %v; a live relocated record must still be found", st)
+	}
+	if !relocUniformN(v, valLen, 42) {
+		t.Fatal("probe on the pre-rehash table resolved to the wrong value")
 	}
 }

@@ -85,7 +85,9 @@ package cache
 //   - `need` is reserved first. PolicyRingbufEvict guarantees a write succeeds;
 //     relocation is a passenger on this one and must never consume the room it was
 //     evicting for, nor fail it, nor stall it.
-//   - at most PageSize/relocateMaxBytesPerEvictionDivisor bytes move per eviction, so
+//   - at most PageSize/relocateMaxBytesPerEvictionDivisor bytes MOVE per eviction — the
+//     budget is charged only for records actually copied, never for the dead ones the
+//     walk steps over, and a record too large for what is left does not end the walk —
 //     the rest of every freed page is genuinely reclaimed and the loop can never be
 //     talked into handing back a page as full as the one it drained.
 //   - it never allocates a page and NEVER recurses into eviction to make room. A record
@@ -225,8 +227,11 @@ func (s *shard) relocateIntoFreedPageLocked(freedIdx, need int) {
 			break
 		}
 		size := entrySize(len(key), len(value))
-		if spent+size > budget {
-			break // budget spent; everything past here stays where it is.
+		if budget-spent < entryHeaderSize {
+			// Not even an empty entry could fit: the budget is spent, and no later record
+			// can change that. This is the ONLY early exit — a budget test against a
+			// particular record's size belongs after that record is classified, below.
+			break
 		}
 		ref := makeSlabRef(uint16(src), p.gen, uint32(cursor)) //nolint:gosec // src bounded by MaxPagesPerShard (≤65535); cursor < PageSize ≤ MaxInt32
 		h := hashKey(key)
@@ -239,6 +244,18 @@ func (s *shard) relocateIntoFreedPageLocked(freedIdx, need int) {
 		}
 		if isExpired(expiryMs, now) {
 			// The retire walk's to tombstone, exactly as today.
+			cursor += size
+			continue
+		}
+		// NOW charge the budget, not before. Everything skipped above is already dead,
+		// and dead bytes are exactly what this pass exists to stop paying for — letting
+		// one large superseded or expired record's SIZE exhaust the budget would leave
+		// live records behind on a page about to be drained, which is the outcome the
+		// feature is meant to prevent. And when a live record does not fit, step OVER it
+		// rather than abandoning the page: a smaller live record further along can still
+		// use what is left. The per-eviction cap is untouched either way; both only
+		// change WHICH records it buys.
+		if spent+size > budget {
 			cursor += size
 			continue
 		}

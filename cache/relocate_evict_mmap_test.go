@@ -301,5 +301,5 @@ func TestRelocatingEvictionMmapRecoveryResolvesRelocatedCopy(t *testing.T) {
 // directly comparable. The absolute ns/op carries the cost of writing through a mapped
 // file and is not comparable to the heap rows; the off-to-on delta within this pair is.
 func BenchmarkRelocatingEvictionABMmap(b *testing.B) {
-	relocABArms(b, b.TempDir())
+	relocABArms(b, true)
 }
