@@ -338,9 +338,11 @@ func TestSeqlockReadsAreCorrectUnderRewrite(t *testing.T) {
 	if st.InPlaceUpdates == 0 {
 		t.Fatal("no write took the in-place path, so nothing was exercised")
 	}
-	if st.SeqlockRetries == 0 {
-		t.Fatal("no read ever retried; the writer never collided with a reader and the protocol went untested")
-	}
+	// Deliberately NOT asserted: that some read retried. Whether a reader's window
+	// overlaps a writer's is up to the scheduler, and zero overlap is a legitimate
+	// outcome of a run that proves exactly as much about correctness as any other.
+	// Asserting it would make this flaky in exchange for nothing — the retry path
+	// is covered deterministically by TestSeqlockRetriesOnAnOddVersion instead.
 	t.Logf("gets=%d retries=%d fallbacks=%d inplace=%d",
 		st.Gets, st.SeqlockRetries, st.SeqlockFallbacks, st.InPlaceUpdates)
 }
@@ -354,16 +356,30 @@ func TestSeqlockManyKeysStayConsistent(t *testing.T) {
 		t.Skip("a seqlock races on the payload by construction; the detector reports it correctly")
 	}
 	const (
-		keys    = 256 // < 256+1 so byte(i) tags each key's value uniquely
+		keys    = 128
+		rounds  = 2 // byte(i) and byte(i+128): both are i mod keys, and they differ
 		valLen  = 512
 		readers = 8
 		writes  = 200_000
 	)
 	s := newSeqlockShard(t)
 	keyFor := func(i int) []byte { return fmt.Appendf(nil, "k%04d", i) }
-	valFor := func(i int) []byte { return bytes.Repeat([]byte{byte(i)}, valLen) }
+	// THE VALUE MUST CHANGE BETWEEN REWRITES OR THIS TEST CANNOT FAIL. A value
+	// derived from the key alone means every rewrite of a key stores byte-identical
+	// bytes, so a torn read of key i yields byte(i) mixed with byte(i) — invisible,
+	// and the only live assertion left would be the cross-key one, which
+	// getSeq's own bytes.Equal already guards without any help from the seqlock.
+	//
+	// So the tag carries BOTH facts at once: the value is a uniform run of a byte
+	// that is congruent to the key index modulo `keys`, and the writer rotates
+	// which member of that residue class it writes. Non-uniform bytes are a TORN
+	// read; a uniform run in the wrong residue class is ANOTHER KEY'S value. Both
+	// failure modes stay detectable, and each is distinguishable from the other.
+	valFor := func(i, round int) []byte {
+		return bytes.Repeat([]byte{byte(i + round*keys)}, valLen)
+	}
 	for i := range keys {
-		if err := s.Put(keyFor(i), valFor(i), 0); err != nil {
+		if err := s.Put(keyFor(i), valFor(i, 0), 0); err != nil {
 			t.Fatalf("seed Put %d: %v", i, err)
 		}
 	}
@@ -386,19 +402,25 @@ func TestSeqlockManyKeysStayConsistent(t *testing.T) {
 				if err != nil {
 					continue
 				}
-				// Every value is a uniform run of byte(i): a torn read shows mixed
-				// bytes, and another key's bytes show a uniform run of the wrong tag.
 				if len(v) != valLen {
 					bad.Add(1)
 					first.CompareAndSwap(nil, fmt.Sprintf("key %d: length %d", i, len(v)))
 					continue
 				}
+				// TORN: the run is not uniform. WRONG KEY: it is uniform but its byte
+				// is not in this key's residue class. Checking both separately is what
+				// keeps the two diagnosable rather than merged into one "bad value".
+				tag := v[0]
 				for j, b := range v {
-					if b != byte(i) {
+					if b != tag {
 						bad.Add(1)
-						first.CompareAndSwap(nil, fmt.Sprintf("key %d byte %d = %#x, want %#x", i, j, b, byte(i)))
+						first.CompareAndSwap(nil, fmt.Sprintf("key %d byte %d = %#x, want %#x (torn)", i, j, b, tag))
 						break
 					}
+				}
+				if int(tag)%keys != i {
+					bad.Add(1)
+					first.CompareAndSwap(nil, fmt.Sprintf("key %d resolved to a value tagged %#x (key %d)", i, tag, int(tag)%keys))
 				}
 			}
 		}(r * 37)
@@ -409,7 +431,8 @@ func TestSeqlockManyKeysStayConsistent(t *testing.T) {
 		defer wg.Done()
 		for n := range writes {
 			i := n % keys
-			if err := s.Put(keyFor(i), valFor(i), 0); err != nil {
+			// Rotate the round so consecutive rewrites of a key differ.
+			if err := s.Put(keyFor(i), valFor(i, (n/keys)%rounds), 0); err != nil {
 				t.Errorf("Put: %v", err)
 				break
 			}
@@ -427,4 +450,49 @@ func TestSeqlockManyKeysStayConsistent(t *testing.T) {
 	}
 	t.Logf("gets=%d retries=%d fallbacks=%d inplace=%d/%d",
 		st.Gets, st.SeqlockRetries, st.SeqlockFallbacks, st.InPlaceUpdates, st.Puts)
+}
+
+// TestSeqlockRetriesOnAnOddVersion drives the retry-and-fall-back path with no
+// concurrency at all, by leaving a stripe's version ODD — the state a writer
+// holds it in for the few nanoseconds it is rewriting an entry. Every attempt
+// must refuse it, the budget must run out, and the read must then take the lock
+// and return the right value.
+//
+// This is what lets the concurrent tests stop asserting that a retry happened:
+// there, whether a reader overlaps a writer is the scheduler's business, so the
+// assertion would be flaky. Here it is forced.
+func TestSeqlockRetriesOnAnOddVersion(t *testing.T) {
+	s := newSeqlockShard(t)
+	key := []byte("hot")
+	if err := s.Put(key, []byte("value123"), 0); err != nil {
+		t.Fatalf("seed Put: %v", err)
+	}
+	ref, _ := refFor(t, s, key)
+
+	s.mu.Lock()
+	ver := s.pages[ref.pageIdx()].versionAt(ref.offset())
+	ver.Add(1) // odd: as if a rewrite were in flight on this stripe
+	s.mu.Unlock()
+	if ver.Load()%2 == 0 {
+		t.Fatal("the version is not odd; the test would prove nothing")
+	}
+
+	got, err := s.Get(key)
+	if err != nil {
+		t.Fatalf("Get while a stripe reads as mid-write: %v", err)
+	}
+	if !bytes.Equal(got, []byte("value123")) {
+		t.Fatalf("value = %q, want %q", got, "value123")
+	}
+	st := s.snapshot()
+	if st.SeqlockRetries != seqlockMaxRetries {
+		t.Fatalf("SeqlockRetries = %d, want %d (every attempt should have refused the odd version)",
+			st.SeqlockRetries, seqlockMaxRetries)
+	}
+	if st.SeqlockFallbacks != 1 {
+		t.Fatalf("SeqlockFallbacks = %d, want 1", st.SeqlockFallbacks)
+	}
+	if st.Misses != 0 {
+		t.Fatalf("Misses = %d; a read that fell back to the lock was counted as a miss", st.Misses)
+	}
 }

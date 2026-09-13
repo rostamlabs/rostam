@@ -30,10 +30,12 @@ const (
 	inPlaceJitterSpan = benchValSz + 1 // 257 lengths, 128..384, mean 256
 )
 
-// The three arms every benchmark here reports, which are the three states this
-// work passes through: today's append path, in-place updates paying the read
-// lock for them, and in-place updates validating reads against a version counter
-// instead.
+// The arms every benchmark here reports. They are the states this work passes
+// through, plus relocating eviction, which is the other way a ringbuf shard keeps
+// live records it would otherwise drop and so the baseline in-place has to beat:
+// today's append path, that path with relocating eviction, in-place updates
+// paying the read lock for them, in-place updates validating reads against a
+// version counter instead, and that last one with relocation as well.
 type inPlaceMode int
 
 const (
@@ -296,20 +298,28 @@ func BenchmarkInPlaceRead(b *testing.B) {
 // That only bites when eviction is actually running, so this shard is
 // deliberately sized SMALLER than its live set — the one regime where in-place
 // cannot simply avoid evicting. Writes interleave a small hot set, rewritten over
-// and over at a constant size, with a stream of cold keys written once; the
+// and over at a constant size, with a stream of cold keys each written ONCE; the
 // number that matters is how much of the HOT set is still resident afterwards.
 //
-// Reported per arm: hot% (the hot set's survival, the figure under test), all%
-// over every key ever written, and evictions per write.
+// The cold keys being distinct is load-bearing, not incidental. If they repeat,
+// they are rewrites too, and the benchmark stops contrasting "rewritten often"
+// against "written once" — which is the only contrast it exists to draw.
+//
+// Reported per arm: hot% (the hot set'"'"'s survival, the figure under test), the
+// index'"'"'s total occupancy, evictions per write, and the share of writes that took
+// the in-place path.
 func BenchmarkInPlaceWriteRecency(b *testing.B) {
 	const (
 		hotKeys   = 2_000
-		coldKeys  = 40_000 // far past what the budget holds, so eviction never stops
 		writes    = 1_500_000
 		hotEveryN = 4 // one hot rewrite per three cold inserts
 	)
 	hotKey := func(i int) []byte { return fmt.Appendf(nil, "h%011d", i%hotKeys) }
-	coldKey := func(i int) []byte { return fmt.Appendf(nil, "c%011d", i%coldKeys) }
+	// EVERY COLD KEY IS DISTINCT — no modulus here. Wrapping them turns the cold
+	// stream into a rewrite stream, which is the opposite of the contrast this
+	// benchmark is built on: the hot set is meant to be the only thing rewritten,
+	// so that what survives measures recency and nothing else.
+	coldKey := func(i int) []byte { return fmt.Appendf(nil, "c%011d", i) }
 
 	for _, mode := range inPlaceModes {
 		b.Run(mode.String(), func(b *testing.B) {

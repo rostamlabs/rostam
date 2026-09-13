@@ -324,8 +324,11 @@ type Config struct {
 	// put numbers on both halves: against the append path it retained about a
 	// quarter more keys in total and evicted about a fifth less often, while
 	// holding roughly ten percent less of the frequently-rewritten subset.
-	// Relocating eviction recovers very little of that (about a point and a half),
-	// so do not count on it as a remedy.
+	//
+	// Relocating eviction does NOT remedy it — it makes the recency loss somewhat
+	// worse, not better, while raising the eviction rate. Carrying a record off a
+	// drained page preserves the record, but it does not restore the ordering that
+	// decides which page is drained next, which is the thing recency was.
 	//
 	// So: if a shard is sized for its working set, this is close to pure gain — it
 	// is the garbage that drove eviction, and removing it removes the evictions.

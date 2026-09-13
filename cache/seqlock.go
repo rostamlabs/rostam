@@ -113,6 +113,20 @@ const (
 	// that guarantee unconditional — without one, a reader unlucky enough to share
 	// a stripe with a hot key could spin arbitrarily long.
 	seqlockMaxRetries = 4
+
+	// seqlockMaxRestarts bounds the OTHER loop, the one inside a single probe. A
+	// rehash freezes the table a probe is walking, and the only correct response is
+	// to start again on the live one — so getSeq restarts internally, and those
+	// restarts are not retries and were not covered by the budget above.
+	//
+	// Each restart does require a rehash to have actually happened, and a rehash
+	// costs a table's worth of inserts, so a writer cannot drive them faster than a
+	// reader completes a probe. That is an argument about relative cost, though,
+	// not a bound — and the read-lock fallback is right there, so paying for a
+	// counter turns "cannot be sustained in practice" into "terminates". The
+	// budget is generous because reaching it should mean something is wrong, not
+	// that the shard is busy.
+	seqlockMaxRestarts = 8
 )
 
 // enableVersions gives a heap page its seqlock version counters. Called on every

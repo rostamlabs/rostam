@@ -210,8 +210,13 @@ func (t *indexTable) rechaseSlot(s *shard, i uint64, r slabRef) (*page, slabRef,
 func (t *indexTable) getSeq(s *shard, dst, key []byte, h uint64) (out []byte, exp uint64, ref slabRef, st lookupStatus, ok bool) {
 	tag := tagFor(h)
 	tab := t
-probe:
-	for {
+	// Restarts are bounded as well as retries: see seqlockMaxRestarts. Exhausting
+	// this reports a retry, so the caller reaches the read lock rather than
+	// circling here.
+	for restarts := 0; ; restarts++ {
+		if restarts > seqlockMaxRestarts {
+			return dst, 0, 0, lkMiss, false
+		}
 		for i := h & tab.mask; ; i = (i + 1) & tab.mask {
 			c := tab.ctrl[i].Load()
 			if c == ctrlEmpty {
@@ -230,7 +235,7 @@ probe:
 				p, r, live = tab.rechaseSlot(s, i, r)
 				if live != nil {
 					tab = live
-					continue probe
+					break // restart the probe on the live table
 				}
 				if p == nil {
 					continue
