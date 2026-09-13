@@ -305,11 +305,13 @@ type Config struct {
 	//     response writer). Overwriting live bytes under it would change a value a
 	//     caller is still holding.
 	//   - MMAP shards are the DURABLE copy. Overwriting destroys the old version,
-	//     and the loss is not limited to the key being written: an append can only
-	//     tear at the page TAIL, while an in-place write tears mid-page, and
-	//     recovery answers a torn entry by truncating the page there and abandoning
-	//     the rest of it. Keys that were durable long before the torn write are lost
-	//     with it. Heap pages are not persisted, so the concern does not arise.
+	//     and the loss is not limited to the key being written. For a tear in entry
+	//     data, with the page's persisted framing intact: an append writes only at
+	//     the page TAIL, while an in-place write tears mid-page, and recovery
+	//     answers a torn entry by truncating the page there and abandoning the rest
+	//     of it, so keys durable long before the torn write are lost with it. (A
+	//     tear in the page framing resets the whole page for either shape.) Heap
+	//     pages are not persisted, so the concern does not arise.
 	//
 	// WHAT IT ALSO COSTS: WRITE RECENCY, and this is a change in EVICTION
 	// SEMANTICS, not only in locking. Eviction here reclaims whole pages in

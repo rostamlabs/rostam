@@ -194,14 +194,18 @@ func (p *page) Write(key, value []byte, expiryMs, meta uint64) (offset uint32, s
 // and no index slot changes.
 //
 // HEAP BACKING ONLY, refused otherwise. An mmap page is the DURABLE copy of the
-// data, and overwriting destroys the old version. The loss is wider than the key
-// being written: an append tears only at the page TAIL, but an in-place write
+// data, and overwriting destroys the old version. For an ENTRY-DATA tear — one
+// leaving the page's persisted head/tail intact — the loss is wider than the key
+// being written: an append writes only at the page TAIL, but an in-place write
 // tears mid-page, and recovery answers that by truncating the page at the tear
 // and abandoning everything after it (see rebuildIndexFromPages). Unrelated keys
-// that were durable long before the torn write go with it. Heap pages are never
-// persisted, so that failure mode does not exist for them. shard.inPlaceEligible already forbids the mmap
-// case; refusing here as well keeps the invariant with the bytes it protects
-// rather than resting on a caller staying correct.
+// durable long before the torn write go with it. (A tear in the page framing
+// itself resets the whole page whichever shape wrote it; that one is common to
+// both.) Heap pages are never persisted, so none of this applies to them.
+//
+// shard.inPlaceEligible already forbids the mmap case; refusing here as well
+// keeps the invariant with the bytes it protects rather than resting on a caller
+// staying correct.
 //
 // The destination is sliced to EXACTLY the entry size, so encodeEntryNoCRC's own
 // length check is the backstop against a mis-sized write spilling into the next

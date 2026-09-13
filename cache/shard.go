@@ -1022,16 +1022,22 @@ func (s *shard) inPlaceEligible() bool {
 	// GUARD 3 — HEAP BACKING. An mmap page is the DURABLE copy, and the cost of a
 	// torn write is NOT confined to the key being written.
 	//
-	// An append can only ever tear at the page TAIL, so recovery discards the torn
-	// write and nothing beyond it. An in-place write tears at an arbitrary offset
-	// INSIDE a live page, and rebuildIndexFromPages answers a CRC failure by
-	// truncating the page at that offset and abandoning the rest of it — it cannot
-	// simply skip the bad entry, because EvictFront frames entries from raw bytes
-	// with no CRC, so the torn region has to be excluded from every future eviction
-	// walk. The loss is therefore every entry AFTER the tear on that page:
-	// unrelated keys, durable long before the write that tore.
+	// Compare the two write shapes for an ENTRY-DATA tear, i.e. one where the page's
+	// persisted head/tail survives. An append writes only at the page TAIL, so
+	// recovery discards the torn write and nothing beyond it. An in-place write
+	// tears at an arbitrary offset INSIDE a live page, and rebuildIndexFromPages
+	// answers a CRC failure by truncating the page at that offset and abandoning the
+	// rest of it — it cannot simply skip the bad entry, because EvictFront frames
+	// entries from raw bytes with no CRC, so the torn region has to be excluded from
+	// every future eviction walk. The loss is therefore every entry AFTER the tear on
+	// that page: unrelated keys, durable long before the write that tore.
 	//
-	// That is also why the boundary cannot be redefined to make this safe — read
+	// The page FRAMING is a separate failure mode that both shapes share: Write
+	// persists the tail after encoding, so a crash torn mid-setTail can leave
+	// head/tail out of range, and recovery resets the whole page. That one is not an
+	// argument for either shape over the other — the mid-page exposure above is.
+	//
+	// It is also why the boundary cannot be redefined to make this safe — read
 	// rebuildIndexFromPages before concluding otherwise. Heap pages are not
 	// persisted, so there is nothing a torn write could cost that the process
 	// dying has not already cost.
