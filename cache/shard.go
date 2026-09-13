@@ -647,6 +647,7 @@ func (s *shard) needsReadLockForGet() bool {
 func (s *shard) nextGen() uint16 {
 	g := s.genCounter
 	s.genCounter++
+	regionNoteGen(s, g) // compiled out unless the measurement build tag is set
 	return g
 }
 
@@ -1219,6 +1220,7 @@ func (s *shard) putAtExpLocked(key, value []byte, exp uint64, h uint64) error {
 				if s.sieve {
 					tgt.tab.setVisited(tgt.slot, tagFor(h), tgt.ref)
 				}
+				regionNoteInPlace(s, tgt.p) // compiled out unless the measurement build tag is set
 				// NO fireOnRemove: nothing was removed. The key is still live, at the
 				// same address, and the hook reports REMOVALS — firing it here would
 				// drop a live key's postings from every derived index.

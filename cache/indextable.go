@@ -141,6 +141,13 @@ probe:
 			if s.sieve {
 				tab.setVisited(i, tag, r)
 			}
+			// Classify the page the probe SETTLED on — p, the page r names, which is
+			// the same record the mark above is about. Both must be, and for the same
+			// reason: rechaseSlot may have moved the probe to another page, and a
+			// notification naming one record while the mark names another would be
+			// two answers to one question. Compiled out unless the measurement build
+			// tag is set — see cache/regionfr_off.go.
+			regionNoteHit(s, p)
 			return val, e, r, lkHit
 		}
 	}
@@ -298,6 +305,10 @@ func (t *indexTable) getSeq(s *shard, dst, key []byte, h uint64) (out []byte, ex
 			if s.sieve {
 				tab.setVisited(i, tag, r)
 			}
+			// The settled page, as in get, naming the same record the mark above
+			// does. Here the ref is already documented as final from the version
+			// snapshot onwards, so both are speaking about that one.
+			regionNoteHit(s, p)
 			return out, e, r, lkHit, true
 		}
 	}
