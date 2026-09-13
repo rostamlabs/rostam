@@ -49,16 +49,43 @@ import (
 // WHAT IT FOUND, and the first finding revises the reason this benchmark was written.
 //
 // MOST OF THE TAIL IS NOT THE EVICTION HOLD. Writes whose own shard froze no page at all
-// — the clean class, which by construction never waited on a retire — still reach roughly
-// 0.6 to 0.9 ms at p999, in EVERY arm including the one with no relocation compiled into
-// the path. Against a p50 under a microsecond that is about a thousandfold, and none of
-// it is anything either relocation pass touches. The read baseline places the floor the
-// machine imposes far below that (tens to a couple of hundred microseconds at p999), so
-// this is not merely the box either: there is several hundred microseconds of write-path
-// tail that is neither eviction nor scheduler. The leading suspect is the index rehash,
-// which allocates a table and re-inserts every live entry under the write lock and grows
-// with the entry count — that is a HYPOTHESIS, not a measurement, and nothing here has
-// tested it.
+// — the clean class, which by construction never waited on a retire — still reach several
+// hundred microseconds at p999, in EVERY arm including the one with no relocation compiled
+// into the path. Against a p50 under a microsecond that is about a thousandfold, and none
+// of it is anything either relocation pass touches. The read baseline places the floor the
+// machine imposes far below that, so this is not merely the box either.
+//
+// IT IS NOT THE INDEX REHASH, which this comment used to name as the leading suspect and
+// which is now measured rather than guessed. The clean class is split a second time on
+// whether the write performed a table rehash, and clean_norehash_p999_ns comes out EQUAL
+// to clean_p999_ns, bucket for bucket, in every arm: take every rehashing write out of the
+// class and its p999 does not move. The reason is FREQUENCY, not size. A rehash is genuinely
+// expensive and it owns the max — but the threshold is met only once per live-set's worth of
+// accumulated tombstones, so clean_rehash_frac lands around 1e-5 or below — orders of
+// magnitude too rare to reach a p999 at all. In the relocating arms it is 0 for whole runs, because relocation repoints
+// a surviving entry's slot in place (see relocateIntoFreedPageLocked) and leaves no tombstone
+// behind, so those arms rehash barely at all — and their clean p999 is the same as the arm
+// that rehashes. BenchmarkIndexRehashTail drives the step directly, sweeps the live set it
+// scales with, and runs the decisive control — a table pre-sized so no rehash can fire —
+// which leaves the tail unchanged and makes the MEDIAN worse, an oversized table costing a
+// cache miss on every probe.
+//
+// WHAT IT IS: WAITING FOR ANOTHER WRITER. See BenchmarkWriteTailContention, which holds
+// per-write work fixed and varies only whether the writers share a shard. Alone on a shard a
+// writer's p999 is a couple of microseconds. Add a second writer to the same shard and it is
+// tens of microseconds; at eight it is hundreds. Give those same eight writers a shard each —
+// same goroutines, same work, same machine — and the p999 stays where it was for one. The
+// median barely moves in either case, which is the signature of queueing rather than of work.
+// A mutex profile of the shared arm puts essentially all of the blocking delay on the shard
+// lock. That is also why the read baseline sits so far below the write rows: a Get on these
+// shards takes no exclusive lock and so never queues behind one.
+//
+// The consequence for anyone tuning this is that the clean-class tail is set by HOW LONG THE
+// LOCK IS HELD and HOW MANY WRITERS SHARE IT, not by what any one write does — so shortening
+// holds (which is what chunking the retire below is about) attacks it and optimising a
+// per-write step does not. Note that raising the shard count is not automatically the answer:
+// the rows here are Zipf-distributed, so at sixty-four shards the hot shards are just as
+// contended as at eight and the clean p999 does not improve.
 //
 // RELOCATION'S OWN CONTRIBUTION IS REAL AND IT SHOWS AT p99, which is where the write-path
 // pass roughly doubles the no-relocation figure. That increment is the hold, and it is the
@@ -156,9 +183,10 @@ func relocTailArms(b *testing.B, shards int) {
 		}
 
 		var (
-			mu          sync.Mutex
-			clean, held latHist
-			workers     int64
+			mu                         sync.Mutex
+			clean, held                latHist
+			cleanRehash, cleanNoRehash latHist
+			workers                    int64
 		)
 		b.Run("reloc="+arm.name, func(b *testing.B) {
 			b.ReportAllocs()
@@ -170,23 +198,34 @@ func relocTailArms(b *testing.B, shards int) {
 				mu.Unlock()
 				rng := rand.New(rand.NewSource(seed))                       //nolint:gosec // benchmark RNG
 				z := rand.NewZipf(rng, relocABZipfS, 1, uint64(keyspace-1)) //nolint:gosec // keyspace > 1
-				var myClean, myHeld latHist
+				var myClean, myHeld, myCleanRehash, myCleanNoRehash latHist
 				for pb.Next() {
 					k := keys[z.Uint64()]
 					_, s := c.shardForH(k)
 					before := s.evictions.Load()
+					beforeRehash := s.indexRehashes.Load()
 					t0 := time.Now()
 					_ = c.Put(k, val, 0)
 					ns := uint64(time.Since(t0)) //nolint:gosec // a duration here is never negative
-					if s.evictions.Load() == before {
-						myClean.add(ns)
-					} else {
+					if s.evictions.Load() != before {
 						myHeld.add(ns)
+						continue
+					}
+					// Clean writes split again on the index rehash, the step the clean
+					// class's own tail was once suspected of being. Both loads sit
+					// outside the timed region, exactly as the eviction pair does.
+					myClean.add(ns)
+					if s.indexRehashes.Load() == beforeRehash {
+						myCleanNoRehash.add(ns)
+					} else {
+						myCleanRehash.add(ns)
 					}
 				}
 				mu.Lock()
 				clean.merge(&myClean)
 				held.merge(&myHeld)
+				cleanRehash.merge(&myCleanRehash)
+				cleanNoRehash.merge(&myCleanNoRehash)
 				mu.Unlock()
 			})
 			b.StopTimer()
@@ -206,6 +245,13 @@ func relocTailArms(b *testing.B, shards int) {
 			b.ReportMetric(frac, "held_frac")
 			b.ReportMetric(float64(clean.quantile(0.999)), "clean_p999_ns")
 			b.ReportMetric(float64(held.quantile(0.999)), "held_p999_ns")
+			rehashFrac := 0.0
+			if clean.n > 0 {
+				rehashFrac = float64(cleanRehash.n) / float64(clean.n)
+			}
+			b.ReportMetric(rehashFrac, "clean_rehash_frac")
+			b.ReportMetric(float64(cleanNoRehash.quantile(0.999)), "clean_norehash_p999_ns")
+			b.ReportMetric(float64(cleanRehash.max), "clean_rehash_max_ns")
 		})
 		_ = c.Close()
 	}
