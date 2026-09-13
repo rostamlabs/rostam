@@ -696,16 +696,38 @@ func TestRelocatingEvictionConcurrentReadersNeverMiss(t *testing.T) {
 //	evict/op       page entries dropped per write
 //	evict_live/op  of those, the ones that were still the live copy for their key —
 //	               the loss relocation is meant to remove
-//	reloc/op       records copied forward per write
-//	reloc_B/op     bytes those copies moved per write — the price of the saves
+//	reloc/op       records copied forward per write BY THE WRITE ITSELF — the cost the
+//	               background arm exists to remove, so this is the column to read the
+//	               three arms against each other on
+//	reloc_B/op     bytes those write-path copies moved per write
+//	bg_reloc/op    records the background free-page reserve copied forward per write —
+//	               the same work, done by the sweeper instead (cache/relocate_reserve.go)
+//	bg_pages       pages that reserve fully evacuated and retired over the run
 func BenchmarkRelocatingEvictionAB(b *testing.B) {
 	relocABArms(b, false)
 }
 
-// relocABArms runs the off/on pair over one storage mode, selected by mmap. Both arms
-// of a pair get the same seed and the same key population, so the only difference
-// between the two rows is the flag. Each arm makes its OWN pages directory, so the
-// caller passes a mode rather than a path.
+// relocABArms runs the arms over one storage mode, selected by mmap. Each arm makes
+// its OWN pages directory. Every arm gets the same seed and the same key population, so the only
+// difference between two rows is the configuration named in the row.
+//
+// THREE arms on heap — off, synchronous, background — and two on mmap, because the
+// background reserve is heap-only (see the HEAP RINGBUF ONLY note in
+// cache/relocate_reserve.go). The background arm is the synchronous arm plus a running
+// sweeper: the write-path pass is still installed as its fallback, which is exactly the
+// configuration it ships as, so reloc/op falling while bg_reloc/op rises is the whole
+// claim in two columns.
+//
+// READ THE BACKGROUND ARM'S ns/op WITH THE HARNESS IN MIND, because this harness is the
+// worst case for that arm and the figure is not a prediction about a server. There is ONE
+// shard here and ONE goroutine writing to it flat out, so the shard's sweeper has no idle
+// lock time to work in: every lock hold it takes to move a record stalls the write stream
+// directly, and the CPU it burns is CPU the writer wanted. A cadence slow enough not to
+// contend is also too slow to take a meaningful share of the copying on a shard being
+// written at memory speed — the two cannot be separated here, and the arm is set to
+// relocABSweepMs precisely to show the work moving rather than to show a latency win.
+// NumShards > 1 spreads the same write stream over shards that each have their own lock
+// and their own sweeper, which is the regime the layer is for; nothing here measures it.
 func relocABArms(b *testing.B, mmap bool) {
 	keys := make([][]byte, relocABKeyspace)
 	for i := range keys {
@@ -716,10 +738,19 @@ func relocABArms(b *testing.B, mmap bool) {
 		val[i] = byte(i)
 	}
 
-	for _, arm := range []struct {
-		name string
-		on   bool
-	}{{"off", false}, {"on", true}} {
+	arms := []struct {
+		name    string
+		on      bool
+		sweepMs int
+	}{
+		{"off", false, 0},
+		{"sync", true, 0},
+		{"background", true, relocABSweepMs},
+	}
+	if mmap {
+		arms = arms[:2] // the reserve is heap-only; a third mmap row would be the second
+	}
+	for _, arm := range arms {
 		b.Run("reloc="+arm.name, func(b *testing.B) {
 			cfg := DefaultConfig()
 			cfg.NumShards = 1
@@ -727,7 +758,7 @@ func relocABArms(b *testing.B, mmap bool) {
 			cfg.MaxMemoryPerShard = relocABPages << 20
 			cfg.InitialPagesPerShard = 0
 			cfg.AtCapPolicy = PolicyRingbufEvict
-			cfg.TTLSweepIntervalMs = 0
+			cfg.TTLSweepIntervalMs = arm.sweepMs
 			cfg.RelocatingEviction = arm.on
 			dir := ""
 			if mmap {
@@ -780,6 +811,8 @@ func relocABArms(b *testing.B, mmap bool) {
 			b.ReportMetric(perOp(st.EvictionsLive-warm.EvictionsLive), "evict_live/op")
 			b.ReportMetric(perOp(st.EvictionRelocations-warm.EvictionRelocations), "reloc/op")
 			b.ReportMetric(perOp(st.EvictionBytesRelocated-warm.EvictionBytesRelocated), "reloc_B/op")
+			b.ReportMetric(perOp(st.ReserveRelocations-warm.ReserveRelocations), "bg_reloc/op")
+			b.ReportMetric(float64(st.ReservePagesFreed-warm.ReservePagesFreed), "bg_pages")
 		})
 	}
 }
@@ -793,6 +826,11 @@ const (
 	relocABZipfS    = 1.3
 	relocABSeed     = 0x5EED
 	relocABWarmOps  = 400_000
+	// The tightest cadence the sweeper's ticker will take, so the background arm gets
+	// the best chance of keeping up with a benchmark loop that writes as fast as it
+	// can. A real shard ticks at TTLSweepIntervalMs (default 1s) against a real write
+	// rate; this is the arm's upper bound, not its typical setting.
+	relocABSweepMs = 1
 )
 
 // pageObjects snapshots the shard's page object identities. A heap eviction RETIRES

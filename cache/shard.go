@@ -182,6 +182,21 @@ type shard struct {
 	evictRelocations    atomic.Uint64 // live records copied forward instead of dropped
 	evictRelocatedBytes atomic.Uint64 // their framed byte total
 
+	// BACKGROUND (free-page reserve) relocation counters — the sweeper's half of the
+	// same feature (cache/relocate_reserve.go), kept SEPARATE from the write-path pair
+	// above so the split between the two is observable: a shard whose sweeper is
+	// keeping up shows these climbing while evictRelocations stays flat. Same
+	// bytes-first, count-second discipline, for the same reason.
+	reserveRelocations    atomic.Uint64 // live records the reserve pass copied forward
+	reserveRelocatedBytes atomic.Uint64 // their framed byte total
+	reservePagesFreed     atomic.Uint64 // pages it fully evacuated and retired
+
+	// reserveChunkHook observes each finished chunk of the reserve pass (entries and
+	// bytes moved under one lock acquisition), called with s.mu released. Nil unless a
+	// test installs one, to assert the chunk bound or to act inside the window
+	// the chunking opens. Atomic because the sweeper goroutine reads it.
+	reserveChunkHook atomic.Pointer[func(entries, bytes int)]
+
 	// reclaimableCache holds the last-published ghost-byte snapshot (figure + the
 	// wall-clock nanos it was taken), so Stats() stays O(1) under frequent scraping: the
 	// O(entries) liveness walk (liveAndUsedBytes) runs at most once per reclaimableStatsTTL,
@@ -1050,6 +1065,8 @@ func (s *shard) snapshot() Stats {
 	// gets/misses shape here, not that one.
 	relocations := s.evictRelocations.Load()
 	relocatedBytes := s.evictRelocatedBytes.Load()
+	reserveRelocations := s.reserveRelocations.Load()
+	reserveRelocatedBytes := s.reserveRelocatedBytes.Load()
 	live, tomb := s.entries()
 	return Stats{
 		Gets:             gets,
@@ -1081,6 +1098,9 @@ func (s *shard) snapshot() Stats {
 
 		EvictionRelocations:    relocations,
 		EvictionBytesRelocated: relocatedBytes,
+		ReserveRelocations:     reserveRelocations,
+		ReserveBytesRelocated:  reserveRelocatedBytes,
+		ReservePagesFreed:      s.reservePagesFreed.Load(),
 	}
 }
 
@@ -1515,7 +1535,7 @@ func (s *shard) evictVictimLocked(victim, need int) error {
 		// retire walk above has already tombstoned, and which for reader-safety
 		// reasons could never have rescued its own (see cache/relocate_evict.go).
 		if s.cfg.RelocatingEviction {
-			s.relocateIntoFreedPageLocked(victim, need)
+			s.noteEvictRelocation(s.relocateIntoFreedPageLocked(victim, need))
 		}
 		return nil
 	}
@@ -1529,7 +1549,7 @@ func (s *shard) evictVictimLocked(victim, need int) error {
 	// (needsReadLockForGet), and the crash-consistency argument for appending
 	// without a sync is in cache/relocate_evict.go.
 	if s.cfg.RelocatingEviction {
-		s.relocateIntoFreedPageLocked(victim, need)
+		s.noteEvictRelocation(s.relocateIntoFreedPageLocked(victim, need))
 	}
 	return nil
 }
@@ -1725,6 +1745,12 @@ func (s *shard) sweepOnce() {
 		return
 	}
 	s.sweepIndex(s.now())
+	// Then top the free-page reserve up, so a write on a shard at its page cap finds
+	// room instead of evicting and relocating inline (cache/relocate_reserve.go). A
+	// no-op on every shard that has not opted into Config.RelocatingEviction, and on
+	// mmap ones that have. It takes and releases the write lock per CHUNK, never for a
+	// whole page, so it cannot stall the write path for an unbounded pass.
+	s.topUpFreeReserve()
 }
 
 // pageCapacityBytes is the total ENTRY capacity of the shard's pages: the bytes

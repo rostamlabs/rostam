@@ -193,6 +193,21 @@ type Config struct {
 	// allocates a page, never triggers another eviction, and never fails a write — a
 	// record that does not fit the budget is simply left to be dropped as it is today.
 	// Stats.EvictionRelocations / EvictionBytesRelocated report what it moved.
+	//
+	// WHO ACTUALLY PAYS IT. On a HEAP ringbuf shard with the sweeper running
+	// (TTLSweepIntervalMs > 0) most of that copying moves OFF the write path: the
+	// sweeper keeps a small reserve of free pages by evacuating and retiring rotation
+	// victims ahead of time (cache/relocate_reserve.go), so a write at capacity finds
+	// room in an already-free page and never evicts. The write-path pass above stays as
+	// the fallback for when a burst outruns the sweeper or the shard is too dense to
+	// evacuate. Stats.ReserveRelocations / ReserveBytesRelocated / ReservePagesFreed
+	// report the background half, and reading them next to the Eviction* pair says how
+	// much of the cost writes are still carrying. The reserve costs a page or two of
+	// capacity held empty and MORE total copying than the write-path pass alone (it
+	// moves records on a clock, so it copies some that would have been superseded
+	// before their page came round); it buys a steady-state write paying none of it.
+	// Mmap ringbuf shards keep the write-path pass alone — see the HEAP RINGBUF ONLY
+	// note in cache/relocate_reserve.go for why.
 	RelocatingEviction bool
 
 	// AliasQuarantine is how long online relocating compaction must let a RETIRED
