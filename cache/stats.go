@@ -34,11 +34,24 @@ type Stats struct {
 	// EvictionsLive is the one to watch to decide whether a cache is sized for
 	// its working set. EvictionsLive > 0 with Expirations low means the budget,
 	// not the TTL, is deciding how long entries survive.
-	EvictionsLive  uint64
-	Rejects        uint64 // refused due to PolicyRejectWrites
-	PagesAllocated uint64
-	BytesAllocated uint64
-	BytesUsed      uint64
+	EvictionsLive uint64
+	Rejects       uint64 // refused due to PolicyRejectWrites
+	// InPlaceCandidates counts write ATTEMPTS whose new entry would have been
+	// framed byte-identically to the copy already stored for the key — same key,
+	// same value LENGTH — and so could have been written over it instead of
+	// appended after it. It is a MEASUREMENT: the write path appends regardless,
+	// so this reports headroom, not a saving.
+	//
+	// InPlaceCandidates/Puts is the share of the write stream that is pure
+	// same-size rewriting. Every one of those writes leaves its predecessor
+	// framed and dead in the pages, and on a PolicyRingbufEvict shard dead
+	// versions are what carry the shard to capacity and start it evicting live
+	// keys — so on a workload with roughly-constant record sizes this ratio is
+	// also, near enough, the share of eviction pressure that is self-inflicted.
+	InPlaceCandidates uint64
+	PagesAllocated    uint64
+	BytesAllocated    uint64
+	BytesUsed         uint64
 	// Entries is the number of keys the index currently holds, and Tombstones
 	// the deleted-but-not-yet-reclaimed slots beside them. Entries is the only
 	// way to answer "how many keys fit in this budget": every other gauge here
@@ -146,6 +159,7 @@ func (s *Stats) Add(o Stats) {
 	s.Evictions += o.Evictions
 	s.EvictionsLive += o.EvictionsLive
 	s.Rejects += o.Rejects
+	s.InPlaceCandidates += o.InPlaceCandidates
 	s.PagesAllocated += o.PagesAllocated
 	s.BytesAllocated += o.BytesAllocated
 	s.BytesUsed += o.BytesUsed
@@ -195,6 +209,7 @@ func (s Stats) WritePrometheus(w io.Writer) error {
 		{"rostam_kv_reserve_bytes_relocated_total", "bytes copied by the background reserve - background work, not write-path cost", s.ReserveBytesRelocated},
 		{"rostam_kv_reserve_pages_freed_total", "pages the background reserve fully evacuated and retired - the free pages it produced for the write path", s.ReservePagesFreed},
 		{"rostam_kv_rejects_total", "writes refused under PolicyRejectWrites", s.Rejects},
+		{"rostam_kv_inplace_candidates_total", "writes that would have been framed byte-identically to the stored copy of their key (same key, same value length) and so could have overwritten it in place instead of appending a new copy and stranding the old one - headroom, not a saving taken", s.InPlaceCandidates},
 		{"rostam_kv_corruption_errors_total", "CRC mismatches seen on read", s.CorruptionErrors},
 		{"rostam_kv_compactions_total", "page files rewritten live-only at shard open (mmap)", s.Compactions},
 		{"rostam_kv_compactions_aborted_total", "compactions decided against or abandoned; the original file was kept", s.CompactionsAborted},

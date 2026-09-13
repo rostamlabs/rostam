@@ -153,3 +153,90 @@ func BenchmarkRostamGetWithExpiryInto(b *testing.B) {
 		buf = out
 	}
 }
+
+// BenchmarkInPlaceCandidateRate reports what share of a write stream could have
+// overwritten its predecessor where it lay instead of appending a fresh copy —
+// Stats.InPlaceCandidates / Stats.Puts, in percent — across write shapes that
+// bracket the interesting range. It is a REPORT, not a throughput measurement:
+// the timed loop is the same append path in every case.
+//
+// The shapes:
+//
+//	fresh-keys       every write is a new key. Nothing to overwrite; the floor.
+//	rewrite-samesize a bounded key set rewritten at a constant record size —
+//	                 the shape the optimisation exists for.
+//	rewrite-jitter   the same key set, but each rewrite picks a value length
+//	                 from a small spread, so most rewrites reframe the entry.
+//
+// The shard is driven to capacity first so the rate reported is the steady-state
+// one, eviction included: a rewrite whose key was evicted in the meantime is not
+// a candidate, and that loss belongs in the figure rather than outside it.
+func BenchmarkInPlaceCandidateRate(b *testing.B) {
+	const (
+		pages   = 8
+		keySpan = 20_000
+	)
+	shapes := []struct {
+		name string
+		// value returns the bytes written on iteration i, and key the key.
+		key   func(i int) []byte
+		value func(r *rand.Rand, base []byte) []byte
+	}{
+		{
+			name:  "fresh-keys",
+			key:   func(i int) []byte { return fmt.Appendf(nil, "k%012d", i) },
+			value: func(_ *rand.Rand, base []byte) []byte { return base },
+		},
+		{
+			name:  "rewrite-samesize",
+			key:   func(i int) []byte { return fmt.Appendf(nil, "k%012d", i%keySpan) },
+			value: func(_ *rand.Rand, base []byte) []byte { return base },
+		},
+		{
+			name: "rewrite-jitter",
+			key:  func(i int) []byte { return fmt.Appendf(nil, "k%012d", i%keySpan) },
+			value: func(r *rand.Rand, base []byte) []byte {
+				return base[:len(base)-r.Intn(16)]
+			},
+		},
+	}
+	for _, sh := range shapes {
+		b.Run(sh.name, func(b *testing.B) {
+			cfg := DefaultConfig()
+			cfg.NumShards = 1
+			cfg.PageSize = 1 << 20
+			cfg.MaxMemoryPerShard = pages << 20
+			cfg.TTLSweepIntervalMs = 0
+			s, err := newShard(cfg, "", nil)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer func() { _ = s.Close() }()
+			base := benchValue()
+			r := rand.New(rand.NewSource(1)) //nolint:gosec // deterministic shape, not security
+			// Warm to steady state: fill every page and start evicting, so the
+			// measured window sees the rate a running shard actually has.
+			for i := 0; s.evictions.Load() == 0 && i < 1<<22; i++ {
+				_ = s.Put(sh.key(i), sh.value(r, base), 0)
+			}
+			before := s.snapshot()
+			b.ReportAllocs()
+			b.ResetTimer()
+			i := 0
+			for b.Loop() {
+				_ = s.Put(sh.key(i), sh.value(r, base), 0)
+				i++
+			}
+			b.StopTimer()
+			after := s.snapshot()
+			puts := after.Puts - before.Puts
+			cand := after.InPlaceCandidates - before.InPlaceCandidates
+			if puts == 0 {
+				b.Fatal("no writes measured")
+			}
+			b.ReportMetric(float64(cand)/float64(puts)*100, "%candidates")
+			b.ReportMetric(float64(after.BytesUsed)/float64(max(after.Entries, 1)), "B/livekey")
+			b.ReportMetric(float64(after.Evictions-before.Evictions)/float64(puts), "evict/put")
+		})
+	}
+}

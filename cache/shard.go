@@ -151,6 +151,23 @@ type shard struct {
 	pagesAlloc    atomic.Uint64
 	corrupt       atomic.Uint64
 
+	// inPlaceCandidates counts the writes whose new entry would be FRAMED
+	// BYTE-IDENTICALLY to the copy the index already points at — same key, same
+	// value LENGTH — so the bytes could have been laid down at the existing
+	// offset instead of appended at the tail. It measures the headroom for that
+	// optimisation, nothing more: this build still appends every write, so the
+	// counter changes no behaviour and the number it reports is a potential, not
+	// a saving already taken.
+	//
+	// It matters because every update appends and leaves its predecessor framed
+	// and dead. Under PolicyRingbufEvict those dead versions are what drives the
+	// shard to capacity and starts evicting live keys, so a workload that rewrites
+	// the same keys at a constant record size pays eviction for garbage it never
+	// had to create. How much of the write stream looks like that is exactly this
+	// ratio (inPlaceCandidates / puts), and it is the number that decides whether
+	// writing in place is worth the reader-side cost it would impose.
+	inPlaceCandidates atomic.Uint64
+
 	// cold-compaction counters (cache/compact.go). Written once, at open, before
 	// the shard is published; atomic only so Stats can read them from any
 	// goroutine afterwards. compactAborts covers every path that decided against
@@ -872,6 +889,65 @@ func (s *shard) putAbsH(key, value []byte, expiryMs uint64, h uint64) error {
 	return s.putAtExpLocked(key, value, expiryMs, h)
 }
 
+// inPlaceTargetLocked resolves the entry a same-size update of (key, value)
+// would overwrite: the page object and offset of the copy the index currently
+// points at, when that copy's framing is byte-identical to what the new write
+// would produce. ok=false means the write has no such target and must append.
+//
+// An entry is [entryHeaderSize][key][value] and the header is fixed-width, so
+// for the SAME key and an identical value LENGTH the new framing occupies
+// exactly the same bytes as the stored one. Everything the index holds — page,
+// offset, generation — therefore stays correct across the overwrite, which is
+// what makes the slot upsert, the page allocation and any eviction behind it
+// unnecessary.
+//
+// Must be called with s.mu held for writing. The guards, in order:
+//
+//  1. the key is indexed at all;
+//  2. its ref lands on an allocated page slot;
+//  3. that page is still the GENERATION the ref was minted against — heap
+//     ringbuf eviction retires a page by swapping in a fresh object, so a stale
+//     ref would otherwise resolve against a slab under active append;
+//  4. the framed entry decodes;
+//  5. the stored key EQUALS the caller's — the index is keyed by 64-bit hash, so
+//     a collision resolves to a different key's entry, and overwriting it would
+//     destroy an unrelated live record;
+//  6. the stored value length equals the new one — the whole premise;
+//  7. the entry lies wholly inside the page's live band [head, tail). Outside it
+//     the bytes are either already evicted or unwritten free space, neither of
+//     which an index-current entry can occupy; refusing is cheaper than reasoning
+//     about how a violation could arise.
+func (s *shard) inPlaceTargetLocked(key, value []byte, h uint64) (*page, uint32, bool) {
+	t := s.tab.Load()
+	_, ref, found := t.findSlot(h)
+	if !found {
+		return nil, 0, false // (1) key absent
+	}
+	idx := int(ref.pageIdx())
+	if idx >= len(s.pages) {
+		return nil, 0, false // (2) ref outside the allocated page list
+	}
+	p := s.pages[idx]
+	if p == nil || p.gen != ref.gen() {
+		return nil, 0, false // (3) page retired and replaced since the ref was minted
+	}
+	off := ref.offset()
+	storedKey, storedVal, _, err := p.Read(off)
+	if err != nil {
+		return nil, 0, false // (4) unreadable framing
+	}
+	if !bytes.Equal(storedKey, key) {
+		return nil, 0, false // (5) hash collision: a different key's entry
+	}
+	if len(storedVal) != len(value) {
+		return nil, 0, false // (6) different size: the framing would not line up
+	}
+	if int(off) < p.head() || int(off)+entrySize(len(key), len(value)) > p.tail() {
+		return nil, 0, false // (7) not inside the page's live band
+	}
+	return p, off, true
+}
+
 // putAtExpLocked is the shared write body: it takes the already-resolved
 // absolute expiry (exp) and performs the page write + index upsert. putH,
 // putAtH, and putAbsH differ ONLY in how they derive exp — the storage path is
@@ -881,6 +957,13 @@ func (s *shard) putAtExpLocked(key, value []byte, exp uint64, h uint64) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// MEASUREMENT ONLY — no behaviour hangs off this. Count the writes that could
+	// have overwritten their predecessor where it already lies instead of
+	// appending a fresh copy and stranding the old one. See inPlaceCandidates.
+	if _, _, ok := s.inPlaceTargetLocked(key, value, h); ok {
+		s.inPlaceCandidates.Add(1)
+	}
 
 	// Find a page with enough tail room; lazily allocate or evict as needed.
 	pageIdx, err := s.findOrMakePageLocked(entrySize(len(key), len(value)))
@@ -1073,21 +1156,22 @@ func (s *shard) snapshot() Stats {
 	reserveRelocatedBytes := s.reserveRelocatedBytes.Load()
 	live, tomb := s.entries()
 	return Stats{
-		Gets:             gets,
-		Hits:             gets - misses,
-		Misses:           misses,
-		Puts:             s.puts.Load(),
-		Dels:             s.dels.Load(),
-		Expirations:      s.expirations.Load(),
-		Evictions:        s.evictions.Load(),
-		EvictionsLive:    s.evictionsLive.Load(),
-		Rejects:          s.rejects.Load(),
-		PagesAllocated:   s.pagesAlloc.Load(),
-		BytesAllocated:   uint64(s.numPages()) * uint64(s.cfg.PageSize), //nolint:gosec // numPages and PageSize are always non-negative
-		BytesUsed:        s.bytesUsed(),
-		Entries:          live,
-		Tombstones:       tomb,
-		CorruptionErrors: s.corrupt.Load(),
+		Gets:              gets,
+		Hits:              gets - misses,
+		Misses:            misses,
+		Puts:              s.puts.Load(),
+		Dels:              s.dels.Load(),
+		Expirations:       s.expirations.Load(),
+		Evictions:         s.evictions.Load(),
+		EvictionsLive:     s.evictionsLive.Load(),
+		Rejects:           s.rejects.Load(),
+		InPlaceCandidates: s.inPlaceCandidates.Load(),
+		PagesAllocated:    s.pagesAlloc.Load(),
+		BytesAllocated:    uint64(s.numPages()) * uint64(s.cfg.PageSize), //nolint:gosec // numPages and PageSize are always non-negative
+		BytesUsed:         s.bytesUsed(),
+		Entries:           live,
+		Tombstones:        tomb,
+		CorruptionErrors:  s.corrupt.Load(),
 
 		Compactions:              s.compactions.Load(),
 		CompactionsAborted:       s.compactAborts.Load(),
