@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/cespare/xxhash/v2"
+
+	"github.com/rostamlabs/rostam/cache/internal/pageseal"
 )
 
 // ErrNotFound is returned when a key is absent or expired.
@@ -69,6 +71,27 @@ type shard struct {
 	// genCounter mints page generations (see page.gen / slabRef.gen). Monotonic
 	// per shard; accessed under mu (or during single-threaded construction).
 	genCounter uint16
+
+	// mutableRegion is the shard's MUTABLE REGION: the heap pages still carrying an
+	// unsealed latch (see page.seal), oldest first. Membership is held as an explicit
+	// FIFO of page POINTERS and not derived from page.gen — generations wrap at 65536,
+	// and wrap-aware comparison would buy nothing a FIFO does not already give
+	// exactly. freshHeapPageLocked pushes each new page on the back; anything the
+	// bound pushes off the front is sealed on the way out, which is the only place a
+	// page is ever sealed.
+	//
+	// Holding pointers means the FIFO keeps the pages in it GC-alive, retired ones
+	// included, so it is strictly bounded by mutableRegionPages and popped slots are
+	// nilled. Guarded by mu (write path only).
+	mutableRegion []*page
+
+	// mutableRegionPages bounds that FIFO. ZERO DISABLES THE REGION ENTIRELY — no
+	// membership is tracked, nothing is ever sealed, and every heap page stays mutable
+	// for its whole life. Zero is the value every shard the cache constructs runs
+	// with; only tests set it, and the substrate ships inert by design: no read or
+	// write path consults a page's latch, so neither state can change what the cache
+	// does. Guarded by mu.
+	mutableRegionPages int
 
 	// writeIdx is the page Put writes into first (the current "open" page). It
 	// avoids re-scanning every page on each write: after eviction frees a page,
@@ -214,6 +237,21 @@ type shard struct {
 	reserveRelocations    atomic.Uint64 // live records the reserve pass copied forward
 	reserveRelocatedBytes atomic.Uint64 // their framed byte total
 	reservePagesFreed     atomic.Uint64 // pages it fully evacuated and retired
+
+	// mutable-region counters (see mutableRegion). mutablePagesBorn counts the heap
+	// pages admitted to the region and mutablePagesSealed the pages the FIFO pushed
+	// out of it — i.e. actual mutable→sealed transitions, counted by the CAS that
+	// performed each one, so a page sealed twice is counted once. Both stay 0 on a
+	// shard with the region disabled (every shard the cache constructs) and on every
+	// mmap shard, whose pages are never members.
+	//
+	// They are what makes the latch observable: born tracks heap page turnover
+	// through the single chokepoint, and born-minus-sealed should equal the resident
+	// membership. They are deliberately NOT surfaced in Stats/Prometheus while the
+	// region is inert — a permanently-zero series on every node is noise, not
+	// observability — and move there when something starts consuming the latch.
+	mutablePagesBorn   atomic.Uint64
+	mutablePagesSealed atomic.Uint64
 
 	// reserveChunkHook observes each finished chunk of the reserve pass (entries and
 	// bytes moved under one lock acquisition), called with s.mu released. Nil unless a
@@ -1699,7 +1737,46 @@ func (s *shard) freshHeapPageLocked() *page {
 	if s.seqlockReads() {
 		p.enableVersions()
 	}
+	// Born MUTABLE, here and nowhere else. Minting the latch at the same single
+	// chokepoint as the generation is what makes "a heap page starts mutable and is
+	// sealed at most once" a property of the code rather than of a convention: a
+	// page that reached a reader without passing through here would have no latch at
+	// all (nil, i.e. sealed), and a page cannot be handed a second one without
+	// constructing a new page object.
+	p.seal = pageseal.New()
+	s.admitToMutableRegionLocked(p)
 	return p
+}
+
+// admitToMutableRegionLocked makes p the NEWEST member of the shard's mutable
+// region and seals whatever the region's bound pushes out of the back.
+//
+// A no-op when the region is disabled (mutableRegionPages == 0), which is every
+// shard the cache constructs: nothing is tracked, so the FIFO stays empty and no
+// page is ever sealed. It is also a no-op for mmap pages, which never call it —
+// they do not come from freshHeapPageLocked, and their objects are reused in place,
+// so a latch on one could not stay monotone.
+//
+// Sealing here is observationally inert: no path in the cache reads page.Mutable,
+// so a sealed page still accepts exactly the writes it accepted before. Must hold
+// mu for writing (or run during construction, before the shard is shared).
+func (s *shard) admitToMutableRegionLocked(p *page) {
+	if s.mutableRegionPages <= 0 {
+		return
+	}
+	s.mutableRegion = append(s.mutableRegion, p)
+	s.mutablePagesBorn.Add(1)
+	for len(s.mutableRegion) > s.mutableRegionPages {
+		oldest := s.mutableRegion[0]
+		// Nil the popped slot before resliceing: the FIFO holds page pointers, and a
+		// stale one left in the backing array would keep a retired page's whole slab
+		// GC-alive for as long as the array lives.
+		s.mutableRegion[0] = nil
+		s.mutableRegion = s.mutableRegion[1:]
+		if oldest.Seal() {
+			s.mutablePagesSealed.Add(1)
+		}
+	}
 }
 
 // allocHeapPageLocked appends a fresh heap-backed page and returns its index.

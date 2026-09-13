@@ -7,6 +7,8 @@ import (
 	"errors"
 	"sync/atomic"
 	"time"
+
+	"github.com/rostamlabs/rostam/cache/internal/pageseal"
 )
 
 // errPageFull is returned when a page has no remaining contiguous capacity
@@ -82,6 +84,26 @@ type page struct {
 	// the alias-hold bound is a real network-write duration. Zero on a non-retired
 	// page and on every heap / single-node / ringbuf shard. Guarded by shard.mu.
 	retiredAt time.Time
+
+	// seal is the page's MONOTONE mutable→sealed latch, and the page's membership
+	// token for its shard's mutable region (see shard.mutableRegion). A heap page is
+	// born mutable — freshHeapPageLocked mints the latch, and it is the only place
+	// that does — and is sealed once the region's FIFO pushes it out. It never goes
+	// back: pageseal offers no unseal, so re-mutating an extent costs a new page
+	// object, exactly as retirement already builds one.
+	//
+	// NIL, and therefore permanently sealed, on every MMAP page. An mmap page object
+	// is REUSED in place — drainPageLocked keeps both the object and its generation —
+	// so a latch on one could observably go sealed→mutable and the monotonicity
+	// readers would rely on would not hold. Nil is also the conservative reading
+	// there: an mmap page's bytes may never be overwritten where they lie anyway
+	// (WriteAt refuses it outright), so "not mutable" is the true answer.
+	//
+	// NOTHING IN THE CACHE READS IT YET. It is substrate: no write path consults it,
+	// so sealing a page cannot change which writes go in place or where a record
+	// lands. Guarded by nothing — the latch is atomic — but only ever minted under
+	// s.mu.
+	seal *pageseal.Latch
 
 	// relocatedOut is the framed bytes EITHER relocating pass has copied OFF this page
 	// since this object was created — the background reserve
@@ -304,7 +326,31 @@ func (p *page) EvictFront() ([]byte, uint32, error) {
 	return out, size, nil
 }
 
+// Mutable reports whether this page is still a member of its shard's mutable
+// region. False on every mmap page and on every heap page the region's FIFO has
+// pushed out; once false it stays false for this page OBJECT's lifetime.
+//
+// No caller acts on it today (see page.seal). It is here so that the state is
+// observable — by the region's own bookkeeping and by tests — before anything
+// depends on it.
+func (p *page) Mutable() bool { return p.seal.Mutable() }
+
+// Seal moves this page out of the mutable region, permanently. Returns true only
+// for the call that performed the transition, so the shard's counter cannot
+// double-count a page sealed twice.
+//
+// Sealing forbids OVERWRITING live bytes; it says nothing about APPENDING. A
+// sealed page's tail is ordinary free space and a Write into it stays legal — the
+// property being protected is that bytes already handed to a reader do not change
+// underneath it, not that the page stops growing.
+func (p *page) Seal() bool { return p.seal.Seal() }
+
 // Reset clears the page in-place so it can be reused.
+//
+// It does NOT touch the seal: resetting recycles the page's SPACE, and a sealed
+// page that starts taking writes again where an old reader may still be looking is
+// exactly what the latch exists to rule out. Mutability comes back only with a new
+// page object.
 func (p *page) Reset() {
 	p.setHead(0)
 	p.setTail(0)

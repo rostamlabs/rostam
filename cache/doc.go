@@ -51,6 +51,29 @@
 //     seqlock). Its reads take the read lock for the probe and the value copy,
 //     exactly excluding the writer's overwrite.
 //
+// # The mutable region
+//
+// Each heap shard keeps an explicit FIFO of the pages it considers MUTABLE. A heap
+// page is born mutable — freshHeapPageLocked is the one place a heap page is
+// constructed, so the initial allocation, both retirement paths and the free-page
+// reserve's handoff all mint the flag in the same place — and is SEALED when the
+// region's bound pushes it off the front of the FIFO. The flag is monotone: there
+// is no operation that returns a sealed page to mutable, so an observer that sees
+// "sealed" may conclude it will stay sealed for that page object's life. Mutability
+// comes back only with a NEW page object, which is what retirement already builds.
+//
+// Membership is a FIFO of page pointers rather than a comparison on page.gen:
+// generations wrap, and a FIFO says exactly what is wanted with no wrap-aware
+// arithmetic. Mmap pages are never members (their objects are reused in place, so a
+// flag on one could not stay monotone) and always read as not mutable, which is
+// also the true answer for them — their bytes may never be overwritten where they
+// lie.
+//
+// Sealing forbids OVERWRITING a page's live bytes; appending into its tail stays
+// legal. Nothing in the cache consults the flag today and no shard the cache
+// constructs bounds its region, so the whole mechanism is bookkeeping: it cannot
+// change which writes go in place, where a record lands, or what a read observes.
+//
 // This is the foundational component of Rostam. Higher-level features
 // (Raft replication, transactions, the network server, the migration
 // shim) are layered on top — see docs/concepts/architecture.md.
