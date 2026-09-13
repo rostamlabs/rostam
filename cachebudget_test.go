@@ -3,7 +3,10 @@
 package rostam
 
 import (
+	"errors"
 	"math"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/rostamlabs/rostam/cache"
@@ -83,6 +86,27 @@ func TestCacheGeometry(t *testing.T) {
 				if err == nil {
 					t.Fatalf("cacheGeometry(%d, %d) = %d bytes per shard, want a refusal: %d does not fit an int on this platform",
 						tc.total, tc.shards, perShard, tc.wantPerShard)
+				}
+				// Any non-nil error would pass a bare != nil check, including the
+				// unrelated headroom rejection — and a regression that truncated
+				// perShard BEFORE the conversion would produce exactly that. Pin
+				// the identity, so only this rejection satisfies the case.
+				if !errors.Is(err, ErrBudgetExceedsPlatformInt) {
+					t.Fatalf("cacheGeometry(%d, %d) error = %v, want %v",
+						tc.total, tc.shards, err, ErrBudgetExceedsPlatformInt)
+				}
+				// And pin that it names the real cause: the share that did not fit
+				// and the limit it exceeded. Without these the message could regress
+				// to the misleading downstream wording this guard exists to replace.
+				for _, want := range []string{
+					strconv.FormatInt(tc.total, 10),
+					strconv.Itoa(tc.shards),
+					strconv.FormatInt(tc.wantPerShard, 10),
+					strconv.FormatInt(int64(math.MaxInt), 10),
+				} {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error %q does not name %s", err, want)
+					}
 				}
 				return
 			}
