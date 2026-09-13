@@ -1101,37 +1101,40 @@ func (s *shard) inPlaceEligible() bool {
 //	    which an index-current entry can occupy; refusing is cheaper than
 //	    reasoning about how a violation could arise.
 //
-// It also returns the index SLOT the target was resolved through, which the caller
-// needs for nothing but the SIEVE reference hint (cache/sieve.go): an in-place
-// rewrite is the one write that leaves no other trace of having happened, so the
-// slot is the only place it can record that the key is in use.
-func (s *shard) inPlaceTargetLocked(key, value []byte, h uint64) (*page, uint32, uint64, bool) {
+// It also returns the index TABLE and SLOT the target was resolved through, which
+// the caller needs for nothing but the SIEVE reference hint (cache/sieve.go): an
+// in-place rewrite is the one write that leaves no other trace of having happened,
+// so the slot is the only place it can record that the key is in use. The table is
+// handed back with it rather than re-loaded, so the slot index is always applied to
+// the table it was found in — re-loading would be a second read of s.tab and a slot
+// index is meaningless against any other table.
+func (s *shard) inPlaceTargetLocked(key, value []byte, h uint64) (*page, uint32, *indexTable, uint64, bool) {
 	t := s.tab.Load()
 	slot, ref, found := t.findSlot(h)
 	if !found {
-		return nil, 0, 0, false // (4a) key absent
+		return nil, 0, nil, 0, false // (4a) key absent
 	}
 	idx := int(ref.pageIdx())
 	if idx >= len(s.pages) {
-		return nil, 0, 0, false // (4b) ref outside the allocated page list
+		return nil, 0, nil, 0, false // (4b) ref outside the allocated page list
 	}
 	p := s.pages[idx]
 	if p == nil || p.gen != ref.gen() {
-		return nil, 0, 0, false // (4b) page retired and replaced since the ref was minted
+		return nil, 0, nil, 0, false // (4b) page retired and replaced since the ref was minted
 	}
 	off := ref.offset()
 	storedKey, storedVal, storedExp, err := p.Read(off)
 	if err != nil {
-		return nil, 0, 0, false // (4c) unreadable framing
+		return nil, 0, nil, 0, false // (4c) unreadable framing
 	}
 	if !bytes.Equal(storedKey, key) {
-		return nil, 0, 0, false // (4c) hash collision: a different key's entry
+		return nil, 0, nil, 0, false // (4c) hash collision: a different key's entry
 	}
 	if len(storedVal) != len(value) {
-		return nil, 0, 0, false // (5) different size: the framing would not line up
+		return nil, 0, nil, 0, false // (5) different size: the framing would not line up
 	}
 	if int(off) < p.head() || int(off)+entrySize(len(key), len(value)) > p.tail() {
-		return nil, 0, 0, false // (4d) not inside the page's live band
+		return nil, 0, nil, 0, false // (4d) not inside the page's live band
 	}
 	// GUARD 6 — the stored copy must still be LIVE. An expired copy is dead
 	// weight, and rewriting it where it lies pins those bytes instead of letting
@@ -1149,9 +1152,9 @@ func (s *shard) inPlaceTargetLocked(key, value []byte, h uint64) (*page, uint32,
 	// The clock is read ONLY when the stored copy actually carries an expiry, so
 	// the ordinary no-TTL write pays nothing for it.
 	if storedExp != 0 && isExpired(storedExp, s.now()) {
-		return nil, 0, 0, false // (6) the stored copy is already dead
+		return nil, 0, nil, 0, false // (6) the stored copy is already dead
 	}
-	return p, off, slot, true
+	return p, off, t, slot, true
 }
 
 // putAtExpLocked is the shared write body: it takes the already-resolved
@@ -1172,7 +1175,7 @@ func (s *shard) putAtExpLocked(key, value []byte, exp uint64, h uint64) error {
 	// version left behind. Any refusal falls through to the append path below,
 	// which is unchanged.
 	if s.inPlaceEligible() {
-		if p, off, slot, ok := s.inPlaceTargetLocked(key, value, h); ok {
+		if p, off, tab, slot, ok := s.inPlaceTargetLocked(key, value, h); ok {
 			// Stamp the next sequence exactly as the append path does — one per
 			// STORED write — but only commit it once the bytes are down, so a
 			// refused overwrite leaves the shard's sequence untouched.
@@ -1192,8 +1195,18 @@ func (s *shard) putAtExpLocked(key, value []byte, exp uint64, h uint64) error {
 				// Marking here restores exactly the standing an APPENDING rewrite gets
 				// for free by landing on the newest page — it does not grant anything
 				// the append path never had.
+				//
+				// THE COST OF THIS LANDS ON THE WRITE LOCK, NOT ON READS, which is the
+				// opposite of where it was expected. Marking on the READ path measures
+				// free — it is one load of a word the probe has already fetched, on a
+				// per-slot line rather than a shared one. This mark is inside s.mu, and
+				// on a shard whose writes are serialised there that critical section is
+				// the throughput limiter, so what is added here is amplified. Keep it
+				// minimal: tab is the table the target was resolved through, so no
+				// second s.tab load, and setVisited returns after one load once the
+				// mark is already set.
 				if s.sieve {
-					s.tab.Load().setVisited(slot, tagFor(h))
+					tab.setVisited(slot, tagFor(h))
 				}
 				// NO fireOnRemove: nothing was removed. The key is still live, at the
 				// same address, and the hook reports REMOVALS — firing it here would
