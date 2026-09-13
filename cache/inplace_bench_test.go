@@ -37,10 +37,11 @@ const (
 type inPlaceMode int
 
 const (
-	modeAppend      inPlaceMode = iota // no in-place updates; reads lock-free
-	modeAppendReloc                    // append path + relocating eviction
-	modeLocked                         // in-place updates; reads take the read lock
-	modeSeqlock                        // in-place updates; reads lock-free via the seqlock
+	modeAppend       inPlaceMode = iota // no in-place updates; reads lock-free
+	modeAppendReloc                     // append path + relocating eviction
+	modeLocked                          // in-place updates; reads take the read lock
+	modeSeqlock                         // in-place updates; reads lock-free via the seqlock
+	modeSeqlockReloc                    // in-place updates + seqlock + relocating eviction
 )
 
 func (m inPlaceMode) String() string {
@@ -49,6 +50,8 @@ func (m inPlaceMode) String() string {
 		return "append"
 	case modeAppendReloc:
 		return "append+reloc"
+	case modeSeqlockReloc:
+		return "inplace+reloc"
 	case modeLocked:
 		return "locked"
 	default:
@@ -56,7 +59,7 @@ func (m inPlaceMode) String() string {
 	}
 }
 
-var inPlaceModes = []inPlaceMode{modeAppend, modeAppendReloc, modeLocked, modeSeqlock}
+var inPlaceModes = []inPlaceMode{modeAppend, modeAppendReloc, modeLocked, modeSeqlock, modeSeqlockReloc}
 
 // inPlaceShard builds a single heap ringbuf shard in the requested mode, with
 // nothing else differing between the arms.
@@ -67,14 +70,14 @@ func inPlaceShard(tb testing.TB, mode inPlaceMode) *shard {
 	cfg.PageSize = 1 << 20
 	cfg.MaxMemoryPerShard = inPlacePages << 20
 	cfg.TTLSweepIntervalMs = 0 // no background sweeper in the measurement
-	cfg.InPlaceSameSizeUpdate = mode == modeLocked || mode == modeSeqlock
-	cfg.InPlaceSeqlockReads = mode == modeSeqlock
+	cfg.InPlaceSameSizeUpdate = mode == modeLocked || mode == modeSeqlock || mode == modeSeqlockReloc
+	cfg.InPlaceSeqlockReads = mode == modeSeqlock || mode == modeSeqlockReloc
 	// Relocating eviction is the other way a ringbuf shard keeps live records it
 	// would otherwise drop, so it is the baseline in-place has to beat rather than
 	// an unrelated question. Its background reserve ticker stays off: these
 	// benchmarks drive every pass through Put, and a tick landing mid-measurement
 	// would only add variance.
-	cfg.RelocatingEviction = mode == modeAppendReloc
+	cfg.RelocatingEviction = mode == modeAppendReloc || mode == modeSeqlockReloc
 	cfg.RelocateReserveIntervalMs = 0
 	s, err := newShard(cfg, "", nil)
 	if err != nil {
@@ -281,5 +284,64 @@ func BenchmarkInPlaceRead(b *testing.B) {
 				b.ReportMetric(float64(after.SeqlockFallbacks-before.SeqlockFallbacks)/float64(max(gets, 1))*100, "%fallback")
 			})
 		}
+	}
+}
+
+// BenchmarkInPlaceWriteRecency measures what an in-place rewrite gives up:
+// WRITE RECENCY. An appending rewrite moves its key to the newest page, so a key
+// touched often drifts ahead of the eviction rotation and survives. Rewriting a
+// key where it lies leaves it on whatever page it was first written to, so the
+// rotation reaches it on schedule however hot it is.
+//
+// That only bites when eviction is actually running, so this shard is
+// deliberately sized SMALLER than its live set — the one regime where in-place
+// cannot simply avoid evicting. Writes interleave a small hot set, rewritten over
+// and over at a constant size, with a stream of cold keys written once; the
+// number that matters is how much of the HOT set is still resident afterwards.
+//
+// Reported per arm: hot% (the hot set's survival, the figure under test), all%
+// over every key ever written, and evictions per write.
+func BenchmarkInPlaceWriteRecency(b *testing.B) {
+	const (
+		hotKeys   = 2_000
+		coldKeys  = 40_000 // far past what the budget holds, so eviction never stops
+		writes    = 1_500_000
+		hotEveryN = 4 // one hot rewrite per three cold inserts
+	)
+	hotKey := func(i int) []byte { return fmt.Appendf(nil, "h%011d", i%hotKeys) }
+	coldKey := func(i int) []byte { return fmt.Appendf(nil, "c%011d", i%coldKeys) }
+
+	for _, mode := range inPlaceModes {
+		b.Run(mode.String(), func(b *testing.B) {
+			for b.Loop() {
+				b.StopTimer()
+				s := inPlaceShard(b, mode)
+				val := benchValue()
+				b.StartTimer()
+				cold := 0
+				for i := range writes {
+					if i%hotEveryN == 0 {
+						_ = s.Put(hotKey(i/hotEveryN), val, 0)
+					} else {
+						_ = s.Put(coldKey(cold), val, 0)
+						cold++
+					}
+				}
+				b.StopTimer()
+
+				hot := 0
+				for i := range hotKeys {
+					if _, err := s.Get(hotKey(i)); err == nil {
+						hot++
+					}
+				}
+				st := s.snapshot()
+				b.ReportMetric(float64(hot)/float64(hotKeys)*100, "hot%")
+				b.ReportMetric(float64(st.Entries), "keys")
+				b.ReportMetric(float64(st.Evictions)/float64(max(st.Puts, 1)), "evict/put")
+				b.ReportMetric(float64(st.InPlaceUpdates)/float64(max(st.Puts, 1))*100, "%inplace")
+				b.StartTimer()
+			}
+		})
 	}
 }

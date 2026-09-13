@@ -309,6 +309,29 @@ type Config struct {
 	//     previous version framed and recoverable. Heap pages are not persisted, so
 	//     there is nothing to recover and the concern does not arise.
 	//
+	// WHAT IT ALSO COSTS: WRITE RECENCY, and this is a change in EVICTION
+	// SEMANTICS, not only in locking. Eviction here reclaims whole pages in
+	// rotation, so which records survive is decided by which PAGE they sit on. An
+	// appending rewrite moves its key to the newest page, so a key touched often
+	// drifts ahead of the rotation and outlives one touched rarely — recency the
+	// ring buffer gets for free, without tracking anything. An in-place rewrite
+	// keeps the key on whatever page it was first written to, so the rotation
+	// reaches it on schedule however hot it is.
+	//
+	// It only bites on a shard whose live set EXCEEDS its budget, because that is
+	// the only regime where in-place cannot simply stop evicting. There it is a
+	// genuine trade rather than a win, and BenchmarkInPlaceWriteRecency exists to
+	// put numbers on both halves: against the append path it retained about a
+	// quarter more keys in total and evicted about a fifth less often, while
+	// holding roughly ten percent less of the frequently-rewritten subset.
+	// Relocating eviction recovers very little of that (about a point and a half),
+	// so do not count on it as a remedy.
+	//
+	// So: if a shard is sized for its working set, this is close to pure gain — it
+	// is the garbage that drove eviction, and removing it removes the evictions.
+	// If a shard is deliberately run over capacity as a ring buffer AND leans on
+	// rewrite frequency to decide what stays, leave it off.
+	//
 	// WHAT IT COSTS. Heap ringbuf reads are lock-free today only because pages are
 	// append-only and frozen: eviction retires a page by swapping in a fresh object,
 	// never by rewriting live bytes, so the bytes behind a hit are immutable for the
