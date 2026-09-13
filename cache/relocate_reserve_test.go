@@ -5,6 +5,7 @@ package cache
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -768,8 +769,24 @@ func TestReserveIntervalValidation(t *testing.T) {
 		{"RelocateReserveIntervalMs", func(c *Config, ms int) { c.RelocateReserveIntervalMs = ms }},
 		{"TTLSweepIntervalMs", func(c *Config, ms int) { c.TTLSweepIntervalMs = ms }},
 	} {
+		// The interval fields are `int`, so on a 32-bit build they top out at
+		// MaxInt32 and CANNOT express maxIntervalMs at all — int(maxIntervalMs)
+		// does not even compile there. The overflow this guards is therefore
+		// unreachable on those platforms, and the limit case is the largest value
+		// the field can actually hold.
+		if maxIntervalMs > int64(math.MaxInt) {
+			ok := DefaultConfig()
+			tc.set(&ok, math.MaxInt)
+			if err := ok.Validate(); err != nil {
+				t.Fatalf("%s at MaxInt was rejected on a platform whose int cannot reach "+
+					"maxIntervalMs (%d), so no value of the field can overflow: %v",
+					tc.name, maxIntervalMs, err)
+			}
+			continue
+		}
+		lim := maxIntervalMs // through a variable: int(const) does not compile where the const does not fit
 		ok := DefaultConfig()
-		tc.set(&ok, int(maxIntervalMs))
+		tc.set(&ok, int(lim))
 		if err := ok.Validate(); err != nil {
 			t.Fatalf("%s at the limit (%d) was rejected: %v", tc.name, maxIntervalMs, err)
 		}
@@ -777,7 +794,7 @@ func TestReserveIntervalValidation(t *testing.T) {
 		if got := time.Duration(maxIntervalMs) * time.Millisecond; got <= 0 {
 			t.Fatalf("maxIntervalMs=%d does not itself convert: %v", maxIntervalMs, got)
 		}
-		over := int(maxIntervalMs) + 1
+		over := int(lim) + 1
 		bad := DefaultConfig()
 		tc.set(&bad, over)
 		if err := bad.Validate(); err == nil {
