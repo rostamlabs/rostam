@@ -174,6 +174,106 @@ func (t *indexTable) rechaseSlot(s *shard, i uint64, r slabRef) (*page, slabRef,
 	return p, cur, nil
 }
 
+// getSeq is get under the per-entry seqlock (cache/seqlock.go), for a shard
+// whose writers can rewrite a live entry's bytes where they lie. It differs from
+// get in two ways, both forced by that:
+//
+//   - it COPIES the value into dst rather than returning an alias into the page,
+//     because an alias cannot be validated — the bytes could change after the
+//     caller has been handed them;
+//   - it reports ok=false when the entry's version moved underneath it, meaning
+//     the caller must retry (or take the read lock once its budget is spent).
+//     ok=false is NOT a miss and must never be reported as one.
+//
+// TWO REASONS A READ RETRIES, AND THEY COMPOSE IN ONE ORDER ONLY. A generation
+// mismatch means the record MOVED — relocating eviction copied it forward and
+// repointed its slot — and rechaseSlot resolves that to the copy the index now
+// names, inside this probe, exactly as get does. The version check means the
+// record CHANGED WHERE IT LIES. The version must therefore be snapshotted from
+// the page and offset rechase SETTLED ON, never from the ref the slot first
+// advertised: a relocated record's old page is frozen and its counter never moves
+// again, so validating against it would miss every later in-place update at the
+// record's real home. Neither retry substitutes for the other — one re-resolves
+// WHERE the record is, the other re-reads WHAT it says — and collapsing them
+// would answer one question with the other's evidence.
+//
+// WHY THE RACY DECODE CANNOT MISBEHAVE. p.Read on bytes a writer may be
+// rewriting looks alarming, but an in-place update is the ONLY thing that
+// rewrites live bytes here, and it writes the SAME key at the SAME length — so
+// the keyLen and valLen fields it stores are byte-for-byte what was already
+// there. A torn read of an unchanged byte is that byte. The framing a reader
+// decodes is therefore stable even mid-write, and the slice bounds derived from
+// it cannot go out of range. Only the expiry, the meta word and the value can
+// differ, and each is validated by the trailing version check before it reaches
+// the caller. Eviction and relocation DO change framing, but both leave the old
+// page frozen and are already handled by the generation gate above.
+func (t *indexTable) getSeq(s *shard, dst, key []byte, h uint64) (out []byte, exp uint64, ref slabRef, st lookupStatus, ok bool) {
+	tag := tagFor(h)
+	tab := t
+probe:
+	for {
+		for i := h & tab.mask; ; i = (i + 1) & tab.mask {
+			c := tab.ctrl[i].Load()
+			if c == ctrlEmpty {
+				return dst, 0, 0, lkMiss, true // probe run ended: key absent
+			}
+			if c != tag {
+				continue
+			}
+			r := slabRef(tab.refs[i].Load())
+			p := s.pageSlots[r.pageIdx()].Load()
+			if p == nil || p.gen != r.gen() {
+				// Evicted, or MOVED and the slot repointed. rechaseSlot tells them
+				// apart on the table that can answer, and hands back the live table
+				// when this one has been frozen by a rehash. See get.
+				var live *indexTable
+				p, r, live = tab.rechaseSlot(s, i, r)
+				if live != nil {
+					tab = live
+					continue probe
+				}
+				if p == nil {
+					continue
+				}
+			}
+			// The ref is final from here, so this is the counter that actually guards
+			// the bytes about to be read.
+			ver := p.versionAt(r.offset())
+			if ver == nil {
+				// No counter on this page, so nothing here can be validated. Report a
+				// retry so the caller takes the read lock rather than trusting an
+				// unguarded read.
+				return dst, 0, 0, lkMiss, false
+			}
+			v1 := ver.Load()
+			if v1&1 != 0 {
+				return dst, 0, 0, lkMiss, false // a rewrite is in flight on this stripe
+			}
+			k, val, e, err := p.Read(r.offset())
+			if err != nil {
+				if ver.Load() != v1 {
+					return dst, 0, 0, lkMiss, false
+				}
+				return dst, 0, 0, lkCorrupt, true
+			}
+			if !bytes.Equal(k, key) {
+				// Either a genuinely different key on this hash, or bytes that moved
+				// under the comparison. Only the version says which, and guessing wrong
+				// in the second case would report a miss for a key that is present.
+				if ver.Load() != v1 {
+					return dst, 0, 0, lkMiss, false
+				}
+				continue
+			}
+			out = append(dst, val...)
+			if ver.Load() != v1 {
+				return dst, 0, 0, lkMiss, false // the value moved while it was copied
+			}
+			return out, e, r, lkHit, true
+		}
+	}
+}
+
 // lookupStatus is the outcome of a table probe.
 type lookupStatus uint8
 

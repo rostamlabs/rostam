@@ -5,6 +5,7 @@ package cache
 import (
 	"encoding/binary"
 	"errors"
+	"sync/atomic"
 	"time"
 )
 
@@ -63,6 +64,13 @@ type page struct {
 	// pageSlots + the generation gate). Always false on heap / single-node / ringbuf
 	// shards, so those paths are byte-for-byte unchanged.
 	retired bool
+
+	// vers holds the seqlock version counters guarding this page's entries when
+	// the shard reads through the seqlock (Config.InPlaceSeqlockReads); nil on
+	// every other page, which is every page on every other shard. Allocated by
+	// enableVersions before the page is published, never resized, so readers index
+	// it with no synchronisation of their own. See cache/seqlock.go.
+	vers []atomic.Uint64
 
 	// retiredAt is the wall-clock instant this page was marked retired (set only
 	// when retired flips true). It starts the alias-drain QUARANTINE: the page's

@@ -318,6 +318,32 @@ type Config struct {
 	// trade: writes stop creating garbage, reads stop being lock-free.
 	InPlaceSameSizeUpdate bool
 
+	// InPlaceSeqlockReads makes a shard with InPlaceSameSizeUpdate keep its reads
+	// LOCK-FREE, validating each one against a per-stripe version counter instead
+	// of taking the shard read lock. Default false. Ignored unless in-place
+	// updates are enabled — it protects against exactly one hazard, a writer
+	// rewriting an entry's bytes underneath a reader, which only in-place updates
+	// create.
+	//
+	// It exists because the read lock is what in-place updates otherwise cost, and
+	// the cost is large: an RWMutex read acquisition is a read-modify-write on one
+	// cache line every reader shares, so read throughput stops scaling with cores.
+	//
+	// IT IS OFF BY DEFAULT AND SHOULD STAY OFF UNLESS THE READ:WRITE RATIO PAYS FOR
+	// IT, for two reasons that are not tuning preferences:
+	//
+	//   - A seqlock's payload access is a DATA RACE by construction — validating
+	//     after the fact is what it does instead of preventing the access — so the
+	//     race detector reports it, and the protocol rests on how Go compiles its
+	//     atomics rather than on a guarantee the memory model extends to racing
+	//     plain accesses. cache/seqlock.go sets out the ordering argument and its
+	//     limits in full. Accessing the payload atomically would close both gaps and
+	//     costs more than the read lock it replaces (measured there).
+	//   - It is only a win when reads outnumber writes by enough. The version bump
+	//     is two atomic read-modify-writes on the WRITE path; below roughly six
+	//     reads per write the read lock is the cheaper of the two.
+	InPlaceSeqlockReads bool
+
 	// NowFn overrides the WALL-CLOCK source for the non-apply expiry sites (client
 	// read filter, sweeper, warm-restart rebuild, Iterate). nil ⇒ the real clock
 	// (nowMs / time.Now) — the production default, byte-identical to pre-B1

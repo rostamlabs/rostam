@@ -21,16 +21,42 @@ const (
 	inPlaceKeyFmt  = "k%012d" // 13 bytes
 )
 
-// inPlaceShard builds a single heap ringbuf shard with the flag in the requested
-// state and nothing else differing.
-func inPlaceShard(tb testing.TB, inPlace bool) *shard {
+// The three arms every benchmark here reports, which are the three states this
+// work passes through: today's append path, in-place updates paying the read
+// lock for them, and in-place updates validating reads against a version counter
+// instead.
+type inPlaceMode int
+
+const (
+	modeAppend  inPlaceMode = iota // no in-place updates; reads lock-free
+	modeLocked                     // in-place updates; reads take the read lock
+	modeSeqlock                    // in-place updates; reads lock-free via the seqlock
+)
+
+func (m inPlaceMode) String() string {
+	switch m {
+	case modeAppend:
+		return "append"
+	case modeLocked:
+		return "locked"
+	default:
+		return "seqlock"
+	}
+}
+
+var inPlaceModes = []inPlaceMode{modeAppend, modeLocked, modeSeqlock}
+
+// inPlaceShard builds a single heap ringbuf shard in the requested mode, with
+// nothing else differing between the arms.
+func inPlaceShard(tb testing.TB, mode inPlaceMode) *shard {
 	tb.Helper()
 	cfg := DefaultConfig()
 	cfg.NumShards = 1
 	cfg.PageSize = 1 << 20
 	cfg.MaxMemoryPerShard = inPlacePages << 20
 	cfg.TTLSweepIntervalMs = 0 // no background sweeper in the measurement
-	cfg.InPlaceSameSizeUpdate = inPlace
+	cfg.InPlaceSameSizeUpdate = mode != modeAppend
+	cfg.InPlaceSeqlockReads = mode == modeSeqlock
 	s, err := newShard(cfg, "", nil)
 	if err != nil {
 		tb.Fatal(err)
@@ -75,11 +101,11 @@ func BenchmarkInPlaceOccupancy(b *testing.B) {
 		{"skewed", hot},
 	}
 	for _, sh := range shapes {
-		for _, inPlace := range []bool{false, true} {
-			b.Run(fmt.Sprintf("%s/inplace=%v", sh.name, inPlace), func(b *testing.B) {
+		for _, mode := range inPlaceModes {
+			b.Run(fmt.Sprintf("%s/%s", sh.name, mode), func(b *testing.B) {
 				for b.Loop() {
 					b.StopTimer()
-					s := inPlaceShard(b, inPlace)
+					s := inPlaceShard(b, mode)
 					val := benchValue()
 					// Seed the FULL key span, so the skewed shape has cold keys to lose.
 					for i := range inPlaceKeySpan {
@@ -116,9 +142,9 @@ func BenchmarkInPlaceOccupancy(b *testing.B) {
 // append path — no page search, no slot upsert, no eviction — so it should be
 // the faster of the two.
 func BenchmarkInPlaceWrite(b *testing.B) {
-	for _, inPlace := range []bool{false, true} {
-		b.Run(fmt.Sprintf("inplace=%v", inPlace), func(b *testing.B) {
-			s := inPlaceShard(b, inPlace)
+	for _, mode := range inPlaceModes {
+		b.Run(mode.String(), func(b *testing.B) {
+			s := inPlaceShard(b, mode)
 			val := benchValue()
 			// Warm until the shard is at capacity and turning over, so the timed
 			// window is the steady state rather than the fill.
@@ -176,9 +202,9 @@ func BenchmarkInPlaceRead(b *testing.B) {
 		{"samesize", false, func(_ *rand.Rand, base []byte) []byte { return base }},
 	}
 	for _, sh := range shapes {
-		for _, inPlace := range []bool{false, true} {
-			b.Run(fmt.Sprintf("%s/inplace=%v", sh.name, inPlace), func(b *testing.B) {
-				s := inPlaceShard(b, inPlace)
+		for _, mode := range inPlaceModes {
+			b.Run(fmt.Sprintf("%s/%s", sh.name, mode), func(b *testing.B) {
+				s := inPlaceShard(b, mode)
 				base := benchValue()
 				warm := rand.New(rand.NewSource(1)) //nolint:gosec // deterministic shape, not security
 				if sh.readOnly {
@@ -213,6 +239,8 @@ func BenchmarkInPlaceRead(b *testing.B) {
 				puts := after.Puts - before.Puts
 				b.ReportMetric(float64(after.Hits-before.Hits)/float64(max(gets, 1))*100, "hit%")
 				b.ReportMetric(float64(after.InPlaceUpdates-before.InPlaceUpdates)/float64(max(puts, 1))*100, "%inplace")
+				b.ReportMetric(float64(after.SeqlockRetries-before.SeqlockRetries)/float64(max(gets, 1))*100, "%retry")
+				b.ReportMetric(float64(after.SeqlockFallbacks-before.SeqlockFallbacks)/float64(max(gets, 1))*100, "%fallback")
 			})
 		}
 	}
