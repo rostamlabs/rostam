@@ -24,11 +24,21 @@ func TestLatHistBucketsAreMonotoneAndBounded(t *testing.T) {
 		if lo := latValue(idx); lo > ns {
 			t.Fatalf("latIndex(%d) = %d, whose lower bound %d is ABOVE the value", ns, idx, lo)
 		}
-		// And the bucket is fine enough for the ratios this benchmark reports: worst case
-		// one part in latSub, so never more than ~13%% wide.
-		if ns >= latSub {
-			if lo := latValue(idx); ns-lo > lo/latSub+1 {
-				t.Fatalf("bucket %d (lower bound %d) is too wide to hold %d", idx, lo, ns)
+		// The value must land INSIDE the bucket it was mapped to, not merely at or above
+		// its floor — the bound above only rules out the mapping being too high. Together
+		// they say lo <= ns < hi, which is what makes a reported quantile meaningful.
+		//
+		// This replaces an assertion that compared ns-lo against lo/latSub+1 and could
+		// never fire: a bucket's width at lower bound lo is at most lo/latSub by
+		// construction, so the test was restating the construction rather than checking
+		// it. The width IS worth asserting, but against the real adjacent bucket.
+		if idx+1 < latBuckets {
+			lo, hi := latValue(idx), latValue(idx+1)
+			if ns >= hi {
+				t.Fatalf("latIndex(%d) = %d, but that bucket ends at %d", ns, idx, hi)
+			}
+			if lo >= latSub && (hi-lo)*latSub > lo {
+				t.Fatalf("bucket %d spans [%d,%d), wider than one part in %d", idx, lo, hi, latSub)
 			}
 		}
 	}
@@ -78,10 +88,16 @@ func TestLatHistQuantilesTrackTheTruth(t *testing.T) {
 	for _, q := range []float64{0.5, 0.9, 0.99, 0.999} {
 		want := raw[int(q*float64(len(raw)))]
 		got := h.quantile(q)
-		// The histogram reports a bucket lower bound, so it may sit up to one bucket width
-		// below the exact value and never above it.
-		if got > want || want-got > want/latSub+1 {
-			t.Fatalf("q%.3f: histogram says %d, exact is %d", q, got, want)
+		// The histogram reports a bucket LOWER BOUND, so the exact answer must sit in the
+		// bucket it named: at or above what it reported, and below the next bucket's
+		// floor. Stating it that way rather than as a tolerance is what makes it exact —
+		// a tolerance of want/latSub is the bucket width at `want`, not at `got`, and the
+		// two differ across a bucket edge, which is precisely where an off-by-one would
+		// hide.
+		idx := latIndex(got)
+		if got > want || (idx+1 < latBuckets && want >= latValue(idx+1)) {
+			t.Fatalf("q%.3f: histogram says %d (bucket [%d,%d)), exact is %d",
+				q, got, latValue(idx), latValue(idx+1), want)
 		}
 	}
 	if h.max != raw[len(raw)-1] {

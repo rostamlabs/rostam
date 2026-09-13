@@ -5,9 +5,16 @@ package cache
 import (
 	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"time"
 )
+
+// maxIntervalMs is the largest millisecond figure that still converts to a
+// time.Duration: beyond it, ms * time.Millisecond wraps. Every interval field in this
+// Config is validated against it, because each one is multiplied out exactly that way
+// when its ticker starts.
+const maxIntervalMs = int64(math.MaxInt64) / int64(time.Millisecond)
 
 // AtCapPolicy controls behavior when a shard is at MaxPages and all pages are full.
 type AtCapPolicy uint8
@@ -343,11 +350,23 @@ func (c Config) Validate() error {
 	default:
 		return fmt.Errorf("config: AtCapPolicy=%d invalid", c.AtCapPolicy)
 	}
+	// Both intervals become time.Duration(ms) * time.Millisecond when their ticker
+	// starts, which overflows silently past maxIntervalMs and hands time.NewTicker a
+	// negative period — a panic on a background goroutine, at start-up, from a value
+	// that passed validation. Reject it here instead.
 	if c.TTLSweepIntervalMs < 0 {
 		return errors.New("config: TTLSweepIntervalMs must be >= 0")
 	}
+	if int64(c.TTLSweepIntervalMs) > maxIntervalMs {
+		return fmt.Errorf("config: TTLSweepIntervalMs=%d overflows a duration; must be <= %d",
+			c.TTLSweepIntervalMs, maxIntervalMs)
+	}
 	if c.RelocateReserveIntervalMs < 0 {
 		return errors.New("config: RelocateReserveIntervalMs must be >= 0")
+	}
+	if int64(c.RelocateReserveIntervalMs) > maxIntervalMs {
+		return fmt.Errorf("config: RelocateReserveIntervalMs=%d overflows a duration; must be <= %d",
+			c.RelocateReserveIntervalMs, maxIntervalMs)
 	}
 	if c.DataDir != "" && !mmapSupported {
 		return fmt.Errorf("cache.Config: DataDir set but mmap not supported on %s; use DataDir=\"\"", runtime.GOOS)

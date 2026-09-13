@@ -85,6 +85,12 @@ func BenchmarkRelocatingEvictionABSharded(b *testing.B) {
 // merely works.
 var relocABShardCounts = []int{8, 64}
 
+// relocABFastArmMaxShards is the largest shard count the millisecond-cadence BACKGROUND
+// arm is run at. Above it the arm is not slow but unusable — see the note in
+// relocABShardedArms — and the swept-fast control, which does complete, is what prices
+// the cadence there instead.
+const relocABFastArmMaxShards = 8
+
 // relocABShardedArms runs the four heap arms at one shard count. Same arm list, same
 // meanings and same columns as relocABArms — see its doc for what each arm and each
 // column is, including why the swept control is not optional.
@@ -100,6 +106,15 @@ func relocABShardedArms(b *testing.B, shards int) {
 	}
 
 	for _, arm := range relocABArmList() {
+		if arm.name == "background-fast" && shards > relocABFastArmMaxShards {
+			// Not skipped for tidiness: at sixty-four shards this arm did not finish a
+			// single attempt in over an hour of wall clock, which is the figure the doc
+			// above reports for it. Leaving it in the list would mean every run of this
+			// benchmark either burns that hour again or gets killed part-way, and the
+			// swept-fast row at the same shard count already prices where the cost comes
+			// from. The arm still runs where it completes.
+			continue
+		}
 		// The cache is built and warmed OUTSIDE b.Run, and that is not a tidiness choice.
 		// Go calls a benchmark body repeatedly with a growing b.N until it fills the time
 		// budget, so a warm-up written inside the body runs once per attempt — and this

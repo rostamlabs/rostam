@@ -1596,7 +1596,19 @@ func (s *shard) retirePageLocked(idx int) {
 			// already expired but not yet been swept, which is TTL turnover
 			// wearing a capacity costume - and precisely the case a
 			// correctly-sized cache is full of.
-			if !isExpired(expiryMs, now) {
+			//
+			// That turnover is counted as an EXPIRATION instead, which is where it
+			// belongs and where a reader looking for it will go: Stats.Expirations is
+			// what EvictionsLive is meant to be read against ("EvictionsLive > 0 with
+			// Expirations low means the budget, not the TTL, is deciding how long
+			// entries survive"), and that comparison is only true if the entries a
+			// retire reaps ahead of the sweeper land in it. Whichever pass gets to an
+			// expired entry first, the shard reports the same thing. It is additive:
+			// the entry is still one of Evictions, which counts every framed entry a
+			// retire displaces regardless of why.
+			if isExpired(expiryMs, now) {
+				s.expirations.Add(1)
+			} else {
 				s.evictionsLive.Add(1)
 			}
 			// INSIDE the cur == ref guard, never outside it. This walk visits every

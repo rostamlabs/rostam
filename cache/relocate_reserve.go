@@ -273,7 +273,13 @@ func (s *shard) reserveRelocationEligible() bool {
 	return s.cfg.RelocatingEviction &&
 		s.cfg.AtCapPolicy == PolicyRingbufEvict &&
 		!s.isMmap &&
-		!s.cfg.Replicated
+		!s.cfg.Replicated &&
+		// A shard whose page CAP is below the divisor can never have a non-zero reserve
+		// target (reserveTargetBytesLocked floors to zero there), so every tick would
+		// walk in and turn straight round. Declining here is what keeps such a shard
+		// from carrying a goroutine and a timer to do nothing — the cap is a config
+		// constant, so this is decidable before the shard has allocated a single page.
+		s.cfg.MaxPagesPerShard() >= relocateReserveShardDivisor
 }
 
 // reserveTargetBytesLocked is the free room this shard should hold, capped at a
@@ -403,6 +409,9 @@ func (s *shard) reserveMoveVictim(victim int, p *page, budget int, retire bool) 
 	cursor, spent := -1, 0
 	for {
 		chunkEntries, chunkBytes, scanned, stop := 0, 0, 0, false
+		// Set when a live record is stepped over: the page still holds it, so it must not
+		// be retired however cleanly the rest of the walk finishes.
+		skippedLive := false
 		s.mu.Lock()
 		if !s.reserveValidateVictimLocked(victim, p) {
 			s.mu.Unlock()
@@ -435,6 +444,14 @@ func (s *shard) reserveMoveVictim(victim int, p *page, budget int, retire bool) 
 				break
 			}
 			size := entrySize(len(key), len(value))
+			if budget-spent < entryHeaderSize {
+				// Not even an empty entry could fit in what is left of the tick, and no
+				// later record can change that. This is the ONLY budget test that ends
+				// the walk; the one against a PARTICULAR record's size belongs after
+				// that record is classified, below.
+				stop = true
+				break
+			}
 			ref := makeSlabRef(uint16(victim), p.gen, uint32(cursor)) //nolint:gosec // victim bounded by MaxPagesPerShard (≤65535); cursor < PageSize ≤ MaxInt32
 			h := hashKey(key)
 			_, cur, ok := t.findSlot(h)
@@ -451,14 +468,35 @@ func (s *shard) reserveMoveVictim(victim int, p *page, budget int, retire bool) 
 				cursor += size
 				continue
 			}
-			if spent+size > budget {
-				stop = true // tick budget spent.
+			// Moving this record has to leave the page still worth retiring, and that is
+			// checked BEFORE the copy: afterwards the bytes are spent whether or not they
+			// bought anything, which is precisely how a nearly-all-live page could take a
+			// page of background capacity and free nothing. The post-copy test further
+			// down catches the case where the record that fits was the last one that did.
+			if tail-(p.relocatedOut+size) < minGain {
+				stop = true
 				break
+			}
+			if spent+size > budget {
+				// Step OVER it rather than abandon the page — a smaller live record
+				// further along can still use what is left of the tick — which is the
+				// same correction dc4ee95 made to the synchronous pass, for the same
+				// reason. The page cannot be retired this tick either way, since a live
+				// record is being left on it; skippedLive is what records that.
+				skippedLive = true
+				cursor += size
+				continue
 			}
 			dstIdx := s.reserveDestinationLocked(size, victim)
 			if dstIdx < 0 {
 				// Nowhere to put it, so the page cannot be fully evacuated — and this
 				// pass never drops what it could not move. Leave it to the write path.
+				//
+				// This one ENDS the walk where the budget test above steps over: the
+				// budget is a bound on what this tick may spend, so a smaller record may
+				// still fit under it, but no destination means the shard itself is out of
+				// contiguous room, and walking the rest of a page to place nothing costs
+				// a full page of index probes for it.
 				stop = true
 				break
 			}
@@ -500,7 +538,7 @@ func (s *shard) reserveMoveVictim(victim int, p *page, budget int, retire bool) 
 			}
 		}
 		freed := false
-		if !stop && cursor >= tail && retire {
+		if !stop && !skippedLive && cursor >= tail && retire {
 			// tail - relocatedOut >= minGain holds by construction: the loop above stops
 			// the moment it does not, so reaching the end of the page with stop unset is
 			// itself the proof that retiring this page repays what was spent on it.
@@ -522,7 +560,20 @@ func (s *shard) reserveMoveVictim(victim int, p *page, budget int, retire bool) 
 			// evictVictimLocked does, with the very same pass and the very same budget,
 			// and the round that follows then evacuates whatever that budget left.
 			// Charged to the sweeper: no write paid for it.
-			s.noteReserveRelocation(s.relocateIntoFreedPageLocked(victim, 0))
+			// Bounded by what is LEFT of the tick, and charged against it. The handoff
+			// used to run with its own independent budget, so a tick could spend its
+			// stated bound and then spend most of it again here — the per-tick byte bound
+			// was a claim the code did not keep. `need` is the room the pass must leave
+			// alone, so asking it to leave everything past the remainder caps its spend at
+			// exactly that.
+			fresh := s.pages[victim]
+			need := fresh.FreeTail() - (budget - spent)
+			if need < 0 {
+				need = 0
+			}
+			moved, movedBytes := s.relocateIntoFreedPageLocked(victim, need)
+			s.noteReserveRelocation(moved, movedBytes)
+			spent += int(movedBytes) //nolint:gosec // bounded by the tick budget above
 			freed = true
 		}
 		done := stop || cursor >= tail

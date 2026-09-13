@@ -77,6 +77,26 @@ import (
 // accordingly", not "the worst write gets better" — the worst write gets worse. Chunking
 // that hold is the change both halves of that sentence point at; it is deliberately not
 // made here, because it would also change the write path's own pass.
+//
+// THE HOLD SPLITS ROUGHLY IN HALF, which matters to whoever does chunk it. Timing the two
+// calls separately puts retirePageLocked's page walk and relocateIntoFreedPageLocked's
+// copy within about 1.25x of each other, the walk the larger — not the copy dominating as
+// the shape of the code suggests. Only the walk is the reserve's to bound: the copy is the
+// synchronous pass, shared with the write path, and capping it through its `need`
+// parameter would evacuate the successor less thoroughly than an ordinary eviction does,
+// which is exactly what TestReserveRelocationPreparesTheNextVictim forbids. So the hold
+// can be roughly HALVED from inside this file and cannot be BOUNDED from inside it.
+//
+// WHY THE CLASSIFICATION USES A PER-ENTRY COUNTER, since a once-per-retire one looks
+// tidier: the per-entry counter moves throughout a hold, so a write that blocks across any
+// part of one is detected, while a counter bumped once at the top is only visible to a
+// write that arrives in that instant. Measured against a once-per-call counter of the same
+// scope, the per-entry one classifies about twice as many writes as held (0.8% against
+// 0.37%) and reports a correspondingly LOWER clean p999 (roughly 430 microseconds against
+// 790). The coarse counter leaves genuinely-held writes in the clean class and inflates it.
+// The finding above — that clean writes still carry most of the tail — is therefore stated
+// against the tighter of the two estimates, and a coarser classification would only make
+// it look stronger.
 func BenchmarkRelocatingEvictionTail(b *testing.B) {
 	for _, shards := range relocABShardCounts {
 		b.Run(fmt.Sprintf("shards=%d", shards), func(b *testing.B) {

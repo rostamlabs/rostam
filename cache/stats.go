@@ -17,12 +17,16 @@ import (
 // the index's current occupancy (both fall on delete, and Tombstones falls again when
 // a rehash reclaims the slots).
 type Stats struct {
-	Gets        uint64
-	Hits        uint64
-	Misses      uint64
-	Puts        uint64
-	Dels        uint64
-	Expirations uint64 // expired by sweeper or lazy-on-read
+	Gets   uint64
+	Hits   uint64
+	Misses uint64
+	Puts   uint64
+	Dels   uint64
+	// Expirations counts entries whose TTL had elapsed when something reclaimed them:
+	// the sweeper, a lazy check on read, or a ringbuf retire that reached the entry
+	// before either (such an entry is counted in Evictions too — see EvictionsLive for
+	// why the two are kept apart).
+	Expirations uint64
 	Evictions   uint64 // entries displaced by ringbuf eviction, live or not
 	// EvictionsLive counts only those evictions that displaced the entry the
 	// index still pointed at: a record lost to CAPACITY rather than to its TTL.

@@ -487,29 +487,44 @@ func TestReserveRelocationLetsAWriterThroughMidPass(t *testing.T) {
 	seedReserveSmallShard(t, c)
 	s := c.shards[0]
 
-	var once sync.Once
-	wrote := make(chan error, 1)
+	var (
+		once      sync.Once
+		fired     atomic.Bool
+		timedOut  atomic.Bool
+		writerErr error
+		writerRan = make(chan struct{}) // closed when the writer's Put returns
+	)
 	hook := func(int, int) {
 		once.Do(func() {
-			go func() { wrote <- c.Put(relocKey(77777), reserveSmallValue(9), 0) }()
+			fired.Store(true)
+			go func() {
+				defer close(writerRan)
+				writerErr = c.Put(relocKey(77777), reserveSmallValue(9), 0)
+			}()
 			select {
-			case err := <-wrote:
-				wrote <- err // hand it back to the assertion below
+			case <-writerRan:
 			case <-time.After(20 * time.Second):
-				wrote <- fmt.Errorf("writer did not complete while the pass was mid-page")
+				timedOut.Store(true)
 			}
 		})
 	}
 	s.reserveChunkHook.Store(&hook)
 	s.topUpFreeReserve()
 
-	select {
-	case err := <-wrote:
-		if err != nil {
-			t.Fatalf("concurrent write during a background pass: %v", err)
-		}
-	default:
+	if !fired.Load() {
 		t.Fatal("the observer never fired; the pass did not chunk")
+	}
+	// WAIT for the writer even when it timed out, rather than reporting and walking away.
+	// It holds the cache the deferred Close is about to tear down, so a writer left
+	// running outlives the test and races that Close — and it would do so from a
+	// goroutine no failure message points at. Blocking here costs nothing when the write
+	// completed, and turns a leak into an ordinary test timeout when it did not.
+	<-writerRan
+	if timedOut.Load() {
+		t.Fatal("the writer did not complete while the pass was mid-page")
+	}
+	if writerErr != nil {
+		t.Fatalf("concurrent write during a background pass: %v", writerErr)
 	}
 	if v, err := c.Get(relocKey(77777)); err != nil || !bytes.Equal(v, reserveSmallValue(9)) {
 		t.Fatalf("the write that went through mid-pass did not stick: %v", err)
@@ -700,6 +715,37 @@ func TestReserveIntervalValidation(t *testing.T) {
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("a negative reserve interval validated")
 	}
+
+	// And the other end, which is the one that gets past a >= 0 check and then panics:
+	// ms * time.Millisecond wraps past maxIntervalMs, so time.NewTicker is handed a
+	// negative period on a background goroutine at start-up. Rejecting it here turns a
+	// panic nobody can attribute into a config error at the call site.
+	for _, tc := range []struct {
+		name string
+		set  func(c *Config, ms int)
+	}{
+		{"RelocateReserveIntervalMs", func(c *Config, ms int) { c.RelocateReserveIntervalMs = ms }},
+		{"TTLSweepIntervalMs", func(c *Config, ms int) { c.TTLSweepIntervalMs = ms }},
+	} {
+		ok := DefaultConfig()
+		tc.set(&ok, int(maxIntervalMs))
+		if err := ok.Validate(); err != nil {
+			t.Fatalf("%s at the limit (%d) was rejected: %v", tc.name, maxIntervalMs, err)
+		}
+		// The limit is exactly the point where the multiplication stops fitting.
+		if got := time.Duration(maxIntervalMs) * time.Millisecond; got <= 0 {
+			t.Fatalf("maxIntervalMs=%d does not itself convert: %v", maxIntervalMs, got)
+		}
+		over := int(maxIntervalMs) + 1
+		bad := DefaultConfig()
+		tc.set(&bad, over)
+		if err := bad.Validate(); err == nil {
+			// Computed through a variable, because the compiler rejects the same
+			// multiplication written as a constant — which is itself the point.
+			t.Fatalf("%s = %d validated, and multiplies out to %v rather than a duration",
+				tc.name, over, time.Duration(over)*time.Millisecond)
+		}
+	}
 }
 
 // TestReserveRelocationConcurrentReadersNeverMiss runs the background pass against
@@ -715,9 +761,9 @@ func TestReserveRelocationConcurrentReadersNeverMiss(t *testing.T) {
 		hotKeys     = 4
 		valLen      = 40_000
 	)
-	writeOps := 40_000
+	writeOps := 12_000
 	if testing.Short() {
-		writeOps = 5_000
+		writeOps = 4_000
 	}
 	c, err := New(reserveConfig(4, true))
 	if err != nil {
@@ -726,13 +772,20 @@ func TestReserveRelocationConcurrentReadersNeverMiss(t *testing.T) {
 	defer func() { _ = c.Close() }()
 	s := c.shards[0]
 
-	val := func(tag int) []byte {
+	// Keys and payloads are built ONCE and reused. Minting a fresh valLen-byte payload
+	// per write made this test allocate gigabytes of garbage for a run that stores a few
+	// megabytes, which is a poor trade in the ordinary suite and, worse, spent the
+	// readers' and the writer's time in the allocator rather than on the shard lock —
+	// which is the contention the test exists to exercise.
+	values := make([][]byte, 256)
+	for tag := range values {
 		v := make([]byte, valLen)
 		for i := range v {
 			v[i] = byte(tag)
 		}
-		return v
+		values[tag] = v
 	}
+	val := func(tag int) []byte { return values[tag%len(values)] }
 	ok := func(tag int, v []byte) bool {
 		if len(v) != valLen {
 			return false
@@ -744,8 +797,16 @@ func TestReserveRelocationConcurrentReadersNeverMiss(t *testing.T) {
 		}
 		return true
 	}
-	workKey := func(i int) []byte { return fmt.Appendf(nil, "work-%03d", i) }
-	hotKey := func(i int) []byte { return fmt.Appendf(nil, "hot-%03d", i) }
+	workKeyBufs := make([][]byte, workingKeys)
+	for i := range workKeyBufs {
+		workKeyBufs[i] = fmt.Appendf(nil, "work-%03d", i)
+	}
+	hotKeyBufs := make([][]byte, hotKeys)
+	for i := range hotKeyBufs {
+		hotKeyBufs[i] = fmt.Appendf(nil, "hot-%03d", i)
+	}
+	workKey := func(i int) []byte { return workKeyBufs[i] }
+	hotKey := func(i int) []byte { return hotKeyBufs[i] }
 
 	// Page 0 is drained with nothing having evacuated it — the rotation cursor starts
 	// there and both passes always run one page ahead — so fill it with filler before

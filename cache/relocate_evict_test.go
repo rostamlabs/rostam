@@ -715,7 +715,7 @@ func BenchmarkRelocatingEvictionAB(b *testing.B) {
 // its OWN pages directory. Every arm gets the same seed and the same key population, so the only
 // difference between two rows is the configuration named in the row.
 //
-// FOUR arms on heap and two on mmap, because the background reserve is heap-only (see the
+// SIX arms on heap and two on mmap, because the background reserve is heap-only (see the
 // HEAP RINGBUF ONLY note in cache/relocate_reserve.go):
 //
 //	off              neither pass, no ticker — positional eviction on its own
