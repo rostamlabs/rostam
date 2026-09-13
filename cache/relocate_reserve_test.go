@@ -12,9 +12,9 @@ import (
 	"time"
 )
 
-// reserveConfig is relocConfig with the sweeper still OFF: the deterministic tests
-// below drive topUpFreeReserve by hand, so a tick landing mid-assertion can never make
-// them flaky. The two tests that need the REAL sweeper set the interval themselves.
+// reserveConfig is relocConfig with both background tickers still OFF: the deterministic
+// tests below drive topUpFreeReserve by hand, so a tick landing mid-assertion can never
+// make them flaky. The one test that needs the REAL ticker sets its interval itself.
 func reserveConfig(pages int, on bool) Config { return relocConfig(pages, on) }
 
 // seedReserveShard fills a `pages`-page heap ringbuf shard to its page cap, leaving
@@ -328,6 +328,11 @@ func TestReserveRelocationOffDoesNothing(t *testing.T) {
 	if n := chunks.Load(); n != 0 {
 		t.Fatalf("the reserve pass ran %d chunks with RelocatingEviction off", n)
 	}
+	// And the ticker itself never starts on such a shard, so it costs not even a
+	// goroutine: startReserveSweeper declines a shard the reserve could never apply to.
+	if s.reserveRelocationEligible() {
+		t.Fatal("a shard with RelocatingEviction off reports itself eligible for the reserve")
+	}
 	if freed := changedPage(before, pageObjects(s)); freed >= 0 {
 		t.Fatalf("page %d was replaced with the feature off", freed)
 	}
@@ -621,13 +626,15 @@ func TestReserveRelocationFallsBackToTheWritePath(t *testing.T) {
 	}
 }
 
-// TestReserveRelocationRunsUnderTheRealSweeper is the wiring check the two tests above
-// deliberately do not make: that sweepOnce actually reaches topUpFreeReserve on a
-// ticking shard. It asserts only that the pass ran, never how much it kept up with, so
-// there is nothing here for a slow machine to fail.
-func TestReserveRelocationRunsUnderTheRealSweeper(t *testing.T) {
+// TestReserveRelocationRunsUnderItsOwnTicker is the wiring check the two tests above
+// deliberately do not make: that Config.RelocateReserveIntervalMs actually starts a ticker
+// that reaches topUpFreeReserve, WITHOUT the TTL sweeper running at all — which is the
+// decoupling, stated as a test. It asserts only that the pass ran, never how much it kept
+// up with, so there is nothing here for a slow machine to fail.
+func TestReserveRelocationRunsUnderItsOwnTicker(t *testing.T) {
 	cfg := reserveConfig(4, true)
-	cfg.TTLSweepIntervalMs = 5
+	cfg.TTLSweepIntervalMs = 0 // the reserve must not need this one
+	cfg.RelocateReserveIntervalMs = 5
 	c, err := New(cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -646,7 +653,53 @@ func TestReserveRelocationRunsUnderTheRealSweeper(t *testing.T) {
 			}
 		}
 	}
-	t.Fatalf("the sweeper never freed a page in 30s: %d pages freed", c.Stats().ReservePagesFreed)
+	t.Fatalf("the reserve ticker never freed a page in 30s: %d pages freed", c.Stats().ReservePagesFreed)
+}
+
+// TestReserveRelocationIntervalZeroRunsNoTicker pins the meaning of a zero interval: no
+// reserve ticker at all, so an opted-in shard degrades to exactly the write-path pass —
+// #127 and nothing else. It is the escape hatch for the cadence being wrong for a given
+// shard count, and it has to work without also turning relocation off.
+func TestReserveRelocationIntervalZeroRunsNoTicker(t *testing.T) {
+	cfg := reserveConfig(4, true) // RelocatingEviction on, RelocateReserveIntervalMs 0
+	cfg.TTLSweepIntervalMs = 5    // and the TTL sweeper ticking, which must not drive it
+	c, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	const hotKeys = 3
+	reserveSeedChurnSet(t, c, 20)
+	deadline := time.Now().Add(2 * time.Second)
+	for n := 0; time.Now().Before(deadline); n++ {
+		mustPut(t, c, relocKey(500+n%hotKeys), reserveMediumValue(n%256))
+	}
+	st := c.Stats()
+	if st.ReservePagesFreed != 0 || st.ReserveRelocations != 0 {
+		t.Fatalf("the reserve ran with no interval set: %d pages, %d records",
+			st.ReservePagesFreed, st.ReserveRelocations)
+	}
+	if st.EvictionRelocations == 0 {
+		t.Fatal("the write-path pass did not run either; the shard never reached its cap")
+	}
+}
+
+// TestReserveIntervalValidation pins that the new field is validated like the interval it
+// sits beside, so a negative is a config error rather than a ticker that never fires.
+func TestReserveIntervalValidation(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.RelocateReserveIntervalMs != defaultRelocateReserveIntervalMs {
+		t.Fatalf("DefaultConfig RelocateReserveIntervalMs = %d, want %d",
+			cfg.RelocateReserveIntervalMs, defaultRelocateReserveIntervalMs)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("the default config does not validate: %v", err)
+	}
+	cfg.RelocateReserveIntervalMs = -1
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("a negative reserve interval validated")
+	}
 }
 
 // TestReserveRelocationConcurrentReadersNeverMiss runs the background pass against

@@ -210,6 +210,38 @@ type Config struct {
 	// note in cache/relocate_reserve.go for why.
 	RelocatingEviction bool
 
+	// RelocateReserveIntervalMs is how often each shard tops up its free-page reserve
+	// (cache/relocate_reserve.go). Zero — the value a zero Config carries — runs no
+	// reserve ticker at all, which leaves RelocatingEviction as exactly the write-path
+	// pass and nothing else. DefaultConfig sets it; see below for the value and why.
+	//
+	// It is a CADENCE, not a second on/off switch: RelocatingEviction remains the gate,
+	// and this field does nothing at all while that is false.
+	//
+	// WHY IT IS NOT TTLSweepIntervalMs, which is the ticker the reserve first rode. Those
+	// are two different jobs with two different right answers. A tick of the TTL sweeper
+	// runs sweepIndex, which takes the shard write lock for sweepBatchSize slots at a
+	// time and decodes every live entry it passes; a tick of this one calls only
+	// topUpFreeReserve, which walks at most the rotation victim and usually returns at
+	// once. The reserve earns nothing at a cadence measured in seconds — it cannot get
+	// ahead of the write stream — but running sweepIndex at the cadence the reserve wants
+	// costs far more than the reserve saves. One interval forces one of the two onto the
+	// other's setting, so they are separate and the TTL sweeper keeps its own.
+	//
+	// THE COST IS PER SHARD, which is the thing to hold on to when changing it. Every
+	// shard runs its own ticker, so at a fixed interval the work the cache does per unit
+	// time scales with NumShards while the write stream does not: an interval that is
+	// free on a handful of shards is not the same setting on hundreds. Tick work is
+	// bounded (see topUpFreeReserve) but it is not zero, and a shard below its page cap
+	// still costs a lock acquisition and a length check per tick to discover it has
+	// nothing to do.
+	//
+	// THE DEFAULT is the value the A/B measured as earning more than it costs
+	// (cache/relocate_sharded_bench_test.go). Read that benchmark's doc before changing
+	// it: the figure is the outcome of a measurement, not a round number, and the two
+	// directions it is wrong in are not symmetric.
+	RelocateReserveIntervalMs int
+
 	// AliasQuarantine is how long online relocating compaction must let a RETIRED
 	// mmap page sit — bytes mapped and immutable — before it may RECYCLE that page
 	// (reset head/tail to 0 and hand its extent back to the write path). It is the
@@ -262,6 +294,8 @@ func DefaultConfig() Config {
 		AtCapPolicy:          PolicyRingbufEvict,
 		TTLSweepIntervalMs:   1000,
 		MsyncIntervalMs:      100,
+		// Inert unless RelocatingEviction is set, which is off by default.
+		RelocateReserveIntervalMs: defaultRelocateReserveIntervalMs,
 	}
 }
 
@@ -311,6 +345,9 @@ func (c Config) Validate() error {
 	}
 	if c.TTLSweepIntervalMs < 0 {
 		return errors.New("config: TTLSweepIntervalMs must be >= 0")
+	}
+	if c.RelocateReserveIntervalMs < 0 {
+		return errors.New("config: RelocateReserveIntervalMs must be >= 0")
 	}
 	if c.DataDir != "" && !mmapSupported {
 		return fmt.Errorf("cache.Config: DataDir set but mmap not supported on %s; use DataDir=\"\"", runtime.GOOS)
