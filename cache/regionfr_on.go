@@ -67,6 +67,12 @@ type regionFRCounts struct {
 	// at K = the page count, which is what inPlaceRegionKs exists to report.
 	HitDist   [regionFRMaxK]uint64
 	PlaceDist [regionFRMaxK]uint64
+	// WrapUnsafe reports that enough pages have been published for a generation
+	// distance to have wrapped, so the histograms above may be counting the oldest
+	// page on the shard as the newest. See regionFRWrapBudget. A caller must treat
+	// it as a failure and discard the run, never as a warning: the numbers stay
+	// entirely plausible once it is set, which is the whole reason it exists.
+	WrapUnsafe bool
 }
 
 // regionProbe is the live measurement state for ONE shard. Benchmarks measure a
@@ -76,13 +82,46 @@ type regionFRCounts struct {
 type regionProbe struct {
 	s      *shard
 	newest atomic.Uint32 // generation of the most recently PUBLISHED page on s
-	counts struct {
+	// published counts page publications since attach, at FULL width, which the
+	// uint16 generations themselves cannot offer. It is the guard described at
+	// regionFRWrapBudget.
+	published atomic.Uint64
+	counts    struct {
 		hitDist   [regionFRMaxK]atomic.Uint64
 		placeDist [regionFRMaxK]atomic.Uint64
 	}
 }
 
 var regionActive atomic.Pointer[regionProbe]
+
+// regionFRWrapBudget is how many page publications this probe will classify
+// before it declares itself unsafe.
+//
+// A page generation is a uint16, so every distance derived from one is modular,
+// and a page whose TRUE age is 2^16 - d retirements computes an age of d. Once d
+// is under regionFRMaxK that page is counted as sitting in the region when it is
+// in fact the oldest thing on the shard. This is not a hypothetical sharp edge in
+// this codebase: it is the reason a region's membership, if one is ever built,
+// must be a FIFO of page POINTERS rather than an ordering on generations.
+// Generation order is the only ordering a *page already resident* can offer, so
+// the probe uses it — and bounds it rather than assuming it.
+//
+// WHAT THE BUDGET COVERS AND WHAT IT DOES NOT. From attach onwards every
+// publication is counted at full width, so no page published during a measurement
+// can alias until this many have gone by. It says nothing about the shard's
+// history BEFORE attach: a page that was already 2^16 - 16 retirements old when
+// the probe attached would alias immediately, and no arithmetic on uint16
+// generations can detect it — which is exactly why the FIFO is the right
+// primitive and this is a bounded instrument rather than a general mechanism.
+// Attaching to a shard that has retired on the order of 2^16 pages is therefore
+// outside what this measures, and the benchmarks here attach after a warm-up
+// three orders of magnitude short of it.
+//
+// Using the shard's own generation counter instead would not help and would cost
+// the fix that came before this one: genCounter names the NEXT generation to
+// mint, which is one a page may hold without having been published yet, and
+// reading it is the publication race regionNotePage exists to close.
+const regionFRWrapBudget = 1<<16 - regionFRMaxK
 
 // age returns how many page retirements behind the newest generation gen is, or
 // -1 when that is further back than the histograms resolve.
@@ -122,6 +161,7 @@ func regionLive(s *shard) *regionProbe {
 func regionNotePage(s *shard, p *page) {
 	if pr := regionLive(s); pr != nil && p != nil {
 		pr.newest.Store(uint32(p.gen))
+		pr.published.Add(1) // see regionFRWrapBudget
 	}
 }
 
@@ -156,7 +196,13 @@ func regionNoteInPlace(s *shard, p *page) {
 // It seeds newest from the newest page the shard has actually PUBLISHED, not
 // from its generation counter, for the reason in regionNotePage: a shard caught
 // mid-allocation has minted a generation no reader can resolve yet, and starting
-// from it would mis-age every hit until the next publication.
+// from it would mis-age every hit until the next publication. The seed matters
+// most where it might look least important — a shape with no writer publishes no
+// page during its window, so the seed is the ONLY thing every hit is measured
+// against.
+//
+// The scan picks the newest by the same modular comparison age uses, and carries
+// the same bound: see regionFRWrapBudget for what that covers and what it cannot.
 func regionFRAttach(s *shard) func() {
 	pr := &regionProbe{s: s}
 	s.mu.Lock()
@@ -183,7 +229,7 @@ func regionFRSnapshot() regionFRCounts {
 	if pr == nil {
 		return regionFRCounts{}
 	}
-	var out regionFRCounts
+	out := regionFRCounts{WrapUnsafe: pr.published.Load() >= regionFRWrapBudget}
 	for i := range out.HitDist {
 		out.HitDist[i] = pr.counts.hitDist[i].Load()
 		out.PlaceDist[i] = pr.counts.placeDist[i].Load()

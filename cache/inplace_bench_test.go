@@ -575,6 +575,12 @@ func reportRegionResidency(b *testing.B, before, after regionFRCounts, gets, put
 	if !regionFRInstrumented {
 		return
 	}
+	// A wrapped generation distance is not a warning to print beside the numbers —
+	// it means the numbers may be counting the shard's oldest page as its newest,
+	// and they look no different when they are. Fail the arm instead.
+	if after.WrapUnsafe {
+		b.Fatal("region residency: generation distance may have wrapped; see regionFRWrapBudget")
+	}
 	var rcum, wcum uint64
 	for k := 1; k <= regionFRMaxK; k++ {
 		rcum += after.HitDist[k-1] - before.HitDist[k-1]
@@ -737,13 +743,31 @@ const readLockSweepMode = modeSeqlock
 // to offer, because in-place rewriting is precisely what the plain lock-free read
 // is not safe against.
 //
-// THAT IS DELIBERATE AND IT IS A COST INSTRUMENT ONLY. A read here can observe a
-// value mid-rewrite and hand back torn bytes, which the benchmark discards. It
-// cannot do worse than that: a same-size overwrite stores the same key at the
-// same length, so the framing a reader decodes is byte-for-byte what was already
-// there and the slice bounds derived from it stay in range — the argument written
-// out in indexTable.getSeq. Nothing here may be read as a claim that the
-// combination is safe to ship; the seqlock exists because it is not.
+// THAT IS DELIBERATE AND IT IS A COST INSTRUMENT ONLY. What holds is narrower
+// than "the entry cannot change underneath the read", and worth stating exactly,
+// because a same-size overwrite does rewrite the header: WriteAt lays down
+// keyLen, valLen, the expiry and the meta word again on every call.
+//
+// BOUNDS ARE SAFE. Only two of those fields decide where the decode slices, and
+// both are rewritten byte-identically — the key is the same key and the value is
+// the same length, so keyLen at [0:2] and valLen at [2:6] are being overwritten
+// with the values already there and no torn mixture of old and new bytes differs
+// from either. The total the decode derives is therefore unchanged, the length
+// check that passed before still passes, and the key compare that follows sees
+// the same key bytes.
+//
+// EVERYTHING ELSE CAN TEAR, and does. The expiry and the meta word are genuinely
+// rewritten with new values and can be read half-updated; the value bytes can be
+// read as any mixture of the old and the new; the CRC slot is not rewritten at
+// all, so after an overwrite it no longer matches the bytes it covers. None of
+// that reaches a conclusion here — decodeEntryFast never loads meta and skips the
+// CRC, the shapes that use this path store no expiry, and the value is discarded.
+// A benchmark measuring the COST of a read is entitled to a garbage answer; it is
+// not entitled to an out-of-range one, and the paragraph above is why it cannot
+// get one.
+//
+// Nothing here may be read as a claim that the combination is safe to ship. The
+// seqlock exists because it is not.
 func benchGetLockFree(s *shard, key []byte, h uint64) []byte {
 	s.gets.Add(1)
 	t := s.tab.Load()

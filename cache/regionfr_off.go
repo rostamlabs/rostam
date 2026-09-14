@@ -33,8 +33,9 @@ func regionNoteInPlace(*shard, *page) {}
 // regionFRCounts is the histogram pair a measurement window produces. See
 // regionfr_on.go for the meaning of each field.
 type regionFRCounts struct {
-	HitDist   [regionFRMaxK]uint64
-	PlaceDist [regionFRMaxK]uint64
+	HitDist    [regionFRMaxK]uint64
+	PlaceDist  [regionFRMaxK]uint64
+	WrapUnsafe bool
 }
 
 func regionFRAttach(*shard) func() { return func() {} }
