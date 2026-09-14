@@ -5,10 +5,10 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
-- **Breaking: `objstore.ObjectStore` gains `PutIfAbsent`, and two backups at
-  one timestamp can no longer both publish.** A backup refused an existing
-  snapshot key by listing it first and then writing, and nothing made those
-  steps atomic: two runs starting in the same second — an on-demand backup
+- **Breaking: `objstore.ObjectStore` gains `PutIfAbsent`, and two single-node
+  backups at one timestamp can no longer both publish.** A backup refused an
+  existing snapshot key by listing it first and then writing, and nothing made
+  those steps atomic: two runs starting in the same second — an on-demand backup
   landing in the periodic run's second, or two servers backing up the same
   prefix — could both see the key absent and both write, the second replacing
   the first's snapshot and config.
@@ -19,15 +19,20 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   creates the snapshot the same way, so exactly one concurrent run publishes and
   the rest report `backup.ErrSnapshotExists` without writing anything.
 
+  This covers **single-node collection backups only**. Cluster backups (shard
+  snapshots, their sidecars and the catalog) still write with `Put`, so two
+  cluster backups at one timestamp can still overwrite each other; making that
+  path write-once is not done yet.
+
   - **S3** sends `If-None-Match: *`; the service answers 412 when the key exists.
     Some S3-compatible stores — older MinIO releases among them — ignore that
     header and overwrite. A store cannot be told apart by its response, so the
     first conditional write checks once, with a throwaway object next to the
     key, that the service really refuses a second create. A service that
     ignores or rejects the header makes every `PutIfAbsent` fail with
-    `objstore.ErrConditionalWriteUnsupported`, and **backups to it fail loudly**
-    rather than silently losing the guarantee. Upgrade the store to a release
-    that supports conditional writes.
+    `objstore.ErrConditionalWriteUnsupported`, and **single-node backups to it
+    fail loudly** rather than silently losing the guarantee. Upgrade the store
+    to a release that supports conditional writes.
   - **Filesystem** (`-backup-dir`) stages as before and publishes with a hard
     link, which refuses an existing name where a rename replaces it. The backup
     directory must be on a filesystem with hard links (not FAT32 or exFAT); on
