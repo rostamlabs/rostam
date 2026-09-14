@@ -172,6 +172,25 @@ type State struct {
 	// tracker then catches up on the next applied command (the node replays the log
 	// after restore). Mirrors how CatalogGen/CatalogReshard/Aliases were added.
 	LastIndex uint64
+	// PopulatedFields is snapshot metadata, like LastIndex: the path of every
+	// field, nested ones included ("Members[].NodeID"), that carries a non-zero
+	// value in the snapshot. SnapshotBytes stamps it and Restore checks it, then
+	// clears it; live state never holds it.
+	//
+	// It exists because gob silently DROPS a field the reader does not have. A
+	// newer binary's snapshot can carry state this binary does not know — the
+	// result of an op this binary would halt on — and restoring it would discard
+	// that state and resume past it: the same silent skip MetaFSM.Apply refuses
+	// for an unknown op, reached through InstallSnapshot instead of the log.
+	// Restore refuses a snapshot that names a populated field this binary lacks.
+	// A field the writer left at its zero value is not listed, so it never blocks
+	// a restore: nothing would be lost.
+	//
+	// Snapshots written before this field existed decode it as nil and restore
+	// unchecked, as they always did. RETIRING a State field therefore needs care:
+	// a snapshot that still carries it would be refused by the binary that
+	// removed it, so keep the field (unused) until no such snapshot can exist.
+	PopulatedFields []string
 }
 
 func encodeState(s State) ([]byte, error) {
@@ -194,6 +213,15 @@ func decodeState(b []byte) (State, error) {
 }
 
 // Op tags meta-Raft log entries.
+//
+// An op this binary does not apply HALTS the node (see MetaFSM.Apply): only a
+// binary that knows an op ever proposes it, so peers on that binary apply the
+// entry and skipping it here would silently diverge. Two rules follow. A new op
+// takes a number no binary has used. A retired op keeps its number and its
+// case in Apply, as an explicit known-and-ignored no-op, for as long as any
+// node's log might still carry it — deleting the case would turn a harmless
+// historical entry into a halt. No op has been retired so far; 2 and 3 below
+// were reserved and never implemented, so no log contains them.
 type Op uint8
 
 // Op constants for meta-Raft log entries.
