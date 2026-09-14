@@ -82,9 +82,9 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
     backups use the current time and are unaffected.
 
   The filesystem store no longer fails every write on Windows by trying to fsync
-  a directory, which Windows does not support. Filesystem backups on Windows
-  still do not work, for a separate reason: backup keys contain an RFC 3339
-  timestamp, and its `:` is not allowed in a Windows file name.
+  a directory, which Windows does not support. The separate reason filesystem
+  backups on Windows still failed — the `:` in backup keys — is fixed in the
+  next entry.
 
   **What to do:** code outside this repository that implements
   `objstore.ObjectStore` no longer compiles until it adds `PutIfAbsent`. Implement
@@ -93,6 +93,27 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   concurrent backups will silently overwrite each other again. A wrapper that
   embeds another store and overrides `Put` must override `PutIfAbsent` as well,
   or the embedded one is used and bypasses the override.
+- **Filesystem backups (`-backup-dir`) now work on Windows.** Every backup key
+  embeds an RFC 3339 timestamp, and the filesystem store used the key as the
+  file name, so on Windows every snapshot and config write failed: `:` is not
+  allowed in a Windows file name. The store now writes each `:` as `%3A` in file
+  and directory names, on every platform, and maps names back to keys when
+  listing. Object keys are unchanged on every backend, so retention still ranks
+  snapshots by time and S3 backups are untouched.
+
+  Backup directories written by earlier builds, whose file names contain a
+  literal `:`, stay fully usable on Linux and macOS: restore, `LatestKey` and
+  retention find them, a key present under both spellings is listed once, a
+  delete removes both, and a write-once create is refused when the key exists
+  under either spelling. New backups are written under the escaped names. Such a
+  directory cannot be carried to Windows as-is, since its names cannot exist
+  there.
+
+  The filesystem store now refuses a key that itself contains `%3A` (in any
+  case), since such a key could not be told apart from an escaped `:`. The
+  collection segment of a backup key never contains it (it is percent-escaped,
+  which turns `%` into `%25`), so this only affects a backup prefix
+  (`-backup-prefix`) that contains `%3A` itself.
 - **A corrupt entry met during eviction on a persistent (mmap) cache left the
   evicted page's keys behind in the index.** When the in-place drain could not
   frame an entry it reset the page, but dropped none of the index slots still
