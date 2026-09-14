@@ -192,14 +192,20 @@ func decodeEntry(src []byte) (key, value []byte, expiryMs, meta uint64, err erro
 	if valLen < 0 {
 		return nil, nil, 0, 0, errEntryTruncated
 	}
+	// BOUND valLen BEFORE SUMMING IT. On 32-bit, a POSITIVE valLen within keyLen+26 of
+	// the int32 max still wraps the total negative, which then passes a
+	// `len(src) < total` test and panics on the slice below — at warm restart, where
+	// these bytes come straight off disk, on every restart. The subtraction cannot wrap:
+	// len(src) >= entryHeaderSize and keyLen <= maxKeyLen. Identical on 64-bit to
+	// comparing the sum.
+	if valLen > len(src)-entryHeaderSize-keyLen {
+		return nil, nil, 0, 0, errEntryTruncated
+	}
 	expiryMs = binary.LittleEndian.Uint64(src[6:14])
 	meta = binary.LittleEndian.Uint64(src[entryMetaOff:entryCRCOff])
 	storedCRC := binary.LittleEndian.Uint32(src[entryCRCOff:entryHeaderSize])
 
 	total := entryHeaderSize + keyLen + valLen
-	if len(src) < total {
-		return nil, nil, 0, 0, errEntryTruncated
-	}
 
 	crc := crc32.Checksum(src[0:entryCRCOff], crcTable)
 	crc = crc32.Update(crc, crcTable, src[entryHeaderSize:total])
@@ -236,12 +242,13 @@ func decodeEntryFast(src []byte) (key, value []byte, expiryMs uint64, err error)
 	if valLen < 0 {
 		return nil, nil, 0, errEntryTruncated
 	}
+	// Bounded before it is summed, for the reason given in decodeEntry.
+	if valLen > len(src)-entryHeaderSize-keyLen {
+		return nil, nil, 0, errEntryTruncated
+	}
 	expiryMs = binary.LittleEndian.Uint64(src[6:14])
 
 	total := entryHeaderSize + keyLen + valLen
-	if len(src) < total {
-		return nil, nil, 0, errEntryTruncated
-	}
 
 	key = src[entryHeaderSize : entryHeaderSize+keyLen]
 	value = src[entryHeaderSize+keyLen : total]

@@ -77,9 +77,32 @@ type Stats struct {
 	// are unchanged. It is the right figure to divide a memory budget by, since
 	// all of that occupies the budget, but a dashboard must not label it an
 	// average record size.
-	Entries          uint64
-	Tombstones       uint64
-	CorruptionErrors uint64 // CRC mismatches on read
+	Entries    uint64
+	Tombstones uint64
+	// CorruptionErrors counts EVENTS in which the cache met page bytes it could not
+	// read, and it is bumped on two quite different conditions. A READ whose index
+	// slot leads to an entry that will not frame counts once per read, so one damaged
+	// entry read a thousand times counts a thousand times. The warm-restart walk and
+	// the mmap eviction drain count once per region they give up on: an entry that
+	// fails its checksum or cannot be framed, or a page whose persisted bounds are out
+	// of range. (Reads do not verify checksums — only the warm-restart walk does — so
+	// this is not a count of checksum mismatches.)
+	CorruptionErrors uint64
+	// CorruptionBytesDiscarded is how much page data the warm-restart walk and the
+	// eviction drain discarded because they could not read it, in framed bytes. It
+	// moves ONLY on those two paths, never on a read, so it is not the size of the
+	// events CorruptionErrors counts and the ratio of the two is not a loss per
+	// incident: repeated reads of one damaged entry raise the incident count and leave
+	// this unchanged. Read it on its own, as the total dropped.
+	//
+	// What each case costs: an entry that fails its checksum during a warm restart
+	// costs the page from that entry to its tail, since nothing past an unreadable
+	// entry can be framed safely (see rebuildIndexFromPages); an entry the eviction
+	// drain cannot frame costs the rest of that page, whose records were being evicted
+	// regardless but can no longer be walked; and a page whose persisted head/tail are
+	// out of range, met by either path, costs its whole capacity, since those bounds
+	// were the only record of how much it held.
+	CorruptionBytesDiscarded uint64
 
 	// Cold compaction at shard open (mmap only; cache/compact.go). These are the
 	// operator's view of whether restarts are actually reclaiming the ghost page
@@ -179,6 +202,7 @@ func (s *Stats) Add(o Stats) {
 	s.Entries += o.Entries
 	s.Tombstones += o.Tombstones
 	s.CorruptionErrors += o.CorruptionErrors
+	s.CorruptionBytesDiscarded += o.CorruptionBytesDiscarded
 	s.Compactions += o.Compactions
 	s.CompactionsAborted += o.CompactionsAborted
 	s.CompactionBytesReclaimed += o.CompactionBytesReclaimed
@@ -225,7 +249,8 @@ func (s Stats) WritePrometheus(w io.Writer) error {
 		{"rostam_kv_seqlock_retries_total", "lock-free read attempts discarded because a same-size update moved the bytes mid-read", s.SeqlockRetries},
 		{"rostam_kv_seqlock_fallbacks_total", "reads that spent their retry budget and took the shard read lock instead - should be near zero", s.SeqlockFallbacks},
 		{"rostam_kv_inplace_updates_total", "writes that overwrote the stored copy of their key where it lay, instead of appending a new copy and leaving the old one framed and dead - the writes that created no garbage; requires a heap ringbuf shard with in-place same-size updates enabled", s.InPlaceUpdates},
-		{"rostam_kv_corruption_errors_total", "CRC mismatches seen on read", s.CorruptionErrors},
+		{"rostam_kv_corruption_errors_total", "unreadable page bytes met - once per read that hits a damaged entry, plus once per region the warm restart or the eviction drain gives up on", s.CorruptionErrors},
+		{"rostam_kv_corruption_bytes_discarded_total", "page bytes the warm restart or the eviction drain discarded unread - not incremented by reads, so not a per-incident size for corruption_errors", s.CorruptionBytesDiscarded},
 		{"rostam_kv_compactions_total", "page files rewritten live-only at shard open (mmap)", s.Compactions},
 		{"rostam_kv_compactions_aborted_total", "compactions decided against or abandoned; the original file was kept", s.CompactionsAborted},
 		{"rostam_kv_compaction_bytes_reclaimed_total", "page bytes dropped by those rewrites", s.CompactionBytesReclaimed},
