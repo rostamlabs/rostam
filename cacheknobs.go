@@ -8,10 +8,11 @@ import (
 	"github.com/rostamlabs/rostam/cache"
 )
 
-// applyEvictionKnobs copies CacheConfig's opt-in eviction knobs onto cc. Every one
-// is off in cache.DefaultConfig and a zero CacheConfig leaves it that way; the
-// reserve interval follows TTLSweepIntervalMs (0 keeps the default, negative turns
-// the ticker off, positive sets it).
+// applyEvictionKnobs copies CacheConfig's opt-in eviction knobs onto cc. A zero
+// CacheConfig leaves cache.DefaultConfig's choices untouched: the four switches off,
+// and a reserve interval that is non-zero but inert without RelocatingEviction. The
+// interval follows TTLSweepIntervalMs (0 keeps the default, negative turns the
+// ticker off, positive sets it).
 func applyEvictionKnobs(cc *cache.Config, c CacheConfig) {
 	cc.RelocatingEviction = c.RelocatingEviction
 	switch {
@@ -125,9 +126,9 @@ func inertCacheKnobs(c CacheConfig, d cacheDeployment) []inertCacheKnob {
 }
 
 // warnInertCacheKnobs logs one startup warning per knob inertCacheKnobs reports.
-// A warning rather than an error on purpose: an over-specified config — one file
-// shared by a cluster and a single-node box — is not a broken one, and refusing to
-// start would turn a harmless no-op into an outage.
+// A warning rather than an error on purpose: an over-specified config — the same
+// flags or environment shared by a cluster and a single-node box — is not a broken
+// one, and refusing to start would turn a harmless no-op into an outage.
 func warnInertCacheKnobs(c CacheConfig, d cacheDeployment) {
 	for _, k := range inertCacheKnobs(c, d) {
 		slog.Warn("cache option is set but has no effect on this deployment",

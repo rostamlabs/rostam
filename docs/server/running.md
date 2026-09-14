@@ -142,10 +142,17 @@ transport, principal redacted).
 
 ## Cache eviction knobs
 
-Five opt-in flags change what a shard does when its cache reaches
-`max_memory`. All are **off by default**, and setting them never turns anything
-else on. Each also reads its `ROSTAM_*` variable
-(`-in-place-same-size-update` → `ROSTAM_IN_PLACE_SAME_SIZE_UPDATE`).
+Five opt-in flags change how a shard stores rewrites and what it keeps when its
+cache reaches `max_memory`. Out of the box **none of them has any effect**: the
+four switches are off, and `-relocate-reserve-interval` has a non-zero default
+(`50ms`) that does nothing unless `-relocating-eviction` is on. Setting one
+never turns another on.
+
+**They are flags and environment variables only.** Each reads its `ROSTAM_*`
+variable (`-in-place-same-size-update` → `ROSTAM_IN_PLACE_SAME_SIZE_UPDATE`).
+The `-config` file does **not** accept them: it carries only settings that have
+no flag, and it rejects keys it does not know, so a config file that names one
+of these knobs fails to load and the server refuses to start.
 
 | Flag | What it does |
 |---|---|
@@ -170,11 +177,14 @@ does nothing.
 
 Why:
 
-- **`-cluster`: none of them.** Every one acts only when a shard evicts to make
-  room. A cluster shard never evicts: replicas evicting independently would
-  drop different keys and diverge, so replication makes every shard refuse
-  writes at capacity instead. (Every cluster shard is also file-backed, since a
-  cluster requires `-data`.)
+- **`-cluster`: none of them.** A cluster shard never evicts: replicas evicting
+  independently would drop different keys and diverge, so replication makes
+  every shard refuse writes at capacity instead. The three eviction knobs
+  (`-relocating-eviction`, `-relocate-reserve-interval`, `-sieve-visited-bit`)
+  therefore never run. The in-place pair acts on every same-size rewrite, full
+  shard or not, but only on a shard that evicts rather than refuses at capacity
+  — and every cluster shard is also file-backed, since a cluster requires
+  `-data`.
 - **`-data`: no in-place updates.** A file-backed page is the durable copy. An
   overwrite interrupted by a crash is found at recovery as a corrupt entry
   mid-page, and recovery discards the rest of that page with it — other keys,
@@ -190,8 +200,9 @@ Why:
   `max_memory` spread over many `-shards` can leave fewer, and such a shard
   keeps no reserve; `-relocating-eviction` still works, at eviction time only.
 
-The server does not refuse a knob that has no effect — a config file shared by
-a cluster and a single-node box is over-specified, not broken — but it logs one
+The server does not refuse a knob that has no effect — the same flags or
+`ROSTAM_*` environment shared by a cluster and a single-node box are
+over-specified, not broken — but it logs one
 warning per such knob at startup, naming the flag, the deployment and the
 reason:
 

@@ -13,8 +13,9 @@ import (
 	"github.com/rostamlabs/rostam/cache"
 )
 
-// cacheKnobFlags are the opt-in cache eviction knobs. All are off by default and
-// stay off unless set. Most do nothing on most topologies, so the help text says
+// cacheKnobFlags are the opt-in cache eviction knobs. None has any effect unless set:
+// the four switches default off, and the reserve interval's non-zero default does
+// nothing without -relocating-eviction. Most do nothing on most topologies, so the help text says
 // where each one acts, and the store logs a startup warning naming any that is set
 // where it cannot (rostam.NewDirect / rostam.NewEmbedded).
 //

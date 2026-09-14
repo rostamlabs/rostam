@@ -20,9 +20,13 @@ to `cache.New`).
 | `Mlock` | false | pin the mmap into RAM (needs `ulimit -l` headroom; failure logs and continues) |
 
 The opt-in eviction knobs — `RelocatingEviction`, `RelocateReserveIntervalMs`,
-`InPlaceSameSizeUpdate`, `InPlaceSeqlockReads` and `SieveVisitedBit`, all off by
-default and also settable as `rostam.CacheConfig` fields — act only on shards
-that evict at capacity, and some only on heap shards. Check
+`InPlaceSameSizeUpdate`, `InPlaceSeqlockReads` and `SieveVisitedBit`, also
+settable as `rostam.CacheConfig` fields — have no effect by default: the four
+switches are off, and `RelocateReserveIntervalMs` defaults to 50 ms but is inert
+without `RelocatingEviction`. None acts on a `PolicyRejectWrites` shard. The
+eviction knobs matter only once a shard evicts; the in-place pair changes every
+same-size rewrite, and how reads are taken, whether or not the shard is full,
+but only on a heap shard. Check
 [where each takes effect](../server/running.md#where-each-knob-takes-effect)
 before enabling one, and read the warning there on `InPlaceSeqlockReads`, whose
 read protocol is not covered by race detection.

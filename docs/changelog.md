@@ -13,11 +13,14 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   `-relocating-eviction`, `-relocate-reserve-interval`,
   `-in-place-same-size-update`, `-in-place-seqlock-reads` and
   `-sieve-visited-bit` (each with its `ROSTAM_*` variable), and `CacheConfig`
-  fields of the matching names. Every one stays **off by default**; nothing
-  changes unless you set it.
+  fields of the matching names. None has any effect by default: the four
+  switches are off, and the reserve interval's default does nothing without
+  relocating eviction, so nothing changes unless you set them. They are flags
+  and environment variables only; the `-config` file does not accept them.
 
   Most of them have no effect on most topologies. None acts on a `-cluster`
-  node, whose shards refuse writes at capacity instead of evicting; in-place
+  node, whose shards are file-backed and refuse writes at capacity instead of
+  evicting; in-place
   updates, their seqlock reads and the background reserve act only on a
   single-node server without `-data`. A knob set where it cannot act — or
   paired without the knob it depends on — is accepted and logged as a startup

@@ -1340,11 +1340,19 @@ type CacheConfig struct {
 	// bound RSS independently of it.
 	MaxMemoryBytes int64
 
-	// The five fields below are opt-in eviction knobs, all off by default. Each maps
-	// onto the cache.Config field of the same name, whose doc has the full trade-off.
-	// MOST OF THEM DO NOTHING ON MOST DEPLOYMENTS: every one acts only on a shard that
-	// evicts at capacity, which a cluster shard never does (replication forces it to
-	// refuse writes instead), and the in-place pair acts only on an in-memory shard.
+	// The five fields below are opt-in eviction knobs, and a zero value for each has no
+	// effect (RelocateReserveIntervalMs zero keeps the library's non-zero cadence, which
+	// does nothing without RelocatingEviction). Each maps onto the cache.Config field of
+	// the same name, whose doc has the full trade-off.
+	//
+	// MOST OF THEM DO NOTHING ON MOST DEPLOYMENTS. None acts on a shard whose at-capacity
+	// policy is to refuse writes, which replication forces on every cluster shard. Past
+	// that, RelocatingEviction, RelocateReserveIntervalMs and SieveVisitedBit matter only
+	// when a shard actually evicts, and the reserve runs only on an in-memory shard. The
+	// in-place pair is not tied to capacity — it changes every same-size rewrite, and how
+	// reads are taken, whether or not the shard is full — but it acts only on an
+	// in-memory shard.
+	//
 	// NewDirect and NewEmbedded log a warning naming each knob that is set but has no
 	// effect on the store being built; docs/server/running.md has the full matrix.
 
