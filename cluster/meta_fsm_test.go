@@ -77,12 +77,14 @@ func TestMetaFSMSnapshotRestore(t *testing.T) {
 }
 
 func TestMetaFSMApplyUnknownOp(t *testing.T) {
-	f := NewMetaFSM()
+	// An unknown op halts (see TestMetaFSMUnknownOpFailsClosed); record the halt
+	// instead of exiting the test binary.
+	f, halts := newHaltRecordingMetaFSM()
 	bad := []byte{0xFF}
 	// Encode the bad-op via the path: 1 byte op + minimal gob body for empty struct.
 	good, _ := encodeLogEntry(LogEntry{Op: 0xFF})
-	if got := f.Apply(&raft.Log{Data: good}); got == nil {
-		t.Error("expected error on unknown op")
+	if got := f.Apply(&raft.Log{Data: good}); got == nil || len(*halts) != 1 {
+		t.Errorf("unknown op: resp=%v halts=%d, want an error and one halt", got, len(*halts))
 	}
 	// Also: malformed data (1 byte, no gob payload).
 	if got := f.Apply(&raft.Log{Data: bad}); got == nil {

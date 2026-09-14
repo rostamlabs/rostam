@@ -31,6 +31,36 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   `-in-place-seqlock-reads` is an opt-in performance trade whose read protocol
   is a deliberate data race validated after the fact: it is not covered by race
   detection, and its concurrent tests are skipped under `-race`.
+- **Breaking (rolling upgrades): a node now HALTS on cluster metadata it does
+  not recognise, instead of silently skipping it.** When the meta-Raft log
+  delivered an entry whose op this binary did not know, the node returned an
+  error that Raft ignores, recorded the entry as applied, and carried on. Its
+  peers on the newer binary that proposed the entry applied it, so the node's
+  cluster metadata diverged from theirs permanently — and because the entry
+  was recorded as applied, not even a restart would revisit it. Shard groups
+  have long failed closed on the equivalent condition; the meta log now does
+  too.
+
+  The node exits with an error log naming the entry's op and log index, the
+  applied index it stopped at, and the remedy. Nothing about the entry is
+  recorded, so on every restart the node replays the log, meets the same entry
+  and exits again, until its binary is upgraded to one that knows the op. A
+  process supervisor will show this as a crash loop repeating that one line.
+
+  The same gap existed through snapshots: once the leader compacts its log
+  past such an entry it sends a snapshot instead, and a snapshot carrying
+  state from a newer binary had that state silently dropped on restore.
+  Snapshots now record which fields carry data, and a node refuses one that
+  carries data in a field its binary does not have, logging which field. Raft
+  retries a refused snapshot install, so the node stays behind rather than
+  wrong. Snapshots written by earlier binaries carry no such record and restore
+  as before, so this protection starts with the binaries that write it.
+
+  **What to do about it:** upgrade every node's binary before using a feature
+  that introduces new cluster metadata. That was always required for correct
+  behaviour; it is now enforced by a visible stop rather than risked as silent
+  divergence. If a node is halting with this message, upgrade that node — no
+  data needs repairing, since nothing was applied.
 
 - **`Server.Close` could panic the process, or return while a connection handler
   was still running.** The accept loop published a connection into the tracked
