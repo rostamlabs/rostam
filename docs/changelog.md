@@ -5,6 +5,55 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **Breaking: `objstore.ObjectStore` gains `PutIfAbsent`, and two single-node
+  backups at one timestamp can no longer both publish.** A backup refused an
+  existing snapshot key by listing it first and then writing, and nothing made
+  those steps atomic: two runs starting in the same second — an on-demand backup
+  landing in the periodic run's second, or two servers backing up the same
+  prefix — could both see the key absent and both write, the second replacing
+  the first's snapshot and config.
+
+  `PutIfAbsent(ctx, key, r, size)` stores an object only if the key does not
+  exist, as one atomic step, and returns `objstore.ErrExists` otherwise. A
+  backup now claims its timestamp by creating the config object with it, then
+  creates the snapshot the same way, so exactly one concurrent run publishes and
+  the rest report `backup.ErrSnapshotExists` without writing anything.
+
+  This covers **single-node collection backups only**. Cluster backups (shard
+  snapshots, their sidecars and the catalog) still write with `Put`, so two
+  cluster backups at one timestamp can still overwrite each other; making that
+  path write-once is not done yet.
+
+  - **S3** sends `If-None-Match: *`; the service answers 412 when the key exists.
+    Some S3-compatible stores — older MinIO releases among them — ignore that
+    header and overwrite. A store cannot be told apart by its response, so the
+    first conditional write checks once, with a throwaway object next to the
+    key, that the service really refuses a second create. A service that
+    ignores or rejects the header makes every `PutIfAbsent` fail with
+    `objstore.ErrConditionalWriteUnsupported`, and **single-node backups to it
+    fail loudly** rather than silently losing the guarantee. Upgrade the store
+    to a release that supports conditional writes.
+  - **Filesystem** (`-backup-dir`) stages as before and publishes with a hard
+    link, which refuses an existing name where a rename replaces it. The backup
+    directory must be on a filesystem with hard links (not FAT32 or exFAT); on
+    one without, backups fail with the link error.
+  - An orphaned config — left by a backup that died between its two writes —
+    now holds its timestamp: a retry at that exact timestamp is refused, since
+    it cannot be told apart from a run still writing. Periodic and on-demand
+    backups use the current time and are unaffected.
+
+  The filesystem store no longer fails every write on Windows by trying to fsync
+  a directory, which Windows does not support. Filesystem backups on Windows
+  still do not work, for a separate reason: backup keys contain an RFC 3339
+  timestamp, and its `:` is not allowed in a Windows file name.
+
+  **What to do:** code outside this repository that implements
+  `objstore.ObjectStore` no longer compiles until it adds `PutIfAbsent`. Implement
+  it atomically against the backing store; if the store cannot guarantee that,
+  return `objstore.ErrConditionalWriteUnsupported` rather than calling `Put`, or
+  concurrent backups will silently overwrite each other again. A wrapper that
+  embeds another store and overrides `Put` must override `PutIfAbsent` as well,
+  or the embedded one is used and bypasses the override.
 - **A corrupt entry met during eviction on a persistent (mmap) cache left the
   evicted page's keys behind in the index.** When the in-place drain could not
   frame an entry it reset the page, but dropped none of the index slots still
