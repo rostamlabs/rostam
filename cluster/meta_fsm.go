@@ -3,8 +3,12 @@
 package cluster
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"os"
+	"reflect"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -51,6 +55,47 @@ type MetaFSM struct {
 	// Guarded by m.mu (set under the write lock, read under it in Apply) so it is
 	// race-free even though the meta-Raft goroutine may already be applying.
 	leaseRenewObserver func(shardID int, epoch uint64)
+	// onFatalApply is invoked when Apply meets an op this binary does not
+	// recognise. Its contract is to HALT the process without the applied frontier
+	// advancing. nil means the production halt (defaultMetaFatalApply, os.Exit);
+	// tests inject a hook that records and returns, and Apply suppresses the
+	// advance on that path too. Mirrors shard's fsm.onFatalApply.
+	onFatalApply func(err error)
+}
+
+// errMetaUnknownOp marks a committed meta entry whose op this binary does not
+// apply. See MetaFSM.Apply for why it halts instead of returning.
+var errMetaUnknownOp = errors.New("meta-fsm: unknown op")
+
+// fireFatalApply halts on an unknown op: the injected hook when one is set,
+// otherwise the production halt.
+func (m *MetaFSM) fireFatalApply(err error) {
+	if m.onFatalApply != nil {
+		m.onFatalApply(err)
+		return
+	}
+	defaultMetaFatalApply(err, m.appliedIndex.Load())
+}
+
+// defaultMetaFatalApply is the production halt, the meta-Raft twin of shard's
+// defaultFatalApply. os.Exit runs no deferred functions and cannot be recovered,
+// so Apply's deferred frontier advance never runs, raft's FSM goroutine never
+// returns from this entry, and no snapshot can be taken that covers it. On
+// restart raft replays the entry and the node stops on it again — until the
+// binary is upgraded to one that knows the op. A panic would NOT do: the
+// deferred advance runs during the unwind.
+//
+// The log line is the operator's only signal, because the process is gone and
+// with it any health endpoint, so it names the entry, the frontier the node
+// stopped at, and the remedy.
+func defaultMetaFatalApply(err error, applied uint64) {
+	slog.Error("FATAL: meta-Raft log entry uses an op this binary does not recognise — halting "+
+		"WITHOUT applying it (deliberate fail-closed; skipping it would silently diverge this node's "+
+		"cluster metadata from its peers). The entry was committed by a node running a newer binary: "+
+		"upgrade this node's binary to that version and restart. Until then it stops on this same "+
+		"entry on every restart.",
+		"component", "meta", "err", err, "applied_index", applied)
+	os.Exit(1)
 }
 
 // SetLeaseRenewObserver installs (or clears with nil) the leader-local
@@ -360,7 +405,17 @@ func (m *MetaFSM) Apply(log *raft.Log) any {
 	// entry — Apply is only ever called for LogCommand). Placed right after the
 	// decode succeeds: a malformed entry returns above and does NOT move the frontier.
 	// One atomic store on the meta Apply hot path (rare — catalog/membership mutations).
-	defer m.advanceApplied(log.Index)
+	//
+	// skipAdvance suppresses it for the ONE entry that must not be recorded: an op
+	// this binary does not recognise (the default case below). It is set BEFORE the
+	// halt fires, so the advance stays suppressed however the halt leaves this
+	// function — os.Exit in production, a returning test hook, or a panic.
+	skipAdvance := false
+	defer func() {
+		if !skipAdvance {
+			m.advanceApplied(log.Index)
+		}
+	}()
 	// Test-only apply gate (nil in production). Fired for a catalog-gen commit
 	// BEFORE the write lock is taken so the gate can BLOCK without holding the lock
 	// — the node's prior catalog state stays readable (it keeps reporting the old
@@ -629,7 +684,21 @@ func (m *MetaFSM) Apply(log *raft.Log) any {
 		m.state.ShardFormer[entry.ShardID] = entry.Node
 		return true
 	default:
-		return fmt.Errorf("meta-fsm: unknown op %d", entry.Op)
+		// FAIL CLOSED (issue #113). Only a binary that knows an op proposes it, so
+		// peers on that binary APPLY this entry. Returning an error is not a stop —
+		// hashicorp/raft ignores an Apply result and moves on — and recording the
+		// entry as applied would make even a restart resume past it: this node would
+		// silently lack a mutation its peers hold. Halt without advancing instead,
+		// exactly as shard's classFatal does for an unregistered op. The entry stays
+		// unapplied and replays on restart; upgrading the binary is the remedy.
+		//
+		// Every value outside the cases above lands here, including OpUnknown and
+		// the reserved-but-never-implemented 2 and 3. There is no retired op to
+		// exempt — see the Op doc for how one would be kept known-and-ignored.
+		skipAdvance = true
+		err := fmt.Errorf("%w %d at log index %d", errMetaUnknownOp, entry.Op, log.Index)
+		m.fireFatalApply(err)
+		return err
 	}
 }
 
@@ -672,7 +741,97 @@ func (m *MetaFSM) SnapshotBytes() ([]byte, error) {
 	// m.state) so we never mutate live FSM state from a read path.
 	snap := m.state
 	snap.LastIndex = m.appliedIndex.Load()
+	// Stamp which fields carry data, so a binary that lacks one of them refuses
+	// the snapshot instead of silently dropping it (see State.PopulatedFields).
+	snap.PopulatedFields = populatedFieldPaths(snap)
 	return encodeState(snap)
+}
+
+// populatedFieldPaths lists, sorted, the path of every exported struct field
+// holding a non-zero value anywhere in s: top-level fields by name, fields of
+// slice/array elements and map keys/values under "Parent[].Field". Exported
+// fields are exactly what gob encodes, so this is the set of fields a reader
+// must have to decode s without loss.
+func populatedFieldPaths(s State) []string {
+	set := make(map[string]struct{})
+	walkPopulatedFields(reflect.ValueOf(s), "", set)
+	out := make([]string, 0, len(set))
+	for p := range set {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func walkPopulatedFields(v reflect.Value, path string, set map[string]struct{}) {
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Interface:
+		if !v.IsNil() {
+			walkPopulatedFields(v.Elem(), path, set)
+		}
+	case reflect.Struct:
+		t := v.Type()
+		for i := 0; i < t.NumField(); i++ {
+			f, fv := t.Field(i), v.Field(i)
+			// An empty non-nil map or slice carries no data either (gob omits it),
+			// so it must not make a reader without the field refuse the snapshot.
+			empty := fv.IsZero() || ((fv.Kind() == reflect.Map || fv.Kind() == reflect.Slice) && fv.Len() == 0)
+			if !f.IsExported() || empty {
+				continue
+			}
+			p := joinFieldPath(path, f.Name)
+			set[p] = struct{}{}
+			walkPopulatedFields(fv, p, set)
+		}
+	case reflect.Slice, reflect.Array:
+		if v.Type().Elem().Kind() == reflect.Uint8 {
+			return // []byte: opaque to gob, no fields inside
+		}
+		for i := 0; i < v.Len(); i++ {
+			walkPopulatedFields(v.Index(i), path+"[]", set)
+		}
+	case reflect.Map:
+		iter := v.MapRange()
+		for iter.Next() {
+			walkPopulatedFields(iter.Key(), path+"[]", set)
+			walkPopulatedFields(iter.Value(), path+"[]", set)
+		}
+	}
+}
+
+// knownFieldPaths is every path populatedFieldPaths could produce for THIS
+// binary's State, derived from the type alone. Computed once.
+var knownFieldPaths = sync.OnceValue(func() map[string]struct{} {
+	set := make(map[string]struct{})
+	var walk func(t reflect.Type, path string)
+	walk = func(t reflect.Type, path string) {
+		switch t.Kind() {
+		case reflect.Pointer:
+			walk(t.Elem(), path)
+		case reflect.Struct:
+			for i := 0; i < t.NumField(); i++ {
+				if f := t.Field(i); f.IsExported() {
+					p := joinFieldPath(path, f.Name)
+					set[p] = struct{}{}
+					walk(f.Type, p)
+				}
+			}
+		case reflect.Slice, reflect.Array:
+			walk(t.Elem(), path+"[]")
+		case reflect.Map:
+			walk(t.Key(), path+"[]")
+			walk(t.Elem(), path+"[]")
+		}
+	}
+	walk(reflect.TypeOf(State{}), "")
+	return set
+})
+
+func joinFieldPath(parent, name string) string {
+	if parent == "" {
+		return name
+	}
+	return parent + "." + name
 }
 
 // Restore replaces state from a snapshot reader.
@@ -686,6 +845,27 @@ func (m *MetaFSM) Restore(r io.ReadCloser) error {
 	if err != nil {
 		return err
 	}
+	// Refuse, before touching any state, a snapshot carrying data in a field this
+	// binary does not have: gob has already dropped it, and adopting the rest would
+	// resume past whatever produced it (see State.PopulatedFields). Raft keeps the
+	// node behind instead — a refused InstallSnapshot is retried by the leader, and
+	// a refused startup restore falls back to an older snapshot or fails startup —
+	// which is the fail-closed outcome Apply gives an unknown op.
+	known := knownFieldPaths()
+	var unknown []string
+	for _, p := range s.PopulatedFields {
+		if _, ok := known[p]; !ok {
+			unknown = append(unknown, p)
+		}
+	}
+	if len(unknown) > 0 {
+		err := fmt.Errorf("meta-fsm: snapshot carries state this binary does not recognise %v "+
+			"(written by a newer binary; upgrade this node's binary to restore it)", unknown)
+		slog.Error("refusing meta-Raft snapshot rather than silently dropping state it carries",
+			"component", "meta", "err", err, "snapshot_index", s.LastIndex)
+		return err
+	}
+	s.PopulatedFields = nil
 	m.mu.Lock()
 	m.state = s
 	m.mu.Unlock()
