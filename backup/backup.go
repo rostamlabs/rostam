@@ -181,8 +181,8 @@ func Backup(ctx context.Context, store *vector.CollectionStore, obj objstore.Obj
 // backupOne snapshots a single collection to a temp file and Puts it under its
 // timestamped key, then prunes per retention. All failures are returned in the
 // BackupResult (never panics, never aborts the caller's loop).
-func backupOne(ctx context.Context, store *vector.CollectionStore, obj objstore.ObjectStore, name string, opts BackupOpts) BackupResult {
-	res := BackupResult{Collection: name}
+func backupOne(ctx context.Context, store *vector.CollectionStore, obj objstore.ObjectStore, name string, opts BackupOpts) (res BackupResult) {
+	res = BackupResult{Collection: name}
 
 	c, ok := store.Acquire(name)
 	if !ok {
@@ -249,12 +249,24 @@ func backupOne(ctx context.Context, store *vector.CollectionStore, obj objstore.
 	}
 	// claimed stays true only while the config may be paired with a snapshot of
 	// ours; any return with it still set means the snapshot was certainly not
-	// written, so the claim is released. The context is detached so a cancelled
-	// run still releases.
+	// written, so the claim is released. The release runs under cleanupContext:
+	// detached, so a cancelled run still releases, and bounded, so a stalled
+	// store cannot hold the run (and a shutdown waiting on it) indefinitely.
+	//
+	// A release that fails is reported, not dropped. The config it leaves is at
+	// best an orphan holding its timestamp and at worst — when the run stopped
+	// because a snapshot with no config of its own already held the key — taken
+	// by Restore as that snapshot's config, which it does not describe. Either
+	// way it needs removing by hand, and only the error can say so.
 	claimed := true
 	defer func() {
-		if claimed && res.Err != nil {
-			_ = obj.Delete(context.WithoutCancel(ctx), cfgKey)
+		if !claimed || res.Err == nil {
+			return
+		}
+		cctx, cancel := cleanupContext(ctx)
+		defer cancel()
+		if err := obj.Delete(cctx, cfgKey); err != nil && !errors.Is(err, objstore.ErrNotFound) {
+			res.Err = errors.Join(res.Err, fmt.Errorf("backup %q: could not release the claimed config %q, remove it by hand: %w", name, cfgKey, err))
 		}
 	}()
 
@@ -464,4 +476,18 @@ func RestoreLatest(ctx context.Context, store *vector.CollectionStore, obj objst
 		return err
 	}
 	return Restore(ctx, store, obj, tenant, collection, key)
+}
+
+// cleanupTimeout bounds cleanup that has to run even when the caller's context
+// has ended — releasing a backup's timestamp claim. It is a var, not a const, purely so a test can shorten it;
+// nothing in production assigns to it.
+var cleanupTimeout = 30 * time.Second
+
+// cleanupContext returns the context for such cleanup. It is detached from
+// ctx, because cleanup exists precisely for the runs that were cancelled or ran
+// out of time; and it carries a deadline of its own, because detaching also
+// drops ctx's deadline, and without one a stalled store (or an HTTP client with
+// no timeout) would hold the caller indefinitely.
+func cleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 }

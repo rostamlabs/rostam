@@ -17,7 +17,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -60,10 +59,12 @@ type S3Store struct {
 	clock     func() time.Time
 
 	// condState records whether the service enforces If-None-Match (condUnknown,
-	// condSupported, condUnsupported); condMu serialises the one-time probe that
-	// decides it. See verifyConditionalCreate.
+	// condSupported, condUnsupported). condGate, a one-slot channel, serialises
+	// the probe that decides it; a channel rather than a mutex so a caller
+	// waiting on another caller's probe can give up when its context ends. See
+	// verifyConditionalCreate.
 	condState atomic.Int32
-	condMu    sync.Mutex
+	condGate  chan struct{}
 }
 
 const s3Service = "s3"
@@ -126,6 +127,7 @@ func NewS3Store(cfg Config) (*S3Store, error) {
 		service:   s3Service,
 		client:    client,
 		clock:     clock,
+		condGate:  make(chan struct{}, 1),
 	}, nil
 }
 
@@ -345,8 +347,12 @@ func (s *S3Store) verifyConditionalCreate(ctx context.Context, key string) error
 	if s.condState.Load() != condUnknown {
 		return s.conditionalCreateVerdict(key)
 	}
-	s.condMu.Lock()
-	defer s.condMu.Unlock()
+	select {
+	case s.condGate <- struct{}{}:
+	case <-ctx.Done():
+		return fmt.Errorf("objstore: PUT %q: waiting for the conditional-create check: %w", key, ctx.Err())
+	}
+	defer func() { <-s.condGate }()
 	if s.condState.Load() != condUnknown {
 		return s.conditionalCreateVerdict(key) // decided while we waited
 	}
@@ -360,6 +366,21 @@ func (s *S3Store) verifyConditionalCreate(ctx context.Context, key string) error
 		probe = key[:i+1] + probe
 	}
 
+	// removeProbe deletes the probe object under cleanupContext: detached, so a
+	// caller cancelled mid-probe still removes it, and bounded, so a stalled
+	// service cannot hold the call. A probe that cannot be removed is reported by
+	// name. Nothing else would ever remove it — retention only looks at snapshot
+	// keys — so a silent failure would leave one behind for every process that
+	// hit it.
+	removeProbe := func() error {
+		cctx, cancel := cleanupContext(ctx)
+		defer cancel()
+		if err := s.Delete(cctx, probe); err != nil && !errors.Is(err, ErrNotFound) {
+			return fmt.Errorf("objstore: PUT %q not attempted: the conditional-create probe object %q could not be removed, remove it by hand: %w", key, probe, err)
+		}
+		return nil
+	}
+
 	first := s.putIfAbsent(ctx, probe, strings.NewReader(""), 0)
 	if errors.Is(first, ErrConditionalWriteUnsupported) {
 		s.condState.Store(condUnsupported)
@@ -367,20 +388,22 @@ func (s *S3Store) verifyConditionalCreate(ctx context.Context, key string) error
 	}
 	if first != nil {
 		// Nothing decided; the probe may or may not exist.
-		_ = s.Delete(ctx, probe)
-		return fmt.Errorf("objstore: verify conditional create: %w", first)
+		return errors.Join(fmt.Errorf("objstore: verify conditional create: %w", first), removeProbe())
 	}
 	second := s.putIfAbsent(ctx, probe, strings.NewReader(""), 0)
-	_ = s.Delete(ctx, probe)
+	cleanupErr := removeProbe()
 	switch {
 	case errors.Is(second, ErrExists):
 		s.condState.Store(condSupported)
 	case second == nil, errors.Is(second, ErrConditionalWriteUnsupported):
 		s.condState.Store(condUnsupported)
 	default:
-		return fmt.Errorf("objstore: verify conditional create: %w", second)
+		return errors.Join(fmt.Errorf("objstore: verify conditional create: %w", second), cleanupErr)
 	}
-	return s.conditionalCreateVerdict(key)
+	// The verdict stands even if the probe could not be removed, so later calls
+	// do not probe (and possibly strand another object) again; this call fails
+	// without writing key so the leftover is reported, once.
+	return errors.Join(s.conditionalCreateVerdict(key), cleanupErr)
 }
 
 // conditionalCreateVerdict turns a decided condState into PutIfAbsent's answer

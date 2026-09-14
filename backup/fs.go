@@ -140,7 +140,7 @@ func (f *FSObjectStore) keyToPath(key string) (string, error) {
 // accepted for interface parity (Content-Length on the wire); the bytes actually
 // written are whatever r yields.
 func (f *FSObjectStore) Put(_ context.Context, key string, r io.Reader, size int64) error {
-	return f.put(key, r, false)
+	return f.put(context.Background(), key, r, false)
 }
 
 // PutIfAbsent writes r's full contents to <root>/<key> only if no file exists
@@ -176,14 +176,16 @@ func (f *FSObjectStore) Put(_ context.Context, key string, r io.Reader, size int
 // own link and its bytes. On Windows the unlink can also fail while a reader
 // holds the published file open (Go opens files there without
 // FILE_SHARE_DELETE); that leftover is reclaimed the same way.
-func (f *FSObjectStore) PutIfAbsent(_ context.Context, key string, r io.Reader, size int64) error {
-	return f.put(key, r, true)
+func (f *FSObjectStore) PutIfAbsent(ctx context.Context, key string, r io.Reader, size int64) error {
+	return f.put(ctx, key, r, true)
 }
 
 // put stages r into a temp file beside the destination and publishes it: by
 // rename, which replaces an existing object, or — when exclusive — by link,
-// which refuses one (see PutIfAbsent).
-func (f *FSObjectStore) put(key string, r io.Reader, exclusive bool) error {
+// which refuses one (see PutIfAbsent). ctx is consulted only when exclusive,
+// immediately before the link: a PutIfAbsent whose caller gave up while the body
+// was being staged publishes nothing. Put keeps ignoring ctx, as it always has.
+func (f *FSObjectStore) put(ctx context.Context, key string, r io.Reader, exclusive bool) error {
 	dst, err := f.keyToPath(key)
 	if err != nil {
 		return err
@@ -234,6 +236,10 @@ func (f *FSObjectStore) put(key string, r io.Reader, exclusive bool) error {
 	// the sweep, and the path is about to stop existing under this name.
 	stopHeartbeat()
 	if exclusive {
+		if err := ctx.Err(); err != nil {
+			_ = os.Remove(tmpName)
+			return fmt.Errorf("fsstore: put-if-absent %q: %w", key, err)
+		}
 		linkErr := os.Link(tmpName, dst)
 		// Win or lose, the staging name goes: after a successful link it is a
 		// second name for dst, after a failed one it is the loser's copy.

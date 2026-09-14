@@ -54,6 +54,13 @@ type ObjectStore interface {
 	// intact. A backend that cannot guarantee that returns
 	// ErrConditionalWriteUnsupported rather than degrading to an overwrite. size
 	// is as for Put.
+	//
+	// Only ErrExists means "another object holds the key and nothing of this
+	// call's was stored". Any other error — a cancelled context, a transport
+	// failure, or S3's 409 when conditional writes to one key collide in flight —
+	// can leave the outcome unknown: the object may or may not have been stored.
+	// A caller must not treat such an error as proof that nothing was written,
+	// and must not retry it as though the key were still free.
 	PutIfAbsent(ctx context.Context, key string, r io.Reader, size int64) error
 	// Get returns a reader over the object stored under key. The caller must
 	// Close it. Returns ErrNotFound if the key does not exist.
@@ -130,6 +137,11 @@ func (m *MemStore) PutIfAbsent(ctx context.Context, key string, r io.Reader, siz
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Checked again, under the lock: the caller may have given up while the body
+	// was being read, and a cancelled call must not publish.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if _, ok := m.objects[key]; ok {
 		return ErrExists
 	}
@@ -191,3 +203,17 @@ func (m *MemStore) Delete(ctx context.Context, key string) error {
 
 // compile-time assertion that MemStore satisfies ObjectStore.
 var _ ObjectStore = (*MemStore)(nil)
+
+// cleanupTimeout bounds cleanup that has to run even when the caller's context
+// has ended — removing the S3 store's support-probe object. It is a var, not a const, purely so a test can shorten it;
+// nothing in production assigns to it.
+var cleanupTimeout = 30 * time.Second
+
+// cleanupContext returns the context for such cleanup. It is detached from
+// ctx, because cleanup exists precisely for the runs that were cancelled or ran
+// out of time; and it carries a deadline of its own, because detaching also
+// drops ctx's deadline, and without one a stalled store (or an HTTP client with
+// no timeout) would hold the caller indefinitely.
+func cleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+}
