@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -21,7 +22,8 @@ import (
 
 // FSObjectStore is a filesystem-backed objstore.ObjectStore rooted at a local
 // directory. Each object key maps to a file at <root>/<key>, with key's "/"
-// separators becoming directory levels (parent dirs are created on Put). It is
+// separators becoming directory levels (parent dirs are created on Put) and
+// each ':' spelled as colonEscape, since Windows file names cannot hold one. It is
 // fully demoable today with no cloud credentials and lets the backup driver run
 // against local disk before any S3 bucket is configured.
 //
@@ -74,6 +76,30 @@ const staleTempAge = time.Hour
 // it; nothing in production assigns to it.
 var tempHeartbeat = staleTempAge / 4
 
+// colonEscape is how a ':' in an object key is spelled in a file name. Backup
+// keys embed an RFC 3339 timestamp, and ':' is not a legal character in a
+// Windows file name, so a key cannot be used as a file name verbatim.
+//
+// Only this store changes the spelling; keys stay RFC 3339 on every backend.
+// Retention ranks snapshots by a lexical sort of keys, and a second key format
+// under one prefix would sort by character values rather than by time.
+//
+// The mapping is ':' -> "%3A" over the whole key, and List maps "%3A" back to
+// ':'. That is exactly reversible because keyToPath refuses any key already
+// containing "%3A" (in either case, since a case-insensitive filesystem would
+// take the lower-case spelling for the same file): every "%3A" in a file name is
+// then one this store wrote, and none can straddle an original character, since
+// its only '%' is its first byte. The refusal costs backup keys nothing: the
+// collection segment is url.PathEscape'd, which never escapes ':' and always
+// escapes '%' to "%25", so it can never contain "%3A". It is deliberately not a
+// full percent-encoding: escaping '%' as well would respell every existing
+// collection directory ("default%2Fc" as "default%252Fc").
+//
+// Names written before the escape existed carry a literal ':'. Where a file name
+// can hold one (everywhere but Windows), reads accept that spelling too; see
+// literalPath.
+const colonEscape = "%3A"
+
 // NewFSObjectStore returns an FSObjectStore rooted at root, creating root if it
 // does not exist.
 func NewFSObjectStore(root string) (*FSObjectStore, error) {
@@ -89,10 +115,15 @@ func NewFSObjectStore(root string) (*FSObjectStore, error) {
 // destination is verified to stay within root. A key containing "../" segments,
 // a NUL byte, or one that resolves to root itself is an error — so Put cannot
 // overwrite, Get cannot read, and Delete cannot remove a file outside root. It
-// also rejects a key landing in the reserved staging name space (see below).
+// also rejects a key landing in the reserved staging name space (see below), and
+// one containing colonEscape in either case (see there). Each ':' in the key is
+// spelled as colonEscape in the returned path.
 func (f *FSObjectStore) keyToPath(key string) (string, error) {
 	if strings.ContainsRune(key, '\x00') {
 		return "", fmt.Errorf("fsstore: invalid key %q", key)
+	}
+	if strings.Contains(strings.ToUpper(key), colonEscape) {
+		return "", fmt.Errorf("fsstore: invalid key %q (%q is reserved for an escaped ':')", key, colonEscape)
 	}
 	// path.Clean("/"+key) forces an absolute path and resolves away ".."/"." so a
 	// traversal key like "../../etc/passwd" cleans to "/etc/passwd" (a single
@@ -101,6 +132,7 @@ func (f *FSObjectStore) keyToPath(key string) (string, error) {
 	if clean == "/" {
 		return "", fmt.Errorf("fsstore: invalid key %q (empty after clean)", key)
 	}
+	clean = strings.ReplaceAll(clean, ":", colonEscape)
 	// The putTempPrefix name space is RESERVED for Put's staging files, which
 	// reclaimStaleTemps is entitled to delete once they age past staleTempAge. A
 	// key whose final segment lands in that name space would be published as a
@@ -133,6 +165,20 @@ func (f *FSObjectStore) keyToPath(key string) (string, error) {
 		return "", fmt.Errorf("fsstore: key %q escapes root", key)
 	}
 	return dst, nil
+}
+
+// literalPath returns the path a build from before colonEscape wrote key at —
+// the key verbatim, ':' and all. Call it only with a key keyToPath accepted: the
+// literal path differs from keyToPath's only within name segments, so it stays
+// inside root exactly when that one does. ok is false when the key has no ':'
+// (it has one spelling only) and on Windows, where a ':' in a path names an NTFS
+// alternate data stream, so a lookup under the literal spelling could open
+// something that is not the object.
+func (f *FSObjectStore) literalPath(key string) (string, bool) {
+	if runtime.GOOS == "windows" || !strings.ContainsRune(key, ':') {
+		return "", false
+	}
+	return filepath.Join(f.root, filepath.FromSlash(path.Clean("/"+key))), true
 }
 
 // Put writes r's full contents to <root>/<key> atomically (temp file + rename),
@@ -197,6 +243,12 @@ func (f *FSObjectStore) put(ctx context.Context, key string, r io.Reader, exclus
 	// ours. Doing it here rather than at open is what makes it race-free on a root
 	// shared by several processes; it is best-effort and never fails the Put.
 	reclaimStaleTemps(filepath.Dir(dst))
+	lit, hasLit := f.literalPath(key)
+	if hasLit && filepath.Dir(lit) != filepath.Dir(dst) {
+		// A directory named before colonEscape existed gets no new staging files,
+		// but can still hold ones abandoned there.
+		reclaimStaleTemps(filepath.Dir(lit))
+	}
 	// Staging name deliberately does NOT end in snapExt: List/LatestKey/prune
 	// filter on the ".snap" suffix, so a temp named "*.snap" would be visible to
 	// them mid-write — a concurrent prune could delete an in-flight Put's staging
@@ -239,6 +291,20 @@ func (f *FSObjectStore) put(ctx context.Context, key string, r io.Reader, exclus
 		if err := ctx.Err(); err != nil {
 			_ = os.Remove(tmpName)
 			return fmt.Errorf("fsstore: put-if-absent %q: %w", key, err)
+		}
+		// The key may already exist under its literal spelling (see literalPath).
+		// The link only refuses the escaped name, so without this check it would
+		// publish a second object for the key beside the first. The check and the
+		// link are not one atomic step, but this build never creates a literal name:
+		// only a build from before colonEscape sharing the root could race it.
+		if hasLit {
+			if _, err := os.Lstat(lit); err == nil {
+				_ = os.Remove(tmpName)
+				return fmt.Errorf("fsstore: put-if-absent %q: %w", key, objstore.ErrExists)
+			} else if !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) {
+				_ = os.Remove(tmpName)
+				return fmt.Errorf("fsstore: put-if-absent %q: check literal name: %w", key, err)
+			}
 		}
 		linkErr := os.Link(tmpName, dst)
 		// Win or lose, the staging name goes: after a successful link it is a
@@ -369,13 +435,18 @@ func syncDir(dir string) error {
 }
 
 // Get opens <root>/<key> for reading. The caller MUST Close the returned reader.
-// A missing key returns objstore.ErrNotFound.
+// A missing key returns objstore.ErrNotFound. When the key's escaped name is
+// absent, its literal spelling (see literalPath) is read instead; when both
+// exist the escaped one wins, since only a later write can have created it.
 func (f *FSObjectStore) Get(_ context.Context, key string) (io.ReadCloser, error) {
 	dst, err := f.keyToPath(key)
 	if err != nil {
 		return nil, err
 	}
 	file, err := os.Open(dst)
+	if lit, ok := f.literalPath(key); ok && os.IsNotExist(err) {
+		file, err = os.Open(lit)
+	}
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, objstore.ErrNotFound
@@ -445,6 +516,11 @@ func (f *FSObjectStore) List(_ context.Context, prefix string) ([]objstore.Objec
 		return nil, nil // no such prefix: nothing to list
 	}
 	var out []objstore.ObjectInfo
+	// index maps each key reported so far to its entry in out; fromLiteral holds
+	// the keys whose entry came from a literal-spelling name, which an escaped
+	// name for the same key replaces (it is the copy Get reads).
+	index := map[string]int{}
+	fromLiteral := map[string]bool{}
 	err = fs.WalkDir(r.FS(), start, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -452,19 +528,36 @@ func (f *FSObjectStore) List(_ context.Context, prefix string) ([]objstore.Objec
 		if d.IsDir() {
 			return nil
 		}
-		// fs.FS paths are already slash-separated and root-relative: p IS the key.
-		if !strings.HasPrefix(p, prefix) {
+		// fs.FS paths are already slash-separated and root-relative, so p is the key
+		// with each ':' spelled as colonEscape, or with a literal ':' in a name
+		// written before the escape existed. Either way it maps back to the key here,
+		// BEFORE the prefix filter and the sort: both only ever see real keys, so
+		// retention ranks keys, never file names.
+		key := strings.ReplaceAll(p, colonEscape, ":")
+		if !strings.HasPrefix(key, prefix) {
+			return nil
+		}
+		literal := strings.ContainsRune(p, ':')
+		i, dup := index[key]
+		if dup && (literal || !fromLiteral[key]) {
 			return nil
 		}
 		info, ierr := d.Info()
 		if ierr != nil {
 			return ierr
 		}
-		out = append(out, objstore.ObjectInfo{
-			Key:          p,
+		oi := objstore.ObjectInfo{
+			Key:          key,
 			Size:         info.Size(),
 			LastModified: info.ModTime(),
-		})
+		}
+		if dup {
+			out[i] = oi
+		} else {
+			index[key] = len(out)
+			out = append(out, oi)
+		}
+		fromLiteral[key] = literal
 		return nil
 	})
 	if err != nil {
@@ -484,6 +577,9 @@ func (f *FSObjectStore) List(_ context.Context, prefix string) ([]objstore.Objec
 // separator while the key filter treats it as a literal, so a scoped walk
 // there could return keys that do not carry the requested prefix — walking
 // from the parent lets the lexical filter decide, identically everywhere.
+// Scoping stops the same way at a segment containing a ':': such a directory may
+// exist under both of its spellings (see literalPath), and on Windows the
+// verbatim name would address an alternate data stream.
 // A prefix whose directory part is not already canonical (a leading "/", a
 // "." or ".." segment, a doubled "/") can match no key at all — every key is
 // a clean relative path — so it yields nothing without touching disk, rather
@@ -504,7 +600,7 @@ func listStart(r *os.Root, prefix string) (start string, ok bool, err error) {
 		return start, true, nil
 	}
 	for _, seg := range strings.Split(rel, "/") {
-		if strings.ContainsRune(seg, '\\') {
+		if strings.ContainsAny(seg, `\:`) {
 			break
 		}
 		next := path.Join(start, seg)
@@ -527,17 +623,30 @@ func listStart(r *os.Root, prefix string) (start string, ok bool, err error) {
 }
 
 // Delete removes <root>/<key>. Deleting a missing key returns
-// objstore.ErrNotFound, matching the S3 client and the MemStore fake.
+// objstore.ErrNotFound, matching the S3 client and the MemStore fake. The key is
+// removed under both of its spellings (see literalPath): a copy left under
+// either would let Get and List bring the deleted object back.
 func (f *FSObjectStore) Delete(_ context.Context, key string) error {
 	dst, err := f.keyToPath(key)
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(dst); err != nil {
-		if os.IsNotExist(err) {
-			return objstore.ErrNotFound
+	paths := []string{dst}
+	if lit, ok := f.literalPath(key); ok {
+		paths = append(paths, lit)
+	}
+	removed := false
+	for _, p := range paths {
+		if err := os.Remove(p); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("fsstore: delete %q: %w", key, err)
 		}
-		return fmt.Errorf("fsstore: delete %q: %w", key, err)
+		removed = true
+	}
+	if !removed {
+		return objstore.ErrNotFound
 	}
 	return nil
 }

@@ -20,6 +20,11 @@ Every `-backup-interval`, each collection is snapshotted into `-backup-dir`
 (keyed under `-backup-prefix`, default `default`); only the newest
 `-backup-retention` snapshots per collection are kept (default 24).
 
+File names follow the object layout below, except that each `:` (from the
+timestamp) is written as `%3A`, since Windows file names cannot contain `:`.
+Directories written by earlier builds, with a literal `:` in their file names,
+are still read, restored from and pruned on Linux and macOS.
+
 ## S3-compatible backups
 
 Point the same machinery at S3, MinIO, Cloudflare R2, or any SigV4-compatible
