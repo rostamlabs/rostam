@@ -90,6 +90,7 @@ func (s *CollectionStore) CreateNamedConfig(name string, cfg NamedConfig) error 
 	// NOT touch the cluster snapshot/Raft path.
 	wal := cfg.WAL && !s.persistentCluster
 
+	defer s.lockName(canonical)()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.collections[canonical]; ok {
@@ -282,6 +283,8 @@ func (s *CollectionStore) DropNamed(name string) error {
 	if err != nil {
 		return err
 	}
+	// Held through the file cleanup below; see lockName.
+	defer s.lockName(canonical)()
 	s.mu.Lock()
 	nc, ok := s.named[canonical]
 	if ok {

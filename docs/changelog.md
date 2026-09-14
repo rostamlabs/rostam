@@ -155,6 +155,76 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   divergence. If a node is halting with this message, upgrade that node — no
   data needs repairing, since nothing was applied.
 
+- **A restore from a bad backup no longer destroys the collection it was meant
+  to replace.** `backup.Restore` and `CollectionStore.RestoreCollection` /
+  `RestoreCollectionWithConfig` are create-or-replace, and they dropped the
+  existing collection — removing its files — before reading the snapshot. A
+  truncated or corrupt snapshot then failed with an empty collection left where
+  the original had been, and a config the index rejected left no collection at
+  all.
+
+  The snapshot is now restored into a collection built outside the catalog while
+  the existing one keeps serving, and the existing one is dropped only after the
+  restore has succeeded. A failed restore leaves it untouched and nothing of the
+  attempt behind. (#112)
+
+  What to expect:
+
+  - The swap is not atomic. Between dropping the existing collection and
+    registering the restored one, the name resolves to no collection, and an
+    operation on it fails as it would on an absent name. That window covers
+    draining the existing collection's in-flight operations, closing it and
+    removing its files, and writing the new config marker (and opening the log
+    of a WAL collection) — not the restore itself. A filesystem failure inside
+    it still leaves neither collection, and the error says so.
+  - A restore now holds both the existing collection and the restored copy in
+    memory until the swap, where it used to need room for one. No store-wide
+    quota counts this; running out fails the restore with the existing
+    collection intact.
+  - Operations that change what a collection name refers to now wait for one
+    another instead of interleaving: creating, dropping, restoring, promoting a
+    cold collection, and committing an eviction. So while a restore of a name
+    runs, a create or drop of that name, or a second restore of it, **waits**
+    rather than failing, then acts on the result — a create reports
+    `ErrCollectionExists` if the restore succeeded, and a drop removes the
+    restored collection. Reads and writes on an existing hot collection are not
+    held up while the snapshot is restored.
+  - **Reading a cold (evicted) collection that is being restored blocks until
+    the restore finishes**, because resolving it promotes it and promotion takes
+    part in that ordering. It then sees the restored collection. In the other
+    direction, a drop, create or restore of a cold name waits for a promotion
+    already in progress, including its read of the snapshot from object storage,
+    and then acts on the promoted collection.
+  - A whole-store `RestoreAll` swap that arrives while a restore is registering
+    its replacement waits for that step, at most the window described above,
+    rather than landing in the middle of it.
+  - A dense restore over a **named-vector** or **multi-vector** collection is
+    refused with `ErrCollectionExists`. Over a named-vector collection it used
+    to succeed while leaving that collection's files on disk, so after a restart
+    the name loaded as both kinds. A restore with a named-vector config is also
+    refused up front; it could never succeed, and used to drop the existing
+    collection before failing.
+
+  Cluster disaster recovery (`-restore`) installs whole shard snapshots through
+  Raft and does not use this path, so it is unaffected.
+
+- **Catalog operations on one collection name no longer undo each other.** These
+  races existed independent of restore, and the ordering above closes them:
+
+  - A drop removes the collection from the catalog, then waits for in-flight
+    operations before deleting its files by name. A create (or restore) of the
+    same name in that gap wrote its config marker and log, which the drop's
+    cleanup then deleted — the call succeeded and the collection vanished on
+    restart.
+  - A cold promotion that lost a race with a drop discards what it built by
+    deleting the name's files, including files a create or restore of the name
+    had just written.
+  - An eviction snapshots a collection, releases it, and then replaced whatever
+    was registered under the name with a cold entry for that snapshot. If the
+    name had been dropped and recreated, or restored, in between, the new
+    collection was replaced by the old data. It now commits only if the
+    collection it snapshotted is still the one registered.
+
 - **`Server.Close` could panic the process, or return while a connection handler
   was still running.** The accept loop published a connection into the tracked
   set and only then counted its handler goroutine, while `Close` walked that set

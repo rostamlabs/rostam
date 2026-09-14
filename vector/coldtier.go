@@ -140,16 +140,27 @@ func (s *CollectionStore) EvictCollection(ctx context.Context, name string, obj 
 	}
 	c.Release()
 
+	if evictCommitHook != nil {
+		evictCommitHook()
+	}
+
 	// Register the stub and remove the live collection under the store lock, then
 	// retire the index out of the lock (drain in-flight users, close/unmap — the
 	// REAL memory release). A racing access between Acquire above and the lock here
 	// is harmless: it sees the collection still hot and serves normally; the next
 	// access sees the stub and lazily restores.
+	//
+	// The commit holds the name lock, so it cannot interleave with a drop, create,
+	// promotion or restore of this name.
+	defer s.lockName(canonical)()
 	s.mu.Lock()
 	live, stillHot := s.collections[canonical]
-	if !stillHot {
-		// Dropped out from under us between the Acquire and here. Nothing to evict;
-		// the snapshot we wrote is just an extra backup. Not an error.
+	if !stillHot || live != c {
+		// Dropped out from under us between the Acquire and here — or dropped and
+		// replaced (a restore, or a drop and create). The snapshot above is of a
+		// collection that is no longer this name's, so committing it would put a
+		// stub for the OLD data in place of the current collection. Nothing to
+		// evict; the snapshot we wrote is just an extra backup. Not an error.
 		s.mu.Unlock()
 		return nil
 	}
@@ -170,6 +181,11 @@ func (s *CollectionStore) EvictCollection(ctx context.Context, name string, obj 
 	live.retire(nil)
 	return nil
 }
+
+// evictCommitHook, when non-nil, runs in EvictCollection between releasing the
+// collection it snapshotted and committing the eviction — the gap in which the
+// name can be dropped and replaced. Tests only; nil in production.
+var evictCommitHook func()
 
 // putColdSnapshot streams c's snapshot to obj under key and writes the sibling
 // config object, identical in layout to the backup package (a cold collection's
@@ -207,6 +223,11 @@ func (s *CollectionStore) putColdSnapshot(ctx context.Context, c *Collection, ob
 // It seeds the freshly-hot collection's lastAccess from the injected clock (zero
 // time if none — no time.Now in the engine).
 func (s *CollectionStore) promoteCold(canonical string, e *coldEntry) error {
+	// The whole promotion holds the name lock: it writes the collection's files and,
+	// if a drop won the race, deletes them by path again — which must not reach
+	// files a later operation on the name has published. Taken before promoteMu,
+	// which nothing else takes.
+	defer s.lockName(canonical)()
 	e.promoteMu.Lock()
 	defer e.promoteMu.Unlock()
 

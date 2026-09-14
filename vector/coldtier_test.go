@@ -463,17 +463,28 @@ func TestDropDuringPromoteDoesNotResurrect(t *testing.T) {
 		}
 	}()
 
-	// Wait until the promote is parked inside Get, then drop the cold stub. Drop
-	// deletes s.cold["default/docs"] under s.mu and returns success.
+	// Wait until the promote is parked inside Get, then drop the name. A promotion
+	// holds the name lock for its whole body, so the drop now queues behind it
+	// instead of deleting the stub mid-promotion; it then drops whatever the
+	// promotion left, which must still end with the collection gone. (Before the
+	// name lock, the drop deleted the stub here and the promotion took its discard
+	// branch; both orders must leave nothing behind.)
 	<-gate.entered
-	if err := s.DropCollection("docs"); err != nil {
-		t.Fatalf("drop: %v", err)
+	dropped := make(chan error, 1)
+	go func() { dropped <- s.DropCollection("docs") }()
+	deadline := time.Now().Add(10 * time.Second)
+	for nameLockHolders(s, "default/docs") < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("drop did not queue behind the in-flight promotion")
+		}
+		time.Sleep(100 * time.Microsecond)
 	}
 
-	// Let the parked promote proceed to its publish block; it must now observe the
-	// stub gone and DISCARD the rebuilt collection instead of resurrecting it.
 	close(gate.release)
 	wg.Wait()
+	if err := <-dropped; err != nil {
+		t.Fatalf("drop: %v", err)
+	}
 
 	// The collection must be GONE: not hot, not cold, not listed, not serving.
 	s.mu.RLock()

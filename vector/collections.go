@@ -72,6 +72,19 @@ type CollectionStore struct {
 	// collections (hot) XOR cold (evicted). nil/empty unless cold tiering is used,
 	// so the hot path's only cost is a len()==0 check in Acquire.
 	cold map[string]*coldEntry
+
+	// nameLocks holds the per-name structural locks (see lockName), guarded by
+	// nameLocksMu, which is never held while waiting on one of them.
+	nameLocksMu sync.Mutex
+	nameLocks   map[string]*nameLock
+
+	// catalogMu keeps a whole-store RestoreAll swap from landing inside a
+	// create-or-replace restore's publication, which is several steps (drop the
+	// old collection, write its files, register the new one). Publication holds
+	// the read side, RestoreAll's swap the write side. Taken after a name lock and
+	// before mu.
+	catalogMu sync.RWMutex
+
 	// nowFn is the INJECTED clock used to stamp lastAccess on resolve (Acquire) and
 	// to seed it on promote. nil (the default) means the engine reads no clock at
 	// all — determinism — and lastAccess is driven only by the explicit timestamps
@@ -486,6 +499,7 @@ func (s *CollectionStore) CreateCollection(name string, cfg Config) error {
 	if err != nil {
 		return err
 	}
+	defer s.lockName(canonical)()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.collections[canonical]; ok {
@@ -590,12 +604,21 @@ func (s *CollectionStore) SetNowFunc(fn func() int64) {
 }
 
 // DropCollection removes a collection and its on-disk files. Drop of an
-// unknown name is a no-op (returns nil).
+// unknown name is a no-op (returns nil). It waits for any other structural
+// operation on the name (see lockName), and holds off the next one until the
+// files are gone.
 func (s *CollectionStore) DropCollection(name string) error {
 	canonical, err := canonicalName(name)
 	if err != nil {
 		return err
 	}
+	defer s.lockName(canonical)()
+	return s.dropCollection(canonical)
+}
+
+// dropCollection is DropCollection for a caller that already holds canonical's
+// name lock.
+func (s *CollectionStore) dropCollection(canonical string) error {
 	s.mu.Lock()
 	c, ok := s.collections[canonical]
 	if !ok {
@@ -659,9 +682,9 @@ func (s *CollectionStore) DropCollection(name string) error {
 // reconstructed from a snapshot stream OUTSIDE the on-disk startup load path
 // (e.g. by the backup package pulling a snapshot back from object storage).
 //
-// It is create-or-replace: any existing collection of this name is Dropped
-// first (its on-disk files removed), then a fresh collection is constructed and
-// Collection.Restore is applied on top. The dense HNSW snapshot stream carries
+// It is create-or-replace, with RestoreCollectionWithConfig's guarantee: a
+// snapshot that fails to restore leaves any existing collection of this name
+// untouched. The dense HNSW snapshot stream carries
 // the core index config (Dim/Metric/M/EfConstruction/EfSearch/Seed) and
 // readSnapshot overwrites the target index's cfg with it, so a minimal
 // placeholder config suffices here — the restored collection ends up with the
@@ -698,28 +721,205 @@ func (s *CollectionStore) RestoreCollection(name string, r io.Reader) error {
 // its codes/graph on top. The backup package supplies this Config from the
 // sibling .cfg.json object written alongside each snapshot.
 //
-// It is create-or-replace: any existing collection of this name is Dropped first
-// (its on-disk files removed), then a fresh collection is constructed from cfg and
-// Collection.Restore is applied.
+// It is create-or-replace, and a failed restore destroys nothing. The snapshot is
+// restored into a collection built OFF-catalog, while any existing collection of
+// this name keeps serving; only once Collection.Restore has returned success is
+// the existing collection dropped and the restored one published in its place.
+// A truncated or corrupt stream, a config the index rejects, or a
+// snapshot/config mismatch therefore leaves the existing collection exactly as it
+// was, and nothing of the attempt behind.
+//
+// The replacement is NOT atomic. There is no in-place rename of a collection's
+// on-disk identity (its files are named after it, and a WAL or mmap backing file
+// is held open by the live index), so publishing is drop-then-register: between
+// the two, the name resolves to no collection and an operation on it fails as it
+// would on an absent name — it never sees a half-restored index. That window
+// lasts as long as the existing collection takes to drain its in-flight
+// operations, close, and have its files removed, plus writing the new config
+// marker and (for a WAL collection) opening the new log. It does not include the
+// restore itself. A failure inside the window — a filesystem error writing that
+// marker or opening that log, or the store being closed under the call — leaves
+// neither collection, and the error says so.
+//
+// The call holds the name's structural lock (lockName) throughout, so it
+// serializes with every other operation that changes what the name refers to.
+// While it runs, a create or drop of the name — or a second restore of it — waits
+// rather than failing, and acts on whatever the restore left: a create then
+// reports ErrCollectionExists if the restore succeeded, and a drop removes the
+// restored collection. Reads and writes on an existing HOT collection are not
+// held up during staging. A COLD (evicted) collection is different: resolving it
+// promotes it, and promotion takes the same lock, so an operation on a cold name
+// waits for the whole restore and then sees its result. A whole-store RestoreAll
+// never lands inside the publication; its swap waits for at most that window.
+//
+// Until the swap, the existing collection and the restored copy are both in
+// memory, so a restore needs room for two copies where the drop-first sequence
+// needed room for one. No store-wide quota counts that — MaxVectors and MaxBytes
+// are per index — so running out surfaces as the allocation failure itself,
+// returned by the restore, with the existing collection still intact.
+//
+// The restored copy is staged without file-backed storage: a single-node store
+// builds it heap-backed and attaches the collection's own WAL and config marker
+// only at publish, since mmap or WAL files at the collection's paths would
+// collide with the live original's. (Restore itself replaces an mmap-backed
+// vector arena with a heap one regardless, so that is where a Persistent
+// collection's vectors end up either way.) A persistent-cluster store stages on a
+// fresh mmap generation, whose files are disjoint from the ones the original
+// maps — the mechanism RestoreAll already uses.
 func (s *CollectionStore) RestoreCollectionWithConfig(name string, cfg Config, r io.Reader) error {
 	canonical, err := canonicalName(name)
 	if err != nil {
 		return err
 	}
-	if err := s.DropCollection(canonical); err != nil {
-		return err
+	if len(cfg.NamedVectors) > 0 {
+		// A dense snapshot cannot populate a named-vector collection. Refused before
+		// anything is touched — this used to drop the existing collection first.
+		return fmt.Errorf("vector: restore %q: a named-vector config cannot be restored from a dense snapshot", canonical)
 	}
-	if err := s.CreateCollection(canonical, cfg); err != nil {
-		return err
+
+	// Nothing below may resolve canonical through Acquire or Get: the name lock is
+	// not reentrant, and resolving a cold collection promotes it, which takes this
+	// lock. The family check reads the maps directly, staging touches no catalog
+	// state, and publication drops a cold stub without promoting it.
+	defer s.lockName(canonical)()
+
+	s.mu.RLock()
+	_, multi := s.multi[canonical]
+	_, named := s.named[canonical]
+	nowFnMs := s.nowFnMs
+	s.mu.RUnlock()
+	if multi || named {
+		// A dense snapshot replaces a dense collection (hot or cold) or fills an
+		// absent name. Dropping a dense name never removes a multi-vector
+		// collection, and it removes a named-vector collection from memory but not
+		// its files — so a restart would load the name in two families. Both are
+		// refused before any work; the name lock keeps the answer stable.
+		family := "multi-vector"
+		if named {
+			family = "named-vector"
+		}
+		return fmt.Errorf("vector: restore %q: the name holds a %s collection, which a dense snapshot cannot replace: %w", canonical, family, ErrCollectionExists)
 	}
-	c, ok := s.Acquire(canonical)
-	if !ok {
-		return fmt.Errorf("vector: restore %q: collection vanished after create", canonical)
-	}
-	defer c.Release()
-	if err := c.Restore(r); err != nil {
+
+	c, err := s.stageRestore(canonical, cfg, nowFnMs, r)
+	if err != nil {
 		return fmt.Errorf("vector: restore %q: %w", canonical, err)
 	}
+	return s.publishRestore(canonical, cfg, c)
+}
+
+// stageRestore builds canonical's replacement off-catalog and restores r into
+// it. Nothing it does is visible to the catalog or touches a path the existing
+// collection of that name uses, so its failure needs no rollback beyond
+// discarding what it built.
+func (s *CollectionStore) stageRestore(canonical string, cfg Config, nowFnMs func() int64, r io.Reader) (*Collection, error) {
+	cfgPath, _ := s.collectionPath(canonical)
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o750); err != nil {
+		return nil, err
+	}
+	// eff is the config the published collection carries and the store acts on
+	// (Flush, Drop), exactly as buildCollection would derive it.
+	eff := s.effectiveConfig(canonical, cfg)
+	build := eff
+	if s.persistentCluster {
+		eff = s.effectiveClusterConfig(canonical, s.gen.Add(1), cfg)
+		build = eff
+	} else {
+		// The index reads these only at construction, to open its backing files —
+		// the original's files, while the original is still live.
+		build.QuantStorage = QuantInRAM
+		build.MmapPath = ""
+		build.GraphMmapPath = ""
+	}
+	c, err := NewCollection(canonical, build)
+	if err != nil {
+		if s.persistentCluster {
+			removeClusterMmapFiles(eff)
+		}
+		return nil, err
+	}
+	c.cfg.QuantStorage, c.cfg.MmapPath, c.cfg.GraphMmapPath = eff.QuantStorage, eff.MmapPath, eff.GraphMmapPath
+	if nowFnMs != nil {
+		c.SetNowFunc(nowFnMs)
+	}
+	if err := c.Restore(r); err != nil {
+		s.discardStaged(c)
+		return nil, err
+	}
+	return c, nil
+}
+
+// discardStaged tears down a collection that was never published. Its cfg paths
+// are only its own files on a persistent-cluster store (a fresh generation); on a
+// single-node store they name the live collection's files and must be left alone.
+func (s *CollectionStore) discardStaged(c *Collection) {
+	c.Stop()
+	_ = c.Close()
+	if s.persistentCluster {
+		removeClusterMmapFiles(c.cfg)
+	}
+}
+
+// publishRestore replaces canonical's current collection, if any, with the fully
+// restored c. The name resolves to no collection from the drop's catalog removal
+// until c is registered; see RestoreCollectionWithConfig. The caller holds
+// canonical's name lock.
+func (s *CollectionStore) publishRestore(canonical string, cfg Config, c *Collection) error {
+	// Read side of catalogMu: a RestoreAll swap waits for this whole publication
+	// instead of replacing the maps between the drop and the registration.
+	s.catalogMu.RLock()
+	defer s.catalogMu.RUnlock()
+
+	cfgPath, _ := s.collectionPath(canonical)
+	_, _, _, walPath := s.persistPaths(canonical)
+	wal := cfg.WAL && !s.persistentCluster
+	fail := func(err error) error {
+		s.discardStaged(c)
+		// Mirrors CreateCollection: a marker left by a failed publish would
+		// resurrect an empty collection on restart.
+		_ = os.Remove(cfgPath)
+		if wal {
+			_ = os.Remove(walPath)
+		}
+		return fmt.Errorf("vector: restore %q: the snapshot restored, but the existing collection had already been removed when publishing the restored one failed: %w", canonical, err)
+	}
+	// Synchronous: returns once in-flight users have drained and the files are gone.
+	// Any other drop of this name finished before the name lock was granted, so no
+	// cleanup still pending can remove the files written below.
+	if err := s.dropCollection(canonical); err != nil {
+		return fail(err)
+	}
+	if err := writeConfig(cfgPath, cfg); err != nil {
+		return fail(err)
+	}
+	if wal {
+		w, err := openWAL(walPath, cfg.WALNoSync)
+		if err != nil {
+			return fail(err)
+		}
+		c.wal = w
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.collections == nil {
+		return fail(errors.New("store is closed"))
+	}
+	// Unreachable while every publisher of a name takes its lock and RestoreAll
+	// takes catalogMu; kept so a future path that does not cannot leak an index by
+	// overwriting its map entry. Nothing else can have written this name's files,
+	// so fail removes ours.
+	_, dense := s.collections[canonical]
+	_, multi := s.multi[canonical]
+	_, named := s.named[canonical]
+	if dense || multi || named {
+		return fail(ErrCollectionExists)
+	}
+	// The clock captured for staging may have been replaced since; SetNowFunc
+	// updates only catalogued collections, so apply the current one here, under
+	// the same lock it takes.
+	c.SetNowFunc(s.nowFnMs)
+	s.collections[canonical] = c
 	return nil
 }
 

@@ -115,6 +115,7 @@ func (s *CollectionStore) CreateMultiVector(name string, cfg MultiVectorConfig) 
 	if err != nil {
 		return err
 	}
+	defer s.lockName(canonical)()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.multi[canonical]; ok {
@@ -347,6 +348,8 @@ func (s *CollectionStore) DropMultiVector(name string) error {
 	if err != nil {
 		return err
 	}
+	// Held through the file cleanup below; see lockName.
+	defer s.lockName(canonical)()
 	s.mu.Lock()
 	idx, ok := s.multi[canonical]
 	if ok {
