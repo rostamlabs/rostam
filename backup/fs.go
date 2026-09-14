@@ -286,7 +286,14 @@ func reclaimStaleTemps(dir string) {
 // made durable. Both a failure to open the directory and a Sync error are
 // surfaced to the caller, since either means the rename cannot be guaranteed
 // durable across a crash.
+//
+// Where the platform has no directory fsync (Windows, see dirsync_windows.go)
+// there is nothing to force and it returns nil. Attempting it there fails every
+// time, which used to fail every Put on a Windows backup directory.
 func syncDir(dir string) error {
+	if !dirSyncSupported {
+		return nil
+	}
 	d, err := os.Open(dir)
 	if err != nil {
 		return err
