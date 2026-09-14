@@ -369,7 +369,7 @@ func (s *CollectionStore) DropMultiVector(name string) error {
 // heap-checkpoint) and the cluster generation files (no-ops if absent — a heap-only
 // collection has none). It is shared by DropMultiVector and DropCollection, so the
 // two drops of a multi-vector collection cannot disagree about which files it owns:
-// a .cfg.json marker left behind would reload the collection on the next open.
+// a .mvcfg marker left behind would reload the collection on the next open.
 func (s *CollectionStore) retireMulti(canonical string, idx *MultiVectorIndex) {
 	cfgPath, vecs, graph := s.mvPaths(canonical)
 	wsnap, wwal := s.mvWALPaths(canonical)

@@ -6,15 +6,18 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 ## Unreleased
 
 - **Dropping a multi-vector collection through the generic collection drop now
-  removes it and its files, so it no longer comes back on restart.** The generic
-  drop (`DELETE /v1/collections/{name}`, the gRPC `DropCollection` call and
+  removes it, so it no longer reports success without doing anything and no
+  longer comes back on restart.** The generic drop (`DELETE
+  /v1/collections/{name}`, the gRPC `DropCollection` call and
   `CollectionStore.DropCollection`) did not recognise a multi-vector collection
-  at all: it returned success while leaving the index in memory and its
-  `.cfg.json` marker, vectors, graph and write-ahead log on disk, so a
-  single-node collection reloaded on the next start. The generic drop now deletes
-  the same files as the multi-vector drop (`DELETE /v1/multivector/{name}`).
-  Heap-only multi-vector collections, and those on a `-cluster` node, write no
-  single-node files and were not affected.
+  at all: it returned success while leaving the index live in memory — so the
+  drop was a no-op in every mode, heap included. Where the collection had files
+  (a persistent or WAL single-node collection, or any collection on a `-cluster`
+  node, which always writes its `.mvcfg` marker and may write generation mmap
+  files), those files were left on disk too, so the collection reloaded on the
+  next start. The generic drop now performs the same cleanup as the multi-vector
+  drop (`DELETE /v1/multivector/{name}`). Heap-only multi-vector collections
+  write no files, so for them only the in-memory no-op is fixed.
 - **Dropping a named-vector collection through the generic collection drop now
   removes its files, so it no longer comes back on restart.** The generic drop
   (`DELETE /v1/collections/{name}`, the gRPC `DropCollection` call and

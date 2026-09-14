@@ -140,6 +140,19 @@ func TestDropRemovesEveryFamilysFiles(t *testing.T) {
 			if err := tc.drop(s); err != nil {
 				t.Fatalf("drop: %v", err)
 			}
+			// In-memory no-op guard: the drop must remove the name from the live
+			// store's maps, not only its files. A heap-only mode writes nothing, so
+			// the file and reopen checks below pass vacuously; only this catches a
+			// drop that reported success while leaving the index in memory.
+			if _, ok := s.Get(col); ok {
+				t.Error("dropped name still live as a dense collection")
+			}
+			if _, ok := s.GetMultiVector(col); ok {
+				t.Error("dropped name still live as a multi-vector collection")
+			}
+			if _, ok := s.GetNamed(col); ok {
+				t.Error("dropped name still live as a named-vector collection")
+			}
 			if left := collectionFiles(t, dir, col); len(left) != 0 {
 				t.Errorf("files left after drop: %v", left)
 			}
