@@ -241,7 +241,10 @@ func indexRehashTailArm(b *testing.B, live int, presized bool) {
 func newIndexRehashShard(b *testing.B, entries int) (*Cache, *shard) {
 	b.Helper()
 	const pageSize = 4 << 20
-	perEntry := entrySize(indexRehashKeyLen, indexRehashValueLen)
+	// OCCUPANCY: this sizes the shard so no write is ever refused, and what a write
+	// consumes is the room page.Write reserves — the same question the next-fit
+	// comment below is about.
+	perEntry := entrySpan(indexRehashKeyLen, indexRehashValueLen, true)
 	// Round up to whole pages and add one, since an entry that does not fit a page's
 	// tail room moves to the next page and strands the remainder.
 	pages := (entries*perEntry)/pageSize + 2
