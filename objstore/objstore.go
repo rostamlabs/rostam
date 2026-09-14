@@ -23,6 +23,16 @@ import (
 // exist in the object store.
 var ErrNotFound = errors.New("objstore: object not found")
 
+// ErrExists is returned by PutIfAbsent when an object is already stored under
+// the key. Nothing was written.
+var ErrExists = errors.New("objstore: object already exists")
+
+// ErrConditionalWriteUnsupported is returned by PutIfAbsent when the backend
+// cannot guarantee a create-if-absent: for example an S3-compatible service that
+// ignores the conditional header and would silently overwrite. Nothing was
+// written under the key.
+var ErrConditionalWriteUnsupported = errors.New("objstore: backend does not support conditional create")
+
 // ObjectInfo describes a single stored object as returned by List.
 type ObjectInfo struct {
 	Key          string
@@ -37,6 +47,14 @@ type ObjectStore interface {
 	// Put stores the contents of r under key. size is the exact number of
 	// bytes that will be read from r (used for Content-Length).
 	Put(ctx context.Context, key string, r io.Reader, size int64) error
+	// PutIfAbsent stores the contents of r under key only if no object exists
+	// under key, as ONE atomic step: of any number of concurrent callers for the
+	// same absent key — in this process or another — exactly one succeeds. The
+	// rest return ErrExists and write nothing; the stored object is the winner's
+	// intact. A backend that cannot guarantee that returns
+	// ErrConditionalWriteUnsupported rather than degrading to an overwrite. size
+	// is as for Put.
+	PutIfAbsent(ctx context.Context, key string, r io.Reader, size int64) error
 	// Get returns a reader over the object stored under key. The caller must
 	// Close it. Returns ErrNotFound if the key does not exist.
 	Get(ctx context.Context, key string) (io.ReadCloser, error)
@@ -94,6 +112,28 @@ func (m *MemStore) Put(ctx context.Context, key string, r io.Reader, size int64)
 	m.mu.Lock()
 	m.objects[key] = memObject{data: data, lastModified: m.now()}
 	m.mu.Unlock()
+	return nil
+}
+
+// PutIfAbsent copies r fully into memory, then stores it under key only if key
+// is absent. The existence check and the insert happen under one hold of the
+// write lock, so concurrent callers cannot both see the key absent. The body is
+// read BEFORE taking the lock: a slow reader must not stall every other store
+// operation, and a read error must leave the map untouched.
+func (m *MemStore) PutIfAbsent(ctx context.Context, key string, r io.Reader, size int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.objects[key]; ok {
+		return ErrExists
+	}
+	m.objects[key] = memObject{data: data, lastModified: m.now()}
 	return nil
 }
 

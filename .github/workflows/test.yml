@@ -331,6 +331,14 @@ jobs:
       - name: Test (vector mmap/persist round-trip, targeted)
         run: go test -count=1 -timeout 15m -run 'Mmap|Persist|Reopen|Grow|Reserve|Slab' -skip 'Concurrent|Latency|SIFT' ./vector/
 
+      # The filesystem backup store publishes a write-once snapshot with a hard
+      # link (CreateHardLinkW here), whose refusal of an existing name is what
+      # makes concurrent backups at one timestamp publish exactly once. Linux
+      # link(2) proves nothing about NTFS, so run the store's write paths and the
+      # concurrent-backup test on the real filesystem.
+      - name: Test (filesystem backup store write paths, targeted)
+        run: go test -count=1 -timeout 10m -run 'PutIfAbsent|TestConcurrentBackups|TestFSObjectStorePut' ./backup/
+
   cgo-disabled-build:
     name: cgo-disabled build
     runs-on: ubuntu-latest

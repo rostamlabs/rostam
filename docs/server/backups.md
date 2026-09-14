@@ -41,6 +41,19 @@ Credentials come from the standard AWS environment variables. Object layout:
 <tenant>/<escaped-collection-name>/<RFC3339-timestamp>.cfg.json
 ```
 
+Snapshot keys are write-once: a backup never overwrites an existing one, and of
+backups that start in the same second — an on-demand backup during a periodic
+one, or two servers sharing a prefix — exactly one publishes and the others
+report that the snapshot exists. That is enforced by the store itself, so it
+needs **conditional writes** (`If-None-Match: *` on PUT), which AWS S3 supports;
+check that your S3-compatible store does. Some, older MinIO releases among
+them, ignore the header and would overwrite instead; Rostam checks this once per
+process with a throwaway object next to the first backup key and, on such a
+store, **fails every backup** with "backend does not support conditional create"
+rather than overwriting silently. A filesystem `-backup-dir` gets the same
+guarantee from hard links, so it must be on a filesystem that has them (not
+FAT32 or exFAT).
+
 ## On-demand backup & restore
 
 With an object store configured (these return **412 Precondition Failed**

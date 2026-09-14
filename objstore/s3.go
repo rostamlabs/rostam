@@ -5,9 +5,11 @@ package objstore
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +17,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -54,6 +58,12 @@ type S3Store struct {
 	service   string
 	client    *http.Client
 	clock     func() time.Time
+
+	// condState records whether the service enforces If-None-Match (condUnknown,
+	// condSupported, condUnsupported); condMu serialises the one-time probe that
+	// decides it. See verifyConditionalCreate.
+	condState atomic.Int32
+	condMu    sync.Mutex
 }
 
 const s3Service = "s3"
@@ -210,29 +220,7 @@ func (s *S3Store) bucketURL(rawQuery string) (*url.URL, string) {
 // rewind; otherwise we buffer the body to hash it. The hash then covers the bytes
 // actually sent, so a tampered body fails server-side signature verification.
 func (s *S3Store) Put(ctx context.Context, key string, r io.Reader, size int64) error {
-	u, host := s.objectURL(key)
-
-	payloadHash := unsignedPayload
-	if s.endpoint.Scheme != "https" {
-		hash, body, err := hashPayload(r, size)
-		if err != nil {
-			return fmt.Errorf("objstore: hash payload for %q: %w", key, err)
-		}
-		payloadHash = hash
-		r = body
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u.String(), r)
-	if err != nil {
-		return err
-	}
-	req.Host = host
-	req.ContentLength = size
-	req.Header.Set("Content-Length", strconv.FormatInt(size, 10))
-
-	signV4(req, payloadHash, s.creds, s.region, s.service, s.clock().UTC())
-
-	resp, err := s.client.Do(req) //nolint:bodyclose // drainClose handles drain+close
+	resp, err := s.put(ctx, key, r, size, false)
 	if err != nil {
 		return err
 	}
@@ -241,6 +229,159 @@ func (s *S3Store) Put(ctx context.Context, key string, r io.Reader, size int64) 
 		return s3Error("PUT", key, resp)
 	}
 	return nil
+}
+
+// put sends the signed PUT for Put and PutIfAbsent and returns the response,
+// whose body the caller must drainClose. ifAbsent adds If-None-Match: *; like
+// every header present at signing time it is covered by the signature, so it
+// cannot be stripped in transit without failing verification.
+func (s *S3Store) put(ctx context.Context, key string, r io.Reader, size int64, ifAbsent bool) (*http.Response, error) {
+	u, host := s.objectURL(key)
+
+	payloadHash := unsignedPayload
+	if s.endpoint.Scheme != "https" {
+		hash, body, err := hashPayload(r, size)
+		if err != nil {
+			return nil, fmt.Errorf("objstore: hash payload for %q: %w", key, err)
+		}
+		payloadHash = hash
+		r = body
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u.String(), r)
+	if err != nil {
+		return nil, err
+	}
+	req.Host = host
+	req.ContentLength = size
+	req.Header.Set("Content-Length", strconv.FormatInt(size, 10))
+	if ifAbsent {
+		req.Header.Set("If-None-Match", "*")
+	}
+
+	signV4(req, payloadHash, s.creds, s.region, s.service, s.clock().UTC())
+
+	return s.client.Do(req) //nolint:bodyclose // the caller drainCloses
+}
+
+// Conditional-create support states for S3Store.condState.
+const (
+	condUnknown int32 = iota
+	condSupported
+	condUnsupported
+)
+
+// condProbePrefix names the throwaway objects verifyConditionalCreate writes.
+const condProbePrefix = ".rostam-conditional-create-probe-"
+
+// PutIfAbsent streams r (size bytes) to key with a SigV4-signed PUT carrying
+// If-None-Match: *, so the service itself refuses the write when key exists:
+// 412 Precondition Failed is reported as ErrExists. S3 decides that atomically
+// against concurrent writers.
+//
+// The danger is a service that does not implement the header and IGNORES it —
+// older MinIO releases and some other S3-compatible stores answer 200 and
+// overwrite, which would make this call claim a guarantee it does not deliver.
+// A response cannot tell the two apart, so before the first conditional write
+// the store verifies the behaviour once (see verifyConditionalCreate) and, on a
+// service that ignores or rejects the header, refuses every PutIfAbsent with
+// ErrConditionalWriteUnsupported without writing the key. It never degrades to
+// a plain overwrite.
+//
+// A 409 (S3's ConditionalRequestConflict, answered when conditional writes to
+// one key collide in flight) is returned as a plain error, not ErrExists: it
+// does not establish that another writer's object was stored.
+func (s *S3Store) PutIfAbsent(ctx context.Context, key string, r io.Reader, size int64) error {
+	if err := s.verifyConditionalCreate(ctx, key); err != nil {
+		return err
+	}
+	return s.putIfAbsent(ctx, key, r, size)
+}
+
+// putIfAbsent is PutIfAbsent's request without the capability check.
+func (s *S3Store) putIfAbsent(ctx context.Context, key string, r io.Reader, size int64) error {
+	resp, err := s.put(ctx, key, r, size, true)
+	if err != nil {
+		return err
+	}
+	defer drainClose(resp.Body)
+	switch {
+	case resp.StatusCode/100 == 2:
+		return nil
+	case resp.StatusCode == http.StatusPreconditionFailed:
+		return fmt.Errorf("objstore: PUT %q: %w", key, ErrExists)
+	case resp.StatusCode == http.StatusNotImplemented:
+		return fmt.Errorf("%w: %w", ErrConditionalWriteUnsupported, s3Error("PUT", key, resp))
+	default:
+		return s3Error("PUT", key, resp)
+	}
+}
+
+// verifyConditionalCreate establishes, once per store, that the service
+// enforces If-None-Match: * rather than ignoring it. It writes a probe object
+// with a random name conditionally, then writes it conditionally AGAIN: a
+// service that enforces the header refuses the second write with 412, one that
+// ignores it accepts both. The probe is then deleted.
+//
+// The probe sits in the same "directory" as key, so credentials scoped to the
+// backup prefix can write it. Its random name keeps concurrent probes — from
+// other processes too — from colliding, so a 412 on the second write can only
+// come from this probe's own first write.
+//
+// Only a definitive answer is remembered: enforced, or ignored/rejected (501).
+// A transport error or any other status fails this call without deciding, so
+// the next call probes again. The check proves that the service enforces the
+// header, not that it does so atomically; a service that checks and then writes
+// non-atomically is indistinguishable from outside.
+func (s *S3Store) verifyConditionalCreate(ctx context.Context, key string) error {
+	if s.condState.Load() != condUnknown {
+		return s.conditionalCreateVerdict(key)
+	}
+	s.condMu.Lock()
+	defer s.condMu.Unlock()
+	if s.condState.Load() != condUnknown {
+		return s.conditionalCreateVerdict(key) // decided while we waited
+	}
+
+	var nonce [8]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return fmt.Errorf("objstore: conditional-create probe name: %w", err)
+	}
+	probe := condProbePrefix + hex.EncodeToString(nonce[:])
+	if i := strings.LastIndex(key, "/"); i >= 0 {
+		probe = key[:i+1] + probe
+	}
+
+	first := s.putIfAbsent(ctx, probe, strings.NewReader(""), 0)
+	if errors.Is(first, ErrConditionalWriteUnsupported) {
+		s.condState.Store(condUnsupported)
+		return s.conditionalCreateVerdict(key)
+	}
+	if first != nil {
+		// Nothing decided; the probe may or may not exist.
+		_ = s.Delete(ctx, probe)
+		return fmt.Errorf("objstore: verify conditional create: %w", first)
+	}
+	second := s.putIfAbsent(ctx, probe, strings.NewReader(""), 0)
+	_ = s.Delete(ctx, probe)
+	switch {
+	case errors.Is(second, ErrExists):
+		s.condState.Store(condSupported)
+	case second == nil, errors.Is(second, ErrConditionalWriteUnsupported):
+		s.condState.Store(condUnsupported)
+	default:
+		return fmt.Errorf("objstore: verify conditional create: %w", second)
+	}
+	return s.conditionalCreateVerdict(key)
+}
+
+// conditionalCreateVerdict turns a decided condState into PutIfAbsent's answer
+// for key.
+func (s *S3Store) conditionalCreateVerdict(key string) error {
+	if s.condState.Load() == condSupported {
+		return nil
+	}
+	return fmt.Errorf("objstore: PUT %q: %w (the S3 endpoint ignores or rejects If-None-Match)", key, ErrConditionalWriteUnsupported)
 }
 
 // Get returns the object body for key, or ErrNotFound on 404.

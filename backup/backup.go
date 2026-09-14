@@ -62,8 +62,10 @@ const cfgExt = ".cfg.json"
 const tsLayout = time.RFC3339
 
 // ErrSnapshotExists is reported (wrapped, in BackupResult.Err) when a run's
-// snapshot key already exists in the store. Snapshot keys are WRITE-ONCE: a
-// backup never overwrites an existing backup. See backupOne for why.
+// snapshot key already exists in the store, or another run — concurrent, or one
+// that died mid-backup — has already claimed its timestamp. Snapshot keys are
+// WRITE-ONCE: a backup never overwrites an existing backup, and of concurrent
+// runs at one timestamp exactly one publishes. See backupOne for why.
 var ErrSnapshotExists = errors.New("backup: snapshot key already exists")
 
 // BackupOpts configures a single Backup run.
@@ -194,28 +196,22 @@ func backupOne(ctx context.Context, store *vector.CollectionStore, obj objstore.
 	cfgKey := cfgKeyFor(key)
 
 	// Snapshot keys are WRITE-ONCE. The two objects of a backup (config, snapshot)
-	// are independent Puts, and no ordering of two independent Puts can keep an
-	// EXISTING pair consistent through a re-run at the same timestamp: whichever
-	// Put fails second leaves the surviving old object paired with a new one
-	// (config-first tears on a failed snapshot Put, snapshot-first tears on a
-	// failed config Put). Refusing to touch an already-backed-up key removes the
-	// overwrite case entirely, so the config-first ordering below is then a TOTAL
-	// pairing guarantee, not just a fresh-key one. It also turns an accidental
-	// same-second collision (tsLayout is second-granularity) into a clean error
-	// instead of a silently overwritten backup. List with the exact key as prefix
-	// is the interface's cheapest existence probe (no body transfer on S3).
-	existing, err := obj.List(ctx, key)
-	if err != nil {
-		res.Err = fmt.Errorf("backup %q: probe %q: %w", name, key, err)
-		return res
-	}
-	for _, info := range existing {
-		if info.Key == key {
-			res.Err = fmt.Errorf("backup %q: %q: %w", name, key, ErrSnapshotExists)
-			return res
-		}
-	}
-
+	// are independent writes, and no ordering of two independent writes can keep
+	// an EXISTING pair consistent through a re-run at the same timestamp: whichever
+	// write fails second leaves the surviving old object paired with a new one.
+	// Refusing to touch an already-claimed timestamp removes the overwrite case
+	// entirely, so the config-first ordering below is a TOTAL pairing guarantee,
+	// not just a fresh-key one. It also turns an accidental same-second collision
+	// (tsLayout is second-granularity) into a clean error instead of a silently
+	// overwritten backup.
+	//
+	// The refusal must be ATOMIC, not a probe followed by writes: two runs at one
+	// timestamp — an admin backup landing in the ticker's second, or two processes
+	// backing up the same prefix — would both see the key absent and both publish.
+	// So the claim is the first write itself, made with PutIfAbsent on the CONFIG
+	// key: exactly one run creates it, and every other run fails there, before it
+	// has written anything. The snapshot then goes second, also with PutIfAbsent.
+	//
 	// Sibling config object FIRST, snapshot SECOND. The ordering is load-bearing:
 	// LatestKey/prune key off the <ts>.snap object, so writing the config before
 	// the snapshot means every snapshot that can ever be selected as "latest"
@@ -223,13 +219,19 @@ func backupOne(ctx context.Context, store *vector.CollectionStore, obj objstore.
 	// quantization / IndexType / Vamana geometry / FullText, so a config-less
 	// restore of such a collection is silently degraded (wrong metric/geometry, or
 	// an empty BM25 index) or fails after already dropping the target. Were the
-	// snapshot written first, an interruption between the two Puts would leave a
+	// snapshot written first, an interruption between the two writes would leave a
 	// selectable snapshot with no config; this order can only ever leave an orphan
-	// config with no snapshot, which LatestKey/prune ignore (they filter on .snap)
-	// — harmless, though not self-healing: later runs use a distinct timestamp key,
-	// so an orphan config persists until a manual sweep (prune only deletes configs
-	// paired with a pruned snapshot; the write-once probe above keys off the
-	// snapshot, so a re-run at the orphan's timestamp is allowed and replaces it).
+	// config with no snapshot, which LatestKey/prune ignore (they filter on .snap).
+	//
+	// Because the config is the claim, an orphan config HOLDS its timestamp: a
+	// re-run at that exact timestamp is refused, since from outside it cannot be
+	// told apart from a run still writing its snapshot. That is why the claim is
+	// released (the config deleted) on every failure that certainly left no
+	// snapshot of ours behind; only a crash, or a snapshot write whose outcome is
+	// unknown, leaves an orphan. Later runs use a distinct timestamp key, so an
+	// orphan never blocks the periodic backup; it persists until a manual sweep
+	// (prune only deletes configs paired with a pruned snapshot).
+	//
 	// We reuse the same JSON marshal the store uses for its on-disk <col>.json
 	// sidecar.
 	cfgData, err := json.Marshal(c.Config())
@@ -237,10 +239,24 @@ func backupOne(ctx context.Context, store *vector.CollectionStore, obj objstore.
 		res.Err = fmt.Errorf("backup %q: marshal config: %w", name, err)
 		return res
 	}
-	if err := obj.Put(ctx, cfgKey, strings.NewReader(string(cfgData)), int64(len(cfgData))); err != nil {
-		res.Err = fmt.Errorf("backup %q: put %q: %w", name, cfgKey, err)
+	if err := obj.PutIfAbsent(ctx, cfgKey, strings.NewReader(string(cfgData)), int64(len(cfgData))); err != nil {
+		if errors.Is(err, objstore.ErrExists) {
+			res.Err = fmt.Errorf("backup %q: %q is already claimed by %q: %w", name, key, cfgKey, ErrSnapshotExists)
+		} else {
+			res.Err = fmt.Errorf("backup %q: put %q: %w", name, cfgKey, err)
+		}
 		return res
 	}
+	// claimed stays true only while the config may be paired with a snapshot of
+	// ours; any return with it still set means the snapshot was certainly not
+	// written, so the claim is released. The context is detached so a cancelled
+	// run still releases.
+	claimed := true
+	defer func() {
+		if claimed && res.Err != nil {
+			_ = obj.Delete(context.WithoutCancel(ctx), cfgKey)
+		}
+	}()
 
 	// Snapshot to a temp file so we know the exact byte size for Put's
 	// Content-Length (the object store streams the file; it does not buffer the
@@ -270,11 +286,27 @@ func backupOne(ctx context.Context, store *vector.CollectionStore, obj objstore.
 		return res
 	}
 
-	if err := obj.Put(ctx, key, tmp, size); err != nil {
+	if err := obj.PutIfAbsent(ctx, key, tmp, size); err != nil {
 		_ = tmp.Close()
-		res.Err = fmt.Errorf("backup %q: put %q: %w", name, key, err)
+		switch {
+		case errors.Is(err, objstore.ErrExists):
+			// A snapshot with no config of its own already holds this key (our
+			// config claim succeeded, so no run of this version wrote it). Leaving
+			// our config would pair it with that snapshot; the deferred release
+			// removes it.
+			res.Err = fmt.Errorf("backup %q: %q: %w", name, key, ErrSnapshotExists)
+		case errors.Is(err, objstore.ErrConditionalWriteUnsupported):
+			res.Err = fmt.Errorf("backup %q: put %q: %w", name, key, err)
+		default:
+			// The write may have landed (a timeout after the store committed), so
+			// the config must stay: deleting it could leave a selectable snapshot
+			// with no config.
+			claimed = false
+			res.Err = fmt.Errorf("backup %q: put %q: %w", name, key, err)
+		}
 		return res
 	}
+	claimed = false
 	_ = tmp.Close()
 	res.Key = key
 	res.Size = size
