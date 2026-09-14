@@ -144,7 +144,11 @@ package cache
 // construction), which is why shard.sieve caches it: the read path tests it on every
 // hit and a single bool load is what that should cost.
 func (s *shard) sieveVisited() bool {
-	return s.cfg.SieveVisitedBit && s.cfg.AtCapPolicy == PolicyRingbufEvict
+	// RelocatingEviction is part of the predicate because it is the ONLY consumer:
+	// without it no drain reads the hint, so marking would be pure write traffic on
+	// the read path for nothing. The config doc promises the bit is a no-op without
+	// it, and this is where that promise is kept rather than merely described.
+	return s.cfg.SieveVisitedBit && s.cfg.RelocatingEviction && s.cfg.AtCapPolicy == PolicyRingbufEvict
 }
 
 // setVisited marks slot as accessed. tag must be the tag the caller matched on.
