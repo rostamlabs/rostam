@@ -216,7 +216,17 @@ func (s *shard) walkLiveAtOpen(dropClock uint64, visit func(key, value []byte, e
 				break
 			}
 			meta := entryMetaAt(entries[cursor:tail])
-			size := entrySize(len(key), len(value))
+			// EXACT, and NOT HEAP-REACHABLE. Cold compaction is the mmap pages file's
+			// open-time rewrite (see the header of this file); a heap shard never gets
+			// here. The figure is both the cursor advance over already-encoded bytes
+			// and the size handed to the visit callback, which the callers sum into
+			// the staging file's byte frontier. Both are encoder lengths on a
+			// persisted page. (The frontier has to match what packLiveInto's
+			// page.Write actually consumes; that is the encode today, and if a
+			// persisted append ever reserved more than it encoded, the frontier would
+			// have to follow the reservation — another reason mmap framing must not
+			// acquire padding without this walk being revisited.)
+			size := entrySpanExact(len(key), len(value))
 			if s.entryIsLiveAtOpen(t, pageIdx, p.gen, cursor, key, exp, meta, dropClock) {
 				if !visit(key, value, exp, meta, size) {
 					return
@@ -231,7 +241,7 @@ func (s *shard) walkLiveAtOpen(dropClock uint64, visit func(key, value []byte, e
 func (s *shard) liveBytesAtOpen(dropClock uint64) uint64 {
 	var live uint64
 	s.walkLiveAtOpen(dropClock, func(_, _ []byte, _, _ uint64, size int) bool {
-		live += uint64(size) //nolint:gosec // entrySize is non-negative
+		live += uint64(size) //nolint:gosec // entrySpanExact is non-negative
 		return true
 	})
 	return live
@@ -249,12 +259,19 @@ func (s *shard) liveBytesAtOpen(dropClock uint64) uint64 {
 func (s *shard) packPagesNeeded(dropClock uint64) int {
 	usable := s.cfg.PageSize - pageHdrSize
 	pages, used := 1, 0
-	s.walkLiveAtOpen(dropClock, func(_, _ []byte, _, _ uint64, size int) bool {
-		if used+size > usable {
+	s.walkLiveAtOpen(dropClock, func(key, value []byte, _, _ uint64, _ int) bool {
+		// OCCUPANCY, and deliberately NOT the `size` walkLiveAtOpen hands over. That
+		// one is the exact framing, which is what liveBytesAtOpen wants; this function
+		// is a capacity decision authorising packLiveInto's page.Write calls, and the
+		// doc above promises it mirrors their next-fit rule EXACTLY. Write tests the
+		// occupancy against FreeTail, so this must too, or the mirror is a claim the
+		// code does not keep. Capacity/write rule, entrySpan.
+		span := entrySpan(len(key), len(value), true)
+		if used+span > usable {
 			pages++
 			used = 0
 		}
-		used += size
+		used += span
 		return true
 	})
 	return pages

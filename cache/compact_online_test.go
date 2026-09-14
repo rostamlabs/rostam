@@ -108,7 +108,7 @@ func TestOnlineReclaimableBytesAccounting(t *testing.T) {
 
 	// Overwrite half of them: each original copy becomes a dead duplicate. Reclaimable
 	// must jump by ~5 entries' worth of bytes.
-	perEntry := uint64(entrySize(len("k00"), len(val)))
+	perEntry := uint64(entrySpanExact(len("k00"), len(val))) // EXACT: mmap ghost-byte accounting
 	for i := 0; i < 5; i++ {
 		if err := c.PutAt([]byte(fmt.Sprintf("k%02d", i)), val, 0, S); err != nil {
 			t.Fatalf("overwrite k%02d: %v", i, err)
@@ -148,7 +148,7 @@ func TestReclaimableStatsCacheRateLimits(t *testing.T) {
 	c := eligibleOnlineCache(t, S+1_000_000, 1<<20, 8<<20)
 	s := c.shards[0]
 	val := bytes.Repeat([]byte("v"), 180_000)
-	perEntry := uint64(entrySize(len("k00"), len(val)))
+	perEntry := uint64(entrySpanExact(len("k00"), len(val))) // EXACT: mmap ghost-byte accounting
 
 	for i := 0; i < 6; i++ {
 		if err := c.PutAt([]byte(fmt.Sprintf("k%02d", i)), val, 0, S); err != nil {
@@ -461,7 +461,7 @@ func TestOnlineCompactionActionGatedWhenDisabled(t *testing.T) {
 	}
 	advanceLogicalClock(c, 1_000)
 	// Stage 0 observability IS live: the dead duplicates are reported as reclaimable.
-	perEntry := uint64(entrySize(len("k00"), len(val)))
+	perEntry := uint64(entrySpanExact(len("k00"), len(val))) // EXACT: mmap ghost-byte accounting
 	if got := s.reclaimableBytesNow(); got != uint64(nKeys)*perEntry {
 		t.Fatalf("reclaimable (observability) = %d, want %d", got, uint64(nKeys)*perEntry)
 	}

@@ -298,7 +298,7 @@ func TestOnRemoveEvictingPutFiresForItsOwnKey(t *testing.T) {
 	// Same-length keys, so every entry needs exactly the same number of bytes and
 	// "is there room for one more" is one question rather than two.
 	key := []byte("KKKKK")
-	need := entrySize(len(key), len(val))
+	need := entrySpan(len(key), len(val), true) // OCCUPANCY: "is there room for one more"
 
 	// K's only copy lands on page 0.
 	if err := c.Put(key, val, 0); err != nil {

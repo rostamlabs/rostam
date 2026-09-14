@@ -137,7 +137,8 @@ func TestReserveRelocationRemembersASkipAcrossChunks(t *testing.T) {
 		s.mu.RLock()
 		room, pages := s.pages[0].FreeTail(), len(s.pages)
 		s.mu.RUnlock()
-		if pages > 1 || room < entrySize(len(relocKey(0)), smallLen) {
+		// OCCUPANCY: room for one more Put on a heap page.
+		if pages > 1 || room < entrySpan(len(relocKey(0)), smallLen, true) {
 			break
 		}
 		mustPut(t, c, relocKey(1000+fillers), small)
@@ -198,7 +199,8 @@ func TestReserveRelocationDeclinesARecordThatWouldEatTheGain(t *testing.T) {
 	s.mu.RLock()
 	tail, minGain := s.pages[0].tail(), s.maxEntryBytes()/relocateReserveMinGainDivisor
 	s.mu.RUnlock()
-	if tail-entrySize(len(hog), 900<<10) >= minGain {
+	// OCCUPANCY: reproduces the reserve's own tail-minus-relocatedOut arithmetic.
+	if tail-entrySpan(len(hog), 900<<10, true) >= minGain {
 		t.Fatalf("the seed does not set up the case: tail %d minus the record still clears minGain %d",
 			tail, minGain)
 	}

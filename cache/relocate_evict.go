@@ -232,7 +232,14 @@ func (s *shard) relocateIntoFreedPageLocked(freedIdx, need int) (uint64, uint64)
 			// exactly as retirePageLocked does.
 			break
 		}
-		size := entrySize(len(key), len(value))
+		// OCCUPANCY, and this one number serves four consumers, every one of which
+		// wants the room the record takes up rather than the bytes its encoder wrote:
+		// the cursor advance over the source page, the relocation budget (`spent`),
+		// the movedBytes charged to page.relocatedOut, and — through the budget —
+		// the room the destination append will need, which is this site's half of
+		// the capacity/write rule (see entrySpan). HEAP-REACHABLE: heap ringbuf
+		// under Config.RelocatingEviction runs this pass.
+		size := entrySpan(len(key), len(value), true)
 		if budget-spent < entryHeaderSize {
 			// Not even an empty entry could fit: the budget is spent, and no later record
 			// can change that. This is the ONLY early exit — a budget test against a
@@ -304,7 +311,7 @@ func (s *shard) relocateIntoFreedPageLocked(freedIdx, need int) (uint64, uint64)
 		// counts are untouched and it can neither grow nor need a rehash here.
 		t.upsert(h, makeSlabRef(uint16(freedIdx), dst.gen, off)) //nolint:gosec // freedIdx bounded by MaxPagesPerShard (≤65535)
 		spent += size
-		movedBytes += uint64(size) //nolint:gosec // entrySize is non-negative
+		movedBytes += uint64(size) //nolint:gosec // entrySpan is non-negative
 		moved++
 		cursor += size
 	}

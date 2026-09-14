@@ -59,11 +59,13 @@ func padPageDownTo(t *testing.T, c *Cache, leave int) int {
 		}
 		key := []byte(fmt.Sprintf("pad-%02d-%06d", idx, i))
 		room := free - leave
-		if room < entrySize(len(key), 1) {
+		// OCCUPANCY throughout: this lands the page's FreeTail on an exact figure, so
+		// it has to reason in the room a Put consumes.
+		if room < entrySpan(len(key), 1, true) {
 			t.Fatalf("cannot land exactly on %d free bytes: %d left, entry overhead %d",
-				leave, room, entrySize(len(key), 0))
+				leave, room, entrySpan(len(key), 0, true))
 		}
-		vlen := room - entrySize(len(key), 0)
+		vlen := room - entrySpan(len(key), 0, true)
 		if vlen > 64<<10 {
 			vlen = 64 << 10
 		}
@@ -235,7 +237,7 @@ func physicalCopies(s *shard, key []byte) int {
 			if bytes.Equal(k, key) {
 				n++
 			}
-			cursor += entrySize(len(k), len(v))
+			cursor += entrySpanExact(len(k), len(v)) // EXACT: a walk over persisted mmap bytes
 		}
 	}
 	return n
@@ -405,7 +407,8 @@ func TestRingbufTombstoneAppendThatEvictsKeepsIndexConsistent(t *testing.T) {
 	}
 	const leave = 300
 	padPageDownTo(t, c, leave)
-	if need := entrySize(len(victim), 0); need <= leave {
+	// OCCUPANCY: the room the tombstone append will ask findOrMakePageLocked for.
+	if need := entrySpan(len(victim), 0, true); need <= leave {
 		t.Fatalf("setup: the tombstone needs %d bytes but %d are free — no eviction "+
 			"would be forced", need, leave)
 	}

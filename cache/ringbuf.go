@@ -248,7 +248,97 @@ func decodeEntryFast(src []byte) (key, value []byte, expiryMs uint64, err error)
 	return key, value, expiryMs, nil
 }
 
-// entrySize returns the byte size an entry will occupy on disk.
-func entrySize(keyLen, valueLen int) int {
+// entrySpanExact returns the EXACT byte size an entry's framing occupies: the
+// header, the key and the value, and nothing else. It is the encoder's length —
+// precisely what encodeEntry / encodeEntryNoCRC will write — so it is the right
+// figure wherever the question is "how many bytes does this framing consume" and
+// the wrong one wherever the question is "how much of the page does this entry
+// OCCUPY".
+//
+// Today those two questions have the same answer everywhere, which is why this
+// used to be one function (entrySize) and why every caller of it was right by
+// accident. Splitting them is deliberate: a call site that has recorded WHICH of
+// the two it means is a call site nobody has to re-derive later.
+//
+// FOUR PLACES COMPUTE THIS SUM INLINE INSTEAD OF CALLING IT, and none of them is
+// an oversight: encodeEntryHeader, decodeEntry and decodeEntryFast DEFINE the
+// framing rather than predicting it (their `total` is the layout itself, taken
+// from the header's own fields), and page.EvictFront reads those fields out of
+// crash-exposed bytes behind its own overflow guards. Note that the rename that
+// introduced this function could not force a visit to any of the four; they were
+// found by grep, not by the compiler.
+func entrySpanExact(keyLen, valueLen int) int {
 	return entryHeaderSize + keyLen + valueLen
+}
+
+// entrySpan returns the bytes an entry OCCUPIES on a page. padded says which
+// question the caller is asking:
+//
+//   - padded=false — the exact framing, byte for byte. For a caller that is
+//     measuring or reproducing an encode.
+//   - padded=true — the occupancy: the room an append reserves, the amount a page
+//     walk steps by, the extent a band check must contain. For a caller that is
+//     reasoning about page space rather than about encoder output.
+//
+// BOTH RETURN THE SAME NUMBER TODAY, because classOf is an identity and there are
+// therefore no size classes for an entry to be padded into. The distinction is
+// carried anyway so that it is recorded at each site while the two are still
+// provably equal, rather than being reconstructed from scratch by whoever first
+// makes them differ.
+//
+// # The capacity/write rule
+//
+// WHEREVER A CAPACITY DECISION AND THE WRITE IT AUTHORISES DERIVE THEIR SIZE
+// INDEPENDENTLY, BOTH MUST USE THE OCCUPANCY SPAN.
+//
+// This is the one failure this whole split exists to prevent, and it is a single
+// shape wearing several costumes. A capacity check that measures LESS than the
+// write reserves says yes and then hands the write an errPageFull its caller
+// treats as unreachable — every one of those call sites comments the error as
+// "the budget already proved the room". The check does not have to be wrong in
+// isolation; it only has to disagree with page.Write, which reserves the
+// occupancy. So the two numbers must come from the same question, not merely be
+// equal by coincidence.
+//
+// Every such pair in the package, all of them occupancy on both sides:
+//
+//	page.Write               FreeTail check      / its own tail advance
+//	putAtExpLocked           findOrMakePageLocked / the page.Write after it
+//	delH                     findOrMakePageLocked / the tombstone page.Write
+//	relocateIntoFreedPageLocked  the eviction budget  / dst.Write
+//	reserveMoveVictim        reserveDestinationLocked / dst.Write
+//	tryRelocatePageLocked    findRelocDestLocked  / the destination page.Write
+//	packPagesNeeded          the next-fit frontier / packLiveInto's page.Write
+//
+// The room helpers themselves (findOrMakePageLocked, firstPageWithRoomLocked,
+// evictUntilFitsLocked, findRelocDestLocked, reserveDestinationLocked) take a
+// `need` and compare it against FreeTail, so they are correct for whatever their
+// callers pass and the rule binds the CALLERS.
+//
+// page.Write is the anchor the rest are checked against: it is the only place
+// that turns a span into reserved bytes, and TestPageWriteReservesTheOccupancySpan
+// pins it to entrySpan(..., true) exactly.
+func entrySpan(keyLen, valueLen int, padded bool) int {
+	if padded {
+		return entrySpanExact(keyLen, classOf(valueLen))
+	}
+	return entrySpanExact(keyLen, valueLen)
+}
+
+// classOf maps a value length to the length of the size CLASS that holds it — the
+// value length an entry framed for that value would actually reserve.
+//
+// IT IS THE IDENTITY FUNCTION. There are no size classes: every entry reserves
+// exactly its own value's length, which is what the whole package does today and
+// what makes entrySpan(padded=true) equal to entrySpanExact. It exists now, ahead
+// of any class scheme, so that the contract its tests pin —
+//
+//	classOf(v) >= v          a class must be able to hold its value
+//	v <= w  ⇒  classOf(v) <= classOf(w)     classes are ordered like lengths
+//	classOf(v) <= maxValueLen and never negative, right up to the top of the range
+//
+// — is already tested against a working implementation, and any later class
+// function is a drop-in that either satisfies it or fails an existing test.
+func classOf(valueLen int) int {
+	return valueLen
 }

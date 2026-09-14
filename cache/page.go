@@ -167,7 +167,11 @@ func (p *page) Empty() bool { return p.head() == p.tail() }
 // passed through VERBATIM: cold compaction re-writes surviving entries through
 // this same method and must not alter their recency or tombstone bit.
 func (p *page) Write(key, value []byte, expiryMs, meta uint64) (offset uint32, size uint32, err error) {
-	need := entrySize(len(key), len(value))
+	// OCCUPANCY. This number reserves tail room, so it is the room the entry takes
+	// up on the page, not the byte count the encoder emits — an append is the site
+	// that would have to reserve a whole class for the entry to have any slack to
+	// be rewritten into later. Equal to the exact framing today.
+	need := entrySpan(len(key), len(value), true)
 	if p.FreeTail() < need {
 		return 0, 0, errPageFull
 	}
@@ -182,8 +186,13 @@ func (p *page) Write(key, value []byte, expiryMs, meta uint64) (offset uint32, s
 		return 0, 0, err
 	}
 	off := uint32(tail) //nolint:gosec // tail < PageSize which is validated ≤ MaxInt32
+	// tail advances by the ENCODER'S length, while the room check above reserved the
+	// OCCUPANCY — this method's own half of the capacity/write rule (see entrySpan).
+	// The moment an append reserves more than it encodes, this is the line that must
+	// advance by `need` instead, or the reservation is handed straight back to the
+	// next append and there is no slack to rewrite into.
 	p.setTail(tail + n)
-	return off, uint32(n), nil //nolint:gosec // n = entrySize which fits in uint32
+	return off, uint32(n), nil //nolint:gosec // n = the entry framing, which fits in uint32
 }
 
 // WriteAt overwrites the entry framed at offset with a new one of the SAME size,
@@ -216,14 +225,26 @@ func (p *page) WriteAt(offset uint32, key, value []byte, expiryMs, meta uint64) 
 	if p.backing != backingHeap {
 		return errPageNotOverwritable
 	}
-	need := entrySize(len(key), len(value))
+	// TWO DIFFERENT QUESTIONS AT ONE SITE, the same number today.
+	//
+	// span is OCCUPANCY: the band check below asks how much of the page this entry
+	// takes up, which is the room reserved for it rather than the bytes written
+	// into it.
+	//
+	// exact is the ENCODER'S LENGTH: the destination is sliced to precisely it so
+	// that encodeEntryNoCRC's own length check is the backstop against a mis-sized
+	// write spilling into the next entry (see the doc comment). Slicing the
+	// destination to the occupancy instead would loosen that backstop by whatever
+	// the two differ by, so the split has to be kept even once they do differ.
+	span := entrySpan(len(key), len(value), true)
+	exact := entrySpanExact(len(key), len(value))
 	// The entry must lie wholly inside the page's LIVE band. Below head it has been
 	// evicted; at or past tail it is free space a future append owns. Either way it
 	// is not an entry anyone may overwrite.
-	if int(offset) < p.head() || int(offset)+need > p.tail() {
+	if int(offset) < p.head() || int(offset)+span > p.tail() {
 		return errEntryTruncated
 	}
-	_, err := encodeEntryNoCRC(p.entries()[offset:int(offset)+need], key, value, expiryMs, meta)
+	_, err := encodeEntryNoCRC(p.entries()[offset:int(offset)+exact], key, value, expiryMs, meta)
 	return err
 }
 
@@ -233,6 +254,38 @@ func (p *page) WriteAt(offset uint32, key, value []byte, expiryMs, meta uint64) 
 // [decodeEntryFast] for why this is safe on the hot path. The entry's size
 // is recovered from its header by [decodeEntryFast], so the caller doesn't
 // have to remember it (slabRef no longer carries it).
+//
+// IT IS THE ONE ENTRY WALK IN THIS PACKAGE THAT IS NOT BOUNDED AT tail, and that
+// is deliberate rather than an oversight. Every other walk (compact.go,
+// compact_online.go, relocate_evict.go, relocate_reserve.go, shard.go) slices
+// entries[cursor:tail] — each of them holds s.mu, so tail is stable under it.
+// Read is called from the LOCK-FREE read path (indexTable.get / getSeq), which
+// holds nothing: p.tail() is a plain field on a heap page and plain header bytes
+// on an mmap one, both stored by an appending writer, so reading it here would be
+// an unsynchronised read of mutable state — a data race, not a tightening.
+//
+// THE BOUND IS UNNECESSARY BECAUSE THE FRAMING IS IMMUTABLE, NOT BECAUSE NOTHING
+// RACES. Under Config.InPlaceSeqlockReads a heap page is read lock-free by getSeq
+// while WriteAt rewrites a live entry in place, so live bytes genuinely do change
+// under a reader here. What does NOT change is the framing: WriteAt is reached
+// only through inPlaceTargetLocked, where guard 4c has proved the stored key
+// equal to the caller's and guard 5 the stored value's length equal to the new
+// one's. So encodeEntryHeader restores keyLen at [0:2] and valLen at [2:6] with
+// the bytes already in them, and a torn read of either field yields the same
+// value whichever side of the store it lands on. `total` is therefore the same
+// number before, during and after the rewrite, and the decode stays in bounds.
+//
+// What genuinely tears is the expiry, the meta word and the value bytes (the heap
+// encoder does not rewrite the CRC slot at all). The read is BOUNDS-SAFE but not
+// VALUE-CORRECT, and it is the seqlock version check around this call — not
+// anything here — that turns an incorrect value into a retry.
+//
+// A SLACK-CAPABLE IN-PLACE WRITE WOULD NOT INHERIT THAT. Admitting a rewrite whose
+// value merely fits the stored entry's size class means valLen is rewritten with
+// DIFFERENT bytes, so a torn length is bounded by neither the old value nor the
+// new one and the decode can run past the entry. That path is the one that needs
+// the tail bound — and would first need tail published atomically, since the read
+// it must protect is exactly the one that cannot take the lock.
 func (p *page) Read(offset uint32) ([]byte, []byte, uint64, error) {
 	entries := p.entries()
 	if int(offset) >= len(entries) {
@@ -259,6 +312,13 @@ func (p *page) MetaAt(offset uint32) (uint64, bool) {
 // the freed region is reused by a later Write, so the caller must consume it
 // (e.g. hash it) immediately. The sole caller (evictUntilFitsLocked) does. If
 // the page is empty, returns errEntryTruncated.
+//
+// NOT HEAP-REACHABLE, and it frames the entry's span INLINE rather than through
+// entrySpan — deliberately, on both counts. It is the mmap eviction path only
+// (heap ringbuf retires pages by frozen replacement, see drainPageLocked), and it
+// reads keyLen/valLen straight out of crash-exposed bytes, so the arithmetic here
+// is guarded corruption handling rather than a size computation and must stay
+// where its guards are. Nobody should "unify" it with entrySpan.
 func (p *page) EvictFront() ([]byte, uint32, error) {
 	if p.Empty() {
 		return nil, 0, errEntryTruncated

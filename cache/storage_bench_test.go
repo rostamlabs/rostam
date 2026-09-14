@@ -14,7 +14,7 @@ import (
 func BenchmarkRingbufCodec(b *testing.B) {
 	key := []byte("benchmark-key-0123456789")
 	val := benchValue()
-	dst := make([]byte, entrySize(len(key), len(val)))
+	dst := make([]byte, entrySpanExact(len(key), len(val))) // EXACT: the encoders' output buffer
 	enc, _ := encodeEntry(dst, key, val, 0, makeMeta(1, false))
 	_ = enc
 
@@ -49,7 +49,7 @@ func BenchmarkRingbufCodec(b *testing.B) {
 func BenchmarkPageWrite(b *testing.B) {
 	key := []byte("benchmark-key-0123456789")
 	val := benchValue()
-	need := entrySize(len(key), len(val))
+	need := entrySpan(len(key), len(val), true) // OCCUPANCY: mirrors page.Write's tail check
 	p := newHeapPage(1 << 20)
 	b.ReportAllocs()
 	for b.Loop() {
