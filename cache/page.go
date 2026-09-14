@@ -233,6 +233,22 @@ func (p *page) WriteAt(offset uint32, key, value []byte, expiryMs, meta uint64) 
 // [decodeEntryFast] for why this is safe on the hot path. The entry's size
 // is recovered from its header by [decodeEntryFast], so the caller doesn't
 // have to remember it (slabRef no longer carries it).
+//
+// IT IS THE ONE ENTRY WALK IN THIS PACKAGE THAT IS NOT BOUNDED AT tail, and that
+// is deliberate rather than an oversight. Every other walk (compact.go,
+// compact_online.go, relocate_evict.go, relocate_reserve.go, shard.go) slices
+// entries[cursor:tail] — each of them holds s.mu, so tail is stable under it.
+// Read is called from the LOCK-FREE read path (indexTable.get / getSeq), which
+// holds nothing: p.tail() is a plain field on a heap page and plain header bytes
+// on an mmap one, both stored by an appending writer, so reading it here would be
+// an unsynchronised read of mutable state — a data race, not a tightening.
+//
+// Nothing is lost by that today. A lock-free reader only ever reaches a page
+// whose entries are append-only for its lifetime (heap ringbuf retires by frozen
+// replacement behind the generation gate; reject-writes never overwrites), so an
+// entry's valLen is immutable once its ref is published and the decode below is
+// in bounds by construction. A read path that DID let valLen change underneath it
+// would need the tail bound — and would first need tail published atomically.
 func (p *page) Read(offset uint32) ([]byte, []byte, uint64, error) {
 	entries := p.entries()
 	if int(offset) >= len(entries) {
@@ -259,6 +275,13 @@ func (p *page) MetaAt(offset uint32) (uint64, bool) {
 // the freed region is reused by a later Write, so the caller must consume it
 // (e.g. hash it) immediately. The sole caller (evictUntilFitsLocked) does. If
 // the page is empty, returns errEntryTruncated.
+//
+// It frames the entry's span INLINE rather than through a shared size helper,
+// deliberately: it reads keyLen/valLen straight out of crash-exposed bytes, so
+// the arithmetic here is guarded corruption handling rather than a size
+// computation and must stay where its guards are. It is also the mmap eviction
+// path only — heap ringbuf retires pages by frozen replacement instead (see
+// drainPageLocked).
 func (p *page) EvictFront() ([]byte, uint32, error) {
 	if p.Empty() {
 		return nil, 0, errEntryTruncated
