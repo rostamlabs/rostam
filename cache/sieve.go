@@ -151,7 +151,43 @@ func (s *shard) sieveVisited() bool {
 	return s.cfg.SieveVisitedBit && s.cfg.RelocatingEviction && s.cfg.AtCapPolicy == PolicyRingbufEvict
 }
 
-// setVisited marks slot as accessed. tag must be the tag the caller matched on.
+// setVisited marks slot as accessed. tag must be the tag the caller matched on, and
+// ref the slabRef the caller SETTLED on — the one whose bytes it read and whose key
+// it confirmed, after any rechase.
+//
+// THE TAG ALONE DOES NOT IDENTIFY THE RECORD, AND MARKING ON IT ALONE MARKS THE WRONG
+// KEY. A lock-free reader confirms its key and only then marks; in between, a writer
+// can delete that key and insert a different one, whose upsert reuses the slot's
+// tombstone. A tag is 16 bits of hash, so an unrelated key shares one about once in
+// 65,536 — and on a collision the late mark lands on the new occupant. That occupant
+// is a freshly INSERTED key, which is precisely the record this policy must see as
+// unvisited: the one-hit-wonder resistance the whole design rests on is that a
+// write-once key arrives unmarked. So the failure is not a generic staleness, it is
+// the discriminating half of SIEVE being defeated from the other direction.
+//
+// THE REF IS THE IDENTITY CHECK, AND IT IS FREE. It packs page index, generation and
+// offset, so two different records cannot share one; and the caller already loaded it
+// to find the bytes it read, so re-reading it here hits the same line the probe just
+// touched. Checking it turns "16 bits of hash agree" into "this is the same physical
+// record".
+//
+// THE RESIDUAL, STATED RATHER THAN PAPERED OVER. The check narrows the window to the
+// few instructions between the ref load and the CAS; it does not close it. A wrong
+// mark would now need the slot tombstoned, re-pointed AND re-published with a
+// colliding tag inside that window. If it ever happened the cost is bounded to what
+// relocation did before this hint existed — one live record carried forward
+// positionally — for one rotation, because the hand clears the mark as it passes.
+// That is the mildest failure available: the status quo ante, for one record.
+//
+// A MISMATCH IS A DROPPED HINT, WHICH IS ALWAYS SAFE. If relocation repoints the slot
+// between the read and the mark, the ref no longer matches and the mark is skipped.
+// Losing a hint costs one missed retention and can never produce a wrong answer, so
+// the guard is free to be conservative.
+//
+// THE WRITE PATHS DO NOT NEED THIS GUARD BUT PASS IT ANYWAY. They hold s.mu, and every
+// slot mutation happens under it, so no reuse can interleave with them. One function
+// with one rule is worth more than a second entry point whose safety argument depends
+// on its caller holding a lock.
 //
 // IT IS A COMPARE-AND-SWAP RATHER THAN AN OR, and the reason is a race a plain
 // read-modify-write would lose. A lock-free reader can match a tag and then have the
@@ -171,9 +207,12 @@ func (s *shard) sieveVisited() bool {
 // compare on its first attempt, so only the FIRST read after a drain cleared the bit
 // performs a real store; and the line is per-SLOT, not one word every reader of the
 // shard shares.
-func (t *indexTable) setVisited(slot, tag uint64) {
+func (t *indexTable) setVisited(slot, tag uint64, ref slabRef) {
 	if t.ctrl[slot].Load() != tag {
 		return // already marked, or no longer the slot the caller matched
+	}
+	if slabRef(t.refs[slot].Load()) != ref {
+		return // the slot no longer names the record the caller read
 	}
 	t.ctrl[slot].CompareAndSwap(tag, tag|ctrlVisited)
 }

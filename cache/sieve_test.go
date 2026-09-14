@@ -111,11 +111,11 @@ func TestSieveHintSurvivesRehash(t *testing.T) {
 	}
 	// Mark the even ones.
 	for i := 0; i < n; i += 2 {
-		slot, _, ok := tab.findSlot(hashes[i])
+		slot, ref, ok := tab.findSlot(hashes[i])
 		if !ok {
 			t.Fatalf("entry %d missing before the rehash", i)
 		}
-		tab.setVisited(slot, tagFor(hashes[i]))
+		tab.setVisited(slot, tagFor(hashes[i]), ref)
 	}
 
 	nt := tab.rehashed()
@@ -131,6 +131,71 @@ func TestSieveHintSurvivesRehash(t *testing.T) {
 		if want := i%2 == 0; marked != want {
 			t.Errorf("entry %d: marked=%v after rehash, want %v", i, marked, want)
 		}
+	}
+}
+
+// TestSieveMarkDoesNotFollowSlotReuse reproduces the one way a mark can land on the
+// WRONG record, deterministically rather than by racing for it.
+//
+// THE INTERLEAVING. A lock-free reader matches slot i's tag, loads its ref, reads the
+// record and confirms the key — and only then marks. Between the confirm and the mark
+// a writer can delete that key and insert a DIFFERENT one, whose upsert reuses slot
+// i's tombstone. The control word the reader then marks belongs to the new occupant.
+//
+// THE TAG DOES NOT CATCH IT. A tag is 16 bits of hash, so two unrelated keys share
+// one about once in 65,536, and on a collision the reader's tag test passes against
+// the new occupant's control word. That is why identity has to be checked against
+// something narrower than the tag, and the ref — page, generation and offset packed
+// together — is what the reader already holds.
+//
+// WHY IT MATTERS MORE THAN ITS RATE SUGGESTS. The replacement is a freshly INSERTED
+// key, which is exactly the record SIEVE must see as unvisited: the whole
+// one-hit-wonder resistance is that a write-once key arrives unmarked. A spurious
+// mark is that guarantee failing by another route.
+//
+// The hashes below are built to collide on their top 16 bits AND to probe from the
+// same slot, so the reuse is forced rather than waited for.
+func TestSieveMarkDoesNotFollowSlotReuse(t *testing.T) {
+	const (
+		hOld = 0xABCD<<48 | 0x01 // same top 16 bits => same tag
+		hNew = 0xABCD<<48 | 0x11 // same low bits mod the mask => same start slot
+	)
+	tab := newIndexTable(4)
+	if tagFor(hOld) != tagFor(hNew) {
+		t.Fatal("precondition: the two hashes must share a tag")
+	}
+	if hOld&tab.mask != hNew&tab.mask {
+		t.Fatal("precondition: the two hashes must probe from the same slot")
+	}
+
+	refOld := makeSlabRef(1, 7, 128)
+	slot, _ := tab.upsert(hOld, refOld)
+
+	// The writer's half: the reader's key is deleted and a different key takes the
+	// slot back. upsert reuses the tombstone, so the new occupant IS slot.
+	tab.tombstone(slot)
+	refNew := makeSlabRef(2, 9, 4096)
+	newSlot, inserted := tab.upsert(hNew, refNew)
+	if newSlot != slot || !inserted {
+		t.Fatalf("precondition: expected the new key to reuse slot %d as an insert, got slot %d inserted=%v",
+			slot, newSlot, inserted)
+	}
+	if tab.ctrl[slot].Load()&ctrlVisited != 0 {
+		t.Fatal("precondition: a freshly inserted key must start unvisited")
+	}
+
+	// The reader's half, arriving late with the ref it validated.
+	tab.setVisited(slot, tagFor(hOld), refOld)
+
+	if tab.ctrl[slot].Load()&ctrlVisited != 0 {
+		t.Error("a late mark landed on the key that reused the slot; " +
+			"a freshly inserted key must not inherit another record's reference")
+	}
+	// And the mark must still work for the record that IS there, or the guard has
+	// simply disabled the feature.
+	tab.setVisited(slot, tagFor(hNew), refNew)
+	if tab.ctrl[slot].Load()&ctrlVisited == 0 {
+		t.Error("the guard rejected a mark whose ref matches the slot's current record")
 	}
 }
 

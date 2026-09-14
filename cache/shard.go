@@ -1069,6 +1069,20 @@ func (s *shard) inPlaceEligible() bool {
 	return !s.isMmap
 }
 
+// inPlaceTarget is the entry a same-size update will overwrite, plus the index
+// coordinates that located it. The coordinates travel together deliberately: a slot
+// index is meaningless against any table but the one it was found in, and the ref is
+// what distinguishes THAT record from whatever else may come to occupy the slot, so
+// handing back the slot without both is handing back an identity that cannot be
+// checked (see indexTable.setVisited).
+type inPlaceTarget struct {
+	p    *page
+	off  uint32
+	tab  *indexTable
+	slot uint64
+	ref  slabRef
+}
+
 // inPlaceTargetLocked resolves the entry a same-size update of (key, value)
 // would overwrite: the page object and offset of the copy the index currently
 // points at, when that copy's framing is byte-identical to what the new write
@@ -1101,40 +1115,37 @@ func (s *shard) inPlaceEligible() bool {
 //	    which an index-current entry can occupy; refusing is cheaper than
 //	    reasoning about how a violation could arise.
 //
-// It also returns the index TABLE and SLOT the target was resolved through, which
-// the caller needs for nothing but the SIEVE reference hint (cache/sieve.go): an
-// in-place rewrite is the one write that leaves no other trace of having happened,
-// so the slot is the only place it can record that the key is in use. The table is
-// handed back with it rather than re-loaded, so the slot index is always applied to
-// the table it was found in — re-loading would be a second read of s.tab and a slot
-// index is meaningless against any other table.
-func (s *shard) inPlaceTargetLocked(key, value []byte, h uint64) (*page, uint32, *indexTable, uint64, bool) {
+// The index coordinates come back with it (see inPlaceTarget), for the SIEVE
+// reference hint and nothing else: an in-place rewrite is the one write that leaves
+// no other trace of having happened, so the index slot is the only place it can
+// record that the key is in use.
+func (s *shard) inPlaceTargetLocked(key, value []byte, h uint64) (inPlaceTarget, bool) {
 	t := s.tab.Load()
 	slot, ref, found := t.findSlot(h)
 	if !found {
-		return nil, 0, nil, 0, false // (4a) key absent
+		return inPlaceTarget{}, false // (4a) key absent
 	}
 	idx := int(ref.pageIdx())
 	if idx >= len(s.pages) {
-		return nil, 0, nil, 0, false // (4b) ref outside the allocated page list
+		return inPlaceTarget{}, false // (4b) ref outside the allocated page list
 	}
 	p := s.pages[idx]
 	if p == nil || p.gen != ref.gen() {
-		return nil, 0, nil, 0, false // (4b) page retired and replaced since the ref was minted
+		return inPlaceTarget{}, false // (4b) page retired and replaced since the ref was minted
 	}
 	off := ref.offset()
 	storedKey, storedVal, storedExp, err := p.Read(off)
 	if err != nil {
-		return nil, 0, nil, 0, false // (4c) unreadable framing
+		return inPlaceTarget{}, false // (4c) unreadable framing
 	}
 	if !bytes.Equal(storedKey, key) {
-		return nil, 0, nil, 0, false // (4c) hash collision: a different key's entry
+		return inPlaceTarget{}, false // (4c) hash collision: a different key's entry
 	}
 	if len(storedVal) != len(value) {
-		return nil, 0, nil, 0, false // (5) different size: the framing would not line up
+		return inPlaceTarget{}, false // (5) different size: the framing would not line up
 	}
 	if int(off) < p.head() || int(off)+entrySize(len(key), len(value)) > p.tail() {
-		return nil, 0, nil, 0, false // (4d) not inside the page's live band
+		return inPlaceTarget{}, false // (4d) not inside the page's live band
 	}
 	// GUARD 6 — the stored copy must still be LIVE. An expired copy is dead
 	// weight, and rewriting it where it lies pins those bytes instead of letting
@@ -1152,9 +1163,9 @@ func (s *shard) inPlaceTargetLocked(key, value []byte, h uint64) (*page, uint32,
 	// The clock is read ONLY when the stored copy actually carries an expiry, so
 	// the ordinary no-TTL write pays nothing for it.
 	if storedExp != 0 && isExpired(storedExp, s.now()) {
-		return nil, 0, nil, 0, false // (6) the stored copy is already dead
+		return inPlaceTarget{}, false // (6) the stored copy is already dead
 	}
-	return p, off, t, slot, true
+	return inPlaceTarget{p: p, off: off, tab: t, slot: slot, ref: ref}, true
 }
 
 // putAtExpLocked is the shared write body: it takes the already-resolved
@@ -1175,7 +1186,7 @@ func (s *shard) putAtExpLocked(key, value []byte, exp uint64, h uint64) error {
 	// version left behind. Any refusal falls through to the append path below,
 	// which is unchanged.
 	if s.inPlaceEligible() {
-		if p, off, tab, slot, ok := s.inPlaceTargetLocked(key, value, h); ok {
+		if tgt, ok := s.inPlaceTargetLocked(key, value, h); ok {
 			// Stamp the next sequence exactly as the append path does — one per
 			// STORED write — but only commit it once the bytes are down, so a
 			// refused overwrite leaves the shard's sequence untouched.
@@ -1183,8 +1194,8 @@ func (s *shard) putAtExpLocked(key, value []byte, exp uint64, h uint64) error {
 			// The version bump brackets the payload stores so a lock-free reader can
 			// tell that it saw them half-done. It is a no-op on a shard whose readers
 			// take the read lock instead, which the write lock already excludes.
-			werr := s.bumpVersionLocked(p, off, func() error {
-				return p.WriteAt(off, key, value, exp, makeMeta(seq, false))
+			werr := s.bumpVersionLocked(tgt.p, tgt.off, func() error {
+				return tgt.p.WriteAt(tgt.off, key, value, exp, makeMeta(seq, false))
 			})
 			if werr == nil {
 				s.writeSeq = seq
@@ -1206,7 +1217,7 @@ func (s *shard) putAtExpLocked(key, value []byte, exp uint64, h uint64) error {
 				// second s.tab load, and setVisited returns after one load once the
 				// mark is already set.
 				if s.sieve {
-					tab.setVisited(slot, tagFor(h))
+					tgt.tab.setVisited(tgt.slot, tagFor(h), tgt.ref)
 				}
 				// NO fireOnRemove: nothing was removed. The key is still live, at the
 				// same address, and the hook reports REMOVALS — firing it here would
@@ -1230,14 +1241,15 @@ func (s *shard) putAtExpLocked(key, value []byte, exp uint64, h uint64) error {
 		return werr
 	}
 	t := s.tab.Load()
-	slot, inserted := t.upsert(h, makeSlabRef(uint16(pageIdx), s.pages[pageIdx].gen, off)) //nolint:gosec // pageIdx bounded by MaxPagesPerShard (≤65535)
+	ref := makeSlabRef(uint16(pageIdx), s.pages[pageIdx].gen, off) //nolint:gosec // pageIdx bounded by MaxPagesPerShard (≤65535)
+	slot, inserted := t.upsert(h, ref)
 	// AN UPDATE MARKS, A FIRST INSERTION DOES NOT (cache/sieve.go). The asymmetry is
 	// the whole discrimination: a key written once and never touched again must arrive
 	// unvisited, or a write-once stream marks everything it inserts and the hint stops
 	// distinguishing anything. Marking BEFORE the rehash, so a hint earned by this
 	// write is one rehashed() carries across rather than one it never sees.
 	if s.sieve && !inserted {
-		t.setVisited(slot, tagFor(h))
+		t.setVisited(slot, tagFor(h), ref)
 	}
 	s.rehashIfOverThresholdLocked(t)
 	return nil

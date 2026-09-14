@@ -139,7 +139,7 @@ probe:
 			// table the probe actually settled on (tab, not t), which is the only one
 			// a drain could consult. See cache/sieve.go.
 			if s.sieve {
-				tab.setVisited(i, tag)
+				tab.setVisited(i, tag, r)
 			}
 			return val, e, r, lkHit
 		}
@@ -296,7 +296,7 @@ func (t *indexTable) getSeq(s *shard, dst, key []byte, h uint64) (out []byte, ex
 			// Marked only after the read is VALIDATED, so a probe that turns out to
 			// have read torn bytes leaves no hint behind. See cache/sieve.go.
 			if s.sieve {
-				tab.setVisited(i, tag)
+				tab.setVisited(i, tag, r)
 			}
 			return out, e, r, lkHit, true
 		}
