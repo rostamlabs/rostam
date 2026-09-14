@@ -8,11 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/rostamlabs/rostam/objstore"
@@ -35,12 +37,24 @@ type fakeS3 struct {
 	// condPuts counts conditional PUTs and unsignedCond counts those whose
 	// signature did not cover If-None-Match.
 	condPuts, unsignedCond int
+	// conns counts TCP connections the server accepted. A client that leaves a
+	// response body unclosed cannot reuse its connection, so it shows up here.
+	conns atomic.Int64
 }
+
+// deniedKey is refused with 403 on PUT, whatever the mode.
+const deniedKey = "t/c/denied"
 
 func newFakeS3(t *testing.T, mode string) (*fakeS3, *objstore.S3Store) {
 	t.Helper()
 	f := &fakeS3{mode: mode, objects: map[string][]byte{}}
-	srv := httptest.NewServer(f)
+	srv := httptest.NewUnstartedServer(f)
+	srv.Config.ConnState = func(_ net.Conn, st http.ConnState) {
+		if st == http.StateNew {
+			f.conns.Add(1)
+		}
+	}
+	srv.Start()
 	t.Cleanup(srv.Close)
 	s, err := objstore.NewS3Store(objstore.Config{
 		Endpoint:   srv.URL,
@@ -65,6 +79,11 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
+		if key == deniedKey {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, "<Error><Code>AccessDenied</Code><Message>denied</Message></Error>")
+			return
+		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		if r.Header.Get("If-None-Match") == "*" {
@@ -87,6 +106,9 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		f.objects[key] = body
 		w.WriteHeader(http.StatusOK)
+		// A body on success too, which the client has no use for: a client that
+		// neither reads nor closes it cannot put the connection back in the pool.
+		_, _ = io.WriteString(w, "<PutObjectResult/>")
 	case http.MethodGet:
 		f.mu.Lock()
 		b, ok := f.objects[key]
@@ -284,5 +306,36 @@ func TestS3PutIfAbsentRefusesUnconditionalBackend(t *testing.T) {
 				t.Fatalf("objects after refusal = %v, want only the pre-existing key", got)
 			}
 		})
+	}
+}
+
+// TestS3PutsReuseTheirConnection pins that every PUT path — success, the 412
+// that becomes ErrExists, a plain error status, and the one-time support probe
+// with its delete — closes the response body it was handed. An unclosed body
+// keeps its connection out of the pool, so a sequence of calls would open a new
+// connection each time instead of reusing one.
+func TestS3PutsReuseTheirConnection(t *testing.T) {
+	ctx := context.Background()
+	f, s := newFakeS3(t, "honor")
+	for i := 0; i < 8; i++ {
+		if err := putIfAbsentString(ctx, s, fmt.Sprintf("t/c/new-%d", i), "v"); err != nil {
+			t.Fatal(err)
+		}
+		if err := putIfAbsentString(ctx, s, "t/c/new-0", "v"); !errors.Is(err, objstore.ErrExists) {
+			t.Fatalf("PutIfAbsent over an existing key = %v, want ErrExists", err)
+		}
+		if err := s.Put(ctx, "t/c/new-0", strings.NewReader("w"), 1); err != nil {
+			t.Fatal(err)
+		}
+		// Any other error status, on both PUT paths.
+		if err := s.Put(ctx, deniedKey, strings.NewReader("w"), 1); err == nil {
+			t.Fatal("Put of the denied key unexpectedly succeeded")
+		}
+		if err := putIfAbsentString(ctx, s, deniedKey, "w"); err == nil || errors.Is(err, objstore.ErrExists) {
+			t.Fatalf("PutIfAbsent of the denied key = %v, want a plain error", err)
+		}
+	}
+	if n := f.conns.Load(); n != 1 {
+		t.Fatalf("the client opened %d connections for sequential PUTs, want 1: a response body was left unclosed", n)
 	}
 }

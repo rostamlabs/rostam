@@ -220,29 +220,26 @@ func (s *S3Store) bucketURL(rawQuery string) (*url.URL, string) {
 // rewind; otherwise we buffer the body to hash it. The hash then covers the bytes
 // actually sent, so a tampered body fails server-side signature verification.
 func (s *S3Store) Put(ctx context.Context, key string, r io.Reader, size int64) error {
-	resp, err := s.put(ctx, key, r, size, false)
-	if err != nil {
-		return err
-	}
-	defer drainClose(resp.Body)
-	if resp.StatusCode/100 != 2 {
-		return s3Error("PUT", key, resp)
-	}
-	return nil
+	_, err := s.put(ctx, key, r, size, false)
+	return err
 }
 
-// put sends the signed PUT for Put and PutIfAbsent and returns the response,
-// whose body the caller must drainClose. ifAbsent adds If-None-Match: *; like
-// every header present at signing time it is covered by the signature, so it
-// cannot be stripped in transit without failing verification.
-func (s *S3Store) put(ctx context.Context, key string, r io.Reader, size int64, ifAbsent bool) (*http.Response, error) {
+// put sends the signed PUT for Put and PutIfAbsent. It returns the response's
+// status code (0 if no response arrived) and, for any non-2xx status, the
+// service's error decoded by s3Error. The response never leaves this function:
+// its body is drained and closed here on every path, so the connection goes
+// back to the pool whatever the caller does with the status. ifAbsent adds
+// If-None-Match: *; like every header present at signing time it is covered by
+// the signature, so it cannot be stripped in transit without failing
+// verification.
+func (s *S3Store) put(ctx context.Context, key string, r io.Reader, size int64, ifAbsent bool) (int, error) {
 	u, host := s.objectURL(key)
 
 	payloadHash := unsignedPayload
 	if s.endpoint.Scheme != "https" {
 		hash, body, err := hashPayload(r, size)
 		if err != nil {
-			return nil, fmt.Errorf("objstore: hash payload for %q: %w", key, err)
+			return 0, fmt.Errorf("objstore: hash payload for %q: %w", key, err)
 		}
 		payloadHash = hash
 		r = body
@@ -250,7 +247,7 @@ func (s *S3Store) put(ctx context.Context, key string, r io.Reader, size int64, 
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u.String(), r)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	req.Host = host
 	req.ContentLength = size
@@ -261,7 +258,22 @@ func (s *S3Store) put(ctx context.Context, key string, r io.Reader, size int64, 
 
 	signV4(req, payloadHash, s.creds, s.region, s.service, s.clock().UTC())
 
-	return s.client.Do(req) //nolint:bodyclose // the caller drainCloses
+	resp, err := s.client.Do(req)
+	if err != nil {
+		// net/http: on error there is no body left to close.
+		return 0, err
+	}
+	defer func() {
+		// Drain before closing: a body closed unread cannot be reused for the
+		// next request. Bounded like drainClose, so a huge error body is not
+		// read just to recycle the connection.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode/100 != 2 {
+		return resp.StatusCode, s3Error("PUT", key, resp)
+	}
+	return resp.StatusCode, nil
 }
 
 // Conditional-create support states for S3Store.condState.
@@ -300,20 +312,16 @@ func (s *S3Store) PutIfAbsent(ctx context.Context, key string, r io.Reader, size
 
 // putIfAbsent is PutIfAbsent's request without the capability check.
 func (s *S3Store) putIfAbsent(ctx context.Context, key string, r io.Reader, size int64) error {
-	resp, err := s.put(ctx, key, r, size, true)
-	if err != nil {
-		return err
-	}
-	defer drainClose(resp.Body)
+	status, err := s.put(ctx, key, r, size, true)
 	switch {
-	case resp.StatusCode/100 == 2:
+	case err == nil:
 		return nil
-	case resp.StatusCode == http.StatusPreconditionFailed:
+	case status == http.StatusPreconditionFailed:
 		return fmt.Errorf("objstore: PUT %q: %w", key, ErrExists)
-	case resp.StatusCode == http.StatusNotImplemented:
-		return fmt.Errorf("%w: %w", ErrConditionalWriteUnsupported, s3Error("PUT", key, resp))
+	case status == http.StatusNotImplemented:
+		return fmt.Errorf("%w: %w", ErrConditionalWriteUnsupported, err)
 	default:
-		return s3Error("PUT", key, resp)
+		return err
 	}
 }
 

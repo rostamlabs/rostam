@@ -37,8 +37,10 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
     it cannot be told apart from a run still writing. Periodic and on-demand
     backups use the current time and are unaffected.
 
-  Filesystem backups on Windows also work again: every write there failed
-  trying to fsync the directory, which Windows does not support.
+  The filesystem store no longer fails every write on Windows by trying to fsync
+  a directory, which Windows does not support. Filesystem backups on Windows
+  still do not work, for a separate reason: backup keys contain an RFC 3339
+  timestamp, and its `:` is not allowed in a Windows file name.
 
   **What to do:** code outside this repository that implements
   `objstore.ObjectStore` no longer compiles until it adds `PutIfAbsent`. Implement
