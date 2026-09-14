@@ -5,6 +5,19 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **Dropping a named-vector collection through the generic collection drop now
+  removes its files, so it no longer comes back on restart.** The generic drop
+  (`DELETE /v1/collections/{name}`, the gRPC `DropCollection` call and
+  `CollectionStore.DropCollection`) accepted a named-vector collection and
+  removed it from memory, but left its `.ncfg` marker, snapshot and write-ahead
+  log on disk. A single-node collection with a write-ahead log therefore
+  reloaded on the next start — and if the name had been reused for a dense
+  collection in the meantime, the name loaded as both. The generic drop now
+  deletes the same files as the named-vector drop. Heap-only named collections,
+  and named collections on a `-cluster` node, write no files and were not
+  affected. A name already loaded in two families by this bug still needs the
+  stale collection dropped by hand: `DELETE /v1/named/{name}` removes the
+  named-vector collection and its files and leaves the dense one in place.
 - **The cache eviction knobs can now be set on `rostam-server` and through
   `rostam.CacheConfig`.** Relocating eviction, its background reserve cadence,
   in-place same-size updates, lock-free (seqlock) reads for them, and the SIEVE

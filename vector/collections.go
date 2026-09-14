@@ -645,12 +645,12 @@ func (s *CollectionStore) dropCollection(canonical string) error {
 			return nil
 		}
 		// Dispatch to the named family: a name can be dense XOR named, so a
-		// DropCollection on a named collection drops it (mirrors how the dense
-		// path frees its collection). MV has its own DropMultiVector entry point.
+		// DropCollection on a named collection drops it exactly as DropNamed does,
+		// files included. MV has its own DropMultiVector entry point.
 		if nc, nok := s.named[canonical]; nok {
 			delete(s.named, canonical)
 			s.mu.Unlock()
-			nc.retire(nil)
+			s.retireNamed(canonical, nc)
 			return nil
 		}
 		s.mu.Unlock()
@@ -790,10 +790,12 @@ func (s *CollectionStore) RestoreCollectionWithConfig(name string, cfg Config, r
 	s.mu.RUnlock()
 	if multi || named {
 		// A dense snapshot replaces a dense collection (hot or cold) or fills an
-		// absent name. Dropping a dense name never removes a multi-vector
-		// collection, and it removes a named-vector collection from memory but not
-		// its files — so a restart would load the name in two families. Both are
-		// refused before any work; the name lock keeps the answer stable.
+		// absent name; it does not change a name's family. Publication drops through
+		// dropCollection, which never removes a multi-vector collection, so
+		// replacing one would put the name in two families. A named-vector
+		// collection would be dropped, but replacing another family's collection
+		// with a dense snapshot is a family change, not a restore. Both are refused
+		// before any work; the name lock keeps the answer stable.
 		family := "multi-vector"
 		if named {
 			family = "named-vector"
