@@ -158,7 +158,8 @@ func livePageBytesLocked(s *shard, idx int) int {
 		if err != nil {
 			return live
 		}
-		size := entrySize(len(key), len(value))
+		// OCCUPANCY: this mirrors the heap reserve walk in relocate_reserve.go.
+		size := entrySpan(len(key), len(value), true)
 		ref := makeSlabRef(uint16(idx), p.gen, uint32(cursor)) //nolint:gosec // bounded by the page geometry
 		if _, cur, ok := tab.findSlot(hashKey(key)); ok && cur == ref {
 			live += size

@@ -139,7 +139,9 @@ func TestInPlaceBytesUsedFlatAcrossRewrites(t *testing.T) {
 				}
 			} else {
 				// The control: today's append path pays for every rewrite.
-				want := uint64(rewrites * entrySize(len(key), len(val)))
+				// OCCUPANCY: BytesUsed is page room consumed, and each rewrite is an
+				// append on a heap page.
+				want := uint64(rewrites * entrySpan(len(key), len(val), true))
 				if grew != want {
 					t.Fatalf("append path grew BytesUsed by %d over %d rewrites, want %d", grew, rewrites, want)
 				}

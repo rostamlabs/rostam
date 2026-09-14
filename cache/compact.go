@@ -216,7 +216,17 @@ func (s *shard) walkLiveAtOpen(dropClock uint64, visit func(key, value []byte, e
 				break
 			}
 			meta := entryMetaAt(entries[cursor:tail])
-			size := entrySize(len(key), len(value))
+			// EXACT, and NOT HEAP-REACHABLE. Cold compaction is the mmap pages file's
+			// open-time rewrite (see the header of this file); a heap shard never gets
+			// here. The figure is both the cursor advance over already-encoded bytes
+			// and the size handed to the visit callback, which the callers sum into
+			// the staging file's byte frontier. Both are encoder lengths on a
+			// persisted page. (The frontier has to match what packLiveInto's
+			// page.Write actually consumes; that is the encode today, and if a
+			// persisted append ever reserved more than it encoded, the frontier would
+			// have to follow the reservation — another reason mmap framing must not
+			// acquire padding without this walk being revisited.)
+			size := entrySpanExact(len(key), len(value))
 			if s.entryIsLiveAtOpen(t, pageIdx, p.gen, cursor, key, exp, meta, dropClock) {
 				if !visit(key, value, exp, meta, size) {
 					return
@@ -231,7 +241,7 @@ func (s *shard) walkLiveAtOpen(dropClock uint64, visit func(key, value []byte, e
 func (s *shard) liveBytesAtOpen(dropClock uint64) uint64 {
 	var live uint64
 	s.walkLiveAtOpen(dropClock, func(_, _ []byte, _, _ uint64, size int) bool {
-		live += uint64(size) //nolint:gosec // entrySize is non-negative
+		live += uint64(size) //nolint:gosec // entrySpanExact is non-negative
 		return true
 	})
 	return live

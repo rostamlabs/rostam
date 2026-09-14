@@ -698,7 +698,7 @@ func pageCopiesOf(s *shard, key []byte) [][]byte {
 			if bytes.Equal(k, key) {
 				out = append(out, append([]byte(nil), v...))
 			}
-			cursor += entrySize(len(k), len(v))
+			cursor += entrySpanExact(len(k), len(v)) // EXACT: a walk over persisted mmap bytes
 		}
 	}
 	return out

@@ -1144,7 +1144,19 @@ func (s *shard) inPlaceTargetLocked(key, value []byte, h uint64) (inPlaceTarget,
 	if len(storedVal) != len(value) {
 		return inPlaceTarget{}, false // (5) different size: the framing would not line up
 	}
-	if int(off) < p.head() || int(off)+entrySize(len(key), len(value)) > p.tail() {
+	// OCCUPANCY: the band has to contain what the STORED entry takes up on the page.
+	//
+	// AND IT IS COMPUTED FROM THE NEW VALUE, NOT THE STORED ONE. That is correct
+	// today for one reason only: guard 5 immediately above has just proved
+	// len(storedVal) == len(value), so the two spans are the same number and it
+	// does not matter which is measured. The check does NOT stand on its own.
+	//
+	// Anything that relaxes guard 5 — admitting a rewrite whose value length merely
+	// FITS the stored entry rather than equalling it — invalidates this line and
+	// must recompute the span from len(storedVal). Otherwise a shrinking rewrite
+	// measures a band requirement smaller than the entry actually there and passes
+	// a check the stored entry itself would fail.
+	if int(off) < p.head() || int(off)+entrySpan(len(key), len(value), true) > p.tail() {
 		return inPlaceTarget{}, false // (4d) not inside the page's live band
 	}
 	// GUARD 6 — the stored copy must still be LIVE. An expired copy is dead
@@ -1228,7 +1240,10 @@ func (s *shard) putAtExpLocked(key, value []byte, exp uint64, h uint64) error {
 	}
 
 	// Find a page with enough tail room; lazily allocate or evict as needed.
-	pageIdx, err := s.findOrMakePageLocked(entrySize(len(key), len(value)))
+	// OCCUPANCY, and it must be the SAME figure page.Write reserves a few lines
+	// below: this decides which page the entry goes on, and a requirement short of
+	// what Write reserves would pick a page the write then fails on.
+	pageIdx, err := s.findOrMakePageLocked(entrySpan(len(key), len(value), true))
 	if err != nil {
 		return err
 	}
@@ -1343,7 +1358,10 @@ func (s *shard) delH(key []byte, h uint64) (bool, error) {
 		// value), and PageSize cannot change under a live shard — validateHeader
 		// rotates a file whose header disagrees aside instead of reopening it at a
 		// different geometry.
-		pageIdx, ferr := s.findOrMakePageLocked(entrySize(len(key), 0))
+		// OCCUPANCY, for the same reason as the ordinary append above: it has to
+		// match what the page.Write on the next line reserves. The record is this
+		// key with an empty value.
+		pageIdx, ferr := s.findOrMakePageLocked(entrySpan(len(key), 0, true))
 		if ferr != nil {
 			return false, ferr
 		}
@@ -1597,7 +1615,15 @@ func (s *shard) rebuildIndexFromPages() {
 				}
 				break
 			}
-			esize := entrySize(len(key), len(value))
+			// EXACT, and NOT HEAP-REACHABLE: rebuildIndexFromPages runs in mmap mode
+			// only (newShard calls it on the persisted branch), so nothing that
+			// changes how HEAP pages are framed reaches this walk. It steps over bytes
+			// a previous process encoded, so the cursor advances by the encoder's
+			// length. Should the append path ever reserve more than it encodes on a
+			// PERSISTED page, this walk becomes the site that has to advance by that
+			// reservation instead — but that is a change to mmap framing, not to slack
+			// on heap pages, and it would be found here rather than assumed.
+			esize := entrySpanExact(len(key), len(value))
 			seq := metaSeq(meta)
 			if seq <= s.flushedThroughSeq {
 				// Wiped by a prior Cache.Flush(): this entry is below the durable flush
@@ -1985,7 +2011,11 @@ func (s *shard) retirePageLocked(idx int) {
 			s.fireOnRemove(key)
 		}
 		s.evictions.Add(1)
-		cursor += entrySize(len(key), len(value))
+		// OCCUPANCY. A HEAP page walk (this is the heap retire path — it ends in
+		// freshHeapPageLocked), so the cursor has to step by the room each entry
+		// takes up, not by the bytes its encoder wrote. Advance by anything smaller
+		// and the walk lands mid-entry and mis-frames the rest of the page.
+		cursor += entrySpan(len(key), len(value), true)
 	}
 	fresh := s.freshHeapPageLocked()
 	s.pages[idx] = fresh
@@ -2341,7 +2371,9 @@ func (s *shard) tryRetireExpiredPageLocked(idx int, stamp uint64) {
 			}
 			expiredSlots = append(expiredSlots, expiredSlot{slot: slot, off: uint32(cursor)}) //nolint:gosec // cursor < PageSize ≤ MaxInt32
 		}
-		cursor += entrySize(len(key), len(value))
+		// OCCUPANCY, exactly as in retirePageLocked: another HEAP page walk (it too
+		// ends in freshHeapPageLocked), stepping over each entry's room on the page.
+		cursor += entrySpan(len(key), len(value), true)
 	}
 	// No live current entry: drop every expired current slot and retire the page.
 	for _, es := range expiredSlots {

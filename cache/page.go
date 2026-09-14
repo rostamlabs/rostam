@@ -167,7 +167,11 @@ func (p *page) Empty() bool { return p.head() == p.tail() }
 // passed through VERBATIM: cold compaction re-writes surviving entries through
 // this same method and must not alter their recency or tombstone bit.
 func (p *page) Write(key, value []byte, expiryMs, meta uint64) (offset uint32, size uint32, err error) {
-	need := entrySize(len(key), len(value))
+	// OCCUPANCY. This number reserves tail room, so it is the room the entry takes
+	// up on the page, not the byte count the encoder emits — an append is the site
+	// that would have to reserve a whole class for the entry to have any slack to
+	// be rewritten into later. Equal to the exact framing today.
+	need := entrySpan(len(key), len(value), true)
 	if p.FreeTail() < need {
 		return 0, 0, errPageFull
 	}
@@ -182,8 +186,13 @@ func (p *page) Write(key, value []byte, expiryMs, meta uint64) (offset uint32, s
 		return 0, 0, err
 	}
 	off := uint32(tail) //nolint:gosec // tail < PageSize which is validated ≤ MaxInt32
+	// tail advances by the ENCODER'S length, while the room check above reserved the
+	// OCCUPANCY. Identical today, and they have to stay identical: the moment an
+	// append reserves more than it encodes, this is the line that must advance by
+	// `need` instead, or the reservation is handed straight back to the next append
+	// and there is no slack to rewrite into.
 	p.setTail(tail + n)
-	return off, uint32(n), nil //nolint:gosec // n = entrySize which fits in uint32
+	return off, uint32(n), nil //nolint:gosec // n = the entry framing, which fits in uint32
 }
 
 // WriteAt overwrites the entry framed at offset with a new one of the SAME size,
@@ -216,14 +225,26 @@ func (p *page) WriteAt(offset uint32, key, value []byte, expiryMs, meta uint64) 
 	if p.backing != backingHeap {
 		return errPageNotOverwritable
 	}
-	need := entrySize(len(key), len(value))
+	// TWO DIFFERENT QUESTIONS AT ONE SITE, the same number today.
+	//
+	// span is OCCUPANCY: the band check below asks how much of the page this entry
+	// takes up, which is the room reserved for it rather than the bytes written
+	// into it.
+	//
+	// exact is the ENCODER'S LENGTH: the destination is sliced to precisely it so
+	// that encodeEntryNoCRC's own length check is the backstop against a mis-sized
+	// write spilling into the next entry (see the doc comment). Slicing the
+	// destination to the occupancy instead would loosen that backstop by whatever
+	// the two differ by, so the split has to be kept even once they do differ.
+	span := entrySpan(len(key), len(value), true)
+	exact := entrySpanExact(len(key), len(value))
 	// The entry must lie wholly inside the page's LIVE band. Below head it has been
 	// evicted; at or past tail it is free space a future append owns. Either way it
 	// is not an entry anyone may overwrite.
-	if int(offset) < p.head() || int(offset)+need > p.tail() {
+	if int(offset) < p.head() || int(offset)+span > p.tail() {
 		return errEntryTruncated
 	}
-	_, err := encodeEntryNoCRC(p.entries()[offset:int(offset)+need], key, value, expiryMs, meta)
+	_, err := encodeEntryNoCRC(p.entries()[offset:int(offset)+exact], key, value, expiryMs, meta)
 	return err
 }
 
@@ -276,12 +297,12 @@ func (p *page) MetaAt(offset uint32) (uint64, bool) {
 // (e.g. hash it) immediately. The sole caller (evictUntilFitsLocked) does. If
 // the page is empty, returns errEntryTruncated.
 //
-// It frames the entry's span INLINE rather than through a shared size helper,
-// deliberately: it reads keyLen/valLen straight out of crash-exposed bytes, so
-// the arithmetic here is guarded corruption handling rather than a size
-// computation and must stay where its guards are. It is also the mmap eviction
-// path only — heap ringbuf retires pages by frozen replacement instead (see
-// drainPageLocked).
+// NOT HEAP-REACHABLE, and it frames the entry's span INLINE rather than through
+// entrySpan — deliberately, on both counts. It is the mmap eviction path only
+// (heap ringbuf retires pages by frozen replacement, see drainPageLocked), and it
+// reads keyLen/valLen straight out of crash-exposed bytes, so the arithmetic here
+// is guarded corruption handling rather than a size computation and must stay
+// where its guards are. Nobody should "unify" it with entrySpan.
 func (p *page) EvictFront() ([]byte, uint32, error) {
 	if p.Empty() {
 		return nil, 0, errEntryTruncated

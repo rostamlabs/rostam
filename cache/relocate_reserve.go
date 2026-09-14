@@ -447,7 +447,14 @@ func (s *shard) reserveMoveVictim(victim int, p *page, budget int, retire bool) 
 				stop = true // unreachable on a heap page: no CRC, nothing external can corrupt it.
 				break
 			}
-			size := entrySize(len(key), len(value))
+			// OCCUPANCY, and like the synchronous pass this one number serves every
+			// consumer below — the cursor advance, the tick budget (`spent`), the
+			// per-page p.relocatedOut charge that decides whether the page is still
+			// worth retiring, the reserveRelocatedBytes counter, and the room
+			// reserveDestinationLocked has to find for the append. All of them are
+			// questions about page room. HEAP-REACHABLE: this is the heap ringbuf
+			// background free-page reserve.
+			size := entrySpan(len(key), len(value), true)
 			ref := makeSlabRef(uint16(victim), p.gen, uint32(cursor)) //nolint:gosec // victim bounded by MaxPagesPerShard (≤65535); cursor < PageSize ≤ MaxInt32
 			h := hashKey(key)
 			_, cur, ok := t.findSlot(h)
@@ -536,7 +543,7 @@ func (s *shard) reserveMoveVictim(victim int, p *page, budget int, retire bool) 
 			// them in the opposite order, so a scrape landing between the two can only
 			// see bytes running ahead of the count, never records relocated with
 			// nothing moved.
-			s.reserveRelocatedBytes.Add(uint64(size)) //nolint:gosec // entrySize is non-negative
+			s.reserveRelocatedBytes.Add(uint64(size)) //nolint:gosec // entrySpan is non-negative
 			s.reserveRelocations.Add(1)
 			if tail-p.relocatedOut < minGain {
 				stop = true // spent all this page could repay: it is the write path's now.

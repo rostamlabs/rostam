@@ -151,9 +151,14 @@ func (s *shard) liveAndUsedBytes(dropClock uint64) (live, used uint64) {
 				break
 			}
 			meta := entryMetaAt(entries[cursor:tail])
-			size := entrySize(len(key), len(value))
+			// EXACT, and NOT HEAP-REACHABLE: every caller is gated by
+			// onlineCompactionEligible, which is isMmap && Replicated &&
+			// PolicyRejectWrites. It measures already-encoded persisted bytes, both to
+			// step the cursor and to sum the live/used ghost-byte gauge against the
+			// page's framed extent (tail-head), which is likewise encoder bytes.
+			size := entrySpanExact(len(key), len(value))
 			if s.entryIsLiveAtOpen(t, pageIdx, p.gen, cursor, key, exp, meta, dropClock) {
-				live += uint64(size) //nolint:gosec // entrySize is non-negative
+				live += uint64(size) //nolint:gosec // entrySpanExact is non-negative
 			}
 			cursor += size
 		}
@@ -179,9 +184,11 @@ func (s *shard) pageLiveUsedLocked(idx int, t *indexTable, dropClock uint64) (li
 			break // crash-torn tail: stop the walk (mirrors liveAndUsedBytes / walkLiveAtOpen).
 		}
 		meta := entryMetaAt(entries[cursor:tail])
-		size := entrySize(len(key), len(value))
+		// EXACT, and NOT HEAP-REACHABLE — the single-page twin of liveAndUsedBytes
+		// above, with the same gating and the same reason.
+		size := entrySpanExact(len(key), len(value))
 		if s.entryIsLiveAtOpen(t, idx, p.gen, cursor, key, exp, meta, dropClock) {
-			live += uint64(size) //nolint:gosec // entrySize is non-negative
+			live += uint64(size) //nolint:gosec // entrySpanExact is non-negative
 		}
 		cursor += size
 	}
@@ -480,7 +487,11 @@ func (s *shard) tryRelocatePageLocked(idx int, dropClock uint64) bool {
 			pinned = true
 			break
 		}
-		size := entrySize(len(key), len(value))
+		// EXACT, and NOT HEAP-REACHABLE: tryRelocatePageLocked is reached only from
+		// compactRelocateOnce, behind the same onlineCompactionEligible gate. It
+		// advances the cursor over persisted bytes, asks findRelocDestLocked for room
+		// on another mmap page, and charges relocatedBytes — all encoder lengths.
+		size := entrySpanExact(len(key), len(value))
 		ref := makeSlabRef(uint16(idx), p.gen, uint32(cursor)) //nolint:gosec // idx ≤ MaxPagesPerShard; cursor < PageSize
 		h := hashKey(key)
 		_, cur, ok := t.findSlot(h)
@@ -524,7 +535,7 @@ func (s *shard) tryRelocatePageLocked(idx int, dropClock uint64) bool {
 		s.writeSeq = newSeq
 		t.upsert(h, makeSlabRef(uint16(dest), s.pages[dest].gen, off)) //nolint:gosec // dest ≤ MaxPagesPerShard
 		s.relocations.Add(1)
-		s.relocatedBytes.Add(uint64(size)) //nolint:gosec // entrySize is non-negative
+		s.relocatedBytes.Add(uint64(size)) //nolint:gosec // entrySpanExact is non-negative
 		relocated++
 		cursor += size
 	}
