@@ -80,6 +80,17 @@ type Stats struct {
 	Entries          uint64
 	Tombstones       uint64
 	CorruptionErrors uint64 // CRC mismatches on read
+	// CorruptionBytesDiscarded is how much page data those unreadable entries took
+	// with them, in framed bytes: what a mmap shard dropped WITHOUT being able to
+	// read it. CorruptionErrors counts incidents and says nothing about their size;
+	// read the two together. An entry that fails its checksum during a warm restart
+	// costs the page from that entry to its tail, since nothing past an unreadable
+	// entry can be framed safely (see rebuildIndexFromPages); a page whose persisted
+	// bounds are themselves out of range costs its whole capacity, since those bounds
+	// were the only record of how much it held; and an entry the eviction drain
+	// cannot frame costs the rest of that page, whose records were being evicted
+	// regardless but can no longer be walked.
+	CorruptionBytesDiscarded uint64
 
 	// Cold compaction at shard open (mmap only; cache/compact.go). These are the
 	// operator's view of whether restarts are actually reclaiming the ghost page
@@ -179,6 +190,7 @@ func (s *Stats) Add(o Stats) {
 	s.Entries += o.Entries
 	s.Tombstones += o.Tombstones
 	s.CorruptionErrors += o.CorruptionErrors
+	s.CorruptionBytesDiscarded += o.CorruptionBytesDiscarded
 	s.Compactions += o.Compactions
 	s.CompactionsAborted += o.CompactionsAborted
 	s.CompactionBytesReclaimed += o.CompactionBytesReclaimed
@@ -226,6 +238,7 @@ func (s Stats) WritePrometheus(w io.Writer) error {
 		{"rostam_kv_seqlock_fallbacks_total", "reads that spent their retry budget and took the shard read lock instead - should be near zero", s.SeqlockFallbacks},
 		{"rostam_kv_inplace_updates_total", "writes that overwrote the stored copy of their key where it lay, instead of appending a new copy and leaving the old one framed and dead - the writes that created no garbage; requires a heap ringbuf shard with in-place same-size updates enabled", s.InPlaceUpdates},
 		{"rostam_kv_corruption_errors_total", "CRC mismatches seen on read", s.CorruptionErrors},
+		{"rostam_kv_corruption_bytes_discarded_total", "framed page bytes dropped unread because an entry could not be read - the size of what corruption_errors lost", s.CorruptionBytesDiscarded},
 		{"rostam_kv_compactions_total", "page files rewritten live-only at shard open (mmap)", s.Compactions},
 		{"rostam_kv_compactions_aborted_total", "compactions decided against or abandoned; the original file was kept", s.CompactionsAborted},
 		{"rostam_kv_compaction_bytes_reclaimed_total", "page bytes dropped by those rewrites", s.CompactionBytesReclaimed},
