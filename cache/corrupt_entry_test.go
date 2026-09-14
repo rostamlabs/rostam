@@ -346,3 +346,78 @@ func TestRebuildSurvivesAValLenThatOverflowsInt32(t *testing.T) {
 		t.Errorf("Get(b) = %v, want ErrNotFound", err)
 	}
 }
+
+// TestCorruptDrainBoundsReportTheWholePage: a RUNNING mmap page whose persisted
+// head/tail are corrupted — damage under a live shard, long after recovery checked
+// them — must be reset by the drain with its slots dropped, and the loss reported as
+// the page's capacity, exactly as recovery reports a page whose bounds it rejects.
+// Those bounds were the only record of how much the page held, so no figure derived
+// from them is honest: head > tail made tail-head negative, which wrapped to nearly
+// 2^64 in the counter, and a tail past the page made the drain slice beyond it.
+func TestCorruptDrainBoundsReportTheWholePage(t *testing.T) {
+	cases := []struct {
+		name       string
+		head, tail func(capacity int) uint32
+	}{
+		// Both inside the page, with too little room past tail for the next record, so
+		// the Put has to drain: EvictFront meets head > tail and refuses to frame.
+		{"head past tail", func(c int) uint32 { return uint32(c - 60) }, func(c int) uint32 { return uint32(c - 100) }},
+		{"tail past the page", func(int) uint32 { return 0 }, func(int) uint32 { return 0xFFFFFFF0 }},
+		{"head and tail past the page", func(int) uint32 { return 0xFFFFFFF0 }, func(int) uint32 { return 0xFFFFFFF8 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := corruptDrainShard(t)
+			val := bytes.Repeat([]byte("v"), 4096)
+			span := entrySpanExact(len("k00000000"), len(val))
+			perPage := (s.cfg.PageSize - pageHdrSize) / span
+			for i := range perPage {
+				if err := s.Put(fmt.Appendf(nil, "k%08d", i), val, 0); err != nil {
+					t.Fatalf("Put #%d: %v", i, err)
+				}
+			}
+
+			s.mu.Lock()
+			p := s.pages[0]
+			capacity := len(p.entries())
+			binary.LittleEndian.PutUint32(p.data[0:4], tc.head(capacity))
+			binary.LittleEndian.PutUint32(p.data[4:8], tc.tail(capacity))
+			s.mu.Unlock()
+
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Fatalf("draining a page with corrupt bounds panicked: %v", r)
+					}
+				}()
+				if err := s.Put([]byte("n00000000"), val, 0); err != nil {
+					t.Fatalf("Put after corrupting the bounds: %v", err)
+				}
+			}()
+
+			st := s.snapshot()
+			if st.CorruptionErrors != 1 {
+				t.Errorf("CorruptionErrors = %d, want 1", st.CorruptionErrors)
+			}
+			if want := uint64(capacity); st.CorruptionBytesDiscarded != want {
+				t.Errorf("CorruptionBytesDiscarded = %d, want %d (the page's capacity)", st.CorruptionBytesDiscarded, want)
+			}
+			if st.Entries != 1 {
+				t.Errorf("Entries = %d, want 1 (only the record written after the reset)", st.Entries)
+			}
+			for i := range perPage {
+				k := fmt.Appendf(nil, "k%08d", i)
+				if _, err := s.Get(k); err != ErrNotFound {
+					t.Errorf("Get(%s) = %v, want ErrNotFound", k, err)
+					break
+				}
+			}
+			s.mu.RLock()
+			head, tail := s.pages[0].head(), s.pages[0].tail()
+			s.mu.RUnlock()
+			if head < 0 || head > tail || tail > capacity {
+				t.Errorf("page bounds after the drain: head=%d tail=%d cap=%d", head, tail, capacity)
+			}
+		})
+	}
+}

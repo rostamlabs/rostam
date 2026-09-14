@@ -1589,8 +1589,8 @@ func (s *shard) rebuildIndexFromPages() {
 			// (head > tail, so the walk below never runs). Treat it like the
 			// torn-entry path: drop the page and count the loss instead of
 			// crash-looping or losing data with no signal.
-			s.corrupt.Add(1)
 			s.corruptBytes.Add(uint64(len(entries))) //nolint:gosec // a slice length is non-negative
+			s.corrupt.Add(1)
 			slog.Warn("corrupt page head/tail during recovery; resetting page",
 				"component", "cache", "page", pageIdx, "head", head, "tail", tail, "cap", len(entries))
 			p.Reset()
@@ -1607,8 +1607,8 @@ func (s *shard) rebuildIndexFromPages() {
 				// is unreadable. Record it so recovery-time loss is observable —
 				// consistent with the runtime read paths (getH/getIntoH) that also
 				// bump s.corrupt — rather than swallowing it silently.
+				s.corruptBytes.Add(uint64(tail - cursor)) //nolint:gosec // bounds validated above; cursor < tail inside this loop
 				s.corrupt.Add(1)
-				s.corruptBytes.Add(uint64(tail - cursor)) //nolint:gosec // cursor < tail inside this loop
 				slog.Warn("corrupt entry during recovery; truncating page tail",
 					"component", "cache", "page", pageIdx, "offset", cursor, "tail", tail, "err", err, "truncate_to", cursor, "discarded_bytes", tail-cursor)
 				// Truncate the page's persisted framing to the validated prefix so
@@ -2064,12 +2064,13 @@ func (s *shard) retirePageLocked(idx int) {
 }
 
 // drainPageLocked evicts every live entry from page victim, dropping each from
-// the index, until the page is empty. If EvictFront reports torn framing — an
-// entry header whose lengths run past the page's live band, which the warm-restart
-// walk would have rejected, so these are bytes that changed under a running shard —
-// the rest of the page cannot be walked: the event is counted and logged, every index
-// slot still addressing the page is dropped, and the page is Reset so the shard
-// regains write availability instead of failing every future space-needing Put.
+// the index, until the page is empty. If the page's persisted head/tail are out of
+// range, or EvictFront reports torn framing — an entry header whose lengths run past
+// the page's live band — the page cannot be walked. The warm-restart walk would have
+// rejected either, so these are bytes that changed under a running shard. The event is
+// counted and logged, every index slot still addressing the page is dropped, and the
+// page is Reset so the shard regains write availability instead of failing every future
+// space-needing Put (see discardCorruptPageLocked).
 // Must be called with s.mu held for writing.
 //
 // RESETTING WITHOUT SKIPPING LOSES NOTHING A DRAIN WOULD HAVE KEPT. This function
@@ -2099,9 +2100,25 @@ func (s *shard) drainPageLocked(victim int) error {
 	// stays decided by cur == ref alone.
 	now := s.now()
 	for !s.pages[victim].Empty() {
+		// BOUNDS FIRST. head and tail are raw bytes in the mapped page header, and this
+		// page is live: recovery's bounds check ran at open, and nothing has checked them
+		// since. Every read below trusts them — the expiry probe slices entries up to
+		// tail, EvictFront slices from head — so a corrupted pair must be caught here,
+		// before either runs. p.head() widens a uint32, so on 32-bit a large value is
+		// already negative, which the first test catches.
+		if p := s.pages[victim]; p.head() < 0 || p.tail() < p.head() || p.tail() > len(p.entries()) {
+			// Those bounds were the only record of how much the page held, so nothing
+			// derived from them is a loss figure — tail-head is negative for head > tail.
+			// The page's capacity is reported instead, as recovery does for a page whose
+			// bounds it rejects.
+			slog.Warn("corrupt page head/tail during eviction; resetting page",
+				"component", "cache", "page", victim, "head", p.head(), "tail", p.tail(), "cap", len(p.entries()))
+			s.discardCorruptPageLocked(victim, len(p.entries()), now)
+			return nil
+		}
 		// Capture the entry's offset BEFORE EvictFront advances head, so we
 		// can reconstruct the slabRef of the copy being physically removed.
-		off := uint32(s.pages[victim].head()) //nolint:gosec // head < PageSize which is validated ≤ MaxInt32
+		off := uint32(s.pages[victim].head()) //nolint:gosec // 0 <= head <= len(entries) is established above
 		// Read the expiry BEFORE evicting: EvictFront returns only the key, and
 		// evictionsLive must not count an entry that had already expired.
 		var headExpiryMs uint64
@@ -2112,43 +2129,11 @@ func (s *shard) drainPageLocked(victim int) error {
 		}
 		evictedKey, _, err := s.pages[victim].EvictFront()
 		if err != nil {
-			p := s.pages[victim]
-			discarded := p.tail() - int(off)
-			s.corrupt.Add(1)
-			s.corruptBytes.Add(uint64(discarded)) //nolint:gosec // off = head <= tail
+			// The bounds passed the check above, so off <= tail and this is the size of
+			// the region the drain can no longer walk.
+			discarded := s.pages[victim].tail() - int(off)
 			slog.Warn("corrupt entry during eviction; resetting page", "component", "cache", "page", victim, "offset", off, "discarded_bytes", discarded, "err", err)
-			// O(index slots), under the write lock — acceptable only because this branch
-			// is a corruption response, never the steady state. Every slot addressing this
-			// page object is dropped, not just those at or past the tear: the page is about
-			// to be empty, and an empty page holds no record.
-			t := s.tab.Load()
-			for i := range t.ctrl {
-				c := t.ctrl[i].Load()
-				if c == ctrlEmpty || c == ctrlTombstone {
-					continue
-				}
-				ref := slabRef(t.refs[i].Load())
-				if int(ref.pageIdx()) != victim || ref.gen() != p.gen {
-					continue
-				}
-				t.tombstone(uint64(i)) //nolint:gosec // i is a valid slot index
-				s.evictions.Add(1)
-				// The slot says where its record starts, but the bytes there are the ones
-				// that just proved untrustworthy on this page. A key is reported only when
-				// it decodes AND hashes to the slot's own hash; anything else — the torn
-				// record itself, most likely — notifies nothing, exactly as sweepIndex
-				// treats an unreadable slot. Notifying under a key read from garbage would
-				// drop some unrelated live key's postings from a derived index.
-				key, _, exp, rerr := p.Read(ref.offset())
-				if rerr != nil || hashKey(key) != t.hashes[i] {
-					continue
-				}
-				if !isExpired(exp, now) {
-					s.evictionsLive.Add(1)
-				}
-				s.fireOnRemove(key)
-			}
-			p.Reset()
+			s.discardCorruptPageLocked(victim, discarded, now)
 			return nil
 		}
 		// Only drop the index slot if it still points at THIS physical copy.
@@ -2174,6 +2159,52 @@ func (s *shard) drainPageLocked(victim int) error {
 		s.evictions.Add(1)
 	}
 	return nil
+}
+
+// discardCorruptPageLocked is drainPageLocked's response to a page it cannot walk: it
+// records the loss, drops every index slot still addressing the page, and resets it.
+// discarded must be non-negative — the caller has already decided what an honest
+// figure is for its case. Must hold mu for writing.
+func (s *shard) discardCorruptPageLocked(victim, discarded int, now uint64) {
+	p := s.pages[victim]
+	// Bytes before the incident: snapshot() loads the incident count first, so a
+	// concurrent snapshot can see the bytes of an incident it does not yet count, but
+	// never an incident without its bytes.
+	s.corruptBytes.Add(uint64(discarded)) //nolint:gosec // callers pass a non-negative figure
+	s.corrupt.Add(1)
+	// O(index slots), under the write lock — acceptable only because this is a
+	// corruption response, never the steady state. Every slot addressing this page
+	// object is dropped, not just those at or past the tear: the page is about to be
+	// empty, and an empty page holds no record.
+	t := s.tab.Load()
+	for i := range t.ctrl {
+		c := t.ctrl[i].Load()
+		if c == ctrlEmpty || c == ctrlTombstone {
+			continue
+		}
+		ref := slabRef(t.refs[i].Load())
+		if int(ref.pageIdx()) != victim || ref.gen() != p.gen {
+			continue
+		}
+		t.tombstone(uint64(i)) //nolint:gosec // i is a valid slot index
+		s.evictions.Add(1)
+		// The slot says where its record starts, but the bytes there are the ones that
+		// just proved untrustworthy on this page. A key is reported only when it decodes
+		// AND hashes to the slot's own hash; anything else — the torn record itself,
+		// most likely — notifies nothing, exactly as sweepIndex treats an unreadable
+		// slot. Notifying under a key read from garbage would drop some unrelated live
+		// key's postings from a derived index. Read bounds itself by the page, not by
+		// the corrupt tail, so it is safe here whatever the header says.
+		key, _, exp, rerr := p.Read(ref.offset())
+		if rerr != nil || hashKey(key) != t.hashes[i] {
+			continue
+		}
+		if !isExpired(exp, now) {
+			s.evictionsLive.Add(1)
+		}
+		s.fireOnRemove(key)
+	}
+	p.Reset()
 }
 
 // runSweeper expires entries past their TTL on a fixed cadence.

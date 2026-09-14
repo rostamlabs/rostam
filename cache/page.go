@@ -152,7 +152,16 @@ func (p *page) entries() []byte {
 
 // FreeTail returns the contiguous bytes available at the tail of the page.
 func (p *page) FreeTail() int {
-	return len(p.entries()) - p.tail()
+	tail := p.tail()
+	// On 32-bit a corrupt persisted mmap tail at or above 2^31 widens NEGATIVE, which
+	// would report MORE room than the page has and send an append to slice from a
+	// negative offset. Report none: the page stays non-empty, so eviction picks it,
+	// and the drain's bounds check resets it. On 64-bit tail is never negative and a
+	// tail past the page already comes out negative here, which reads as full.
+	if tail < 0 {
+		return 0
+	}
+	return len(p.entries()) - tail
 }
 
 // Empty reports whether the page contains zero live entries.
