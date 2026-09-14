@@ -380,8 +380,14 @@ func TestCorruptDrainBoundsReportTheWholePage(t *testing.T) {
 			s.mu.Lock()
 			p := s.pages[0]
 			capacity := len(p.entries())
-			binary.LittleEndian.PutUint32(p.data[0:4], tc.head(capacity))
-			binary.LittleEndian.PutUint32(p.data[4:8], tc.tail(capacity))
+			// Corrupt the RUNTIME bounds directly: after the torn-writeback fix the
+			// mapped header no longer feeds head()/tail() (they are runtime fields
+			// seeded from the durable header at open), so drainPageLocked's bounds
+			// check reads these, not p.data[0:8]. int(uint32) reproduces the same
+			// 32-bit widening the old header read had (a large value stays positive on
+			// 64-bit, widens negative on 386).
+			p.setHead(int(tc.head(capacity)))
+			p.setTail(int(tc.tail(capacity)))
 			s.mu.Unlock()
 
 			func() {

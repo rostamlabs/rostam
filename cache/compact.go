@@ -301,10 +301,21 @@ func (s *shard) packPagesNeeded(dropClock uint64) int {
 // sparse region beyond the reservation packPagesNeeded sized.
 func (s *shard) packLiveInto(dst []byte, dropClock uint64) (int, bool) {
 	maxPages := s.cfg.MaxPagesPerShard()
+	// Retain each materialized dst page so its runtime bounds can be projected into
+	// the staging header below. page.Write now advances only the RUNTIME head/tail
+	// (heapHead/heapTail) and never the mapped per-page header, so a compacted file
+	// left un-projected would carry all-zero headers and recover EMPTY — total data
+	// loss. Projecting here is safe by construction: the staging region is msync'd +
+	// fsync'd and atomically renamed with a directory fsync (compactAtOpen), so the
+	// bounds and the entries they name reach disk together before the file is ever
+	// published, and the entries-before-bounds ordering the runtime paths need does
+	// not apply to a file nothing has yet mapped.
+	var dstPages []*page
 	dstPage := func(i int) *page {
 		off := headerSize + i*s.cfg.PageSize
-		p := newMmapPage(dst[off : off+s.cfg.PageSize])
+		p := newMmapPage(dst[off : off+s.cfg.PageSize : off+s.cfg.PageSize])
 		p.Reset() // the file is fresh (zero-filled); be explicit anyway
+		dstPages = append(dstPages, p)
 		return p
 	}
 	di, fits := 0, true
@@ -323,6 +334,12 @@ func (s *shard) packLiveInto(dst []byte, dropClock uint64) (int, bool) {
 			cur = dstPage(di)
 		}
 	})
+	// Project the packed runtime bounds into the staging file's per-page headers so
+	// the recovered file frames exactly what was packed (see the note above). Only
+	// pages 0..di were materialized; the rest stay zeroed (empty), which is correct.
+	for _, p := range dstPages {
+		p.projectBounds(p.head(), p.tail())
+	}
 	return di, fits
 }
 

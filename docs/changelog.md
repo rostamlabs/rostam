@@ -5,6 +5,20 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **Security (GHSA-m63m-rp87-w4rf): a persistent cache no longer trusts a page's
+  stored bounds after an unclean host shutdown.** On a power loss or kernel panic
+  (not an ordinary process crash), a persistent (mmap) shard could recover a page
+  whose stored start/end offsets named byte ranges whose contents had not reached
+  disk, or a reused page whose old contents were still present, and index records
+  from the page's previous life. Depending on timing this could resurrect a
+  deleted or overwritten record, or — for a client that could choose stored
+  values — let a crafted record be recovered ahead of the genuine one. The page
+  bounds are now written to disk only after the entry bytes they describe, and a
+  reused page's cleared bounds are made durable before the page is written again,
+  so recovery can only index data that was durably written in the page's current
+  life. No on-disk format change; existing data files are read as-is. A file
+  written by a newer build is now refused rather than silently rotated aside and
+  served empty.
 - **Dropping a multi-vector collection through the generic collection drop now
   removes it, so it no longer reports success without doing anything and no
   longer comes back on restart.** The generic drop (`DELETE

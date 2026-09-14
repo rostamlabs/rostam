@@ -404,6 +404,15 @@ func newShard(cfg Config, dataDir string, onRemove *atomic.Pointer[func([]byte)]
 		return nil, err
 	}
 	appliedIdx, fresh, verr := validateHeader(region, uint32(cfg.PageSize), uint32(maxPages)) //nolint:gosec // PageSize and maxPages are validated positive
+	if verr != nil && errors.Is(verr, errFutureVersion) {
+		// A pages file written by a NEWER build. Do NOT rotate it aside — that would
+		// silently destroy data a future format wrote deliberately. Refuse the open so
+		// an operator downgrade is a loud, recoverable error instead of data loss.
+		if cerr := munmapAndClose(file, region); cerr != nil {
+			return nil, fmt.Errorf("cache: close future-version file: %w (validation: %w)", cerr, verr)
+		}
+		return nil, verr
+	}
 	if verr != nil {
 		// Rotate the bad file and start fresh.
 		if cerr := munmapAndClose(file, region); cerr != nil {
@@ -515,11 +524,133 @@ func (s *shard) attachMmapRegion(file *os.File, region []byte) {
 	s.pages = make([]*page, maxPages)
 	for i := 0; i < maxPages; i++ {
 		offset := headerSize + i*s.cfg.PageSize
-		p := newMmapPage(region[offset : offset+s.cfg.PageSize])
+		// 3-index slice: cap the page at its own end so a bug in the append path can
+		// never reach past this page into the next one's bytes through the region tail.
+		p := newMmapPage(region[offset : offset+s.cfg.PageSize : offset+s.cfg.PageSize])
 		p.gen = s.nextGen()
+		// Seed the RUNTIME bounds from the DURABLE header. This is the one place the
+		// mapped header is read back into runtime: recovery (rebuildIndexFromPages)
+		// trusts the durable header bounds, so the runtime bounds head()/tail() serves
+		// from here on must START from exactly what a prior process projected there.
+		// After this, head()/tail() are plain runtime fields and the header is written
+		// only by projectBounds at a flush point. A fresh file has a zeroed header, so
+		// this seeds (0,0) — correct for an empty page.
+		p.heapHead, p.heapTail = p.durableBounds()
 		s.pages[i] = p
 		s.pageSlots[i].Store(p) // mmap page objects are fixed; publish once
 		regionNotePage(s, p)    // compiled out unless the measurement build tag is set
+	}
+}
+
+// pageBoundSnap captures an mmap page's runtime bounds and generation at an
+// instant, for a crash-ordered durable projection at an UNLOCKED sync point (see
+// snapshotPageBounds / projectSnapshotBounds).
+type pageBoundSnap struct {
+	head, tail int
+	gen        uint16
+}
+
+// snapshotPageBounds records every page's runtime head/tail and generation under
+// s.mu. Taken BEFORE an unlocked data msync so the bounds later projected from it
+// name only entries that msync flushed — never a write that lands DURING the msync,
+// whose bytes are not yet on disk (a durable bound naming non-durable bytes is the
+// forward skew this whole change removes). mmap shards only.
+func (s *shard) snapshotPageBounds() []pageBoundSnap {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	snaps := make([]pageBoundSnap, len(s.pages))
+	for i, p := range s.pages {
+		snaps[i] = pageBoundSnap{head: p.head(), tail: p.tail(), gen: p.gen}
+	}
+	return snaps
+}
+
+// projectSnapshotBounds writes each snapshot's bounds into its page's DURABLE
+// header under s.mu. A page whose generation no longer matches its snapshot was
+// RECYCLED during the unlocked window (compactRecycleRetiredLocked swapped in a
+// fresh object over the same extent); its extent may now hold different bytes, so
+// its durable bound is set to (0,0). Under-projecting a reused extent is the safe
+// direction — recovery indexes nothing there until a later flush advances it —
+// whereas projecting the snapshot's now-stale tail would name bytes the recycle
+// freed. The caller must issue a full-region msync AFTER this to make the
+// projection durable. mmap shards only.
+//
+// The generation is a uint16, so in principle a page recycled EXACTLY 65536 times
+// within one unlocked window would alias its snapshot generation and be treated as
+// unchanged. That needs 65536 alias-quarantine cycles between the snapshot and this
+// call — astronomically unlikely on any real timescale — so it is documented, not
+// guarded; widening gen would ripple through slabRef's bit packing for no practical
+// gain.
+func (s *shard) projectSnapshotBounds(snaps []pageBoundSnap) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, p := range s.pages {
+		if i >= len(snaps) {
+			break // mmap page count is fixed; defensive against a shorter snapshot
+		}
+		if p.gen == snaps[i].gen {
+			p.projectBounds(snaps[i].head, snaps[i].tail)
+		} else {
+			p.projectBounds(0, 0)
+		}
+	}
+}
+
+// msyncPageHeaderLocked flushes just the OS page carrying mmap page idx's 8-byte
+// durable header (head/tail). msync requires a PAGE-ALIGNED start address, and a
+// page's header sits at headerSize+idx*PageSize — almost never OS-page-aligned — so
+// the flush runs from the OS page boundary at or below that offset through the end
+// of the header. That also flushes whatever entry bytes happen to share the header's
+// OS page, which is harmless. A no-op on a heap shard (never mmap) and where the
+// platform has no msync. Caller ensures exclusive access to the header bytes.
+func (s *shard) msyncPageHeaderLocked(idx int) error {
+	if !s.isMmap || s.region == nil {
+		return nil
+	}
+	off := headerSize + idx*s.cfg.PageSize
+	start := off &^ (os.Getpagesize() - 1)
+	return msync(s.file, s.region[start:off+pageHdrSize])
+}
+
+// zeroDurableBoundsForReuseLocked zeroes mmap page idx's DURABLE header bounds and
+// flushes that header to disk. It is the REUSE-ORDERING guard: whenever an mmap
+// extent is reset to be handed back to the write path (drain-to-empty, corruption
+// discard, online recycle), its durable bound must reach disk at (0,0) BEFORE the
+// extent is republished, or the OS may write back the reused entry bytes while the
+// header still holds the OLD (larger) bound — recovery would then frame a previous
+// life's bytes (reverse skew / a forged frame). This is mandatory even on a
+// non-Durable mmap shard, whose pages the OS still flushes lazily. One small msync
+// per page RESET, not per write. A no-op on a heap shard. Must hold s.mu.
+func (s *shard) zeroDurableBoundsForReuseLocked(idx int) {
+	if !s.isMmap || s.region == nil {
+		return
+	}
+	s.pages[idx].projectBounds(0, 0)
+	if err := s.msyncPageHeaderLocked(idx); err != nil {
+		slog.Warn("DURABILITY WARNING: msync of reset page header failed; a crash could recover stale bytes for this extent",
+			"component", "cache", "page", idx, "err", err)
+	}
+}
+
+// flushRecoveredBoundsLocked projects mmap page idx's CURRENT runtime bounds into
+// its durable header and flushes that header. It is the recovery-time counterpart
+// to zeroDurableBoundsForReuseLocked: rebuildIndexFromPages corrects a page's bounds
+// in runtime when it rejects a corrupt header or truncates a torn tail, and since
+// setHead/setTail no longer write through to the durable header, that correction
+// must be projected and flushed or the next open (or a reuse before the first sync
+// point) would trust the stale on-disk bound again. Safe to flush immediately: the
+// bytes the corrected bounds name are already on disk (they decoded from it), so
+// there is no entries-before-bounds ordering to respect here. A no-op on a heap
+// shard / where the platform has no msync.
+func (s *shard) flushRecoveredBoundsLocked(idx int) {
+	if !s.isMmap || s.region == nil {
+		return
+	}
+	p := s.pages[idx]
+	p.projectBounds(p.head(), p.tail())
+	if err := s.msyncPageHeaderLocked(idx); err != nil {
+		slog.Warn("DURABILITY WARNING: msync of recovered page header failed; a stale bound may persist on disk",
+			"component", "cache", "page", idx, "err", err)
 	}
 }
 
@@ -1515,7 +1646,21 @@ func (s *shard) Close() error {
 	close(s.stopSweeper)
 	s.sweepWG.Wait()
 	if s.region != nil {
-		_ = msync(s.file, s.region) // best-effort final sync
+		// A clean shutdown is a SYNC POINT and must advance the durable bounds, or the
+		// reopen loses every write since the last one. setHead/setTail no longer write
+		// through to the mapped header (it is a projection now), so the header on disk
+		// LAGS the runtime bounds until something projects it. Use the same
+		// entries-before-bounds ordering as the other sync points: flush the entries,
+		// project each page's current runtime bounds, then flush again so a bound never
+		// reaches disk ahead of the bytes it names. The sweeper is stopped and the cache
+		// is quiescing, but the lock keeps this correct if a caller races a stray write.
+		_ = msync(s.file, s.region)
+		s.mu.Lock()
+		for _, p := range s.pages {
+			p.projectBounds(p.head(), p.tail())
+		}
+		s.mu.Unlock()
+		_ = msync(s.file, s.region) // best-effort final sync of entries + projected bounds
 	}
 	return munmapAndClose(s.file, s.region)
 }
@@ -1573,27 +1718,32 @@ func (s *shard) rebuildIndexFromPages() {
 		head := p.head()
 		tail := p.tail()
 		entries := p.entries()
-		// Validate BEFORE the head==tail shortcut below: head/tail are read
-		// straight off disk, and a corrupt page can have them bit-rotted (or
-		// crash-torn mid-setTail) to the SAME out-of-range value — e.g. both
-		// 0xFFFFFFF0. That still satisfies head==tail, so checking bounds only
-		// in the else branch let such a page slip through untouched: no
-		// corruption counted, no reset, and FreeTail() = len(entries) - tail
-		// goes negative, wedging the page's writes behind errPageFull forever.
-		// head is `int(uint32(...))`, so it is never negative in practice; the
-		// `head < 0` check is kept only as defense in depth.
+		// Validate BEFORE the head==tail shortcut below: head/tail were seeded at open
+		// from the raw durable header, and a corrupt page can carry them bit-rotted (or
+		// crash-torn) to the SAME out-of-range value — e.g. both 0xFFFFFFF0. That still
+		// satisfies head==tail, so checking bounds only in the else branch let such a
+		// page slip through untouched: no corruption counted, no reset, and FreeTail()
+		// = len(entries) - tail goes negative, wedging the page's writes behind
+		// errPageFull forever. head is `int(uint32(...))`, so it is never negative in
+		// practice; the `head < 0` check is kept only as defense in depth.
 		if head < 0 || tail < head || tail > len(entries) {
-			// Corrupt head/tail (e.g. bit-rot or a crash mid-setTail): trusting
-			// these raw values into entries[cursor:tail] below would either panic
-			// (tail beyond the mmap region) or silently skip the whole page
-			// (head > tail, so the walk below never runs). Treat it like the
-			// torn-entry path: drop the page and count the loss instead of
-			// crash-looping or losing data with no signal.
+			// Corrupt head/tail (e.g. bit-rot or a torn writeback): trusting these
+			// values into entries[cursor:tail] below would either panic (tail beyond
+			// the mmap region) or silently skip the whole page (head > tail, so the
+			// walk below never runs). Treat it like the torn-entry path: drop the page
+			// and count the loss instead of crash-looping or losing data with no signal.
 			s.corruptBytes.Add(uint64(len(entries))) //nolint:gosec // a slice length is non-negative
 			s.corrupt.Add(1)
 			slog.Warn("corrupt page head/tail during recovery; resetting page",
 				"component", "cache", "page", pageIdx, "head", head, "tail", tail, "cap", len(entries))
 			p.Reset()
+			// Persist the correction: setHead/setTail no longer write through to the
+			// durable header, so a reset that stayed only in runtime would leave the
+			// corrupt bound on disk — and the next open (or a reuse before the first
+			// sync point) would trust it again. Project (0,0) and flush this page's
+			// header now. The entries it named are being dropped, so nothing durable
+			// depends on ordering here.
+			s.flushRecoveredBoundsLocked(pageIdx)
 			continue
 		}
 		if head == tail {
@@ -1652,6 +1802,13 @@ func (s *shard) rebuildIndexFromPages() {
 				} else {
 					p.setTail(cursor)
 				}
+				// Persist the truncated bound to the durable header (setTail/Reset no
+				// longer do — see the head/tail-corruption site above). The retained
+				// prefix [head, cursor) is already durable (its bytes decoded from disk),
+				// so reducing the durable tail to cursor names only on-disk bytes and,
+				// crucially, drops the torn region from the durable framing so a reuse
+				// before the first sync point cannot re-expose it.
+				s.flushRecoveredBoundsLocked(pageIdx)
 				break
 			}
 			// EXACT, and NOT HEAP-REACHABLE: rebuildIndexFromPages runs in mmap mode
@@ -2100,12 +2257,13 @@ func (s *shard) drainPageLocked(victim int) error {
 	// stays decided by cur == ref alone.
 	now := s.now()
 	for !s.pages[victim].Empty() {
-		// BOUNDS FIRST. head and tail are raw bytes in the mapped page header, and this
-		// page is live: recovery's bounds check ran at open, and nothing has checked them
-		// since. Every read below trusts them — the expiry probe slices entries up to
-		// tail, EvictFront slices from head — so a corrupted pair must be caught here,
-		// before either runs. p.head() widens a uint32, so on 32-bit a large value is
-		// already negative, which the first test catches.
+		// BOUNDS FIRST. head and tail are the runtime bounds, seeded at open from the
+		// raw durable header (attachMmapRegion) and not re-checked since: recovery's
+		// bounds check ran once at open, and nothing has validated them again. Every
+		// read below trusts them — the expiry probe slices entries up to tail,
+		// EvictFront slices from head — so a corrupted pair must be caught here, before
+		// either runs. p.head() carries a value widened from a uint32 at open, so on
+		// 32-bit a large seeded value is already negative, which the first test catches.
 		if p := s.pages[victim]; p.head() < 0 || p.tail() < p.head() || p.tail() > len(p.entries()) {
 			// Those bounds were the only record of how much the page held, so nothing
 			// derived from them is a loss figure — tail-head is negative for head > tail.
@@ -2158,6 +2316,14 @@ func (s *shard) drainPageLocked(victim int) error {
 		}
 		s.evictions.Add(1)
 	}
+	// REUSE ORDERING. The drain emptied this mmap extent (EvictFront's last step reset
+	// the runtime head/tail to 0); the write path may now refill it from offset 0.
+	// Zero the DURABLE header for the extent and flush it BEFORE that reuse, or the OS
+	// could write back the new entry bytes while the header still held the old (larger)
+	// bound — recovery would then frame the extent's former contents. The corrupt-page
+	// exits above route through discardCorruptPageLocked, which zeroes the durable
+	// header the same way after its Reset.
+	s.zeroDurableBoundsForReuseLocked(victim)
 	return nil
 }
 
@@ -2205,6 +2371,10 @@ func (s *shard) discardCorruptPageLocked(victim, discarded int, now uint64) {
 		s.fireOnRemove(key)
 	}
 	p.Reset()
+	// REUSE ORDERING (see zeroDurableBoundsForReuseLocked). Reset cleared only the
+	// runtime bounds; the durable header still names the discarded extent's bytes.
+	// Zero and flush it before the write path can refill this now-empty page.
+	s.zeroDurableBoundsForReuseLocked(victim)
 }
 
 // runSweeper expires entries past their TTL on a fixed cadence.

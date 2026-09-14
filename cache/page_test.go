@@ -132,38 +132,61 @@ func TestPageMmapWriteRead(t *testing.T) {
 	}
 }
 
-func TestPageMmapPersistedAcrossNewMmapPage(t *testing.T) {
+func TestPageMmapBoundsSurviveOnlyViaProjection(t *testing.T) {
 	region := make([]byte, 4096)
 	p1 := newMmapPage(region)
 	off, sz, _ := p1.Write([]byte("k"), []byte("v"), 0, 0)
 
-	// Simulate process restart: fresh page object on the same region.
+	// A bare re-wrap on the same region does NOT inherit the runtime bounds: after
+	// the torn-writeback fix, an append advances only the runtime head/tail and never
+	// the mapped header, so a fresh page object starts at (0,0). The entry BYTES are
+	// in the region and still decode — it is the bounds that need a projection.
 	p2 := newMmapPage(region)
 	key, val, _, err := p2.Read(off)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(key) != "k" || string(val) != "v" {
-		t.Errorf("got %q=%q after re-wrap, want k=v", key, val)
+		t.Errorf("entry bytes did not survive re-wrap: got %q=%q, want k=v", key, val)
 	}
-	// head and tail should also survive.
-	if p2.head() != 0 || p2.tail() != int(sz) {
-		t.Errorf("head=%d tail=%d, want 0 and %d", p2.head(), p2.tail(), sz)
+	if p2.head() != 0 || p2.tail() != 0 {
+		t.Errorf("bare re-wrap head=%d tail=%d, want (0,0): bounds must not be inferred without projection", p2.head(), p2.tail())
+	}
+
+	// Publish the bounds into the durable header, then a fresh wrap seeded from it
+	// (exactly as attachMmapRegion seeds at open) recovers them.
+	p1.projectBounds(p1.head(), p1.tail())
+	p3 := newMmapPage(region)
+	h, tl := p3.durableBounds()
+	p3.heapHead, p3.heapTail = h, tl
+	if p3.head() != 0 || p3.tail() != int(sz) {
+		t.Errorf("seeded-from-durable head=%d tail=%d, want 0 and %d", p3.head(), p3.tail(), sz)
 	}
 }
 
-func TestPageMmapHeadTailInData(t *testing.T) {
+func TestPageMmapWriteLeavesDurableHeaderToProjection(t *testing.T) {
 	region := make([]byte, 4096)
 	p := newMmapPage(region)
 	if _, _, err := p.Write([]byte("k"), []byte("v"), 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	// The first 8 bytes of region should contain head/tail.
-	if region[0] != 0 {
-		t.Errorf("byte 0 (head LSB) = %d, want 0", region[0])
+	// The append advanced the RUNTIME tail but must NOT have touched the durable
+	// header (bytes 0..7): the header is a projection, written only by projectBounds.
+	if p.tail() == 0 {
+		t.Fatal("Write did not advance the runtime tail")
+	}
+	for i := 0; i < pageHdrSize; i++ {
+		if region[i] != 0 {
+			t.Fatalf("Write wrote durable header byte %d = %d; the header must be written only by projectBounds", i, region[i])
+		}
+	}
+	// projectBounds is the sole writer of the header, and durableBounds reads it back.
+	p.projectBounds(p.head(), p.tail())
+	if dh, dt := p.durableBounds(); dh != p.head() || dt != p.tail() {
+		t.Fatalf("durableBounds = (%d,%d), want (%d,%d) after projectBounds", dh, dt, p.head(), p.tail())
 	}
 	if region[4] == 0 && region[5] == 0 && region[6] == 0 && region[7] == 0 {
-		t.Error("tail bytes are all zero — Write didn't update tail in mmap region")
+		t.Error("projectBounds did not write the tail into the mmap region")
 	}
 }
 

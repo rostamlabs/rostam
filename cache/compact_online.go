@@ -427,9 +427,15 @@ func (s *shard) compactRecycleRetiredLocked(now time.Time, quarantine time.Durat
 			continue // still within the alias-drain window; a reader may alias its bytes.
 		}
 		fresh := newMmapPage(p.data) // same mmap extent; retired=false, retiredAt zero.
-		fresh.Reset()                // head/tail → 0 in the persisted header: full FreeTail restored.
+		fresh.Reset()                // head/tail → 0 in the RUNTIME bounds; full FreeTail restored.
 		fresh.gen = s.nextGen()      // bump generation so any stale ref into the old content misses.
 		s.pages[idx] = fresh
+		// REUSE ORDERING: zero the DURABLE header for this extent and flush it BEFORE
+		// republishing the page, so a crash after future writes can never recover the
+		// old bytes under the old (larger) durable bound. Reset above touched only the
+		// runtime bounds — the durable header still names the retired extent's former
+		// contents until this projects and flushes (0,0).
+		s.zeroDurableBoundsForReuseLocked(idx)
 		s.pageSlots[idx].Store(fresh) // publish atomically for the lock-free read path.
 		regionNotePage(s, fresh)      // compiled out unless the measurement build tag is set
 		s.relocatePagesRecycled.Add(1)
