@@ -71,19 +71,10 @@ type DirectConfig struct {
 	Authenticator server.Authenticator
 }
 
-// NewDirect constructs an in-process Store backed by a single cache.Cache,
-// with no Raft layer. Writes are ~30× faster than NewEmbedded because no
-// log entry is created, no FSM dispatch happens, and no applied-index
-// bookkeeping runs.
-//
-// Use NewEmbedded when you need replication (multi-node clusters). Use
-// NewDirect when you have a single-node deployment and want the cache
-// layer's raw write speed.
-func NewDirect(cfg DirectConfig) (Store, error) {
-	if cfg.Ops == nil {
-		return nil, errors.New("rostam: DirectConfig.Ops is required")
-	}
-
+// directCacheConfig builds the cache.Config NewDirect opens: cache.DefaultConfig
+// with cfg's cache knobs applied and the per-shard geometry derived from the
+// node's total budget.
+func directCacheConfig(cfg DirectConfig) (cache.Config, error) {
 	cc := cache.DefaultConfig()
 	if cfg.Cache.NumShardsPerNode > 0 {
 		cc.NumShards = cfg.Cache.NumShardsPerNode
@@ -108,8 +99,34 @@ func NewDirect(cfg DirectConfig) (Store, error) {
 	// stayed at cache.DefaultConfig()'s 256 MiB and the real bound was
 	// NumShards * 256 MiB: 64 GiB by default, 256 GiB at -shards 1024.
 	if err := applyCacheBudget(&cc, cfg.Cache.MaxMemoryBytes, cc.NumShards); err != nil {
+		return cache.Config{}, err
+	}
+	applyEvictionKnobs(&cc, cfg.Cache)
+	return cc, nil
+}
+
+// NewDirect constructs an in-process Store backed by a single cache.Cache,
+// with no Raft layer. Writes are ~30× faster than NewEmbedded because no
+// log entry is created, no FSM dispatch happens, and no applied-index
+// bookkeeping runs.
+//
+// Use NewEmbedded when you need replication (multi-node clusters). Use
+// NewDirect when you have a single-node deployment and want the cache
+// layer's raw write speed.
+func NewDirect(cfg DirectConfig) (Store, error) {
+	if cfg.Ops == nil {
+		return nil, errors.New("rostam: DirectConfig.Ops is required")
+	}
+
+	cc, err := directCacheConfig(cfg)
+	if err != nil {
 		return nil, err
 	}
+	deployment := deploySingleNodeHeap
+	if cfg.DataDir != "" {
+		deployment = deploySingleNodeDataDir
+	}
+	warnInertCacheKnobs(cfg.Cache, deployment)
 
 	c, err := cache.New(cc)
 	if err != nil {

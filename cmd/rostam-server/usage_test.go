@@ -9,20 +9,21 @@ import (
 
 func TestGroupForMatchesTheDocumentedAreas(t *testing.T) {
 	for name, want := range map[string]string{
-		"http":                 "Transports",
-		"epoll-loops":          "Transports",
-		"data":                 "Storage",
-		"api-key":              "Authentication",
-		"jwt-issuer":           "Authentication",
-		"tls-node-cert":        "TLS", // TLS wins over Clustering: order matters
-		"pb-auto-failover":     "Clustering",
-		"nosync":               "Clustering",
-		"backup-bucket":        "Backups & cold tier",
-		"cold-tier-after":      "Backups & cold tier",
-		"log-format":           "Logging",
-		"wasm-blob-retention":  "WASM",
-		"version":              "Help",
-		"some-future-flag-xyz": "Other", // unmatched is visible, not missing
+		"http":                   "Transports",
+		"epoll-loops":            "Transports",
+		"data":                   "Storage",
+		"in-place-seqlock-reads": "Storage",
+		"api-key":                "Authentication",
+		"jwt-issuer":             "Authentication",
+		"tls-node-cert":          "TLS", // TLS wins over Clustering: order matters
+		"pb-auto-failover":       "Clustering",
+		"nosync":                 "Clustering",
+		"backup-bucket":          "Backups & cold tier",
+		"cold-tier-after":        "Backups & cold tier",
+		"log-format":             "Logging",
+		"wasm-blob-retention":    "WASM",
+		"version":                "Help",
+		"some-future-flag-xyz":   "Other", // unmatched is visible, not missing
 	} {
 		if got := groupFor(name); got != want {
 			t.Errorf("groupFor(%q) = %q, want %q", name, got, want)

@@ -722,16 +722,11 @@ func clusterConfigFrom(cfg EmbeddedConfig, numShards int, shardCfg shard.Config)
 	}
 }
 
-func NewEmbedded(cfg EmbeddedConfig) (Store, error) {
-	if cfg.Ops == nil {
-		return nil, errors.New("rostam: EmbeddedConfig.Ops must not be nil")
-	}
-
-	numShards := cfg.NumShards
-	if numShards == 0 {
-		numShards = 64
-	}
-
+// embeddedCacheConfig builds the cache.Config every Raft shard of a NewEmbedded
+// node opens with (before shard.New applies its replication overrides): one cache
+// shard per Raft shard, cfg's cache knobs applied, and the node's total budget
+// spread across numShards.
+func embeddedCacheConfig(cfg EmbeddedConfig, numShards int) (cache.Config, error) {
 	cc := cache.DefaultConfig()
 	cc.NumShards = 1 // forced per shard; cluster handles fanout
 	// Thread the effective server WriteTimeout so a replicated shard's alias-drain
@@ -769,8 +764,40 @@ func NewEmbedded(cfg EmbeddedConfig) (Store, error) {
 	// bound numShards * 256 MiB (16 GiB at the default 64 shards) with no way
 	// to lower it.
 	if err := applyCacheBudget(&cc, cfg.Cache.MaxMemoryBytes, numShards); err != nil {
+		return cache.Config{}, err
+	}
+	applyEvictionKnobs(&cc, cfg.Cache)
+	return cc, nil
+}
+
+// embeddedDeployment classifies a NewEmbedded node for the inert-knob warnings.
+// Every shard is file-backed (cluster.Config requires DataDir). With Peers the
+// node takes cluster.New's multi-node path, which wires every shard to a Raft
+// transport, and shard.New then forces it to refuse writes at capacity. Without
+// Peers the shards get no transport, keep ring-buffer eviction, and behave as a
+// single node with a data directory. It is the same predicate cluster.New uses.
+func embeddedDeployment(cfg EmbeddedConfig) cacheDeployment {
+	if len(cfg.Peers) > 0 {
+		return deployCluster
+	}
+	return deploySingleNodeDataDir
+}
+
+func NewEmbedded(cfg EmbeddedConfig) (Store, error) {
+	if cfg.Ops == nil {
+		return nil, errors.New("rostam: EmbeddedConfig.Ops must not be nil")
+	}
+
+	numShards := cfg.NumShards
+	if numShards == 0 {
+		numShards = 64
+	}
+
+	cc, err := embeddedCacheConfig(cfg, numShards)
+	if err != nil {
 		return nil, err
 	}
+	warnInertCacheKnobs(cfg.Cache, embeddedDeployment(cfg))
 
 	shardCfg := shard.DefaultConfig(cfg.DataDir, cfg.NodeID, cfg.Ops)
 	shardCfg.Cache = cc

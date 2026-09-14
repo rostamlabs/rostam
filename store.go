@@ -1339,4 +1339,53 @@ type CacheConfig struct {
 	// multiplier is GC headroom rather than engine overhead; set GOMEMLIMIT to
 	// bound RSS independently of it.
 	MaxMemoryBytes int64
+
+	// The five fields below are opt-in eviction knobs, and a zero value for each has no
+	// effect (RelocateReserveIntervalMs zero keeps the library's non-zero cadence, which
+	// does nothing without RelocatingEviction). Each maps onto the cache.Config field of
+	// the same name, whose doc has the full trade-off.
+	//
+	// MOST OF THEM DO NOTHING ON MOST DEPLOYMENTS. None acts on a shard whose at-capacity
+	// policy is to refuse writes, which replication forces on every cluster shard. Past
+	// that, RelocatingEviction, RelocateReserveIntervalMs and SieveVisitedBit matter only
+	// when a shard actually evicts, and the reserve runs only on an in-memory shard. The
+	// in-place pair is not tied to capacity — it changes every same-size rewrite, and how
+	// reads are taken, whether or not the shard is full — but it acts only on an
+	// in-memory shard.
+	//
+	// NewDirect and NewEmbedded log a warning naming each knob that is set but has no
+	// effect on the store being built; docs/server/running.md has the full matrix.
+
+	// RelocatingEviction copies the live records off a page about to be evicted
+	// instead of dropping them with the dead versions sharing that page. Single-node
+	// only (with or without a DataDir); no effect on a cluster.
+	RelocatingEviction bool
+
+	// RelocateReserveIntervalMs is the cadence of RelocatingEviction's background
+	// free-page reserve. It follows TTLSweepIntervalMs: zero keeps the library
+	// default, a NEGATIVE value runs no reserve ticker (relocation then happens on the
+	// write path only), positive sets the interval in milliseconds. It does nothing
+	// unless RelocatingEviction is on, and the reserve runs only on a single-node
+	// store without a DataDir.
+	RelocateReserveIntervalMs int
+
+	// InPlaceSameSizeUpdate lets a rewrite of a key with a value of the same length
+	// overwrite the stored copy instead of appending a new one. It changes eviction
+	// semantics (a rewritten key no longer moves to the newest page) and makes reads
+	// take the shard read lock unless InPlaceSeqlockReads is also set. Single-node
+	// without a DataDir only; no effect with a DataDir or on a cluster.
+	InPlaceSameSizeUpdate bool
+
+	// InPlaceSeqlockReads keeps reads lock-free on a shard with in-place updates by
+	// validating each read against a version counter afterwards. That read is a
+	// DELIBERATE DATA RACE on page bytes: the race detector reports it and its
+	// concurrent tests skip under -race, so a green race-enabled test run does not
+	// cover this protocol. An opt-in performance trade that pays only when reads far
+	// outnumber writes. Does nothing unless InPlaceSameSizeUpdate takes effect.
+	InPlaceSeqlockReads bool
+
+	// SieveVisitedBit makes RelocatingEviction rescue only records read or rewritten
+	// since the last eviction passed them, instead of whichever live records it meets
+	// first. Does nothing unless RelocatingEviction is on; no effect on a cluster.
+	SieveVisitedBit bool
 }

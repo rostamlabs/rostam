@@ -96,6 +96,23 @@ func TestLoadFileConfigEmptyMeansDerive(t *testing.T) {
 // A typo'd knob must fail loudly. Silently ignoring it would leave the node on
 // a memory bound the operator did not intend — the exact failure this config
 // stanza exists to prevent.
+// The cache eviction knobs are flags and environment variables only, and the docs
+// tell operators a config file naming one fails to load. Pin that, so a future file
+// key cannot quietly give one setting two homes.
+func TestLoadFileConfigRejectsCacheEvictionKnobs(t *testing.T) {
+	for _, key := range []string{
+		"relocating_eviction", "relocate_reserve_interval", "in_place_same_size_update",
+		"in_place_seqlock_reads", "sieve_visited_bit",
+		"RelocatingEviction", "RelocateReserveIntervalMs", "InPlaceSameSizeUpdate",
+		"InPlaceSeqlockReads", "SieveVisitedBit",
+	} {
+		body := `{"cache":{"` + key + `":true}}`
+		if _, err := loadFileConfig(writeConfig(t, body)); err == nil {
+			t.Errorf("loadFileConfig(%s) = nil error, want a rejection", body)
+		}
+	}
+}
+
 func TestLoadFileConfigRejectsUnknownFields(t *testing.T) {
 	for _, body := range []string{
 		`{"cache":{"max_memmory":"8GiB"}}`,

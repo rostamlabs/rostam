@@ -5,6 +5,32 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **The cache eviction knobs can now be set on `rostam-server` and through
+  `rostam.CacheConfig`.** Relocating eviction, its background reserve cadence,
+  in-place same-size updates, lock-free (seqlock) reads for them, and the SIEVE
+  visited bit existed only as `cache.Config` fields, so nothing short of
+  constructing the cache directly could turn them on. They are now the flags
+  `-relocating-eviction`, `-relocate-reserve-interval`,
+  `-in-place-same-size-update`, `-in-place-seqlock-reads` and
+  `-sieve-visited-bit` (each with its `ROSTAM_*` variable), and `CacheConfig`
+  fields of the matching names. None has any effect by default: the four
+  switches are off, and the reserve interval's default does nothing without
+  relocating eviction, so nothing changes unless you set them. They are flags
+  and environment variables only; the `-config` file does not accept them.
+
+  Most of them have no effect on most topologies. None acts on a `-cluster`
+  node, whose shards are file-backed and refuse writes at capacity instead of
+  evicting; in-place
+  updates, their seqlock reads and the background reserve act only on a
+  single-node server without `-data`. A knob set where it cannot act — or
+  paired without the knob it depends on — is accepted and logged as a startup
+  warning naming the flag, the deployment and the reason, rather than silently
+  ignored. The matrix is in
+  [Running the server](server/running.md#cache-eviction-knobs).
+
+  `-in-place-seqlock-reads` is an opt-in performance trade whose read protocol
+  is a deliberate data race validated after the fact: it is not covered by race
+  detection, and its concurrent tests are skipped under `-race`.
 - **Breaking: `objstore.ObjectStore` gains `PutIfAbsent`, and two single-node
   backups at one timestamp can no longer both publish.** A backup refused an
   existing snapshot key by listing it first and then writing, and nothing made
