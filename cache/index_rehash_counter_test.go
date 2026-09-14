@@ -2,7 +2,10 @@
 
 package cache
 
-import "testing"
+import (
+	"runtime"
+	"testing"
+)
 
 // TestIndexRehashCounterCountsEveryTableSwap guards the counter every attribution in
 // BenchmarkIndexRehashTail and BenchmarkRelocatingEvictionTail rests on. Those benchmarks
@@ -85,7 +88,13 @@ func TestIndexRehashCounterCountsEveryTableSwap(t *testing.T) {
 	if got := s.indexRehashes.Load() - rehashesAtStart; got != swaps {
 		t.Fatalf("indexRehashes moved by %d, but the table object was replaced %d times", got, swaps)
 	}
-	if s.indexRehashNanos.Load() == 0 {
+	// The COUNT above is exact on every platform and is the load-bearing
+	// assertion. The nanos are checked too, but NOT on Windows: a rehash of a
+	// table this small takes a few microseconds, and the Windows clock is coarser
+	// than that, so time.Since can legitimately round every one of them to zero.
+	// Requiring non-zero there would pin the host's timer resolution rather than
+	// anything about the cache — it failed exactly that way in CI.
+	if runtime.GOOS != "windows" && s.indexRehashNanos.Load() == 0 {
 		t.Fatalf("indexRehashNanos = 0 after %d rehashes", swaps)
 	}
 }
