@@ -15,7 +15,8 @@ import (
 // Each slot is described by three parallel arrays:
 //
 //	ctrl[i]   atomic control word: 0 = empty, 1 = tombstone, else a non-zero tag
-//	          derived from the high bits of the key hash.
+//	          derived from the high bits of the key hash, optionally carrying the
+//	          SIEVE reference hint in a bit above the tag (see cache/sieve.go).
 //	refs[i]   atomic slabRef (the packed page index + offset).
 //	hashes[i] the full 64-bit key hash. Writer-only metadata (read only under mu);
 //	          readers never touch it, so it needs no atomic access.
@@ -40,6 +41,18 @@ const (
 	// tagPresentBit forces every real tag above the empty/tombstone sentinels, so
 	// a tag can never be mistaken for 0 (empty) or 1 (tombstone).
 	tagPresentBit uint64 = 1 << 16
+	// ctrlVisited is the SIEVE reference hint: set on a slot whose record has been
+	// ACCESSED since it was last passed over by a drain. It lives ABOVE the tag, so
+	// a tag comparison must mask it off — hence ctrlTagMask below, which every
+	// tag test in this file goes through. See cache/sieve.go for what sets it,
+	// what consumes it, and why losing one is harmless where losing a version
+	// counter would not be.
+	ctrlVisited uint64 = 1 << 17
+	// ctrlTagMask isolates the tag from the hint bits above it. ctrlEmpty and
+	// ctrlTombstone lie below tagPresentBit and are therefore compared WHOLE, never
+	// masked — a hint bit is only ever set on a slot that already carries a tag, so
+	// neither sentinel can acquire one (sieve.go, setVisited).
+	ctrlTagMask uint64 = ctrlVisited - 1
 	// minIndexSlots is the smallest table (must be a power of two).
 	minIndexSlots = 8
 )
@@ -86,7 +99,7 @@ probe:
 			if c == ctrlEmpty {
 				return nil, 0, 0, lkMiss // probe run ended: key absent
 			}
-			if c != tag {
+			if c&ctrlTagMask != tag {
 				continue // tombstone or different tag
 			}
 			// Load the ref AFTER the control word: the writer stores ref before
@@ -121,6 +134,12 @@ probe:
 			}
 			if !bytes.Equal(k, key) {
 				continue // false-tag or stale ref → keep probing
+			}
+			// A HIT IS AN ACCESS: leave the SIEVE hint on this slot. It runs on the
+			// table the probe actually settled on (tab, not t), which is the only one
+			// a drain could consult. See cache/sieve.go.
+			if s.sieve {
+				tab.setVisited(i, tag, r)
 			}
 			return val, e, r, lkHit
 		}
@@ -222,7 +241,7 @@ func (t *indexTable) getSeq(s *shard, dst, key []byte, h uint64) (out []byte, ex
 			if c == ctrlEmpty {
 				return dst, 0, 0, lkMiss, true // probe run ended: key absent
 			}
-			if c != tag {
+			if c&ctrlTagMask != tag {
 				continue
 			}
 			r := slabRef(tab.refs[i].Load())
@@ -274,6 +293,11 @@ func (t *indexTable) getSeq(s *shard, dst, key []byte, h uint64) (out []byte, ex
 			if ver.Load() != v1 {
 				return dst, 0, 0, lkMiss, false // the value moved while it was copied
 			}
+			// Marked only after the read is VALIDATED, so a probe that turns out to
+			// have read torn bytes leaves no hint behind. See cache/sieve.go.
+			if s.sieve {
+				tab.setVisited(i, tag, r)
+			}
 			return out, e, r, lkHit, true
 		}
 	}
@@ -297,16 +321,23 @@ func (t *indexTable) findSlot(h uint64) (slot uint64, ref slabRef, ok bool) {
 		if c == ctrlEmpty {
 			return 0, 0, false
 		}
-		if c == tag && t.hashes[i] == h {
+		if c&ctrlTagMask == tag && t.hashes[i] == h {
 			return i, slabRef(t.refs[i].Load()), true
 		}
 	}
 }
 
-// upsert inserts or updates the entry for hash h to point at ref. Writer-side
-// (call under mu). Publication order: ref is stored before ctrl so a lock-free
-// reader that sees the tag also sees a valid ref.
-func (t *indexTable) upsert(h uint64, ref slabRef) {
+// upsert inserts or updates the entry for hash h to point at ref, and reports the
+// slot it wrote and whether the key was ABSENT (a true insert) rather than
+// repointed. Writer-side (call under mu). Publication order: ref is stored before
+// ctrl so a lock-free reader that sees the tag also sees a valid ref.
+//
+// The two returns are the SIEVE hint's business and nothing else's (cache/sieve.go):
+// an insert publishes a clean control word, so a newly stored key starts UNVISITED,
+// while a repoint leaves ctrl alone and so carries any hint the key had already
+// earned. Callers that are moving bytes rather than serving a request — relocation,
+// compaction, the warm-restart rebuild — want exactly that and ignore both values.
+func (t *indexTable) upsert(h uint64, ref slabRef) (slot uint64, inserted bool) {
 	tag := tagFor(h)
 	firstFree := -1
 	for i := h & t.mask; ; i = (i + 1) & t.mask {
@@ -322,16 +353,16 @@ func (t *indexTable) upsert(h uint64, ref slabRef) {
 			t.refs[slot].Store(uint64(ref)) // store value first
 			t.ctrl[slot].Store(tag)         // then publish control
 			t.live++
-			return
+			return slot, true
 		case c == ctrlTombstone:
 			if firstFree < 0 {
 				firstFree = int(i) //nolint:gosec // i <= mask fits an int
 			}
-		case c == tag && t.hashes[i] == h:
+		case c&ctrlTagMask == tag && t.hashes[i] == h:
 			// Existing key: repoint at the new physical copy. ctrl already carries
 			// the tag, so a plain ref store republishes the value in place.
 			t.refs[i].Store(uint64(ref))
-			return
+			return i, false
 		}
 	}
 }
@@ -351,6 +382,14 @@ func (t *indexTable) overThreshold() bool {
 
 // rehashed builds a fresh table sized for the current live set (load ≈ 0.5) and
 // copies every live entry into it, dropping all tombstones. Writer-side.
+//
+// THE SIEVE HINT IS CARRIED ACROSS, and that is not optional (cache/sieve.go).
+// This copy is the one moment every hint in the shard could be lost AT ONCE, and a
+// drain landing just after a rehash would then see a whole page of records as
+// unvisited and drop every one of them. "A lost hint costs one missed retention" is
+// only true of hints lost ONE AT A TIME — which is the residual this loop cannot
+// address and deliberately leaves: a reader still holding the pre-swap table marks a
+// slot no writer will consult again.
 func (t *indexTable) rehashed() *indexTable {
 	nt := newIndexTable(t.live)
 	for i := range t.ctrl {
@@ -358,7 +397,12 @@ func (t *indexTable) rehashed() *indexTable {
 		if c == ctrlEmpty || c == ctrlTombstone {
 			continue
 		}
-		nt.upsert(t.hashes[i], slabRef(t.refs[i].Load()))
+		slot, _ := nt.upsert(t.hashes[i], slabRef(t.refs[i].Load()))
+		if c&ctrlVisited != 0 {
+			// nt is private to this call until the caller publishes it, so a plain
+			// store is enough — no reader can be probing it yet.
+			nt.ctrl[slot].Store(tagFor(t.hashes[i]) | ctrlVisited)
+		}
 	}
 	return nt
 }

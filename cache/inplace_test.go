@@ -360,7 +360,7 @@ func TestInPlaceGuards(t *testing.T) {
 		s.mu.Lock()
 		s.retirePageLocked(int(stale.pageIdx()))
 		s.tab.Load().upsert(hashKey(key), stale)
-		_, _, ok := s.inPlaceTargetLocked(key, []byte("bbbb"), hashKey(key))
+		_, ok := s.inPlaceTargetLocked(key, []byte("bbbb"), hashKey(key))
 		gen := s.pages[stale.pageIdx()].gen
 		s.mu.Unlock()
 
@@ -384,7 +384,7 @@ func TestInPlaceGuards(t *testing.T) {
 			t.Fatalf("seed Put: %v", err)
 		}
 		s.mu.Lock()
-		_, _, ok := s.inPlaceTargetLocked(other, []byte("bbbb"), hashKey(victim))
+		_, ok := s.inPlaceTargetLocked(other, []byte("bbbb"), hashKey(victim))
 		s.mu.Unlock()
 		if ok {
 			t.Fatal("a colliding key was accepted as an in-place target for another key's entry")
@@ -393,7 +393,7 @@ func TestInPlaceGuards(t *testing.T) {
 		// the refusal above came from the key comparison and not from some other
 		// guard tripping first.
 		s.mu.Lock()
-		_, _, ok = s.inPlaceTargetLocked(victim, []byte("bbbb"), hashKey(victim))
+		_, ok = s.inPlaceTargetLocked(victim, []byte("bbbb"), hashKey(victim))
 		s.mu.Unlock()
 		if !ok {
 			t.Fatal("the owning key was refused too; the control is not isolating the key comparison")

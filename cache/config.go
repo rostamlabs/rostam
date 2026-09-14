@@ -281,6 +281,36 @@ type Config struct {
 	// everywhere else.
 	ServerWriteTimeout time.Duration
 
+	// SieveVisitedBit makes relocating eviction choose what to rescue by REFERENCE
+	// instead of by position, using a SIEVE-style visited bit kept in the index
+	// control word (cache/sieve.go). Default false.
+	//
+	// Without it, relocation carries whatever live records the walk meets first off
+	// the page being drained, spending a bounded copying budget with no reference to
+	// whether anything was ever used. With it, a record is rescued only if it has
+	// been READ or REWRITTEN since the last time a drain passed it, and the mark is
+	// cleared on rescue, so a record has to earn each rescue afresh. A key stored and
+	// never touched again starts unmarked and is dropped, which is what stops a
+	// stream of write-once keys from evicting the working set.
+	//
+	// WHERE IT APPLIES. PolicyRingbufEvict only — the bit is maintained nowhere else
+	// and consumed only by relocating eviction, so it is a no-op without
+	// Config.RelocatingEviction and on any shard that never evicts (PolicyRejectWrites,
+	// which is what replication forces). It is not restricted to heap shards: both
+	// ringbuf storage modes run the same pass.
+	//
+	// WHY IT PAIRS WITH InPlaceSameSizeUpdate. A ring buffer gets recency for free
+	// from page order — a rewritten key moves to the newest page and drifts ahead of
+	// the rotation — and in-place updates give exactly that up, because a record
+	// rewritten where it lies keeps its page and only ever grows older. This bit is
+	// how such a shard states that a record is in use without moving it.
+	//
+	// WHAT IT COSTS. One masked compare on every index probe, and one compare-and-swap
+	// on the first read of a record after a drain cleared its mark (subsequent reads
+	// see the bit already set and do not store). The word is per-SLOT, so this is not
+	// a line every reader of the shard shares.
+	SieveVisitedBit bool
+
 	// InPlaceSameSizeUpdate lets a write OVERWRITE the entry already stored for its
 	// key instead of appending a new copy after it, when the two are framed
 	// identically — same key, same value LENGTH. Default false.
