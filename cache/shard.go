@@ -157,6 +157,9 @@ type shard struct {
 	rejects       atomic.Uint64
 	pagesAlloc    atomic.Uint64
 	corrupt       atomic.Uint64
+	// corruptBytes is the framed page bytes those corruption responses discarded
+	// without reading them. See Stats.CorruptionBytesDiscarded.
+	corruptBytes atomic.Uint64
 
 	// inPlaceUpdates counts the writes that overwrote their key's stored copy where
 	// it lay instead of appending a new one and stranding the old — the writes that
@@ -1462,6 +1465,8 @@ func (s *shard) snapshot() Stats {
 		Tombstones:       tomb,
 		CorruptionErrors: s.corrupt.Load(),
 
+		CorruptionBytesDiscarded: s.corruptBytes.Load(),
+
 		Compactions:              s.compactions.Load(),
 		CompactionsAborted:       s.compactAborts.Load(),
 		CompactionBytesReclaimed: s.compactBytesReclaimed.Load(),
@@ -1584,6 +1589,7 @@ func (s *shard) rebuildIndexFromPages() {
 			// (head > tail, so the walk below never runs). Treat it like the
 			// torn-entry path: drop the page and count the loss instead of
 			// crash-looping or losing data with no signal.
+			s.corruptBytes.Add(uint64(len(entries))) //nolint:gosec // a slice length is non-negative
 			s.corrupt.Add(1)
 			slog.Warn("corrupt page head/tail during recovery; resetting page",
 				"component", "cache", "page", pageIdx, "head", head, "tail", tail, "cap", len(entries))
@@ -1601,13 +1607,46 @@ func (s *shard) rebuildIndexFromPages() {
 				// is unreadable. Record it so recovery-time loss is observable —
 				// consistent with the runtime read paths (getH/getIntoH) that also
 				// bump s.corrupt — rather than swallowing it silently.
+				s.corruptBytes.Add(uint64(tail - cursor)) //nolint:gosec // bounds validated above; cursor < tail inside this loop
 				s.corrupt.Add(1)
 				slog.Warn("corrupt entry during recovery; truncating page tail",
-					"component", "cache", "page", pageIdx, "offset", cursor, "tail", tail, "err", err, "truncate_to", cursor)
+					"component", "cache", "page", pageIdx, "offset", cursor, "tail", tail, "err", err, "truncate_to", cursor, "discarded_bytes", tail-cursor)
 				// Truncate the page's persisted framing to the validated prefix so
 				// the torn region is excluded from every future eviction walk
 				// (EvictFront frames entries from raw bytes without a CRC). Reset if
 				// nothing valid preceded the corruption.
+				//
+				// WHY THE WHOLE TAIL, AND NOT A RESYNC PAST THIS ONE ENTRY. Resyncing means
+				// finding where the next entry starts without the framing that says so, and
+				// the only evidence available is the bytes themselves. They cannot carry that
+				// weight, because a VALUE IS CLIENT BYTES: nothing stops a client storing a
+				// complete, correctly checksummed entry inside a value, and every field of
+				// such a frame — lengths, CRC, write sequence — is chosen by whoever wrote it.
+				// CRC32 bounds a RANDOM false match at 2^-32 per candidate; it bounds a chosen
+				// one not at all, and no plausibility test on attacker-chosen bytes restores
+				// the bound. A forward scan adopts a frame planted anywhere in the torn
+				// entry's own value; skipping by the torn entry's own lengths adopts one
+				// wherever a flipped length bit lands.
+				//
+				// Adopting one is worse than losing the page. It indexes a key nobody wrote
+				// with a value nobody stored, and its sequence is chosen too: set high, it
+				// beats the genuine copy of any key in the max-seq contest below and lifts
+				// writeSeq to wherever it says. The sequence is therefore no cross-check —
+				// it is part of what would be forged. The prefix walk is immune: it only
+				// ever steps by lengths that passed a CRC over a header whose sequence and
+				// expiry were assigned by this shard, so it never reads a value as framing.
+				//
+				// The loss is also narrower than it looks for the common cause. A mmap page
+				// is never rewritten where it lies, only appended to and drained, so a crash
+				// can tear only bytes written since the last writeback. What follows such a
+				// tear is either an entry appended AFTER the torn one — truncating is then
+				// recovering the longest valid prefix of that page's append log — or, when a
+				// drain's reset framing did not reach disk, entries that drain had already
+				// evicted. Entries durable long before the damage are lost only to damage
+				// arriving later, bit rot or a stray write, and how much that cost is
+				// reported in Stats.CorruptionBytesDiscarded. A sound resync needs framing a
+				// client cannot forge (a checksum keyed by a per-file secret, or out-of-band
+				// entry boundaries), which is a format change.
 				if cursor == head {
 					p.Reset()
 				} else {
@@ -2025,13 +2064,32 @@ func (s *shard) retirePageLocked(idx int) {
 }
 
 // drainPageLocked evicts every live entry from page victim, dropping each from
-// the index, until the page is empty. If EvictFront reports torn framing
-// (recovered from a crash-corrupted mmap region — a stale/garbage entry header
-// that decodeEntry would have rejected), the page is treated as corrupt: the
-// event is counted and logged and the page is Reset so the shard regains write
-// availability instead of failing every future space-needing Put. Stale index
-// slots left pointing into the reset region resolve to misses on Read and are
-// reclaimed by the sweeper. Must be called with s.mu held for writing.
+// the index, until the page is empty. If the page's persisted head/tail are out of
+// range, or EvictFront reports torn framing — an entry header whose lengths run past
+// the page's live band — the page cannot be walked. The warm-restart walk would have
+// rejected either, so these are bytes that changed under a running shard. The event is
+// counted and logged, every index slot still addressing the page is dropped, and the
+// page is Reset so the shard regains write availability instead of failing every future
+// space-needing Put (see discardCorruptPageLocked).
+// Must be called with s.mu held for writing.
+//
+// RESETTING WITHOUT SKIPPING LOSES NOTHING A DRAIN WOULD HAVE KEPT. This function
+// empties the page whether or not it meets a tear, and relocating eviction takes its
+// rescues off a page one eviction BEFORE the drain that empties it
+// (cache/relocate_evict.go), so every record still on the page at this point was
+// going out regardless. Resynchronising past the bad entry would change only which
+// dead bytes get stepped over, and it would have to trust raw bytes to do it (see
+// rebuildIndexFromPages for why that trust is not available). What the tear DOES
+// cost is the walk, and the walk is what drops each record's index slot — so the
+// slots are dropped from the index side instead.
+//
+// THE SLOTS ARE NOT OPTIONAL. An in-place Reset keeps the page object and its
+// generation, so a slot left addressing the page still passes the read path's
+// generation gate. Until the region is rewritten it serves the record this drain
+// evicted; once the page refills, the bytes at its offset belong to a different
+// record — which Iterate reports under that record's key a second time (it does not
+// check a key against its slot), and which the slot, never matched by any later walk,
+// keeps counted in Entries for the life of the process.
 //
 // This is the MMAP-ONLY eviction path (see evictVictimLocked): it mutates the
 // page's fixed persisted region in place, which is safe because mmap ringbuf
@@ -2042,9 +2100,25 @@ func (s *shard) drainPageLocked(victim int) error {
 	// stays decided by cur == ref alone.
 	now := s.now()
 	for !s.pages[victim].Empty() {
+		// BOUNDS FIRST. head and tail are raw bytes in the mapped page header, and this
+		// page is live: recovery's bounds check ran at open, and nothing has checked them
+		// since. Every read below trusts them — the expiry probe slices entries up to
+		// tail, EvictFront slices from head — so a corrupted pair must be caught here,
+		// before either runs. p.head() widens a uint32, so on 32-bit a large value is
+		// already negative, which the first test catches.
+		if p := s.pages[victim]; p.head() < 0 || p.tail() < p.head() || p.tail() > len(p.entries()) {
+			// Those bounds were the only record of how much the page held, so nothing
+			// derived from them is a loss figure — tail-head is negative for head > tail.
+			// The page's capacity is reported instead, as recovery does for a page whose
+			// bounds it rejects.
+			slog.Warn("corrupt page head/tail during eviction; resetting page",
+				"component", "cache", "page", victim, "head", p.head(), "tail", p.tail(), "cap", len(p.entries()))
+			s.discardCorruptPageLocked(victim, len(p.entries()), now)
+			return nil
+		}
 		// Capture the entry's offset BEFORE EvictFront advances head, so we
 		// can reconstruct the slabRef of the copy being physically removed.
-		off := uint32(s.pages[victim].head()) //nolint:gosec // head < PageSize which is validated ≤ MaxInt32
+		off := uint32(s.pages[victim].head()) //nolint:gosec // 0 <= head <= len(entries) is established above
 		// Read the expiry BEFORE evicting: EvictFront returns only the key, and
 		// evictionsLive must not count an entry that had already expired.
 		var headExpiryMs uint64
@@ -2055,9 +2129,11 @@ func (s *shard) drainPageLocked(victim int) error {
 		}
 		evictedKey, _, err := s.pages[victim].EvictFront()
 		if err != nil {
-			s.corrupt.Add(1)
-			slog.Warn("corrupt entry during eviction; resetting page", "component", "cache", "page", victim, "offset", off, "err", err)
-			s.pages[victim].Reset()
+			// The bounds passed the check above, so off <= tail and this is the size of
+			// the region the drain can no longer walk.
+			discarded := s.pages[victim].tail() - int(off)
+			slog.Warn("corrupt entry during eviction; resetting page", "component", "cache", "page", victim, "offset", off, "discarded_bytes", discarded, "err", err)
+			s.discardCorruptPageLocked(victim, discarded, now)
 			return nil
 		}
 		// Only drop the index slot if it still points at THIS physical copy.
@@ -2083,6 +2159,52 @@ func (s *shard) drainPageLocked(victim int) error {
 		s.evictions.Add(1)
 	}
 	return nil
+}
+
+// discardCorruptPageLocked is drainPageLocked's response to a page it cannot walk: it
+// records the loss, drops every index slot still addressing the page, and resets it.
+// discarded must be non-negative — the caller has already decided what an honest
+// figure is for its case. Must hold mu for writing.
+func (s *shard) discardCorruptPageLocked(victim, discarded int, now uint64) {
+	p := s.pages[victim]
+	// Bytes before the incident: snapshot() loads the incident count first, so a
+	// concurrent snapshot can see the bytes of an incident it does not yet count, but
+	// never an incident without its bytes.
+	s.corruptBytes.Add(uint64(discarded)) //nolint:gosec // callers pass a non-negative figure
+	s.corrupt.Add(1)
+	// O(index slots), under the write lock — acceptable only because this is a
+	// corruption response, never the steady state. Every slot addressing this page
+	// object is dropped, not just those at or past the tear: the page is about to be
+	// empty, and an empty page holds no record.
+	t := s.tab.Load()
+	for i := range t.ctrl {
+		c := t.ctrl[i].Load()
+		if c == ctrlEmpty || c == ctrlTombstone {
+			continue
+		}
+		ref := slabRef(t.refs[i].Load())
+		if int(ref.pageIdx()) != victim || ref.gen() != p.gen {
+			continue
+		}
+		t.tombstone(uint64(i)) //nolint:gosec // i is a valid slot index
+		s.evictions.Add(1)
+		// The slot says where its record starts, but the bytes there are the ones that
+		// just proved untrustworthy on this page. A key is reported only when it decodes
+		// AND hashes to the slot's own hash; anything else — the torn record itself,
+		// most likely — notifies nothing, exactly as sweepIndex treats an unreadable
+		// slot. Notifying under a key read from garbage would drop some unrelated live
+		// key's postings from a derived index. Read bounds itself by the page, not by
+		// the corrupt tail, so it is safe here whatever the header says.
+		key, _, exp, rerr := p.Read(ref.offset())
+		if rerr != nil || hashKey(key) != t.hashes[i] {
+			continue
+		}
+		if !isExpired(exp, now) {
+			s.evictionsLive.Add(1)
+		}
+		s.fireOnRemove(key)
+	}
+	p.Reset()
 }
 
 // runSweeper expires entries past their TTL on a fixed cadence.

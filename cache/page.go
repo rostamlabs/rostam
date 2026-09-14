@@ -152,7 +152,16 @@ func (p *page) entries() []byte {
 
 // FreeTail returns the contiguous bytes available at the tail of the page.
 func (p *page) FreeTail() int {
-	return len(p.entries()) - p.tail()
+	tail := p.tail()
+	// On 32-bit a corrupt persisted mmap tail at or above 2^31 widens NEGATIVE, which
+	// would report MORE room than the page has and send an append to slice from a
+	// negative offset. Report none: the page stays non-empty, so eviction picks it,
+	// and the drain's bounds check resets it. On 64-bit tail is never negative and a
+	// tail past the page already comes out negative here, which reads as full.
+	if tail < 0 {
+		return 0
+	}
+	return len(p.entries()) - tail
 }
 
 // Empty reports whether the page contains zero live entries.
@@ -345,15 +354,17 @@ func (p *page) EvictFront() ([]byte, uint32, error) {
 	// Validate the WHOLE entry (key + value) lies within [head, tail), mirroring
 	// decodeEntry's total-length check. A crash-torn or stale header carries a
 	// garbage valLen; without this guard EvictFront would advance head past tail,
-	// breaking the 0 <= head <= tail invariant and wedging the shard. newHead is
-	// computed in full-width int (keyLen/valLen sum to at most maxKeyLen +
-	// maxValueLen, which fits an int on 64-bit) so a huge valLen can't wrap a
-	// uint32 into a small, deceptively in-bounds size. The caller
+	// breaking the 0 <= head <= tail invariant and wedging the shard. The caller
 	// (drainPageLocked) treats the error as page corruption and Resets the page.
-	newHead := keyEnd + valLen
-	if keyEnd > tail || newHead > tail {
+	//
+	// valLen is compared with the room left rather than added first. On 32-bit a
+	// POSITIVE valLen near the int32 max wraps keyEnd+valLen negative, which passes
+	// `newHead > tail` and is stored as the head — no error at all. keyEnd <= tail is
+	// established before the subtraction, so tail-keyEnd cannot wrap.
+	if keyEnd > tail || valLen > tail-keyEnd {
 		return nil, 0, errEntryTruncated
 	}
+	newHead := keyEnd + valLen
 	// newHead <= tail <= len(entries) <= PageSize, so the entry size fits uint32.
 	size := uint32(entryHeaderSize + keyLen + valLen) //nolint:gosec // bounded by tail-head <= PageSize
 	// Alias the key into the page (no copy): advancing head below doesn't
