@@ -5,6 +5,50 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **A corrupt entry met during eviction on a persistent (mmap) cache left the
+  evicted page's keys behind in the index.** When the in-place drain could not
+  frame an entry it reset the page, but dropped none of the index slots still
+  pointing into it. A reset keeps the page's generation, so those slots stayed
+  valid to the read path: until the page was rewritten they served records the
+  drain had evicted, and once it refilled, the bytes at their offsets belonged to
+  other records — which `Iterate` then reported twice. The slots were never
+  reclaimed, so `Entries` stayed inflated for the life of the process. The drain
+  now drops every slot addressing the page before resetting it, counting and
+  notifying the removals as an ordinary drain would. A key is reported to the
+  removal hook only when its bytes still hash to the slot, so the damaged record
+  itself notifies nothing rather than a key read out of garbage.
+
+- **On 32-bit builds, one corrupt length in a persistent cache's page file
+  crashed every restart.** The entry decoders added a length read off disk into a
+  total before bounding it; a value length near the 32-bit maximum wrapped that
+  total negative, slipped past the length check, and panicked on the slice —
+  during the warm-restart walk, so again on the next start. Eviction's framing
+  had the same sum and stored the wrapped value as the page head without
+  reporting an error. Both now compare the length with the room left instead.
+  64-bit builds are unaffected.
+
+- **New counter `CorruptionBytesDiscarded`
+  (`rostam_kv_corruption_bytes_discarded_total`)** reports how many page bytes
+  the warm restart and the mmap eviction drain discarded because they could not
+  read them. A warm restart that meets an entry failing its checksum still
+  discards that page from the entry to its tail, and this is where that loss now
+  shows; a page whose persisted head/tail are out of range counts as its whole
+  capacity. It does not resynchronise past the bad entry: a value can
+  legitimately contain bytes that form a complete, checksummed entry, so a
+  resync could index a key nobody wrote. Recovering the rest of the page safely
+  needs framing a client cannot forge, which is a format change.
+
+  It is not a per-incident size for `CorruptionErrors`, whose description was
+  also wrong: that counter never counted checksum mismatches on read (reads
+  verify none). It counts once per read that reaches an entry which will not
+  frame, so a damaged entry read repeatedly counts repeatedly, and once per
+  region the warm restart or the drain gives up on.
+
+- **An mmap cache page whose persisted head/tail were corrupted while the cache
+  was running could panic the process at its next eviction**, or, on 32-bit
+  builds, at the next write into it. The drain now checks a page's bounds before
+  reading through them and resets a page whose bounds are out of range, with its
+  index slots dropped.
 - **Breaking (rolling upgrades): a node now HALTS on cluster metadata it does
   not recognise, instead of silently skipping it.** When the meta-Raft log
   delivered an entry whose op this binary did not know, the node returned an
