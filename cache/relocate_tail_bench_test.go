@@ -66,9 +66,12 @@ import (
 // so that equality says a class with every rehash removed has the same p999 as the class
 // with them left in. The reason is FREQUENCY, not size. A rehash is genuinely
 // expensive and it owns the max — but the threshold is met only once per live-set's worth of
-// accumulated tombstones, so clean_rehashoverlap_frac lands around 1e-5 or below — orders
-// of magnitude too rare to reach a p999 at all, and that figure is an OVER-count, so the
-// true rate is lower still. In the relocating arms it is 0 for whole runs, because relocation repoints
+// accumulated tombstones. clean_rehashoverlap_frac measures somewhere between about 1e-6
+// and 5e-5 depending on the shard count, and it varies several-fold between repeats, so
+// take the WORST repeat rather than the average: even there a rehash overlaps roughly one
+// write in eighteen thousand, against the one in a thousand a p999 rests on. And that
+// figure is an OVER-count of the writes that actually rehashed, so the true rate is lower
+// again. In the relocating arms it is 0 for whole runs, because relocation repoints
 // a surviving entry's slot in place (see relocateIntoFreedPageLocked) and leaves no tombstone
 // behind, so those arms rehash barely at all — and their clean p999 is the same as the arm
 // that rehashes. BenchmarkIndexRehashTail drives the step directly, sweeps the live set it
@@ -188,13 +191,23 @@ func relocTailArms(b *testing.B, shards int) {
 			relocTailReadBaseline(b, c, keys, keyspace)
 		}
 
-		var (
-			mu                           sync.Mutex
-			clean, held                  latHist
-			cleanOverlap, cleanNoOverlap latHist
-			workers                      int64
-		)
 		b.Run("reloc="+arm.name, func(b *testing.B) {
+			// EVERY PIECE OF AGGREGATION STATE IS DECLARED IN HERE, and that placement is
+			// load-bearing rather than stylistic. The framework re-invokes this callback:
+			// once to calibrate, and once more per -count repeat. State hoisted outside it
+			// is therefore SHARED by those invocations, so repeat two reports repeat one's
+			// samples as well as its own and repeat three reports all three. Ranges taken
+			// across the printed lines would then be ranges over cumulative sets, not over
+			// independent measurements — and a p999 is exactly the statistic that ruins,
+			// since it rests on a handful of outliers and the early, cold-cache repeats
+			// would leak theirs into every later line. Declared here, each invocation
+			// starts empty and each printed line stands alone.
+			var (
+				mu                           sync.Mutex
+				clean, held                  latHist
+				cleanOverlap, cleanNoOverlap latHist
+				workers                      int64
+			)
 			b.ReportAllocs()
 			b.ResetTimer()
 			b.RunParallel(func(pb *testing.PB) {
@@ -264,6 +277,8 @@ func relocTailArms(b *testing.B, shards int) {
 			var all latHist
 			all.merge(&clean)
 			all.merge(&held)
+			b.ReportMetric(float64(all.n), "samples")
+			b.ReportMetric(float64(clean.n), "clean_samples")
 			b.ReportMetric(float64(all.quantile(0.50)), "p50_ns")
 			b.ReportMetric(float64(all.quantile(0.90)), "p90_ns")
 			b.ReportMetric(float64(all.quantile(0.99)), "p99_ns")
@@ -293,12 +308,15 @@ func relocTailArms(b *testing.B, shards int) {
 // side; held_frac and the two attributed quantiles are omitted, since a read holds nothing
 // and evicts nothing. See relocTailArms for why this row is not optional.
 func relocTailReadBaseline(b *testing.B, c *Cache, keys [][]byte, keyspace int) {
-	var (
-		mu      sync.Mutex
-		all     latHist
-		workers int64
-	)
 	b.Run("reads", func(b *testing.B) {
+		// Declared inside the callback, for the reason given at the write arms' own
+		// aggregation state: this callback is re-invoked per -count repeat, and state
+		// outside it would pool every repeat into the last line.
+		var (
+			mu      sync.Mutex
+			all     latHist
+			workers int64
+		)
 		b.ReportAllocs()
 		b.ResetTimer()
 		b.RunParallel(func(pb *testing.PB) {
@@ -320,6 +338,7 @@ func relocTailReadBaseline(b *testing.B, c *Cache, keys [][]byte, keyspace int) 
 			mu.Unlock()
 		})
 		b.StopTimer()
+		b.ReportMetric(float64(all.n), "samples")
 		b.ReportMetric(float64(all.quantile(0.50)), "p50_ns")
 		b.ReportMetric(float64(all.quantile(0.90)), "p90_ns")
 		b.ReportMetric(float64(all.quantile(0.99)), "p99_ns")
