@@ -3,8 +3,8 @@
 package cache
 
 import (
-	"runtime"
 	"testing"
+	"time"
 )
 
 // TestIndexRehashCounterCountsEveryTableSwap guards the counter every attribution in
@@ -88,13 +88,42 @@ func TestIndexRehashCounterCountsEveryTableSwap(t *testing.T) {
 	if got := s.indexRehashes.Load() - rehashesAtStart; got != swaps {
 		t.Fatalf("indexRehashes moved by %d, but the table object was replaced %d times", got, swaps)
 	}
-	// The COUNT above is exact on every platform and is the load-bearing
-	// assertion. The nanos are checked too, but NOT on Windows: a rehash of a
-	// table this small takes a few microseconds, and the Windows clock is coarser
-	// than that, so time.Since can legitimately round every one of them to zero.
-	// Requiring non-zero there would pin the host's timer resolution rather than
-	// anything about the cache — it failed exactly that way in CI.
-	if runtime.GOOS != "windows" && s.indexRehashNanos.Load() == 0 {
-		t.Fatalf("indexRehashNanos = 0 after %d rehashes", swaps)
+	// The COUNT above is exact on every platform and is the load-bearing assertion.
+	// The nanos are asserted too, but only when this machine's MONOTONIC clock can
+	// actually resolve the work: a rehash of a table this small takes a few
+	// microseconds, and time.Since is quantised to the clock's tick, so on a host
+	// whose tick is coarser than the whole run the counter legitimately reads zero.
+	//
+	// Gate on the MEASURED granularity rather than on GOOS. That keeps the
+	// assertion live wherever it can hold, says in the failure message what the
+	// clock actually did, and starts asserting by itself if a platform's clock
+	// improves. (Windows is the case that forced this: Go's nanotime1 there reads
+	// _INTERRUPT_TIME from the shared data page, which ticks at the system timer
+	// interval rather than at the ~100 ns the precise wall-clock call would give.)
+	if g := monotonicGranularity(); g <= time.Microsecond {
+		if s.indexRehashNanos.Load() == 0 {
+			t.Fatalf("indexRehashNanos = 0 after %d rehashes, on a clock with %v granularity", swaps, g)
+		}
+	} else {
+		t.Logf("skipping the nanos assertion: monotonic clock granularity is %v, coarser than the work being timed", g)
 	}
+}
+
+// monotonicGranularity returns the smallest non-zero interval time.Since can
+// report on this machine, by spinning until the monotonic reading changes. It is
+// the quantum below which timing a short operation yields zero however long the
+// operation really took.
+func monotonicGranularity() time.Duration {
+	best := time.Duration(1 << 62)
+	for range 5 {
+		t0 := time.Now()
+		var d time.Duration
+		for d == 0 {
+			d = time.Since(t0)
+		}
+		if d < best {
+			best = d
+		}
+	}
+	return best
 }
