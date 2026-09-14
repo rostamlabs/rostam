@@ -359,20 +359,28 @@ func (s *CollectionStore) DropMultiVector(name string) error {
 	if !ok {
 		return fmt.Errorf("%w %q", ErrNoMultiVector, canonical)
 	}
+	s.retireMulti(canonical, idx)
+	return nil
+}
+
+// retireMulti finishes dropping idx, which the caller has already removed from the
+// multi map while holding canonical's name lock: it drains in-flight users, closes
+// the index, then deletes the single-node files (mmap Persistent + WAL
+// heap-checkpoint) and the cluster generation files (no-ops if absent — a heap-only
+// collection has none). It is shared by DropMultiVector and DropCollection, so the
+// two drops of a multi-vector collection cannot disagree about which files it owns:
+// a .mvcfg marker left behind would reload the collection on the next open.
+func (s *CollectionStore) retireMulti(canonical string, idx *MultiVectorIndex) {
 	cfgPath, vecs, graph := s.mvPaths(canonical)
 	wsnap, wwal := s.mvWALPaths(canonical)
 	eff := s.withMVPaths(canonical, MultiVectorConfig{Persistent: true, MmapPath: vecs})
 	idxCfg := idx.cfg
-	// Drain in-flight users before closing (no unmap under a reader), then delete
-	// the single-node files (mmap Persistent + WAL heap-checkpoint) and the cluster
-	// generation files (no-ops if absent — a heap-only collection has none).
 	idx.retire(func() {
 		for _, p := range []string{cfgPath, vecs, graph, mvMetaPath(eff), mvMapsPath(eff), wsnap, wwal} {
 			_ = os.Remove(p)
 		}
 		removeClusterMVFiles(idxCfg)
 	})
-	return nil
 }
 
 // MultiAdd inserts or replaces a document's token vectors in the named index.

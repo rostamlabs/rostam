@@ -109,6 +109,11 @@ func TestDropRemovesEveryFamilysFiles(t *testing.T) {
 		{"multi/wal", false, multi(MultiVectorConfig{Dim: 4, Seed: 1, WAL: true}), func(s *CollectionStore) error { return s.FlushMVWAL(col) }, dropMulti, true},
 		{"multi/persistent", false, multi(MultiVectorConfig{Dim: 4, Seed: 1, Persistent: true}), func(s *CollectionStore) error { return s.FlushMultiVector(col) }, dropMulti, true},
 		{"multi/cluster", true, multi(MultiVectorConfig{Dim: 4, Seed: 1}), nil, dropMulti, true},
+		{"multi/heap/DropCollection", false, multi(MultiVectorConfig{Dim: 4, Seed: 1}), nil, dropDense, false},
+		{"multi/wal/DropCollection", false, multi(MultiVectorConfig{Dim: 4, Seed: 1, WAL: true}), func(s *CollectionStore) error { return s.FlushMVWAL(col) }, dropDense, true},
+		{"multi/wal-unflushed/DropCollection", false, multi(MultiVectorConfig{Dim: 4, Seed: 1, WAL: true}), nil, dropDense, true},
+		{"multi/persistent/DropCollection", false, multi(MultiVectorConfig{Dim: 4, Seed: 1, Persistent: true}), func(s *CollectionStore) error { return s.FlushMultiVector(col) }, dropDense, true},
+		{"multi/cluster/DropCollection", true, multi(MultiVectorConfig{Dim: 4, Seed: 1}), nil, dropDense, true},
 		{"named/heap/DropNamed", false, named(false), nil, dropNamed, false},
 		{"named/heap/DropCollection", false, named(false), nil, dropDense, false},
 		{"named/wal/DropNamed", false, named(true), func(s *CollectionStore) error { return s.FlushNamed(col) }, dropNamed, true},
@@ -134,6 +139,19 @@ func TestDropRemovesEveryFamilysFiles(t *testing.T) {
 			}
 			if err := tc.drop(s); err != nil {
 				t.Fatalf("drop: %v", err)
+			}
+			// In-memory no-op guard: the drop must remove the name from the live
+			// store's maps, not only its files. A heap-only mode writes nothing, so
+			// the file and reopen checks below pass vacuously; only this catches a
+			// drop that reported success while leaving the index in memory.
+			if _, ok := s.Get(col); ok {
+				t.Error("dropped name still live as a dense collection")
+			}
+			if _, ok := s.GetMultiVector(col); ok {
+				t.Error("dropped name still live as a multi-vector collection")
+			}
+			if _, ok := s.GetNamed(col); ok {
+				t.Error("dropped name still live as a named-vector collection")
 			}
 			if left := collectionFiles(t, dir, col); len(left) != 0 {
 				t.Errorf("files left after drop: %v", left)
