@@ -762,6 +762,7 @@ func NewEmbedded(cfg EmbeddedConfig) (Store, error) {
 	case cfg.Cache.TTLSweepIntervalMs > 0:
 		cc.TTLSweepIntervalMs = cfg.Cache.TTLSweepIntervalMs
 	}
+	applyRingbufReclaim(&cc, cfg.Cache)
 	// Spread the node's budget across its Raft shards: this node holds
 	// numShards caches, each pinned to cc.NumShards = 1, so the divisor is
 	// numShards and NOT cc.NumShards. Previously each shard inherited

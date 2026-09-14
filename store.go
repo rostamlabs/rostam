@@ -1339,4 +1339,29 @@ type CacheConfig struct {
 	// multiplier is GC headroom rather than engine overhead; set GOMEMLIMIT to
 	// bound RSS independently of it.
 	MaxMemoryBytes int64
+
+	// RelocatingEviction copies a draining page's live records forward instead of
+	// dropping them with the superseded versions beside them. Ringbuf only.
+	// See cache.Config.RelocatingEviction.
+	RelocatingEviction bool
+
+	// RelocateReserveIntervalMs is the free-page reserve cadence, in ms. Inert
+	// unless RelocatingEviction is set. 0 keeps the cache default; negative runs
+	// no reserve ticker, leaving relocation as the write-path pass alone.
+	RelocateReserveIntervalMs int
+
+	// SieveVisitedBit makes relocating eviction rescue by reference rather than by
+	// position. No-op without RelocatingEviction.
+	SieveVisitedBit bool
+
+	// InPlaceSameSizeUpdate overwrites the stored copy when a rewrite frames to the
+	// same size, so a constant-size rewrite stream stops creating garbage. On a heap
+	// ringbuf shard this moves reads onto the read lock unless InPlaceSeqlockReads
+	// is also set. See cache.Config.InPlaceSameSizeUpdate for what it trades.
+	InPlaceSameSizeUpdate bool
+
+	// InPlaceSeqlockReads keeps heap ringbuf reads lock-free under
+	// InPlaceSameSizeUpdate by validating each read against a per-stripe version
+	// counter. No-op without it.
+	InPlaceSeqlockReads bool
 }

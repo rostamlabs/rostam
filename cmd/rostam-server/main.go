@@ -276,9 +276,10 @@ func main() {
 	// -config fails at startup rather than after the listeners are up. Zero =
 	// unset, which the engine turns into a host-derived budget.
 	var cacheMaxMemory int64
+	var fc fileConfig
 	if *configFile != "" {
-		fc, err := loadFileConfig(*configFile)
-		if err != nil {
+		var err error
+		if fc, err = loadFileConfig(*configFile); err != nil {
 			fatal("invalid -config file", "err", err)
 		}
 		if cacheMaxMemory, err = fc.cacheMaxMemoryBytes(); err != nil {
@@ -481,9 +482,14 @@ func main() {
 			InternalToken:           *internalToken,
 			NodeCNAllowlist:         nodeAllowlist,
 			Cache: rostam.CacheConfig{
-				MaxMemoryBytes:        cacheMaxMemory,
-				DisableColdCompaction: *disableColdCompaction,
-				TTLSweepIntervalMs:    ttlSweepIntervalMs,
+				MaxMemoryBytes:            cacheMaxMemory,
+				DisableColdCompaction:     *disableColdCompaction,
+				TTLSweepIntervalMs:        ttlSweepIntervalMs,
+				RelocatingEviction:        fc.Cache.RelocatingEviction,
+				RelocateReserveIntervalMs: fc.Cache.RelocateReserveIntervalMs,
+				SieveVisitedBit:           fc.Cache.SieveVisitedBit,
+				InPlaceSameSizeUpdate:     fc.Cache.InPlaceSameSizeUpdate,
+				InPlaceSeqlockReads:       fc.Cache.InPlaceSeqlockReads,
 			},
 			NoSync:            *noSync,
 			VolatileLog:       *volatileLog,
@@ -566,10 +572,15 @@ func main() {
 			DataDir: *data,
 			Ops:     reg,
 			Cache: rostam.CacheConfig{
-				NumShardsPerNode:      *shards,
-				MaxMemoryBytes:        cacheMaxMemory,
-				DisableColdCompaction: *disableColdCompaction,
-				TTLSweepIntervalMs:    ttlSweepIntervalMs,
+				NumShardsPerNode:          *shards,
+				MaxMemoryBytes:            cacheMaxMemory,
+				DisableColdCompaction:     *disableColdCompaction,
+				TTLSweepIntervalMs:        ttlSweepIntervalMs,
+				RelocatingEviction:        fc.Cache.RelocatingEviction,
+				RelocateReserveIntervalMs: fc.Cache.RelocateReserveIntervalMs,
+				SieveVisitedBit:           fc.Cache.SieveVisitedBit,
+				InPlaceSameSizeUpdate:     fc.Cache.InPlaceSameSizeUpdate,
+				InPlaceSeqlockReads:       fc.Cache.InPlaceSeqlockReads,
 			},
 			// Preserve the authenticator chosen above: it is promoted from the embedded
 			// DirectConfig, so replacing the struct wholesale would otherwise zero it and

@@ -103,6 +103,7 @@ func NewDirect(cfg DirectConfig) (Store, error) {
 	case cfg.Cache.TTLSweepIntervalMs > 0:
 		cc.TTLSweepIntervalMs = cfg.Cache.TTLSweepIntervalMs
 	}
+	applyRingbufReclaim(&cc, cfg.Cache)
 	// Derive the per-shard cap + page size from a TOTAL budget (after NumShards
 	// is final — the geometry divides by it). Without this the per-shard cap
 	// stayed at cache.DefaultConfig()'s 256 MiB and the real bound was

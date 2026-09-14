@@ -30,6 +30,33 @@ type cacheFileConfig struct {
 	// append-only, so memory climbs toward this cap even when the live key set
 	// is small, and recycling only begins once it is reached.
 	MaxMemory string `json:"max_memory"`
+
+	// RelocatingEviction carries live records off a page before it drains, so a
+	// record is not dropped merely for sharing a page with other keys' superseded
+	// versions. Ringbuf shards only; default false.
+	RelocatingEviction bool `json:"relocating_eviction"`
+
+	// RelocateReserveIntervalMs is the free-page reserve cadence in ms, which moves
+	// most of relocation's copying off the write path. Inert unless
+	// relocating_eviction is set. Absent/0 keeps the engine default; negative runs
+	// no reserve.
+	RelocateReserveIntervalMs int `json:"relocate_reserve_interval_ms"`
+
+	// SieveVisitedBit rescues records that have been read or rewritten since the
+	// last drain passed them, rather than whichever the walk meets first. No effect
+	// unless relocating_eviction is set.
+	SieveVisitedBit bool `json:"sieve_visited_bit"`
+
+	// InPlaceSameSizeUpdate writes a same-size rewrite over the copy already
+	// stored instead of appending a new one. Default false. Read
+	// cache.Config.InPlaceSameSizeUpdate before enabling: it trades the recency
+	// a ring buffer gets for free, and matters on a shard whose live set exceeds
+	// its budget.
+	InPlaceSameSizeUpdate bool `json:"inplace_same_size_update"`
+
+	// InPlaceSeqlockReads keeps reads lock-free under inplace_same_size_update by
+	// validating each against a version counter, instead of taking the read lock.
+	InPlaceSeqlockReads bool `json:"inplace_seqlock_reads"`
 }
 
 // loadFileConfig reads and validates the -config document. Unknown fields are
