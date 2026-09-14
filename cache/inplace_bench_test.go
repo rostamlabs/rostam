@@ -303,6 +303,14 @@ func BenchmarkInPlaceWrite(b *testing.B) {
 //	0.05           0.079     0.079     0.488     0.487
 //	0.01           0.113     0.114     0.506     0.506
 //
+// The two columns of each pair agree to within 0.0016 absolute at every K for
+// every arm but the narrowest, where the write stream is confined to a hundredth
+// of the span; there the worst deviation is 0.0069. That arm resolves under 1% of
+// its reads, so its ratio rests on the thinnest counts in the sweep and its
+// sampling error alone is about 0.004 — the deviation is under two of those. The
+// signs are mixed across arms rather than leaning one way, which is what separates
+// sampling noise from a systematic gap.
+//
 // Shrinking the region hands back read protection and takes away rewrites in the
 // same proportion, at every K and at every degree of decoupling, so the region is
 // a DIAL rather than a win. The cause is that THE CACHE RE-MATCHES the two
@@ -670,11 +678,22 @@ func (x *benchRand) next() uint64 {
 // being rare does not dilute.
 //
 // WHAT THE SEQLOCK LEAVES TO TRADE INTO, now that the sweep and the seqlock share
-// a write configuration and the difference between them is read-path only: 1.6%
-// with no writer, 9.4% with one. That gap is the ENTIRE budget any design which
-// locks a share of reads has to buy its way out of — and locking a twentieth of
-// them already spends several times it. The crossover against the seqlock arm is
-// therefore at a locked share of 0.019 with no writer and 0.013 with one.
+// a write configuration and the difference between them is read-path only: a few
+// percent, and no more than that. Across repeated rounds it has measured between
+// -2% and +9%, which is to say the seqlock sits ON the lock-free floor and the
+// sign of the difference is not resolved by this instrument.
+//
+// That gap is the ENTIRE budget a design which locks a share of reads has to buy
+// its way out of, and it is why the crossover cannot be quoted as a point. It has
+// come out anywhere from BELOW ZERO — no positive locked share is cheaper than
+// the seqlock — to 0.019, varying with the round and the shape, because a
+// difference of a few percent is the same size as the spread of the arms it is
+// taken between. What survives every round is the bound: the crossover is at most
+// a couple of percent of reads. Locking a twentieth of them already costs over
+// half the full-lock penalty once a writer is present, which is what puts it
+// there. Any estimate obtained by scaling the all-reads cost linearly — the
+// 0.25-to-0.30 figure that motivated this benchmark — is an order of magnitude
+// too generous, and that conclusion is robust in a way its exact value is not.
 //
 // ENDPOINT REPRODUCTION. With no writer frac000 lands 1.2% above ref_append and
 // frac100 2.0% under ref_locked, inside both arms' own spread. With a writer
