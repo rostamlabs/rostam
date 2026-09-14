@@ -241,10 +241,16 @@ func TestRestoreReplacesCollection(t *testing.T) {
 			}
 			defer func() { _ = s2.Close() }()
 			present := append(append([]uint64(nil), restored...), 4000)
+			absent := append([]uint64(nil), original...)
 			if mode.cfg.WAL {
 				present = append(present, 5000)
+			} else {
+				// No log: a write after the last checkpoint does not survive a
+				// restart. Asserting it absent is what makes the WAL branch's
+				// "present" a statement about the WAL rather than about reopening.
+				absent = append(absent, 5000)
 			}
-			requirePoints(t, s2, "docs", present, original)
+			requirePoints(t, s2, "docs", present, absent)
 			requireOnlyOwnFiles(t, dir, DefaultTenant, "docs")
 		})
 	}
@@ -299,26 +305,60 @@ func TestRestoreRejectedConfigKeepsOriginal(t *testing.T) {
 	requirePoints(t, s, "docs", original, []uint64{1, 2, 3})
 }
 
-// TestRestoreReservesName: while a restore is in flight its name cannot be
-// taken by a create in any family, because the restore will publish under it.
-func TestRestoreReservesName(t *testing.T) {
-	s := newCollectionStore(t)
-	s.mu.Lock()
-	s.restoring = map[string]struct{}{"default/docs": {}}
-	s.mu.Unlock()
-
+// TestRestoreRefusesOtherFamilies: a dense snapshot replaces a dense collection
+// or fills an absent name, and nothing else. Over a named-vector collection the
+// old sequence dropped it from memory but left its marker, snapshot and WAL on
+// disk, then registered a dense collection too — so after a restart the name
+// loaded in BOTH families. The refusal must leave the other family's collection
+// intact across a reopen, and must not have written a dense marker beside it.
+func TestRestoreRefusesOtherFamilies(t *testing.T) {
 	cfg := restoreReplaceModes[0].cfg
-	if err := s.CreateCollection("docs", cfg); !errors.Is(err, ErrCollectionExists) {
-		t.Errorf("CreateCollection on a name being restored = %v, want ErrCollectionExists", err)
-	}
-	if err := s.CreateNamed("docs", map[string]NamedVectorParams{"a": {Dim: 4}}); !errors.Is(err, ErrCollectionExists) {
-		t.Errorf("CreateNamed on a name being restored = %v, want ErrCollectionExists", err)
-	}
-	if err := s.CreateMultiVector("docs", MultiVectorConfig{Dim: 4}); !errors.Is(err, ErrCollectionExists) {
-		t.Errorf("CreateMultiVector on a name being restored = %v, want ErrCollectionExists", err)
-	}
-	if err := s.RestoreCollectionWithConfig("docs", cfg, bytes.NewReader(nil)); !errors.Is(err, ErrCollectionExists) {
-		t.Errorf("concurrent restore of the same name = %v, want ErrCollectionExists", err)
+	snap := sourceSnapshot(t, cfg, restoreIDs(1, 40))
+
+	for _, tc := range []struct {
+		name   string
+		create func(s *CollectionStore) error
+		exists func(s *CollectionStore) bool
+	}{
+		{"named-vector", func(s *CollectionStore) error {
+			return s.CreateNamedConfig("docs", NamedConfig{Spaces: map[string]NamedVectorParams{"a": {Dim: 4}}, WAL: true, WALNoSync: true})
+		}, func(s *CollectionStore) bool { _, ok := s.GetNamed("docs"); return ok }},
+		{"multi-vector", func(s *CollectionStore) error {
+			return s.CreateMultiVector("docs", MultiVectorConfig{Dim: 4, WAL: true, WALNoSync: true})
+		}, func(s *CollectionStore) bool { _, ok := s.GetMultiVector("docs"); return ok }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			s, err := OpenCollectionStore(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.create(s); err != nil {
+				t.Fatal(err)
+			}
+			err = s.RestoreCollectionWithConfig("docs", cfg, bytes.NewReader(snap))
+			if !errors.Is(err, ErrCollectionExists) {
+				t.Fatalf("dense restore over a %s collection = %v, want ErrCollectionExists", tc.name, err)
+			}
+			if !tc.exists(s) {
+				t.Fatalf("the %s collection is gone after a refused restore", tc.name)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			s2, err := OpenCollectionStore(dir)
+			if err != nil {
+				t.Fatalf("reopen: %v", err)
+			}
+			defer func() { _ = s2.Close() }()
+			if !tc.exists(s2) {
+				t.Errorf("the %s collection did not survive a reopen", tc.name)
+			}
+			if _, dense := s2.Get("docs"); dense {
+				t.Errorf("after reopen the name also loads as a dense collection")
+			}
+		})
 	}
 }
 

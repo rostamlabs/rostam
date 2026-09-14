@@ -367,10 +367,16 @@ func (s *CollectionStore) RestoreAll(r io.Reader) error {
 		}
 	}
 
+	// Write side of catalogMu: the swap waits for any create-or-replace restore
+	// that is mid-publication (it has dropped a collection and not yet registered
+	// its replacement), so it lands wholly before or wholly after that publication.
+	// No name lock is taken here, before or while holding catalogMu.
+	s.catalogMu.Lock()
 	s.mu.Lock()
 	old, oldMV, oldNamed := s.collections, s.multi, s.named
 	s.collections, s.multi, s.named = single, multi, named
 	s.mu.Unlock()
+	s.catalogMu.Unlock()
 	// Retire old collections: drain in-flight readers before unmapping, then
 	// delete the previous generation's mmap files. Safe (and immediate) for heap
 	// collections too — their cleanup is a no-op and there's nothing to unmap.
