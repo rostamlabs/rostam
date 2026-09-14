@@ -516,6 +516,7 @@ func (s *shard) attachMmapRegion(file *os.File, region []byte) {
 		p.gen = s.nextGen()
 		s.pages[i] = p
 		s.pageSlots[i].Store(p) // mmap page objects are fixed; publish once
+		regionNotePage(s, p)    // compiled out unless the measurement build tag is set
 	}
 }
 
@@ -1219,6 +1220,7 @@ func (s *shard) putAtExpLocked(key, value []byte, exp uint64, h uint64) error {
 				if s.sieve {
 					tgt.tab.setVisited(tgt.slot, tagFor(h), tgt.ref)
 				}
+				regionNoteInPlace(s, tgt.p) // compiled out unless the measurement build tag is set
 				// NO fireOnRemove: nothing was removed. The key is still live, at the
 				// same address, and the hook reports REMOVALS — firing it here would
 				// drop a live key's postings from every derived index.
@@ -1795,6 +1797,7 @@ func (s *shard) allocHeapPageLocked() int {
 	idx := len(s.pages)
 	s.pages = append(s.pages, p)
 	s.pageSlots[idx].Store(p) // publish for the lock-free read path
+	regionNotePage(s, p)      // compiled out unless the measurement build tag is set
 	s.pagesAlloc.Add(1)
 	return idx
 }
@@ -1990,6 +1993,7 @@ func (s *shard) retirePageLocked(idx int) {
 	fresh := s.freshHeapPageLocked()
 	s.pages[idx] = fresh
 	s.pageSlots[idx].Store(fresh) // publish so readers resolve the new generation
+	regionNotePage(s, fresh)      // compiled out unless the measurement build tag is set
 }
 
 // drainPageLocked evicts every live entry from page victim, dropping each from
@@ -2354,6 +2358,7 @@ func (s *shard) tryRetireExpiredPageLocked(idx int, stamp uint64) {
 	fresh := s.freshHeapPageLocked()
 	s.pages[idx] = fresh
 	s.pageSlots[idx].Store(fresh) // publish so readers resolve the new generation
+	regionNotePage(s, fresh)      // compiled out unless the measurement build tag is set
 }
 
 // rehashIfOverThresholdLocked replaces t with a freshly-sized table when its fill

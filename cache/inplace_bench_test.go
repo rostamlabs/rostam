@@ -4,6 +4,7 @@ package cache
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"sync/atomic"
 	"testing"
@@ -257,22 +258,101 @@ func BenchmarkInPlaceWrite(b *testing.B) {
 //	samesize   two reads per write at a constant record size — the real workload.
 //	           Here the flag-on arm also stops evicting, so the delta is the NET
 //	           effect: the lock's cost minus what not thrashing the pages returns.
+//	decoupled  two reads per write at a constant record size, like samesize, but
+//	           with the two key distributions PULLED APART: writes concentrate on
+//	           a hot subset of the span while reads stay uniform over all of it.
+//	           hot100 draws writes from the whole span, which is samesize again —
+//	           the matched control is the degenerate end of the same sweep, so
+//	           control and treatment sit on one axis.
+//	churn      the decoupled shape with a share of writes inserting BRAND-NEW keys,
+//	           which is the only thing that keeps the log rotating once in-place
+//	           updates have stopped producing garbage. See inPlaceChurnPct: without
+//	           it the page generations freeze and every residency figure below is
+//	           an artifact of the order the shard was filled in.
+//
+// WHY THE DECOUPLED SHAPE EXISTS. Every other shape here draws reads and writes
+// from the SAME distribution. That makes "the share of rewrites that hit a recent
+// record" and "the share of reads that resolve into a recent record" the same
+// underlying quantity — P(this key was written within the last R bytes of write
+// traffic) — so they are identically equal by construction and no arrangement of
+// them can show one being small while the other is large. Only a write
+// distribution strictly more concentrated than the read distribution can separate
+// them, and that separation is the only thing a region confined to the newest
+// pages could ever be paid out of. The sweep parameter is how far apart they are
+// pulled.
+//
+// The shape is not hypothetical. An operate call (ops/operate.go) performs
+// exactly ONE Put of a complete replacement per call, and a record whose fields
+// are fixed-width is overwritten cell-by-cell inside a buffer of unchanged
+// length — so the replacement is byte-identical in size to what it replaces,
+// which is precisely the same-size rewrite inPlaceTargetLocked looks for. Such a
+// record is rewritten at constant size, repeatedly, on whatever narrow key set
+// the application's counters live on, while being read on an independent
+// schedule.
+//
+// WHAT THE RESIDENCY SWEEP SHOWED, medians of three repeats. Across every
+// churning shape — writes confined to the whole key span, then to a half, a
+// quarter, a tenth, a twentieth and a hundredth of it, reads uniform over all of
+// it throughout — the read share and the write share move together exactly:
+//
+//	write share    fr1/fr8   fw1/fw8   fr4/fr8   fw4/fw8
+//	1.00           0.070     0.069     0.469     0.468
+//	0.50           0.073     0.073     0.468     0.469
+//	0.25           0.073     0.073     0.463     0.464
+//	0.10           0.069     0.069     0.475     0.475
+//	0.05           0.079     0.079     0.488     0.487
+//	0.01           0.113     0.114     0.506     0.506
+//
+// The two columns of each pair agree to within 0.0016 absolute at every K for
+// every arm but the narrowest, where the write stream is confined to a hundredth
+// of the span; there the worst deviation is 0.0069. That arm resolves under 1% of
+// its reads, so its ratio rests on the thinnest counts in the sweep and its
+// sampling error alone is about 0.004 — the deviation is under two of those. The
+// signs are mixed across arms rather than leaning one way, which is what separates
+// sampling noise from a systematic gap.
+//
+// Shrinking the region hands back read protection and takes away rewrites in the
+// same proportion, at every K and at every degree of decoupling, so the region is
+// a DIAL rather than a win. The cause is that THE CACHE RE-MATCHES the two
+// distributions this shape pulls apart: a key the write stream never touches is
+// evicted, so what stays resident is what the writes touch, and a read that
+// RESOLVES is therefore drawn from the same set the writes are. Equivalently,
+// fr(K)/hit% equals fw(K)/%inplace to three digits at every point in the table.
+//
+// The raw shares DO differ, and only one thing separates them: the miss rate. At
+// a twentieth of the span fr4 is 2.4% of gets against fw4 at 36.1% of puts — but
+// hit% there is 4.9%. f_r is the residency ratio times the hit rate, so it drops
+// below any interesting threshold only on a cache that is missing almost
+// everything it is asked for.
+//
+// The NON-churning family is worse than a dial, and shows the mechanism. With no
+// new bytes arriving the log stops rotating, and a hot record rewritten in place
+// never returns to a newest page — in-place update is precisely the thing that
+// stops refreshing a record's recency, which is what BenchmarkInPlaceWriteRecency
+// measures from the other side. At a quarter of the span and below, every rewrite
+// target sits on the OLDEST page: fw1, fw2 and fw4 are all 0 while fr4 is 64%. A
+// region would there admit two thirds of the reads to the lock and not one single
+// rewrite.
 //
 // Each parallel goroutine seeds its own RNG from a distinct counter. A shared
 // seed makes every goroutine replay the same (key, length) sequence, which turns
 // the jittered shape into a stream of same-size rewrites and silently destroys
 // the isolation the lockcost arm exists for.
 func BenchmarkInPlaceRead(b *testing.B) {
-	shapes := []struct {
-		name     string
-		readOnly bool
-		value    func(r *rand.Rand, base []byte) []byte
-	}{
-		{"readonly", true, func(_ *rand.Rand, base []byte) []byte { return base }},
-		{"lockcost", false, func(r *rand.Rand, base []byte) []byte {
+	fixed := func(_ *rand.Rand, base []byte) []byte { return base }
+	shapes := []inPlaceReadShape{
+		{name: "readonly", readOnly: true, value: fixed},
+		{name: "lockcost", value: func(r *rand.Rand, base []byte) []byte {
 			return base[:inPlaceJitterLo+r.Intn(inPlaceJitterSpan)]
 		}},
-		{"samesize", false, func(_ *rand.Rand, base []byte) []byte { return base }},
+		{name: "samesize", value: fixed},
+	}
+	for _, pct := range inPlaceHotPercents {
+		hot := max(inPlaceKeySpan*pct/100, 1)
+		shapes = append(shapes,
+			inPlaceReadShape{name: fmt.Sprintf("decoupled_hot%03d", pct), hotKeys: hot, value: fixed},
+			inPlaceReadShape{name: fmt.Sprintf("churn_hot%03d", pct), hotKeys: hot, churnPct: inPlaceChurnPct, value: fixed},
+		)
 	}
 	for _, sh := range shapes {
 		for _, mode := range inPlaceModes {
@@ -299,7 +379,23 @@ func BenchmarkInPlaceRead(b *testing.B) {
 						_ = s.Put(inPlaceKey(i), sh.value(warm, base), 0)
 					}
 				}
+				// A decoupled or churning shape needs a SECOND warm phase under its own
+				// write distribution. The seed above sweeps the whole span, so without this
+				// the timed window would open on a shard whose page ages still reflect
+				// uniform writes and would spend part of itself migrating to the steady
+				// state the residency figures are meant to describe. Long enough to rotate
+				// the ring several times over. It runs only for the new shapes, so every
+				// pre-existing arm warms exactly as it did.
+				var churn atomic.Int64
+				if sh.hotKeys != 0 {
+					for range inPlaceKeySpan * 8 {
+						sh.put(s, warm, base, &churn)
+					}
+				}
+				detach := regionFRAttach(s)
+				defer detach()
 				before := s.snapshot()
+				frBefore := regionFRSnapshot()
 				var seed atomic.Int64
 				b.ResetTimer()
 				b.RunParallel(func(pb *testing.PB) {
@@ -307,7 +403,7 @@ func BenchmarkInPlaceRead(b *testing.B) {
 					n := 0
 					for pb.Next() {
 						if !sh.readOnly && n%3 == 2 { // two reads per write
-							_ = s.Put(inPlaceKey(r.Intn(inPlaceKeySpan)), sh.value(r, base), 0)
+							sh.put(s, r, base, &churn)
 						} else {
 							_, _ = s.Get(inPlaceKey(r.Intn(inPlaceKeySpan)))
 						}
@@ -316,12 +412,14 @@ func BenchmarkInPlaceRead(b *testing.B) {
 				})
 				b.StopTimer()
 				after := s.snapshot()
+				frAfter := regionFRSnapshot()
 				gets := after.Gets - before.Gets
 				puts := after.Puts - before.Puts
 				b.ReportMetric(float64(after.Hits-before.Hits)/float64(max(gets, 1))*100, "hit%")
 				b.ReportMetric(float64(after.InPlaceUpdates-before.InPlaceUpdates)/float64(max(puts, 1))*100, "%inplace")
 				b.ReportMetric(float64(after.SeqlockRetries-before.SeqlockRetries)/float64(max(gets, 1))*100, "%retry")
 				b.ReportMetric(float64(after.SeqlockFallbacks-before.SeqlockFallbacks)/float64(max(gets, 1))*100, "%fallback")
+				reportRegionResidency(b, frBefore, frAfter, gets, puts)
 			})
 		}
 	}
@@ -401,4 +499,426 @@ func BenchmarkInPlaceWriteRecency(b *testing.B) {
 			}
 		})
 	}
+}
+
+// inPlaceHotPercents is the decoupled shape's sweep: what percentage of the key
+// span the WRITE stream is confined to, while reads stay uniform over all of it.
+// 100 is the matched-distribution control — the same shape as samesize — so the
+// control is the degenerate end of the treatment rather than a separate
+// experiment, and the whole sweep reads as one curve.
+var inPlaceHotPercents = []int{100, 50, 25, 10, 5, 1}
+
+// inPlaceChurnPct is the share of a churning shape's writes that insert a
+// BRAND-NEW key instead of rewriting a hot one.
+//
+// It exists because without it the residency question has no subject. A shard
+// whose live set fits its budget, rewriting in place, produces NO garbage — so it
+// never evicts, never retires a page, and its page generations stop moving
+// altogether. "The newest K pages" then names the pages the initial fill happened
+// to end on, and every residency share it yields is an artifact of seeding order
+// rather than of write recency. A mutable region is a claim about a log that TURNS
+// OVER, and only a supply of new bytes makes one turn over. The churn keys are
+// outside the read span, exactly like the cold stream in
+// BenchmarkInPlaceWriteRecency, so they drive the rotation without changing what
+// the reads are drawn from.
+const inPlaceChurnPct = 25
+
+// inPlaceChurnKey formats a churn key at the same 13 bytes as inPlaceKey, so a
+// churning shape's records are the same size as everything else on the shard and
+// page occupancy stays comparable across shapes.
+func inPlaceChurnKey(n int64) []byte { return fmt.Appendf(nil, "n%012d", n) }
+
+// inPlaceReadShape is one access shape of BenchmarkInPlaceRead: what the reads
+// and the writes are each drawn from, and how big a record each write stores.
+// Reads are ALWAYS uniform over the whole key span; only the write side varies.
+type inPlaceReadShape struct {
+	name     string
+	readOnly bool
+	// hotKeys confines writes to [0,hotKeys) of the span; 0 means the whole span,
+	// which is the matched-distribution case.
+	hotKeys int
+	// churnPct is the share of writes that insert a fresh key instead, keeping the
+	// log rotating. 0 for every shape that predates the region question.
+	churnPct int
+	value    func(r *rand.Rand, base []byte) []byte
+}
+
+// put performs one write of the shape. The churn draw is taken only when the
+// shape has churn, so a shape without it consumes exactly the RNG sequence it
+// consumed before this method existed.
+func (sh inPlaceReadShape) put(s *shard, r *rand.Rand, base []byte, churn *atomic.Int64) {
+	if sh.churnPct > 0 && r.Intn(100) < sh.churnPct {
+		_ = s.Put(inPlaceChurnKey(churn.Add(1)), sh.value(r, base), 0)
+		return
+	}
+	span := sh.hotKeys
+	if span == 0 {
+		span = inPlaceKeySpan
+	}
+	_ = s.Put(inPlaceKey(r.Intn(span)), sh.value(r, base), 0)
+}
+
+// inPlaceRegionKs is the region sizes, in pages, the residency shares are
+// reported at. A shard here holds inPlacePages pages, so K = inPlacePages is the
+// whole log and exists as the instrument's own check: at that K the read share
+// must equal hit% and the write share must equal %inplace, because a region
+// covering everything excludes nothing. If it does not, the classification is
+// wrong and the smaller K are not worth reading.
+var inPlaceRegionKs = []int{1, 2, 4, inPlacePages}
+
+// reportRegionResidency reports, for each region size K, the share of GETS that
+// resolved into the newest K pages and the share of PUTS whose same-size rewrite
+// landed there. They are the two halves of the question a mutable region asks:
+// %frK is what the region would make pay, %fwK is what it would pay out.
+//
+// Shares of gets and of puts rather than of hits and of in-place updates,
+// because the decision is about the fraction of the offered LOAD that changes
+// cost. hit% is reported alongside for anyone wanting the per-hit figure.
+//
+// Silent unless the measurement build tag is set — see cache/regionfr_off.go —
+// since the counters are zero otherwise and reporting them would report a zero
+// as a result.
+func reportRegionResidency(b *testing.B, before, after regionFRCounts, gets, puts uint64) {
+	b.Helper()
+	if !regionFRInstrumented {
+		return
+	}
+	// A wrapped generation distance is not a warning to print beside the numbers —
+	// it means the numbers may be counting the shard's oldest page as its newest,
+	// and they look no different when they are. Fail the arm instead.
+	if after.WrapUnsafe {
+		b.Fatal("region residency: generation distance may have wrapped; see regionFRWrapBudget")
+	}
+	var rcum, wcum uint64
+	for k := 1; k <= regionFRMaxK; k++ {
+		rcum += after.HitDist[k-1] - before.HitDist[k-1]
+		wcum += after.PlaceDist[k-1] - before.PlaceDist[k-1]
+		for _, want := range inPlaceRegionKs {
+			if k != want {
+				continue
+			}
+			b.ReportMetric(float64(rcum)/float64(max(gets, 1))*100, fmt.Sprintf("%%fr%d", k))
+			b.ReportMetric(float64(wcum)/float64(max(puts, 1))*100, fmt.Sprintf("%%fw%d", k))
+		}
+	}
+}
+
+// inPlaceReadLockPercents is the sweep for BenchmarkReadLockFraction: the share
+// of reads routed through the shard read lock.
+var inPlaceReadLockPercents = []int{0, 5, 10, 20, 30, 50, 75, 100}
+
+// benchRand is a xorshift64 generator for the per-read coin flip. It is here
+// rather than math/rand because the flip is paid on EVERY read of every arm in
+// the sweep, and a generator costing tens of nanoseconds would be a larger term
+// than the thing being measured. Three shifts and an xor is small enough to be a
+// constant the whole curve carries equally.
+type benchRand uint64
+
+func (x *benchRand) next() uint64 {
+	v := uint64(*x)
+	v ^= v << 13
+	v ^= v >> 7
+	v ^= v << 17
+	*x = benchRand(v)
+	return v
+}
+
+// BenchmarkReadLockFraction prices the shard read lock as a function of HOW MANY
+// reads take it. It exists because the obvious way to price a design that locks
+// only some reads — take the all-reads cost and scale it linearly — has no basis.
+// An RLock is a read-modify-write on one cache line every reader shares (see
+// cache/seqlock.go), so its cost is superlinear in the number of readers
+// contending, and a cost that is superlinear going up falls away FASTER than
+// linearly coming down. Where the curve actually crosses the lock-free arms is a
+// measurement, not an extrapolation, and it is the number any "only a fraction of
+// reads pay" design has to be held against.
+//
+// DELIBERATELY NOT A REGION. The lock is taken on a per-read COIN FLIP at a
+// configured rate, independent of where the key lives, and in-place updates are
+// OFF — so the locked and lock-free paths return identical answers and the only
+// difference between them is the locking. This isolates the lock's cost from
+// every question about which reads a real design would route through it.
+//
+// THE ENDPOINTS ARE THE INSTRUMENT'S OWN CHECK, and nothing in the middle is
+// worth reading until they pass. frac000 must reproduce ref_append and frac100
+// must reproduce ref_locked, because at those two rates the swept arm executes
+// exactly the read path the corresponding mode's shard would select — plus one
+// xorshift, which every point on the curve pays alike. The references are
+// measured here, in the same run and through the same loop, rather than quoted
+// from BenchmarkInPlaceRead, so the comparison carries no cross-run drift.
+//
+// The two shapes are readonly (the floor: no writer, so the lock is uncontended
+// by anything but other readers) and lockcost (a real writer, with value lengths
+// jittered so the in-place path stays idle even on the ref_locked shard — which
+// is what makes that reference a pure read-path difference rather than a write
+// path one; watch its %inplace).
+//
+// WHAT THE SWEEP SHOWED, as the share of the full-lock increment over the
+// lock-free floor that a given locked share actually costs. Medians of nine
+// repeats:
+//
+//	locked share   no writer   with a writer
+//	0.05           0.06        0.55
+//	0.10           0.09        0.60
+//	0.20           0.12        0.71
+//	0.30           0.20        0.79
+//	0.50           0.45        0.88
+//	0.75           0.76        0.78
+//
+// With no writer the cost is SUBLINEAR — locking a fifth of reads costs about
+// three fifths of what scaling the all-reads figure linearly would predict. Real,
+// but small.
+//
+// With a writer it inverts, and far more violently: a twentieth of reads taking
+// the lock already costs more than half of what locking every read costs, and
+// from a fifth onward the curve is nearly flat (the last two rows invert, both
+// inside arms that span up to 1.8x across repeats, so only the column's ordering
+// and its medians are claimed, not its individual points). A waiting writer
+// blocks new readers outright, so every locked read pays a queueing penalty that
+// being rare does not dilute.
+//
+// WHAT THE SEQLOCK LEAVES TO TRADE INTO, now that the sweep and the seqlock share
+// a write configuration and the difference between them is read-path only: a few
+// percent, and no more than that. Across repeated rounds it has measured between
+// -2% and +9%, which is to say the seqlock sits ON the lock-free floor and the
+// sign of the difference is not resolved by this instrument.
+//
+// That gap is the ENTIRE budget a design which locks a share of reads has to buy
+// its way out of, and it is why the crossover cannot be quoted as a point. It has
+// come out anywhere from BELOW ZERO — no positive locked share is cheaper than
+// the seqlock — to 0.019, varying with the round and the shape, because a
+// difference of a few percent is the same size as the spread of the arms it is
+// taken between. What survives every round is the bound: the crossover is at most
+// a couple of percent of reads. Locking a twentieth of them already costs over
+// half the full-lock penalty once a writer is present, which is what puts it
+// there. Any estimate obtained by scaling the all-reads cost linearly — the
+// 0.25-to-0.30 figure that motivated this benchmark — is an order of magnitude
+// too generous, and that conclusion is robust in a way its exact value is not.
+//
+// ENDPOINT REPRODUCTION. With no writer frac000 lands 1.2% above ref_append and
+// frac100 2.0% under ref_locked, inside both arms' own spread. With a writer
+// frac100 lands 0.6% under ref_locked — an exact reproduction, where before the
+// two configurations were equalised the same comparison was off by 8.5%.
+//
+// The remaining cross-configuration gap is now a measurement rather than an
+// explanation: with a writer, frac000 runs 18.8% ABOVE ref_append, and since the
+// two differ only in that the swept shard enables in-place updates, that figure
+// IS the cost of running the same-size eligibility probe on every write. It is
+// much larger than it looks from the read side, which is why leaving it inside
+// the curve mattered: it inflated the apparent room beneath the seqlock and made
+// the crossover look two to three times more generous than it is.
+func BenchmarkReadLockFraction(b *testing.B) {
+	shapes := []struct {
+		name     string
+		readOnly bool
+		value    func(r *rand.Rand, base []byte) []byte
+	}{
+		{"readonly", true, func(_ *rand.Rand, base []byte) []byte { return base }},
+		{"lockcost", false, func(r *rand.Rand, base []byte) []byte {
+			return base[:inPlaceJitterLo+r.Intn(inPlaceJitterSpan)]
+		}},
+	}
+	for _, sh := range shapes {
+		for _, mode := range []inPlaceMode{modeAppend, modeLocked, modeSeqlock} {
+			b.Run(fmt.Sprintf("%s/ref_%s", sh.name, mode), func(b *testing.B) {
+				readLockArm(b, mode, -1, sh.readOnly, sh.value)
+			})
+		}
+		for _, pct := range inPlaceReadLockPercents {
+			b.Run(fmt.Sprintf("%s/frac%03d", sh.name, pct), func(b *testing.B) {
+				readLockArm(b, readLockSweepMode, pct, sh.readOnly, sh.value)
+			})
+		}
+	}
+}
+
+// readLockSweepMode is the ONE shard configuration every point of the sweep runs
+// on, references excepted.
+//
+// The curve is meant to isolate the read lock, so every arm it is drawn from has
+// to agree about everything else — and the write path is the everything else that
+// bites. A shard with in-place updates enabled runs the same-size eligibility
+// probe on EVERY write (a table probe, a page read, a key compare, a live-band
+// check) whether or not the overwrite goes ahead. Sweeping on a shard without
+// that probe while comparing against references that have it mixes a write-path
+// difference into what is supposed to be a read-path curve, and the crossover
+// that comes out is contaminated by a term that has nothing to do with locking.
+//
+// modeSeqlock is the configuration chosen because the crossover is measured
+// against the seqlock, so the seqlock reference is the one that must share the
+// curve's write path exactly. The modeAppend and modeLocked references remain,
+// deliberately on their own configurations: they are the PRODUCTION read paths,
+// and the gap between ref_append and frac000 is no longer an explanation but a
+// measurement of exactly the write-path difference described above.
+const readLockSweepMode = modeSeqlock
+
+// benchGetLockFree is the lock-free branch of shard.getCore, called explicitly:
+// count the get, probe the live table, apply the corrupt/miss and expiry
+// accounting, and hand back an owned copy as the ringbuf contract requires.
+//
+// It exists because getCore cannot be asked for that branch on a shard whose
+// configuration selects another one, and the sweep needs exactly this branch on a
+// shard configured for in-place writes — the combination the cache itself refuses
+// to offer, because in-place rewriting is precisely what the plain lock-free read
+// is not safe against.
+//
+// THAT IS DELIBERATE AND IT IS A COST INSTRUMENT ONLY. What holds is narrower
+// than "the entry cannot change underneath the read", and worth stating exactly,
+// because a same-size overwrite does rewrite the header: WriteAt lays down
+// keyLen, valLen, the expiry and the meta word again on every call.
+//
+// BOUNDS ARE SAFE. Only two of those fields decide where the decode slices, and
+// both are rewritten byte-identically — the key is the same key and the value is
+// the same length, so keyLen at [0:2] and valLen at [2:6] are being overwritten
+// with the values already there and no torn mixture of old and new bytes differs
+// from either. The total the decode derives is therefore unchanged, the length
+// check that passed before still passes, and the key compare that follows sees
+// the same key bytes.
+//
+// EVERYTHING ELSE CAN TEAR, and does. The expiry and the meta word are genuinely
+// rewritten with new values and can be read half-updated; the value bytes can be
+// read as any mixture of the old and the new; the CRC slot is not rewritten at
+// all, so after an overwrite it no longer matches the bytes it covers. None of
+// that reaches a conclusion here — decodeEntryFast never loads meta and skips the
+// CRC, the shapes that use this path store no expiry, and the value is discarded.
+// A benchmark measuring the COST of a read is entitled to a garbage answer; it is
+// not entitled to an out-of-range one, and the paragraph above is why it cannot
+// get one.
+//
+// Nothing here may be read as a claim that the combination is safe to ship. The
+// seqlock exists because it is not.
+func benchGetLockFree(s *shard, key []byte, h uint64) []byte {
+	s.gets.Add(1)
+	t := s.tab.Load()
+	v, exp, ref, st := t.get(s, key, h)
+	out, _, err := s.resolveLookup(v, key, h, exp, ref, st, s.now(), !s.cfg.Replicated)
+	if err != nil {
+		return nil
+	}
+	cp := make([]byte, len(out))
+	copy(cp, out)
+	return cp
+}
+
+// readLockArm runs one arm of BenchmarkReadLockFraction. lockPct < 0 is a
+// REFERENCE arm: the coin can never be won, so every read goes through s.Get and
+// therefore through whatever path the shard's own configuration selects.
+// Otherwise every read flips, and the two outcomes are the two paths a region
+// design would choose between — getLockedCore with the gets counter bumped first,
+// which is exactly what s.Get does on a shard that needs the read lock, and the
+// plain lock-free probe it would use outside the region.
+//
+// REUSING THIS AS A YARDSTICK. mode stays a parameter on purpose, so a caller
+// pricing something else in units of "this share of reads takes the read lock"
+// can sweep on its OWN configuration and share one write path end to end. Two
+// conditions travel with that.
+//
+// A sweep arm must never reach the shard's own Get. If it did, the base's
+// configuration would decide what a coin-LOSS costs, and on a base that already
+// locks its reads — modeLocked is the one here — every read would take the lock
+// whatever the coin said, while the arm went on reporting the coin's share. The
+// instrument would be broken and would still produce a smooth, plausible curve.
+// That is why the losing branch calls benchGetLockFree explicitly rather than
+// s.Get: the constraint is now discharged by construction instead of by picking a
+// mode, which is what frees the base to be chosen for its WRITE path alone. Only
+// reference arms route through s.Get, which is their whole point.
+//
+// The base must be heap-backed, which inPlaceShard guarantees for every mode. A
+// plain lock-free read of an mmap ringbuf shard is not torn-value-safe the way
+// benchGetLockFree's note argues the heap case is — those reads hand back
+// zero-copy aliases that outlive the read, and eviction rewrites the region in
+// place.
+func readLockArm(b *testing.B, mode inPlaceMode, lockPct int, readOnly bool, value func(r *rand.Rand, base []byte) []byte) {
+	s := inPlaceShard(b, mode)
+	base := benchValue()
+	if !readOnly {
+		base = make([]byte, inPlaceJitterLo+inPlaceJitterSpan)
+		for i := range base {
+			base[i] = byte(i)
+		}
+	}
+	warm := rand.New(rand.NewSource(1)) //nolint:gosec // deterministic shape, not security
+	if readOnly {
+		for i := range inPlaceKeySpan {
+			_ = s.Put(inPlaceKey(i), base, 0)
+		}
+	} else {
+		for i := 0; i < 1<<22 && (s.evictions.Load() == 0 || i < inPlaceKeySpan*4); i++ {
+			_ = s.Put(inPlaceKey(i), value(warm, base), 0)
+		}
+	}
+	// The coin's threshold over the full uint64 range, so the endpoints are EXACT
+	// rather than approached: 100 sits above every draw and 0 below every draw. The
+	// 100 case is spelled out because computing it as a fraction of 2^64 overflows
+	// to zero and silently turns the arm that must lock every read into the arm
+	// that locks none — which is a broken instrument that still produces a
+	// plausible-looking curve. A reference arm (lockPct < 0) leaves it at zero and
+	// so runs the shard's own read path, whatever that shard's mode selects.
+	var thresh uint64
+	switch {
+	case lockPct >= 100:
+		thresh = math.MaxUint64
+	case lockPct > 0:
+		thresh = (uint64(lockPct) << 32) / 100 << 32 // pct/100 of 2^64, in two steps
+	}
+	before := s.snapshot()
+	var seed atomic.Int64
+	var lockedReads, totalReads, sunk atomic.Uint64
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		// ONE draw from the counter, used for both generators. Taking a second draw
+		// — even a bare Load after the Add — lets a sibling goroutine land in
+		// between, so two workers can be handed the same coin stream and replay each
+		// other's lock decisions. The arms would still report the right locked share
+		// while resting on fewer independent streams than they claim.
+		id := uint64(seed.Add(1)) //nolint:gosec // a positive counter, not security
+		r := rand.New(rand.NewSource(int64(id)))
+		x := benchRand(id*0x9e3779b97f4a7c15 + 1)
+		var locked, reads, sink uint64
+		n := 0
+		for pb.Next() {
+			if !readOnly && n%3 == 2 { // two reads per write, as in BenchmarkInPlaceRead
+				_ = s.Put(inPlaceKey(r.Intn(inPlaceKeySpan)), value(r, base), 0)
+				n++
+				continue
+			}
+			key := inPlaceKey(r.Intn(inPlaceKeySpan))
+			reads++
+			// The coin is flipped on EVERY arm, reference arms included, even though a
+			// reference's threshold can never be met. The flip is a constant the whole
+			// curve carries, and a reference that skipped it would differ from frac000
+			// by the instrument rather than by the thing being compared — which is the
+			// one difference the endpoint check cannot tolerate, since that check is
+			// the only evidence the middle of the curve means anything.
+			var got []byte
+			switch {
+			case x.next() < thresh:
+				// What getCore does on a shard that needs the read lock: count the get,
+				// then probe and copy under it.
+				s.gets.Add(1)
+				got, _, _ = s.getLockedCore(key, hashKey(key), s.now(), !s.cfg.Replicated)
+				locked++
+			case lockPct < 0:
+				got, _ = s.Get(key) // reference: the shard's own path
+			default:
+				got = benchGetLockFree(s, key, hashKey(key))
+			}
+			// The value is consumed, cheaply, so neither branch's copy can be dropped
+			// as dead — the copy is real work the read path does and an arm that
+			// skipped it would look faster for no reason.
+			sink += uint64(len(got))
+			n++
+		}
+		lockedReads.Add(locked)
+		totalReads.Add(reads)
+		sunk.Add(sink)
+	})
+	b.StopTimer()
+	if sunk.Load() == 1 {
+		b.Fatal("unreachable: keeps the value copies live")
+	}
+	after := s.snapshot()
+	puts := after.Puts - before.Puts
+	b.ReportMetric(float64(lockedReads.Load())/float64(max(totalReads.Load(), 1))*100, "%locked")
+	b.ReportMetric(float64(after.InPlaceUpdates-before.InPlaceUpdates)/float64(max(puts, 1))*100, "%inplace")
 }
