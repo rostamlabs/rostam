@@ -644,13 +644,21 @@ func (s *CollectionStore) dropCollection(canonical string) error {
 			removeClusterMmapFiles(coldCfg.cfg)
 			return nil
 		}
-		// Dispatch to the named family: a name can be dense XOR named, so a
-		// DropCollection on a named collection drops it exactly as DropNamed does,
-		// files included. MV has its own DropMultiVector entry point.
+		// Dispatch to the named family: a name can be dense XOR named XOR
+		// multi-vector, so a DropCollection on a named or multi-vector collection
+		// drops it exactly as DropNamed / DropMultiVector does, files included.
+		// Without these branches the drop would return success while the index
+		// stayed live and its .cfg.json marker reloaded it on the next open.
 		if nc, nok := s.named[canonical]; nok {
 			delete(s.named, canonical)
 			s.mu.Unlock()
 			s.retireNamed(canonical, nc)
+			return nil
+		}
+		if mv, mok := s.multi[canonical]; mok {
+			delete(s.multi, canonical)
+			s.mu.Unlock()
+			s.retireMulti(canonical, mv)
 			return nil
 		}
 		s.mu.Unlock()
