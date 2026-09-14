@@ -285,6 +285,39 @@ func entrySpanExact(keyLen, valueLen int) int {
 // carried anyway so that it is recorded at each site while the two are still
 // provably equal, rather than being reconstructed from scratch by whoever first
 // makes them differ.
+//
+// # The capacity/write rule
+//
+// WHEREVER A CAPACITY DECISION AND THE WRITE IT AUTHORISES DERIVE THEIR SIZE
+// INDEPENDENTLY, BOTH MUST USE THE OCCUPANCY SPAN.
+//
+// This is the one failure this whole split exists to prevent, and it is a single
+// shape wearing several costumes. A capacity check that measures LESS than the
+// write reserves says yes and then hands the write an errPageFull its caller
+// treats as unreachable — every one of those call sites comments the error as
+// "the budget already proved the room". The check does not have to be wrong in
+// isolation; it only has to disagree with page.Write, which reserves the
+// occupancy. So the two numbers must come from the same question, not merely be
+// equal by coincidence.
+//
+// Every such pair in the package, all of them occupancy on both sides:
+//
+//	page.Write               FreeTail check      / its own tail advance
+//	putAtExpLocked           findOrMakePageLocked / the page.Write after it
+//	delH                     findOrMakePageLocked / the tombstone page.Write
+//	relocateIntoFreedPageLocked  the eviction budget  / dst.Write
+//	reserveMoveVictim        reserveDestinationLocked / dst.Write
+//	tryRelocatePageLocked    findRelocDestLocked  / the destination page.Write
+//	packPagesNeeded          the next-fit frontier / packLiveInto's page.Write
+//
+// The room helpers themselves (findOrMakePageLocked, firstPageWithRoomLocked,
+// evictUntilFitsLocked, findRelocDestLocked, reserveDestinationLocked) take a
+// `need` and compare it against FreeTail, so they are correct for whatever their
+// callers pass and the rule binds the CALLERS.
+//
+// page.Write is the anchor the rest are checked against: it is the only place
+// that turns a span into reserved bytes, and TestPageWriteReservesTheOccupancySpan
+// pins it to entrySpan(..., true) exactly.
 func entrySpan(keyLen, valueLen int, padded bool) int {
 	if padded {
 		return entrySpanExact(keyLen, classOf(valueLen))

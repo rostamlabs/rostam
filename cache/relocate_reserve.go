@@ -451,8 +451,9 @@ func (s *shard) reserveMoveVictim(victim int, p *page, budget int, retire bool) 
 			// consumer below — the cursor advance, the tick budget (`spent`), the
 			// per-page p.relocatedOut charge that decides whether the page is still
 			// worth retiring, the reserveRelocatedBytes counter, and the room
-			// reserveDestinationLocked has to find for the append. All of them are
-			// questions about page room. HEAP-REACHABLE: this is the heap ringbuf
+			// reserveDestinationLocked has to find for the append — that last one is
+			// this site's half of the capacity/write rule (see entrySpan). All of them
+			// are questions about page room. HEAP-REACHABLE: this is the heap ringbuf
 			// background free-page reserve.
 			size := entrySpan(len(key), len(value), true)
 			ref := makeSlabRef(uint16(victim), p.gen, uint32(cursor)) //nolint:gosec // victim bounded by MaxPagesPerShard (≤65535); cursor < PageSize ≤ MaxInt32

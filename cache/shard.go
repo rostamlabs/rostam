@@ -1240,9 +1240,8 @@ func (s *shard) putAtExpLocked(key, value []byte, exp uint64, h uint64) error {
 	}
 
 	// Find a page with enough tail room; lazily allocate or evict as needed.
-	// OCCUPANCY, and it must be the SAME figure page.Write reserves a few lines
-	// below: this decides which page the entry goes on, and a requirement short of
-	// what Write reserves would pick a page the write then fails on.
+	// OCCUPANCY: this authorises the page.Write a few lines below — capacity/write
+	// rule, see entrySpan.
 	pageIdx, err := s.findOrMakePageLocked(entrySpan(len(key), len(value), true))
 	if err != nil {
 		return err
@@ -1358,9 +1357,8 @@ func (s *shard) delH(key []byte, h uint64) (bool, error) {
 		// value), and PageSize cannot change under a live shard — validateHeader
 		// rotates a file whose header disagrees aside instead of reopening it at a
 		// different geometry.
-		// OCCUPANCY, for the same reason as the ordinary append above: it has to
-		// match what the page.Write on the next line reserves. The record is this
-		// key with an empty value.
+		// OCCUPANCY: this authorises the tombstone page.Write below — capacity/write
+		// rule, see entrySpan. The record is this key with an empty value.
 		pageIdx, ferr := s.findOrMakePageLocked(entrySpan(len(key), 0, true))
 		if ferr != nil {
 			return false, ferr

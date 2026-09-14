@@ -259,12 +259,19 @@ func (s *shard) liveBytesAtOpen(dropClock uint64) uint64 {
 func (s *shard) packPagesNeeded(dropClock uint64) int {
 	usable := s.cfg.PageSize - pageHdrSize
 	pages, used := 1, 0
-	s.walkLiveAtOpen(dropClock, func(_, _ []byte, _, _ uint64, size int) bool {
-		if used+size > usable {
+	s.walkLiveAtOpen(dropClock, func(key, value []byte, _, _ uint64, _ int) bool {
+		// OCCUPANCY, and deliberately NOT the `size` walkLiveAtOpen hands over. That
+		// one is the exact framing, which is what liveBytesAtOpen wants; this function
+		// is a capacity decision authorising packLiveInto's page.Write calls, and the
+		// doc above promises it mirrors their next-fit rule EXACTLY. Write tests the
+		// occupancy against FreeTail, so this must too, or the mirror is a claim the
+		// code does not keep. Capacity/write rule, entrySpan.
+		span := entrySpan(len(key), len(value), true)
+		if used+span > usable {
 			pages++
 			used = 0
 		}
-		used += size
+		used += span
 		return true
 	})
 	return pages

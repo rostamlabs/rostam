@@ -187,10 +187,10 @@ func (p *page) Write(key, value []byte, expiryMs, meta uint64) (offset uint32, s
 	}
 	off := uint32(tail) //nolint:gosec // tail < PageSize which is validated ≤ MaxInt32
 	// tail advances by the ENCODER'S length, while the room check above reserved the
-	// OCCUPANCY. Identical today, and they have to stay identical: the moment an
-	// append reserves more than it encodes, this is the line that must advance by
-	// `need` instead, or the reservation is handed straight back to the next append
-	// and there is no slack to rewrite into.
+	// OCCUPANCY — this method's own half of the capacity/write rule (see entrySpan).
+	// The moment an append reserves more than it encodes, this is the line that must
+	// advance by `need` instead, or the reservation is handed straight back to the
+	// next append and there is no slack to rewrite into.
 	p.setTail(tail + n)
 	return off, uint32(n), nil //nolint:gosec // n = the entry framing, which fits in uint32
 }
@@ -264,12 +264,28 @@ func (p *page) WriteAt(offset uint32, key, value []byte, expiryMs, meta uint64) 
 // on an mmap one, both stored by an appending writer, so reading it here would be
 // an unsynchronised read of mutable state — a data race, not a tightening.
 //
-// Nothing is lost by that today. A lock-free reader only ever reaches a page
-// whose entries are append-only for its lifetime (heap ringbuf retires by frozen
-// replacement behind the generation gate; reject-writes never overwrites), so an
-// entry's valLen is immutable once its ref is published and the decode below is
-// in bounds by construction. A read path that DID let valLen change underneath it
-// would need the tail bound — and would first need tail published atomically.
+// THE BOUND IS UNNECESSARY BECAUSE THE FRAMING IS IMMUTABLE, NOT BECAUSE NOTHING
+// RACES. Under Config.InPlaceSeqlockReads a heap page is read lock-free by getSeq
+// while WriteAt rewrites a live entry in place, so live bytes genuinely do change
+// under a reader here. What does NOT change is the framing: WriteAt is reached
+// only through inPlaceTargetLocked, where guard 4c has proved the stored key
+// equal to the caller's and guard 5 the stored value's length equal to the new
+// one's. So encodeEntryHeader restores keyLen at [0:2] and valLen at [2:6] with
+// the bytes already in them, and a torn read of either field yields the same
+// value whichever side of the store it lands on. `total` is therefore the same
+// number before, during and after the rewrite, and the decode stays in bounds.
+//
+// What genuinely tears is the expiry, the meta word and the value bytes (the heap
+// encoder does not rewrite the CRC slot at all). The read is BOUNDS-SAFE but not
+// VALUE-CORRECT, and it is the seqlock version check around this call — not
+// anything here — that turns an incorrect value into a retry.
+//
+// A SLACK-CAPABLE IN-PLACE WRITE WOULD NOT INHERIT THAT. Admitting a rewrite whose
+// value merely fits the stored entry's size class means valLen is rewritten with
+// DIFFERENT bytes, so a torn length is bounded by neither the old value nor the
+// new one and the decode can run past the entry. That path is the one that needs
+// the tail bound — and would first need tail published atomically, since the read
+// it must protect is exactly the one that cannot take the lock.
 func (p *page) Read(offset uint32) ([]byte, []byte, uint64, error) {
 	entries := p.entries()
 	if int(offset) >= len(entries) {

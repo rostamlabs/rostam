@@ -49,6 +49,27 @@ func TestEntrySpanEqualsExactInBothModes(t *testing.T) {
 	}
 }
 
+// TestPageWriteReservesTheOccupancySpan anchors the capacity/write rule stated on
+// entrySpan. page.Write is the only place that turns a span into reserved bytes,
+// so every capacity check in the package is checked against THIS: a page with
+// exactly the occupancy span free must accept the entry, and one byte less must
+// refuse it. A capacity site that asks for anything smaller than what this pins
+// would say yes to a page Write then rejects.
+func TestPageWriteReservesTheOccupancySpan(t *testing.T) {
+	key, val := []byte("key"), []byte("a-value-of-some-length")
+	span := entrySpan(len(key), len(val), true)
+
+	exact := newHeapPage(span)
+	if _, _, err := exact.Write(key, val, 0, 0); err != nil {
+		t.Errorf("Write into exactly entrySpan(...,true)=%d bytes: %v, want success", span, err)
+	}
+
+	short := newHeapPage(span - 1)
+	if _, _, err := short.Write(key, val, 0, 0); err != errPageFull {
+		t.Errorf("Write into %d bytes: err = %v, want %v", span-1, err, errPageFull)
+	}
+}
+
 // classOfTestLens spans the lengths a class function has to behave at: the
 // degenerate small ones, powers of two and their neighbours (where any rounding
 // scheme puts its boundaries), and the top of the representable range.

@@ -236,7 +236,8 @@ func (s *shard) relocateIntoFreedPageLocked(freedIdx, need int) (uint64, uint64)
 		// wants the room the record takes up rather than the bytes its encoder wrote:
 		// the cursor advance over the source page, the relocation budget (`spent`),
 		// the movedBytes charged to page.relocatedOut, and — through the budget —
-		// the room the destination append will need. HEAP-REACHABLE: heap ringbuf
+		// the room the destination append will need, which is this site's half of
+		// the capacity/write rule (see entrySpan). HEAP-REACHABLE: heap ringbuf
 		// under Config.RelocatingEviction runs this pass.
 		size := entrySpan(len(key), len(value), true)
 		if budget-spent < entryHeaderSize {

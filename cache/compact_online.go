@@ -489,8 +489,11 @@ func (s *shard) tryRelocatePageLocked(idx int, dropClock uint64) bool {
 		}
 		// EXACT, and NOT HEAP-REACHABLE: tryRelocatePageLocked is reached only from
 		// compactRelocateOnce, behind the same onlineCompactionEligible gate. It
-		// advances the cursor over persisted bytes, asks findRelocDestLocked for room
-		// on another mmap page, and charges relocatedBytes — all encoder lengths.
+		// advances the cursor over persisted bytes and charges relocatedBytes against
+		// a gauge measured in those same bytes — both encoder lengths.
+		//
+		// The DESTINATION SEARCH below is the exception and takes the occupancy
+		// instead; see the capacity/write rule on entrySpan.
 		size := entrySpanExact(len(key), len(value))
 		ref := makeSlabRef(uint16(idx), p.gen, uint32(cursor)) //nolint:gosec // idx ≤ MaxPagesPerShard; cursor < PageSize
 		h := hashKey(key)
@@ -511,7 +514,11 @@ func (s *shard) tryRelocatePageLocked(idx int, dropClock uint64) bool {
 			cursor += size
 			continue
 		}
-		dest := s.findRelocDestLocked(size, idx)
+		// OCCUPANCY: this authorises the s.pages[dest].Write below, so it must ask for
+		// the room Write reserves, not the bytes the encoder emits. The two are equal
+		// today; passing `size` here would make the "unreachable" errPageFull a few
+		// lines down reachable the moment they are not. Capacity/write rule, entrySpan.
+		dest := s.findRelocDestLocked(entrySpan(len(key), len(value), true), idx)
 		if dest < 0 {
 			pinned = true // nowhere to evacuate to; the page stays live and un-retired.
 			cursor += size
