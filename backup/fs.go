@@ -32,6 +32,8 @@ import (
 // Writes are atomic per object: Put streams into a temp file in the destination
 // directory and renames it over the final path, so a crash mid-write never
 // leaves a torn snapshot (mirroring CollectionStore's tmp+rename discipline).
+// PutIfAbsent stages the same way and publishes with a hard link instead, which
+// refuses an existing destination where a rename would replace it.
 type FSObjectStore struct {
 	root string
 }
@@ -138,6 +140,52 @@ func (f *FSObjectStore) keyToPath(key string) (string, error) {
 // accepted for interface parity (Content-Length on the wire); the bytes actually
 // written are whatever r yields.
 func (f *FSObjectStore) Put(_ context.Context, key string, r io.Reader, size int64) error {
+	return f.put(context.Background(), key, r, false)
+}
+
+// PutIfAbsent writes r's full contents to <root>/<key> only if no file exists
+// there, returning objstore.ErrExists (and publishing nothing) if one does.
+//
+// It stages exactly as Put does, then publishes with a hard link from the
+// staging file to the final path instead of a rename. The two differ in the one
+// way that matters: rename(2) REPLACES an existing destination, while link(2)
+// fails with EEXIST if the destination exists, and the kernel decides that as
+// one step — so of any number of concurrent writers, in this process or in
+// others sharing the root, exactly one link succeeds. Once linked, the staging
+// name is only a second name for the published file, and it is removed.
+//
+// Why not open the final path with O_CREATE|O_EXCL and stream into it: that is
+// just as atomic a claim, but it is made BEFORE the body is written, so a crash
+// or a failing reader mid-copy leaves a partial file under the final name — a
+// torn object that List reports and restore selects, and that holds the key
+// against every retry. Staging keeps the final name unpublished until the bytes
+// are complete and fsynced, which is what the staging file exists for.
+//
+// Windows: os.Link is CreateHardLinkW there, which likewise fails with
+// ERROR_ALREADY_EXISTS when the new name exists (errors.Is(err, fs.ErrExist)
+// holds for it), so the same code is correct on NTFS. A filesystem without hard
+// links (FAT32, exFAT, some network and FUSE mounts) makes the link fail with a
+// different error, which is returned as-is: the call fails loudly and never
+// falls back to a rename, which would overwrite.
+//
+// Cooperation with reclaimStaleTemps: the heartbeat runs until the staging file
+// is closed and the link and unlink follow at once, so the sweep cannot take a
+// live PutIfAbsent's staging file. If the process dies between the link and the
+// unlink, the leftover staging name is a second link to the published object,
+// and the sweep removing it later drops only that name — the object keeps its
+// own link and its bytes. On Windows the unlink can also fail while a reader
+// holds the published file open (Go opens files there without
+// FILE_SHARE_DELETE); that leftover is reclaimed the same way.
+func (f *FSObjectStore) PutIfAbsent(ctx context.Context, key string, r io.Reader, size int64) error {
+	return f.put(ctx, key, r, true)
+}
+
+// put stages r into a temp file beside the destination and publishes it: by
+// rename, which replaces an existing object, or — when exclusive — by link,
+// which refuses one (see PutIfAbsent). ctx is consulted only when exclusive,
+// immediately before the link: a PutIfAbsent whose caller gave up while the body
+// was being staged publishes nothing. Put keeps ignoring ctx, as it always has.
+func (f *FSObjectStore) put(ctx context.Context, key string, r io.Reader, exclusive bool) error {
 	dst, err := f.keyToPath(key)
 	if err != nil {
 		return err
@@ -161,7 +209,7 @@ func (f *FSObjectStore) Put(_ context.Context, key string, r io.Reader, size int
 	tmpName := tmp.Name()
 	// Keep this staging file's mtime fresh for as long as the copy runs, so a slow
 	// or wedged reader is not mistaken for an abandoned Put by a concurrent sweep
-	// (see startTempHeartbeat). Stopped explicitly before the rename; the deferred
+	// (see startTempHeartbeat). Stopped explicitly before the publish; the deferred
 	// stop covers every error return in between.
 	stopHeartbeat := startTempHeartbeat(tmpName)
 	defer stopHeartbeat()
@@ -187,11 +235,26 @@ func (f *FSObjectStore) Put(_ context.Context, key string, r io.Reader, size int
 	// The staging file is fully written and closed; nothing is left to protect from
 	// the sweep, and the path is about to stop existing under this name.
 	stopHeartbeat()
-	if err := os.Rename(tmpName, dst); err != nil {
+	if exclusive {
+		if err := ctx.Err(); err != nil {
+			_ = os.Remove(tmpName)
+			return fmt.Errorf("fsstore: put-if-absent %q: %w", key, err)
+		}
+		linkErr := os.Link(tmpName, dst)
+		// Win or lose, the staging name goes: after a successful link it is a
+		// second name for dst, after a failed one it is the loser's copy.
+		_ = os.Remove(tmpName)
+		if linkErr != nil {
+			if errors.Is(linkErr, fs.ErrExist) {
+				return fmt.Errorf("fsstore: put-if-absent %q: %w", key, objstore.ErrExists)
+			}
+			return fmt.Errorf("fsstore: link for %q: %w", key, linkErr)
+		}
+	} else if err := os.Rename(tmpName, dst); err != nil {
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("fsstore: rename for %q: %w", key, err)
 	}
-	// fsync the destination's parent directory so the rename itself is durable;
+	// fsync the destination's parent directory so the publish itself is durable;
 	// otherwise the directory entry for dst may be lost on power loss.
 	if err := syncDir(filepath.Dir(dst)); err != nil {
 		return fmt.Errorf("fsstore: sync dir for %q: %w", key, err)
@@ -286,7 +349,14 @@ func reclaimStaleTemps(dir string) {
 // made durable. Both a failure to open the directory and a Sync error are
 // surfaced to the caller, since either means the rename cannot be guaranteed
 // durable across a crash.
+//
+// Where the platform has no directory fsync (Windows, see dirsync_windows.go)
+// there is nothing to force and it returns nil. Attempting it there fails every
+// time, so it would fail every write to a Windows backup directory.
 func syncDir(dir string) error {
+	if !dirSyncSupported {
+		return nil
+	}
 	d, err := os.Open(dir)
 	if err != nil {
 		return err

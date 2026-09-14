@@ -237,6 +237,15 @@ func (f *failingPutStore) Put(ctx context.Context, key string, r io.Reader, size
 	return f.MemStore.Put(ctx, key, r, size)
 }
 
+// PutIfAbsent must be overridden too: the embedded MemStore's would otherwise be
+// promoted and silently bypass failOn.
+func (f *failingPutStore) PutIfAbsent(ctx context.Context, key string, r io.Reader, size int64) error {
+	if strings.Contains(key, f.failOn) {
+		return errPutBoom
+	}
+	return f.MemStore.PutIfAbsent(ctx, key, r, size)
+}
+
 // TestBackupResilience asserts that one collection's Put failure does not abort
 // the others: the healthy collection still lands and the failure is reported in
 // its own BackupResult.
@@ -288,8 +297,14 @@ func TestBackupResilience(t *testing.T) {
 // TestBackupRefusesExistingSnapshot pins the write-once rule: a second run at
 // a timestamp whose snapshot already exists must fail with ErrSnapshotExists
 // and leave BOTH existing objects (snapshot and sibling config) byte-identical,
-// even though the collection's config changed in between. An orphan config with
-// no snapshot (a run interrupted between the two Puts) must NOT block a re-run.
+// even though the collection's config changed in between.
+//
+// An orphan config with no snapshot (a run that died between its two writes) is
+// indistinguishable from a run still writing its snapshot, so it holds its
+// timestamp: a re-run there is refused and leaves the orphan alone, while a run
+// at the next timestamp is unaffected. A snapshot with no config of its own at
+// the run's key is refused too, and the config the run claimed is released
+// rather than left paired with a snapshot it does not describe.
 func TestBackupRefusesExistingSnapshot(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t)
@@ -328,20 +343,42 @@ func TestBackupRefusesExistingSnapshot(t *testing.T) {
 		t.Error("existing sibling config was modified by the refused re-run")
 	}
 
-	// Orphan config only (no snapshot) must not block: simulate a run that died
-	// between the config Put and the snapshot Put, then re-run at that timestamp.
+	// Orphan config only (no snapshot): simulate a run that died between the
+	// config write and the snapshot write, then re-run at that timestamp.
 	if err := obj.Delete(ctx, key); err != nil {
 		t.Fatal(err)
 	}
-	third, err := Backup(ctx, store, obj, opts)
-	if err != nil {
-		t.Fatalf("re-run over an orphan config must succeed: %v", err)
+	if _, err := Backup(ctx, store, obj, opts); !errors.Is(err, ErrSnapshotExists) {
+		t.Fatalf("re-run over an orphan config = %v, want ErrSnapshotExists", err)
 	}
-	if third[0].Key != key {
-		t.Fatalf("key = %q, want %q", third[0].Key, key)
+	if got := mustGet(t, obj, cfgKeyFor(key)); got != cfgBefore {
+		t.Error("orphan config was modified by the refused re-run")
 	}
-	if got := mustGet(t, obj, cfgKeyFor(key)); got == cfgBefore {
-		t.Error("orphan config was not replaced by the re-run")
+	if _, err := obj.Get(ctx, key); !errors.Is(err, objstore.ErrNotFound) {
+		t.Errorf("refused re-run wrote a snapshot: %v", err)
+	}
+	next := opts
+	next.Timestamp = ts.Add(time.Second)
+	if _, err := Backup(ctx, store, obj, next); err != nil {
+		t.Fatalf("run at the next timestamp must not be blocked by the orphan: %v", err)
+	}
+
+	// Snapshot with no config of its own at the run's key: refused, and the
+	// config the run claimed is released.
+	if err := obj.Delete(ctx, cfgKeyFor(key)); err != nil {
+		t.Fatal(err)
+	}
+	if err := obj.Put(ctx, key, strings.NewReader(snapBefore), int64(len(snapBefore))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Backup(ctx, store, obj, opts); !errors.Is(err, ErrSnapshotExists) {
+		t.Fatalf("run over a config-less snapshot = %v, want ErrSnapshotExists", err)
+	}
+	if _, err := obj.Get(ctx, cfgKeyFor(key)); !errors.Is(err, objstore.ErrNotFound) {
+		t.Errorf("claimed config was left paired with a snapshot it does not describe: %v", err)
+	}
+	if got := mustGet(t, obj, key); got != snapBefore {
+		t.Error("existing config-less snapshot was modified")
 	}
 }
 
