@@ -19,6 +19,14 @@ to `cache.New`).
 | `Durable` | false | `msync` on commit boundaries (bounded by `MsyncIntervalMs`, default 100 ms); false = opportunistic OS flushing |
 | `Mlock` | false | pin the mmap into RAM (needs `ulimit -l` headroom; failure logs and continues) |
 
+The opt-in eviction knobs — `RelocatingEviction`, `RelocateReserveIntervalMs`,
+`InPlaceSameSizeUpdate`, `InPlaceSeqlockReads` and `SieveVisitedBit`, all off by
+default and also settable as `rostam.CacheConfig` fields — act only on shards
+that evict at capacity, and some only on heap shards. Check
+[where each takes effect](../server/running.md#where-each-knob-takes-effect)
+before enabling one, and read the warning there on `InPlaceSeqlockReads`, whose
+read protocol is not covered by race detection.
+
 ## Read semantics
 
 - `Get(key)` — **policy-dependent**. Under `PolicyRejectWrites` it is

@@ -112,6 +112,11 @@ write-heavy replicated node is climbing toward the cache cap between sweeps;
 raise it to cut background CPU on a cluster with many shards and slow-churning
 TTLs.
 
+The cache eviction knobs (`-relocating-eviction`, `-relocate-reserve-interval`,
+`-in-place-same-size-update`, `-in-place-seqlock-reads`, `-sieve-visited-bit`)
+are also Storage flags, but most of them do nothing on most topologies — see
+[Cache eviction knobs](#cache-eviction-knobs) before enabling one.
+
 **Clustering** — `-cluster`, `-node-id`, `-raft-addr`, `-bootstrap`, `-peers`,
 `-replication-factor`, `-persistent-vectors`, `-reconfigure`; durability
 posture: `-nosync`, `-volatile-log`; replication engine: `-replication-mode`
@@ -134,6 +139,87 @@ grouped by the areas on this page; `-help-all` prints every description in full.
 **Logging** — `-log-format` (`text` | `json`), `-log-level`
 (`debug`–`error`), `-access-log` (one structured line per request on every
 transport, principal redacted).
+
+## Cache eviction knobs
+
+Five opt-in flags change what a shard does when its cache reaches
+`max_memory`. All are **off by default**, and setting them never turns anything
+else on. Each also reads its `ROSTAM_*` variable
+(`-in-place-same-size-update` → `ROSTAM_IN_PLACE_SAME_SIZE_UPDATE`).
+
+| Flag | What it does |
+|---|---|
+| `-relocating-eviction` | When a full shard evicts a page, copy the records on it that are still live forward instead of dropping them with the dead versions that share the page. Costs extra copying at eviction time. |
+| `-relocate-reserve-interval` | How often each shard tops up a small reserve of free pages for `-relocating-eviction`, so a write at capacity finds room instead of evicting inline (default `50ms`; `0` turns the reserve off). Every shard runs its own ticker, so a shorter interval costs more on a node with many shards. |
+| `-in-place-same-size-update` | A rewrite of a key whose new value has the same length overwrites the stored copy instead of appending a new one, so steady same-size rewrites stop filling the cache with dead versions. Reads on the shard then take a read lock (unless `-in-place-seqlock-reads`), and a rewritten key no longer moves to the newest page: on a cache run over capacity, a frequently rewritten key is evicted on the same schedule as a rarely rewritten one. |
+| `-in-place-seqlock-reads` | Keeps reads lock-free under `-in-place-same-size-update` by validating each read against a version counter after the fact. See the warning below. |
+| `-sieve-visited-bit` | `-relocating-eviction` rescues only records that were read or rewritten since eviction last passed them, instead of whichever live records it meets first, so a stream of write-once keys cannot push the working set out. |
+
+### Where each knob takes effect
+
+Check this before enabling a knob: on the wrong topology it is accepted and
+does nothing.
+
+| Flag | Single node, in-memory (no `-data`) | Single node with `-data` | `-cluster` |
+|---|---|---|---|
+| `-relocating-eviction` | **takes effect** (at eviction and in the background reserve) | **takes effect** (at eviction only) | no effect |
+| `-relocate-reserve-interval` | **takes effect** with `-relocating-eviction` | no effect | no effect |
+| `-in-place-same-size-update` | **takes effect** | no effect | no effect |
+| `-in-place-seqlock-reads` | **takes effect** with `-in-place-same-size-update` | no effect | no effect |
+| `-sieve-visited-bit` | **takes effect** with `-relocating-eviction` | **takes effect** with `-relocating-eviction` | no effect |
+
+Why:
+
+- **`-cluster`: none of them.** Every one acts only when a shard evicts to make
+  room. A cluster shard never evicts: replicas evicting independently would
+  drop different keys and diverge, so replication makes every shard refuse
+  writes at capacity instead. (Every cluster shard is also file-backed, since a
+  cluster requires `-data`.)
+- **`-data`: no in-place updates.** A file-backed page is the durable copy. An
+  overwrite interrupted by a crash is found at recovery as a corrupt entry
+  mid-page, and recovery discards the rest of that page with it — other keys,
+  written long before. An interrupted append normally costs only the write in
+  flight, and the key's previous version is still on disk. So a file-backed
+  shard always appends, and `-in-place-seqlock-reads`, which exists
+  only to serve in-place updates, has nothing to do either.
+- **`-data`: no background reserve.** On a file-backed shard the reserve's
+  copies and the page it frees could reach disk out of order, so a crash could
+  lose a record that would otherwise have survived. Relocation there runs only
+  at eviction time.
+- **The background reserve also needs at least four pages per shard.** A small
+  `max_memory` spread over many `-shards` can leave fewer, and such a shard
+  keeps no reserve; `-relocating-eviction` still works, at eviction time only.
+
+The server does not refuse a knob that has no effect — a config file shared by
+a cluster and a single-node box is over-specified, not broken — but it logs one
+warning per such knob at startup, naming the flag, the deployment and the
+reason:
+
+```text
+level=WARN msg="cache option is set but has no effect on this deployment" component=cache option=InPlaceSameSizeUpdate flag=-in-place-same-size-update deployment="single-node with a data directory" reason="..."
+```
+
+The same warning fires for a pairing that does nothing: `-sieve-visited-bit` or
+`-relocate-reserve-interval` without `-relocating-eviction`, and
+`-in-place-seqlock-reads` without `-in-place-same-size-update`.
+
+!!! danger "`-in-place-seqlock-reads` is not covered by race detection"
+
+    This is an opt-in performance trade, not a free speed-up. Its reads are a
+    **deliberate data race**: a reader copies page bytes that a writer may be
+    rewriting at that moment, then discards the copy if a version counter
+    moved. Go's race detector reports that access by design, and the engine's
+    concurrent tests for this read protocol are skipped under `-race` — so a
+    green race-enabled test run says nothing about it. The protocol's
+    correctness argument rests on how Go compiles its atomic operations rather
+    than on a guarantee of the language's memory model (the full argument and
+    its limits are in `cache/seqlock.go`). It pays only when reads far
+    outnumber writes; otherwise leave it off and let reads take the lock.
+
+Embedding the engine directly, the same knobs are fields of
+`rostam.CacheConfig` with the same names in Go form, and `NewDirect` /
+`NewEmbedded` log the same warnings. A `NewEmbedded` store with no `Peers` is
+not replicated and behaves as the "single node with `-data`" column.
 
 ## Recipes
 
