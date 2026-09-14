@@ -28,14 +28,27 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   64-bit builds are unaffected.
 
 - **New counter `CorruptionBytesDiscarded`
-  (`rostam_kv_corruption_bytes_discarded_total`)** reports how much page data
-  unreadable entries cost, in bytes, beside the incident count in
-  `CorruptionErrors`. A warm restart that meets an entry failing its checksum
-  still discards that page from the entry to its tail, and this is where that
-  loss now shows. It does not resynchronise past the bad entry: a value can
+  (`rostam_kv_corruption_bytes_discarded_total`)** reports how many page bytes
+  the warm restart and the mmap eviction drain discarded because they could not
+  read them. A warm restart that meets an entry failing its checksum still
+  discards that page from the entry to its tail, and this is where that loss now
+  shows; a page whose persisted head/tail are out of range counts as its whole
+  capacity. It does not resynchronise past the bad entry: a value can
   legitimately contain bytes that form a complete, checksummed entry, so a
   resync could index a key nobody wrote. Recovering the rest of the page safely
   needs framing a client cannot forge, which is a format change.
+
+  It is not a per-incident size for `CorruptionErrors`, whose description was
+  also wrong: that counter never counted checksum mismatches on read (reads
+  verify none). It counts once per read that reaches an entry which will not
+  frame, so a damaged entry read repeatedly counts repeatedly, and once per
+  region the warm restart or the drain gives up on.
+
+- **An mmap cache page whose persisted head/tail were corrupted while the cache
+  was running could panic the process at its next eviction**, or, on 32-bit
+  builds, at the next write into it. The drain now checks a page's bounds before
+  reading through them and resets a page whose bounds are out of range, with its
+  index slots dropped.
 
 - **`Server.Close` could panic the process, or return while a connection handler
   was still running.** The accept loop published a connection into the tracked
