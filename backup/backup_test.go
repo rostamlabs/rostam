@@ -147,6 +147,56 @@ func TestRestoreByExplicitKey(t *testing.T) {
 	}
 }
 
+// TestRestoreCorruptSnapshotKeepsCollection: restoring over a live collection
+// from a snapshot object that turns out to be truncated must fail without
+// touching the collection. Restore is create-or-replace, and it used to drop the
+// target before reading the snapshot, so a bad backup emptied the collection it
+// was meant to recover.
+func TestRestoreCorruptSnapshotKeepsCollection(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t)
+	mustCreate(t, store, "docs", 1, 2, 3)
+
+	obj := objstore.NewMemStore()
+	ts := time.Date(2026, 6, 23, 10, 0, 0, 0, time.UTC)
+	results, err := Backup(ctx, store, obj, BackupOpts{Tenant: "acme", Timestamp: ts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := results[0].Key
+	rc, err := obj.Get(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full, err := io.ReadAll(rc)
+	_ = rc.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	truncated := full[:len(full)/2]
+	if err := obj.Put(ctx, key, strings.NewReader(string(truncated)), int64(len(truncated))); err != nil {
+		t.Fatal(err)
+	}
+
+	// Written after the backup, so only the live collection has it.
+	c, _ := store.Acquire("docs")
+	if err := c.Insert(4, []float32{4, 0}, 0, nil, nil); err != nil {
+		c.Release()
+		t.Fatal(err)
+	}
+	c.Release()
+
+	if err := Restore(ctx, store, obj, "acme", "default/docs", key); err == nil {
+		t.Fatal("restore from a truncated snapshot succeeded, want an error")
+	}
+	for _, id := range []uint64{1, 2, 3, 4} {
+		_, _, _, _, ok, err := store.GetPoint("docs", id)
+		if err != nil || !ok {
+			t.Fatalf("point %d after a failed restore: ok=%v err=%v, want the live collection intact", id, ok, err)
+		}
+	}
+}
+
 // TestRetentionKeepsNewestN backs up the same collection at N+2 distinct
 // timestamps with Retention=N and asserts exactly N objects remain — the N
 // newest — and the older ones were deleted (the newest is NEVER pruned).

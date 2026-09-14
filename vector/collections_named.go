@@ -101,6 +101,9 @@ func (s *CollectionStore) CreateNamedConfig(name string, cfg NamedConfig) error 
 	if _, ok := s.named[canonical]; ok {
 		return ErrCollectionExists
 	}
+	if err := s.restoringErr(canonical); err != nil {
+		return err
+	}
 	nc, err := NewNamedCollection(canonical, cfg.Spaces)
 	if err != nil {
 		return err

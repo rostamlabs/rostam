@@ -126,6 +126,9 @@ func (s *CollectionStore) CreateMultiVector(name string, cfg MultiVectorConfig) 
 	if _, ok := s.named[canonical]; ok {
 		return ErrCollectionExists
 	}
+	if err := s.restoringErr(canonical); err != nil {
+		return err
+	}
 	cfgPath, _, _ := s.mvPaths(canonical)
 	// Single-node WAL: heap-checkpoint durability (mutually exclusive with the mmap
 	// Persistent mode, enforced by NewMultiVectorIndex). FORCED OFF on the cluster

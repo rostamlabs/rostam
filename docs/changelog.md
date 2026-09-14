@@ -129,6 +129,40 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   divergence. If a node is halting with this message, upgrade that node — no
   data needs repairing, since nothing was applied.
 
+- **A restore from a bad backup no longer destroys the collection it was meant
+  to replace.** `backup.Restore` and `CollectionStore.RestoreCollection` /
+  `RestoreCollectionWithConfig` are create-or-replace, and they dropped the
+  existing collection — removing its files — before reading the snapshot. A
+  truncated or corrupt snapshot then failed with an empty collection left where
+  the original had been, and a config the index rejected left no collection at
+  all.
+
+  The snapshot is now restored into a collection built outside the catalog while
+  the existing one keeps serving, and the existing one is dropped only after the
+  restore has succeeded. A failed restore leaves it untouched and nothing of the
+  attempt behind. (#112)
+
+  What to expect:
+
+  - The swap is not atomic. Between dropping the existing collection and
+    registering the restored one, the name resolves to no collection, and an
+    operation on it fails as it would on an absent name. That window covers
+    draining the existing collection's in-flight operations, closing it and
+    removing its files, and writing the new config marker (and opening the log
+    of a WAL collection) — not the restore itself. A filesystem failure inside
+    it still leaves neither collection, and the error says so.
+  - A restore now holds both the existing collection and the restored copy in
+    memory until the swap, where it used to need room for one. No store-wide
+    quota counts this; running out fails the restore with the existing
+    collection intact.
+  - While a restore of a name is in progress, creating that name, or starting
+    a second restore of it, fails with `ErrCollectionExists`.
+  - A restore with a named-vector config is refused up front. It could never
+    succeed, and used to drop the existing collection before failing.
+
+  Cluster disaster recovery (`-restore`) installs whole shard snapshots through
+  Raft and does not use this path, so it is unaffected.
+
 - **`Server.Close` could panic the process, or return while a connection handler
   was still running.** The accept loop published a connection into the tracked
   set and only then counted its handler goroutine, while `Close` walked that set
