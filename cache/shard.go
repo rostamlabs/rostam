@@ -1032,10 +1032,17 @@ func (s *shard) inPlaceEligible() bool {
 	// every future eviction walk. The loss is therefore every entry AFTER the tear on
 	// that page: unrelated keys, durable long before the write that tore.
 	//
-	// The page FRAMING is a separate failure mode that both shapes share: Write
-	// persists the tail after encoding, so a crash torn mid-setTail can leave
-	// head/tail out of range, and recovery resets the whole page. That one is not an
-	// argument for either shape over the other — the mid-page exposure above is.
+	// The page FRAMING is a second failure mode, and it belongs to the OTHER shape:
+	// only append moves it. Write persists the tail after encoding, so a crash torn
+	// mid-setTail can leave head/tail out of range and recovery resets the whole
+	// page; WriteAt never calls setTail and only reads head/tail to bound itself, so
+	// an in-place write cannot tear the framing at all.
+	//
+	// So each shape has its own rare whole-page failure. What is NOT symmetric is the
+	// common case: an in-place tear takes the rest of its page with it, while an
+	// append tear that leaves the framing intact costs only the write in flight — and
+	// the previous version of the key is still framed and recoverable, which an
+	// in-place write has already destroyed.
 	//
 	// It is also why the boundary cannot be redefined to make this safe — read
 	// rebuildIndexFromPages before concluding otherwise. Heap pages are not

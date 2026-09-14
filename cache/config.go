@@ -309,9 +309,11 @@ type Config struct {
 	//     data, with the page's persisted framing intact: an append writes only at
 	//     the page TAIL, while an in-place write tears mid-page, and recovery
 	//     answers a torn entry by truncating the page there and abandoning the rest
-	//     of it, so keys durable long before the torn write are lost with it. (A
-	//     tear in the page framing resets the whole page for either shape.) Heap
-	//     pages are not persisted, so the concern does not arise.
+	//     of it, so keys durable long before the torn write are lost with it. (The
+	//     page framing is the append path's risk rather than this one's — only
+	//     append moves the tail — so each shape has its own rare whole-page
+	//     failure; what is not symmetric is the common case above.) Heap pages are
+	//     not persisted, so the concern does not arise.
 	//
 	// WHAT IT ALSO COSTS: WRITE RECENCY, and this is a change in EVICTION
 	// SEMANTICS, not only in locking. Eviction here reclaims whole pages in

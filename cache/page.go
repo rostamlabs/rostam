@@ -199,9 +199,10 @@ func (p *page) Write(key, value []byte, expiryMs, meta uint64) (offset uint32, s
 // being written: an append writes only at the page TAIL, but an in-place write
 // tears mid-page, and recovery answers that by truncating the page at the tear
 // and abandoning everything after it (see rebuildIndexFromPages). Unrelated keys
-// durable long before the torn write go with it. (A tear in the page framing
-// itself resets the whole page whichever shape wrote it; that one is common to
-// both.) Heap pages are never persisted, so none of this applies to them.
+// durable long before the torn write go with it. (The page framing is the other
+// shape's risk, not this one's: only append calls setTail, and a tear there resets
+// the whole page. WriteAt never moves head or tail.) Heap pages are never
+// persisted, so none of this applies to them.
 //
 // shard.inPlaceEligible already forbids the mmap case; refusing here as well
 // keeps the invariant with the bytes it protects rather than resting on a caller
