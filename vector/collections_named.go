@@ -294,15 +294,24 @@ func (s *CollectionStore) DropNamed(name string) error {
 	if !ok {
 		return fmt.Errorf("%w %q", ErrNoNamed, canonical)
 	}
+	s.retireNamed(canonical, nc)
+	return nil
+}
+
+// retireNamed finishes dropping nc, which the caller has already removed from the
+// named map while holding canonical's name lock: it drains in-flight users, closes
+// the wal and sub-indexes, then deletes the single-node files (no-ops if absent — a
+// heap-only collection, and every named collection in a persistent-cluster store,
+// has none). It is shared by DropNamed and DropCollection, so the two drops of a
+// named collection cannot disagree about which files it owns: the .ncfg marker
+// left behind would reload the collection on the next open.
+func (s *CollectionStore) retireNamed(canonical string, nc *NamedCollection) {
 	cfgPath, snapPath, walPath := s.namedPaths(canonical)
-	// Drain in-flight users, close the wal + sub-indexes, then delete the
-	// single-node files (no-ops if absent — a heap-only collection has none).
 	nc.retire(func() {
 		_ = os.Remove(cfgPath)
 		_ = os.Remove(snapPath)
 		_ = os.Remove(walPath)
 	})
-	return nil
 }
 
 // NamedInsert upserts point id (a map of named vectors + shared payload + ttl)
