@@ -9,6 +9,7 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -149,35 +150,65 @@ func TestMigrateV4ToV5OnOpen(t *testing.T) {
 // read-only, so CREATING the staging temp file fails while the existing pages.dat can
 // still be opened and mapped.
 func TestMigrateV4FailClosed(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.NumShards = 1
-	cfg.PageSize = 1 << 20
-	cfg.MaxMemoryPerShard = 1 << 20
-	cfg.TTLSweepIntervalMs = 0
-
-	dir := t.TempDir()
-	path := filepath.Join(dir, "pages.dat")
-	writeV4File(t, path, cfg.PageSize, 1, []v4Entry{{key: []byte("k0"), val: []byte("AAAA"), seq: 1}})
-
-	// Make the shard directory read-only so CREATING the staging temp file fails
-	// (EACCES) while the existing pages.dat can still be opened and mapped — a clean
-	// simulation of "cannot stage the rewrite" (e.g. a full disk). Restored on cleanup
-	// so the temp dir can be removed.
-	if err := os.Chmod(dir, 0o500); err != nil {
-		t.Fatal(err)
+	newV4Dir := func(t *testing.T) (Config, string, string) {
+		t.Helper()
+		cfg := DefaultConfig()
+		cfg.NumShards = 1
+		cfg.PageSize = 1 << 20
+		cfg.MaxMemoryPerShard = 1 << 20
+		cfg.TTLSweepIntervalMs = 0
+		dir := t.TempDir()
+		path := filepath.Join(dir, "pages.dat")
+		writeV4File(t, path, cfg.PageSize, 1, []v4Entry{{key: []byte("k0"), val: []byte("AAAA"), seq: 1}})
+		return cfg, dir, path
 	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	// On ANY failure to stage the rewrite, the v4 file must be left exactly as it was:
+	// still v4, and not rotated aside to a .bad-* sibling. Losing it would be losing
+	// committed state (a PB cluster's pages file has no log/snapshot behind it).
+	assertV4Intact := func(t *testing.T, path string) {
+		t.Helper()
+		if v := fileVersion(t, path); v != 4 {
+			t.Errorf("v4 file version = %d after a failed migration, want 4 (must be left intact)", v)
+		}
+		if bad, _ := filepath.Glob(path + ".bad-*"); len(bad) != 0 {
+			t.Errorf("failed migration rotated the v4 file aside (%v); it must be left in place", bad)
+		}
+	}
 
-	if _, err := newShard(cfg, dir, nil); err == nil {
-		t.Fatal("newShard succeeded despite an unwritable staging dir; migration must fail closed")
-	}
-	_ = os.Chmod(dir, 0o755) // restore so the assertions below can read the file
-	// The v4 file must be untouched (still v4, no .bad sibling rotated aside).
-	if v := fileVersion(t, path); v != 4 {
-		t.Errorf("v4 file version = %d after a failed migration, want 4 (must be left intact)", v)
-	}
-	if bad, _ := filepath.Glob(path + ".bad-*"); len(bad) != 0 {
-		t.Errorf("failed migration rotated the v4 file aside (%v); it must be left in place", bad)
+	// Portable trigger: obstruct the staging temp path with a non-empty directory, so
+	// the open cannot prepare the staging area on any OS and must fail closed. (The
+	// Unix directory-read-only trick below does not deny file creation on Windows.)
+	t.Run("obstructed staging path", func(t *testing.T) {
+		cfg, dir, path := newV4Dir(t)
+		tmpPath := compactTmpPath(path)
+		if err := os.Mkdir(tmpPath, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(tmpPath, "occupied"), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := newShard(cfg, dir, nil); err == nil {
+			t.Fatal("newShard succeeded despite an unstageable temp path; migration must fail closed")
+		}
+		assertV4Intact(t, path)
+	})
+
+	// Unix-only: a read-only shard directory makes CREATING the staging temp file fail
+	// with EACCES, exercising migrateV4ToV5's own staging-failure path. os.Chmod on a
+	// directory does not deny file creation on Windows, so this variant is Unix-only.
+	if runtime.GOOS != "windows" {
+		t.Run("unwritable staging dir", func(t *testing.T) {
+			cfg, dir, path := newV4Dir(t)
+			if err := os.Chmod(dir, 0o500); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+			if _, err := newShard(cfg, dir, nil); err == nil {
+				t.Fatal("newShard succeeded despite an unwritable staging dir; migration must fail closed")
+			}
+			_ = os.Chmod(dir, 0o755) // restore so the assertions can read the file
+			assertV4Intact(t, path)
+		})
 	}
 }
 
