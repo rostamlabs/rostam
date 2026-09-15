@@ -353,5 +353,17 @@ func classifyApplyErr(err error) applyClass {
 	if errors.Is(err, cache.ErrFlushNotDurable) {
 		return classFatal
 	}
+	// cache.ErrReuseBarrier: this replica could not make a reused mmap extent's cleared
+	// header durable before refilling it — a LOCAL disk/entropy fault (msync or the
+	// crypto/rand nonce rotation) that a peer need not share. It surfaces from a write
+	// whose eviction of a victim page hit the barrier. Fatal for the same reason ErrFull
+	// is: the peer that did not hit the fault stores/applies the write while this node
+	// fails it, so advancing the applied index here would ACK an entry this replica did
+	// not apply — silent divergence. Fail-closed instead (halt in Raft mode; NACK in PB
+	// mode); the fault is transient, so a restart or failover replays the entry and it
+	// then lands in a durably-reset extent.
+	if errors.Is(err, cache.ErrReuseBarrier) {
+		return classFatal
+	}
 	return classAdvance
 }

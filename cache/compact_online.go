@@ -81,7 +81,10 @@ package cache
 // sweep-path scan and trigger run ONLY when the flag is on — a not-opted-in shard adds zero
 // cost to the sweeper.
 
-import "time"
+import (
+	"log/slog"
+	"time"
+)
 
 const (
 	// compactRelocateMaxPagesPerTick bounds how many source pages a single sweeper
@@ -436,7 +439,20 @@ func (s *shard) compactRecycleRetiredLocked(now time.Time, quarantine time.Durat
 		// old bytes under the old (larger) durable bound. Reset above touched only the
 		// runtime bounds — the durable header still names the retired extent's former
 		// contents until this projects and flushes (0,0).
-		s.zeroDurableBoundsForReuseLocked(idx)
+		//
+		// FAIL CLOSED, BUT DO NOT HALT — this is a background tick, not a client op.
+		// If the barrier fails the recycled extent is NOT durably cleared, so it must
+		// not be published to the write path. Restore the retired page object (so
+		// s.pages[idx] and pageSlots[idx] both still name the old, quarantined extent)
+		// and leave it retired: the next compaction tick retries once the fault clears.
+		// Logging and continuing is safe here precisely because nothing is published on
+		// failure.
+		if berr := s.zeroDurableBoundsForReuseLocked(idx); berr != nil {
+			s.pages[idx] = p
+			slog.Warn("online recycle: could not make recycled page header durable; leaving page retired for a later tick",
+				"component", "cache", "page", idx, "err", berr)
+			continue
+		}
 		s.pageSlots[idx].Store(fresh) // publish atomically for the lock-free read path.
 		regionNotePage(s, fresh)      // compiled out unless the measurement build tag is set
 		s.relocatePagesRecycled.Add(1)
@@ -580,6 +596,12 @@ func (s *shard) findRelocDestLocked(need, srcIdx int) int {
 		}
 		if s.pages[i].retired {
 			continue // stranded extent awaiting a recycle stage; not writable.
+		}
+		if s.pages[i].reuseBarrierFailed {
+			// Poisoned: empty with full FreeTail, so a prime destination, but its cleared
+			// header is not yet on disk — it must not receive writes until the reset is
+			// durable, same reason firstPageWithRoomLocked skips it.
+			continue
 		}
 		if s.pages[i].FreeTail() >= need {
 			return i

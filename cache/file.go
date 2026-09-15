@@ -206,6 +206,13 @@ func writeFramingKey(region []byte) error {
 	return nil
 }
 
+// randomNonceTestHook, when non-nil, replaces randomNonce at the extent-reuse
+// nonce-rotation point (zeroDurableBoundsForReuseLocked). It is a TEST-ONLY seam —
+// nil in production, so the only cost is one nil-pointer load per reuse — and it lets
+// a test force a crypto/rand failure to prove the reuse barrier fails closed on the
+// old nonce rather than proceeding.
+var randomNonceTestHook func() (uint64, error)
+
 // randomNonce draws a fresh 8-byte per-page-life nonce. Used at every extent-reuse
 // point to rotate the page nonce (see zeroDurableBoundsForReuseLocked).
 func randomNonce() (uint64, error) {

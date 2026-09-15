@@ -147,8 +147,11 @@ func TestNonceRotatesAndRejectsReverseSkew(t *testing.T) {
 
 	// Hand the extent back to the write path: rotate the nonce + zero the bounds.
 	s.mu.Lock()
-	s.zeroDurableBoundsForReuseLocked(0)
+	rerr := s.zeroDurableBoundsForReuseLocked(0)
 	s.mu.Unlock()
+	if rerr != nil {
+		t.Fatalf("zeroDurableBoundsForReuseLocked: %v", rerr)
+	}
 
 	newNonce := p.nonce
 	if newNonce == 0 {

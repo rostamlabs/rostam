@@ -5,6 +5,17 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **A persistent cache now fails closed if it cannot make a reused or recovered
+  page's cleared header durable.** When the cache hands a page back to the write
+  path (after emptying, discarding a corrupt page, or reclaiming dead space) it
+  first makes the page's cleared header durable on disk; if that step fails, a
+  write that would require the unsafe page reuse now returns an error instead of
+  proceeding. Likewise, at startup a shard whose recovered page bounds cannot be
+  made durable now refuses to open rather than serving them. Previously these
+  cases logged a durability warning and continued, which could let a stale page be
+  resurrected after a later crash. The failure is transient — retry the write, or
+  restart the shard once the underlying disk fault clears.
+
 - **The persistent cache on-disk format is now v5, with keyed per-entry frame
   integrity, so recovery and eviction lose only a damaged entry instead of the
   rest of the page.** Each entry is now protected by a keyed message

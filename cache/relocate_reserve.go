@@ -340,6 +340,14 @@ func (s *shard) reserveScanDestinationLocked(need, victim int, nonEmptyOnly bool
 		if p.retired || (nonEmptyOnly && p.Empty()) {
 			continue
 		}
+		if p.reuseBarrierFailed {
+			// Poisoned: empty with full FreeTail, so it would pass as a destination, but
+			// its cleared header is not yet on disk and must not receive writes until the
+			// reset is durable — same reason firstPageWithRoomLocked skips it. Kept for
+			// symmetry so no relocation destination selector can hand out a
+			// non-durably-reset extent.
+			continue
+		}
 		if p.FreeTail() >= need {
 			return i
 		}
