@@ -2268,14 +2268,19 @@ func (s *shard) firstPageWithRoomLocked(need int) int {
 }
 
 // clearReuseBarrierIfFlushableLocked retries the durable header flush for a page whose
-// reuse barrier previously failed (page.reuseBarrierFailed). The cleared (0,0) bounds
-// and rotated nonce are already in memory — only the msync failed — so a successful
-// retry is all that is needed to make the reset durable. On success it clears the
-// poison and returns true (the extent may be reused); on failure it leaves the poison
-// set and returns false (kept out of the writable set until the fault clears). Must
-// hold s.mu for writing.
+// reuse barrier previously failed (page.reuseBarrierFailed). It retries the WHOLE
+// barrier, not just the msync: the poison can have been set by a nonce-rotation
+// failure, in which case zeroDurableBoundsForReuseLocked returned BEFORE projecting,
+// so the mapped header still carries the extent's old nonce and old (larger) bounds.
+// Re-msyncing that unchanged header would flush a stale reset and clearing the poison
+// would then hand the write path an extent whose reset was never established — the
+// exact resurrection/forge window this barrier closes. Retrying the full barrier
+// (rotate nonce, project (0,0), msync) is idempotent and establishes the reset in
+// both the nonce-failure and msync-failure cases. On success it clears the poison and
+// returns true (the extent may be reused); on failure it leaves the poison set and
+// returns false (kept out of the writable set until the fault clears). Must hold s.mu.
 func (s *shard) clearReuseBarrierIfFlushableLocked(idx int) bool {
-	if err := s.msyncPageHeaderLocked(idx); err != nil {
+	if err := s.zeroDurableBoundsForReuseLocked(idx); err != nil {
 		return false
 	}
 	s.pages[idx].reuseBarrierFailed = false

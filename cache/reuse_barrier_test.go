@@ -430,3 +430,90 @@ func TestReuseBarrierRecoveryFlushFailsOpenWithColdCompaction(t *testing.T) {
 		t.Fatalf("pages.dat missing after a failed open: %v", statErr)
 	}
 }
+
+// TestReuseBarrierNonceFailureHealRetriesFullBarrier proves the self-heal retries the
+// WHOLE barrier, not just the msync. When the poison was set by a nonce-rotation
+// failure, zeroDurableBoundsForReuseLocked returned BEFORE projecting, so the mapped
+// header still holds the extent's OLD nonce and OLD (non-zero) bounds. A heal that only
+// re-msync'd that unchanged header would flush a stale reset and clear the poison,
+// handing the write path an extent whose reset was never established. The heal must
+// instead rotate a fresh nonce, project (0,0), and msync — so after it succeeds the
+// durable header carries a NEW nonce and zeroed bounds.
+func TestReuseBarrierNonceFailureHealRetriesFullBarrier(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("mmap only on linux")
+	}
+	dir := t.TempDir()
+	c, err := New(relocMmapConfig(dir, 3, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	s := c.shards[0]
+
+	// Warm to the first eviction with the barrier working.
+	for n := 0; c.Stats().Evictions == 0; n++ {
+		if n > 10_000 {
+			t.Fatal("shard never reached its first eviction")
+		}
+		mustPut(t, c, fmt.Appendf(nil, "warm%06d", n), relocValue(n%256))
+	}
+
+	// Fault ONLY the nonce draw and force a drain: the barrier fails before projecting,
+	// poisoning the drained victim with its old nonce+bounds still in the durable header.
+	prev := randomNonceTestHook
+	randomNonceTestHook = func() (uint64, error) { return 0, errInjectedBarrier }
+	var putErr error
+	for i := 0; i < 10_000; i++ {
+		if putErr = c.Put(fmt.Appendf(nil, "n%06d", i), relocValue(i%256), 0); putErr != nil {
+			break
+		}
+	}
+	if !errors.Is(putErr, ErrReuseBarrier) {
+		randomNonceTestHook = prev
+		t.Fatalf("Put during nonce fault = %v; want ErrReuseBarrier", putErr)
+	}
+
+	// Capture a poisoned page and its stale durable header (old nonce, non-zero bounds).
+	s.mu.Lock()
+	idx := -1
+	for i := range s.pages {
+		if s.pages[i].reuseBarrierFailed {
+			idx = i
+			break
+		}
+	}
+	var oldNonce uint64
+	if idx >= 0 {
+		// The nonce fault returned BEFORE projectNonce ran, so the durable header still
+		// carries the extent's pre-reuse nonce. That is the signal: a msync-only heal
+		// would flush this unchanged and clear the poison, leaving the stale nonce; the
+		// full-barrier heal must rotate it. (Durable BOUNDS are not a usable signal here
+		// — this shard has no sync point that ever projected them off (0,0).)
+		oldNonce = s.pages[idx].durableNonce()
+	}
+	s.mu.Unlock()
+	if idx < 0 {
+		randomNonceTestHook = prev
+		t.Fatal("no page poisoned after the faulted nonce rotation")
+	}
+
+	// Clear the fault and heal that page directly.
+	randomNonceTestHook = prev
+	s.mu.Lock()
+	ok := s.clearReuseBarrierIfFlushableLocked(idx)
+	poisoned := s.pages[idx].reuseBarrierFailed
+	newNonce := s.pages[idx].durableNonce()
+	newHead, newTail := s.pages[idx].durableBounds()
+	s.mu.Unlock()
+
+	if !ok || poisoned {
+		t.Fatalf("heal: ok=%v poisoned=%v; want ok=true poisoned=false", ok, poisoned)
+	}
+	if newHead != 0 || newTail != 0 {
+		t.Errorf("durable bounds after heal = (%d,%d); want (0,0)", newHead, newTail)
+	}
+	if newNonce == oldNonce {
+		t.Errorf("durable nonce unchanged (%d) after heal; the full barrier must rotate it (a msync-only retry would leave it stale)", oldNonce)
+	}
+}
