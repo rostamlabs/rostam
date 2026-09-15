@@ -44,7 +44,7 @@ func TestDecodersRejectValLenThatOverflowsTheTotal(t *testing.T) {
 						t.Errorf("decodeEntry(keyLen=%d, valLen=%#x) panicked: %v", keyLen, valLen, r)
 					}
 				}()
-				if _, _, _, _, err := decodeEntry(src); err != errEntryTruncated {
+				if _, _, _, _, err := decodeEntry(src, testFramingKey, 0, 0); err != errEntryTruncated {
 					t.Errorf("decodeEntry(keyLen=%d, valLen=%#x) = %v, want errEntryTruncated", keyLen, valLen, err)
 				}
 			}()
@@ -68,10 +68,10 @@ func TestDecodersRejectValLenThatOverflowsTheTotal(t *testing.T) {
 func TestDecodersAcceptAnEntryEndingExactlyAtTheSlice(t *testing.T) {
 	key, val := []byte("key"), []byte("value")
 	src := make([]byte, entrySpanExact(len(key), len(val)))
-	if _, err := encodeEntry(src, key, val, 0, makeMeta(1, false)); err != nil {
+	if _, err := encodeEntry(src, key, val, 0, makeMeta(1, false), testFramingKey, 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, _, err := decodeEntry(src); err != nil {
+	if _, _, _, _, err := decodeEntry(src, testFramingKey, 0, 0); err != nil {
 		t.Errorf("decodeEntry on an exactly-sized slice = %v, want nil", err)
 	}
 	if _, _, _, err := decodeEntryFast(src); err != nil {

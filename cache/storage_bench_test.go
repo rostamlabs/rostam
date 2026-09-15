@@ -9,22 +9,25 @@ import (
 )
 
 // BenchmarkRingbufCodec measures the per-entry encode/decode kernels. encodeEntry
-// includes the CRC32 (mmap/durable path); encodeEntryNoCRC is the heap-mode write
-// path; decodeEntryFast is the hot Get/Del/sweep read path (no CRC).
+// includes the keyed MAC (mmap/durable path); encodeEntryNoCRC is the heap-mode write
+// path (no integrity field); decodeEntryFast is the hot Get/Del/sweep read path (no
+// MAC); decodeEntry is the recovery/eviction path (MAC-verifying).
 func BenchmarkRingbufCodec(b *testing.B) {
 	key := []byte("benchmark-key-0123456789")
 	val := benchValue()
+	const nonce = uint64(0)
+	const offset = uint32(0)
 	dst := make([]byte, entrySpanExact(len(key), len(val))) // EXACT: the encoders' output buffer
-	enc, _ := encodeEntry(dst, key, val, 0, makeMeta(1, false))
+	enc, _ := encodeEntry(dst, key, val, 0, makeMeta(1, false), testFramingKey, nonce, offset)
 	_ = enc
 
-	b.Run("encodeCRC", func(b *testing.B) {
+	b.Run("encodeMAC", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			_, _ = encodeEntry(dst, key, val, 0, makeMeta(1, false))
+			_, _ = encodeEntry(dst, key, val, 0, makeMeta(1, false), testFramingKey, nonce, offset)
 		}
 	})
-	b.Run("encodeNoCRC", func(b *testing.B) {
+	b.Run("encodeNoMAC", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
 			_, _ = encodeEntryNoCRC(dst, key, val, 0, makeMeta(1, false))
@@ -36,10 +39,10 @@ func BenchmarkRingbufCodec(b *testing.B) {
 			_, _, _, _ = decodeEntryFast(dst)
 		}
 	})
-	b.Run("decodeCRC", func(b *testing.B) {
+	b.Run("decodeMAC", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			_, _, _, _, _ = decodeEntry(dst)
+			_, _, _, _, _ = decodeEntry(dst, testFramingKey, nonce, offset)
 		}
 	})
 }

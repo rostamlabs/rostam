@@ -56,13 +56,15 @@ func corruptDrainShard(t *testing.T) (*shard, func() map[string]int) {
 	}
 }
 
-// TestCorruptDrainLeavesNoSlotPointingIntoTheResetPage: when EvictFront cannot frame
-// an entry mid-drain, the page is reset — and every index slot still addressing it
-// must go with it. The page's generation does not change on an in-place reset, so a
-// slot left behind still passes the read path's generation gate and reads whatever
-// bytes now lie at its offset: the evicted record while they survive (a hit for a key
-// the cache has dropped), and once the page refills, a DIFFERENT record — which
-// Iterate reports a second time, since it does not re-check the key against the slot.
+// TestCorruptDrainLeavesNoSlotPointingIntoTheResetPage: when the drain meets an entry
+// whose MAC does not verify mid-drain, v5 RESYNCS past it — evicting everything else
+// on the page normally and dropping ONLY the damaged entry's slot, rather than
+// resetting the whole page as v4 did. The damaged slot must still go (its generation
+// is unchanged, so a slot left behind would pass the read path's generation gate and
+// read whatever bytes later refill its offset — a second Iterate hit for an unrelated
+// key). The torn record's onRemove must NOT fire (its key cannot be trusted), while
+// every other displaced record fires exactly once, and only the ONE damaged record's
+// bytes are counted as discarded.
 func TestCorruptDrainLeavesNoSlotPointingIntoTheResetPage(t *testing.T) {
 	s, removedKeys := corruptDrainShard(t)
 
@@ -84,9 +86,9 @@ func TestCorruptDrainLeavesNoSlotPointingIntoTheResetPage(t *testing.T) {
 		s.mu.Unlock()
 		t.Fatalf("setup: tail=%d free=%d, want a page full to within one record", p.tail(), p.FreeTail())
 	}
-	tailBefore := p.tail()
 	off := torn * span
-	// A valLen no page can hold: EvictFront refuses to frame it on every platform.
+	// A valLen no page can hold: decodeEntry refuses to frame it on every platform, so
+	// its MAC never even gets checked — the drain resyncs to the next genuine frame.
 	binary.LittleEndian.PutUint32(p.entries()[off+2:off+6], 0xFFFFFFF0)
 	s.mu.Unlock()
 
@@ -102,8 +104,8 @@ func TestCorruptDrainLeavesNoSlotPointingIntoTheResetPage(t *testing.T) {
 	if st.CorruptionErrors != 1 {
 		t.Errorf("CorruptionErrors = %d, want 1", st.CorruptionErrors)
 	}
-	if want := uint64(tailBefore - off); st.CorruptionBytesDiscarded != want {
-		t.Errorf("CorruptionBytesDiscarded = %d, want %d (the framed bytes from the tear to the old tail)", st.CorruptionBytesDiscarded, want)
+	if want := uint64(span); st.CorruptionBytesDiscarded != want {
+		t.Errorf("CorruptionBytesDiscarded = %d, want %d (only the one damaged record, not the whole tail)", st.CorruptionBytesDiscarded, want)
 	}
 
 	// No slot may address the page except the records written into it afterwards.
@@ -164,16 +166,80 @@ func TestCorruptDrainLeavesNoSlotPointingIntoTheResetPage(t *testing.T) {
 	}
 }
 
-// embeddedFrame is a complete, CRC-valid entry for key "forged" of exactly 64 bytes,
-// carrying a write sequence far above anything the test writes. Stored as the TAIL of
-// another entry's value, it is indistinguishable, byte for byte, from a genuine entry
-// that happens to begin there.
+// TestCorruptDrainResyncDropsEverySkippedSlot: when eviction's resync jumps over
+// SEVERAL consecutive damaged frames, it must drop the index slot of EACH of them,
+// not only the head one. A slot left addressing an offset inside the skipped gap is
+// stranded below the advanced head — its bytes free to be overwritten on reuse — and a
+// later Get resolves it through the MAC-less read path into whatever now lies there.
+// Two consecutive tears (k1, k2) force the gap; after the drain no live slot may
+// address the page, while the undamaged k0 and the resume target k3 evict normally.
+func TestCorruptDrainResyncDropsEverySkippedSlot(t *testing.T) {
+	s, removedKeys := corruptDrainShard(t)
+
+	keys := [][]byte{[]byte("k0"), []byte("k1"), []byte("k2"), []byte("k3")}
+	for _, k := range keys {
+		if err := s.Put(k, []byte("val"), 0); err != nil {
+			t.Fatalf("Put(%s): %v", k, err)
+		}
+	}
+
+	s.mu.Lock()
+	p := s.pages[0]
+	gen := p.gen
+	tab := s.tab.Load()
+	// Corrupt k1 AND k2 (two consecutive live entries) by flipping a payload byte in
+	// each, breaking their MACs so the drain's resync must skip both to reach k3.
+	for _, k := range [][]byte{[]byte("k1"), []byte("k2")} {
+		_, ref, ok := tab.findSlot(hashKey(k))
+		if !ok {
+			s.mu.Unlock()
+			t.Fatalf("no index slot for %s", k)
+		}
+		p.entries()[int(ref.offset())+entryHeaderSize] ^= 0xFF
+	}
+	if err := s.drainPageLocked(0); err != nil {
+		s.mu.Unlock()
+		t.Fatalf("drainPageLocked: %v", err)
+	}
+	// After a full drain no live slot may still address this page generation. Pre-fix,
+	// k2's slot (inside the skipped gap but not at its head) dangles here.
+	dangling := 0
+	tab = s.tab.Load()
+	for i := range tab.ctrl {
+		c := tab.ctrl[i].Load()
+		if c == ctrlEmpty || c == ctrlTombstone {
+			continue
+		}
+		if ref := slabRef(tab.refs[i].Load()); int(ref.pageIdx()) == 0 && ref.gen() == gen {
+			dangling++
+		}
+	}
+	s.mu.Unlock()
+	if dangling != 0 {
+		t.Errorf("%d index slot(s) still address the drained page; a multi-entry resync gap left them dangling", dangling)
+	}
+
+	rm := removedKeys()
+	if rm["k0"] != 1 || rm["k3"] != 1 {
+		t.Errorf("k0/k3 should evict normally (resync resumed at k3): removed=%v", rm)
+	}
+	if rm["k1"] != 0 || rm["k2"] != 0 {
+		t.Errorf("damaged k1/k2 must not fire onRemove (keys unreadable): removed=%v", rm)
+	}
+}
+
+// embeddedFrame is a complete, self-consistent v5 entry for key "forged" of exactly
+// 64 bytes, carrying a write sequence far above anything the test writes. It is
+// MAC'd under testFramingKey at offset 0 — a key the CLIENT chose, standing in for the
+// per-file secret the client cannot know — so it is byte-for-byte a valid-looking
+// frame, yet its MAC cannot verify at the position (and under the real per-file key
+// and page nonce) it will occupy inside a carrier value.
 func embeddedFrame(t *testing.T) []byte {
 	t.Helper()
 	key := []byte("forged")
 	val := bytes.Repeat([]byte("P"), 64-entryHeaderSize-len(key))
 	frame := make([]byte, entrySpanExact(len(key), len(val)))
-	if _, err := encodeEntry(frame, key, val, 0, makeMeta(forgedSeq, false)); err != nil {
+	if _, err := encodeEntry(frame, key, val, 0, makeMeta(forgedSeq, false), testFramingKey, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	if len(frame) != 64 {
@@ -184,20 +250,21 @@ func embeddedFrame(t *testing.T) []byte {
 
 const forgedSeq = 1 << 50
 
-// TestRebuildDoesNotAdoptAFrameStoredInsideAValue pins why a CRC failure truncates
-// the page rather than resynchronising past the bad entry. A value is client bytes,
-// and nothing stops a client storing bytes that form a complete, checksummed entry.
-// Every field of such a frame — its lengths, its CRC, its write sequence — is chosen
-// by whoever wrote the value, so no test on those bytes can tell it from a real one.
-// A walk that looks for "the next valid frame" after a tear adopts it: a key that was
-// never written, served with a value nobody stored, carrying a sequence that wins every
-// contest for that key and lifts writeSeq to wherever the frame put it.
+// TestRebuildDoesNotAdoptAFrameStoredInsideAValue pins the FORGE resistance of the v5
+// resync (issue #135 / the GHSA-m63m-rp87-w4rf class). A value is client bytes, and
+// nothing stops a client storing bytes that form a complete, valid-looking entry — but
+// the frame's MAC is keyed by a per-file secret the client cannot know and bound to the
+// offset+nonce it sits at, so the resync forward scan NEVER adopts it: no key nobody
+// wrote is served, and writeSeq is not lifted to the embedded frame's sequence.
 //
-// Two tears in the carrier cover the two resync strategies. A torn KEY BYTE leaves the
-// header's lengths intact, so a forward scan for the next valid frame finds the embedded
-// one before it reaches the carrier's genuine successor. A torn LENGTH BIT (valLen 192
-// → 128) makes the carrier's own header claim an end exactly where the embedded frame
-// starts, which is what a "skip the bad entry by its own length" walk steps to.
+// Two tears in the carrier cover the two resync strategies a naive implementation might
+// use. A torn KEY BYTE leaves the header's lengths intact, so a forward scan for the
+// next valid frame would reach the embedded one before the carrier's genuine successor.
+// A torn LENGTH BIT (valLen 192 → 128) makes the carrier's own header claim an end
+// exactly where the embedded frame starts, which is what a "skip the bad entry by its
+// own length" walk steps to. Under v5 both instead skip the embedded frame (its MAC
+// does not verify at that position) and resume at the carrier's GENUINE successor k2,
+// which does verify — so k0 AND k2 survive and only the torn carrier is lost.
 func TestRebuildDoesNotAdoptAFrameStoredInsideAValue(t *testing.T) {
 	frame := embeddedFrame(t)
 	carrierVal := append(bytes.Repeat([]byte("c"), 128), frame...) // valLen 192 = 0b11000000
@@ -228,7 +295,6 @@ func TestRebuildDoesNotAdoptAFrameStoredInsideAValue(t *testing.T) {
 				{[]byte("carrier"), carrierVal},
 				{[]byte("k2"), []byte("CCCC")},
 			})
-			tailBefore := offs[2] + entrySpanExact(len("k2"), len("CCCC"))
 
 			buf, err := os.ReadFile(path)
 			if err != nil {
@@ -255,12 +321,20 @@ func TestRebuildDoesNotAdoptAFrameStoredInsideAValue(t *testing.T) {
 			if v, err := s.Get([]byte("k0")); err != nil || !bytes.Equal(v, []byte("AAAA")) {
 				t.Errorf("Get(k0) = %q, %v; want AAAA (it precedes the tear)", v, err)
 			}
+			// The genuine entry AFTER the torn carrier is recovered by the resync, which
+			// steps PAST the embedded forgery (its MAC fails at that offset) to k2's real
+			// frame — the whole point of the position-bound MAC.
+			if v, err := s.Get([]byte("k2")); err != nil || !bytes.Equal(v, []byte("CCCC")) {
+				t.Errorf("Get(k2) = %q, %v; want CCCC (resync resumed at the genuine successor)", v, err)
+			}
 			st := s.snapshot()
 			if st.CorruptionErrors != 1 {
 				t.Errorf("CorruptionErrors = %d, want 1", st.CorruptionErrors)
 			}
-			if want := uint64(tailBefore - offs[1]); st.CorruptionBytesDiscarded != want {
-				t.Errorf("CorruptionBytesDiscarded = %d, want %d (from the tear to the old tail)", st.CorruptionBytesDiscarded, want)
+			// Only the torn carrier's bytes are discarded — from the tear to the start of
+			// k2 — not the whole page tail a v4 build would have lost.
+			if want := uint64(offs[2] - offs[1]); st.CorruptionBytesDiscarded != want {
+				t.Errorf("CorruptionBytesDiscarded = %d, want %d (just the torn carrier)", st.CorruptionBytesDiscarded, want)
 			}
 		})
 	}

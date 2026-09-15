@@ -282,16 +282,24 @@ func TestDurableHeaderNeverLeadsEntriesAfterCleanClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read pages.dat: %v", err)
 	}
+	fk, ok := readFramingKey(raw)
+	if !ok {
+		t.Fatal("pages.dat has no readable framing key")
+	}
 	for pg := 0; pg < cfg.MaxPagesPerShard(); pg++ {
 		base := headerSize + pg*cfg.PageSize
 		head := int(binary.LittleEndian.Uint32(raw[base : base+4]))
 		tail := int(binary.LittleEndian.Uint32(raw[base+4 : base+8]))
+		nonce := binary.LittleEndian.Uint64(raw[base+8 : base+16]) // per-page durable nonce
 		entriesBase := base + pageHdrSize
 		if head < 0 || tail < head || tail > cfg.PageSize-pageHdrSize {
 			t.Fatalf("page %d durable bounds out of range: head=%d tail=%d", pg, head, tail)
 		}
 		for cursor := head; cursor < tail; {
-			key, value, _, _, err := decodeEntry(raw[entriesBase+cursor : entriesBase+tail])
+			// Verify each framed entry's MAC at its durable (nonce, offset): if the
+			// durable header ever led its entries, the bytes under [head,tail) would not
+			// verify here.
+			key, value, _, _, err := decodeEntry(raw[entriesBase+cursor:entriesBase+tail], fk, nonce, uint32(cursor))
 			if err != nil {
 				t.Fatalf("page %d: durable [head,tail)=[%d,%d) does not decode at offset %d: %v — "+
 					"the durable header leads its entries", pg, head, tail, cursor, err)

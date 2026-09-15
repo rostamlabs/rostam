@@ -5,30 +5,54 @@ package cache
 import (
 	"encoding/binary"
 	"errors"
-	"hash/crc32"
 )
 
-// Entry wire layout (within a page), format version 4:
+// Entry wire layout (within a page), format version 5:
 //
-//	[keyLen:2][valueLen:4][expiryMs:8][meta:8][crc32:4][key][value]
-//	└──────────────────entryHeaderSize (26)──────────────────┘
+//	[keyLen:2][valueLen:4][expiryMs:8][meta:8][mac:8][key][value]
+//	└──────────────────entryHeaderSize (30)──────────────────┘
 //
 // Little-endian throughout, matching the memory layout on amd64/arm64 and
 // consistent with the page head/tail offsets in page.go, which are also
-// little-endian. CRC covers keyLen, valueLen, expiry, meta, key, and value
-// (everything except itself) — one contiguous fixed range [0,entryCRCOff) plus
-// the key/value bytes, exactly as before.
+// little-endian.
 //
-// WHY meta SITS BEFORE THE KEY. It is the only placement that leaves the hot
+// THE INTEGRITY FIELD IS A KEYED MAC, NOT A CRC (this is the v4→v5 change). The
+// 8-byte slot at [22:30] holds SipHash-2-4 over
+//
+//	framingKey :: ( pageNonce ‖ uint32LE(offset) ‖ frame[0:22] ‖ key ‖ value )
+//
+// where framingKey is a per-file 16-byte secret (cache/file.go), pageNonce is the
+// per-page-life nonce from the page header (cache/page.go), and offset is the
+// entry's byte offset within the page's entry region. See the whole argument in
+// cache/siphash.go and rebuildIndexFromPages (cache/shard.go): a CRC bounds a
+// RANDOM false match but not a CHOSEN one, so recovery cannot use it to resynchronise
+// past a torn entry — a client VALUE is attacker-chosen bytes and can contain a
+// complete, correctly-CRC'd frame with a chosen sequence (the GHSA-m63m-rp87-w4rf
+// forge class). A keyed MAC a client cannot compute makes a forged frame verify with
+// probability 2^-64, and binding the nonce+offset in makes a GENUINE frame's bytes
+// unverifiable if copied to a different position or into a reused extent — so
+// recovery and eviction can safely resync forward to the next frame that verifies
+// and lose only the damaged entry, not the rest of the page.
+//
+// v3→v4 grew the META word (write sequence + tombstone) between the expiry and the
+// integrity slot. v4→v5 replaces the 4-byte CRC with the 8-byte MAC (the slot moved
+// from [22:26] to [22:30]) and widened the header from 26 to 30 bytes; nothing else
+// in the field order changed. A v4 entry decoded with the v5 reader frames garbage,
+// so the two codecs are mutually unintelligible and the per-FILE version gate is the
+// only thing separating them — a v4 file is upgraded to v5 on open (cache/migrate.go)
+// rather than read in place.
+//
+// WHY meta STILL SITS BEFORE THE KEY. It is the only placement that leaves the hot
 // lock-free read path untouched. decodeEntryFast reads src[0:2], src[2:6],
-// src[6:14] and then slices the key/value at entryHeaderSize; putting meta at
-// [14:22] changes exactly one compile-time CONSTANT in that function and nothing
-// else — same loads, same order, no branch, and the read NEVER touches the meta
-// word. Appending meta after the value instead would have forced the reader to
-// compute a trailing offset from valLen before it could be skipped, and putting it
-// between the key and value would have moved the key's start off a constant.
-// decodeEntryFast's signature is deliberately left unchanged for the same reason:
-// no read-path caller may acquire a way to ask for the sequence number.
+// src[6:14] and then slices the key/value at entryHeaderSize; the MAC at [22:30]
+// changed exactly one compile-time CONSTANT in that function and nothing else — same
+// loads, same order, no branch, and the read NEVER touches meta OR the MAC. The hot
+// path pays zero MAC cost: it resolves an entry through the index, which was
+// populated only after a MAC-verified decode, so re-verifying on read would be
+// redundant work on the latency-critical path. decodeEntryFast's signature is
+// deliberately left unchanged for the same reason: no read-path caller may acquire a
+// way to ask for the sequence number OR to verify the MAC (which would need the
+// framing key + nonce + offset it has no business threading in).
 //
 // meta = flags<<56 | seq:
 //
@@ -48,11 +72,12 @@ import (
 // 56 bits of sequence is 7.2e16 writes per shard — at ten million writes a second
 // that is 228 years, so wrap is not a condition the code needs to handle.
 const (
-	entryHeaderSize = 2 + 4 + 8 + 8 + 4
-	// entryMetaOff / entryCRCOff locate the meta word and the CRC slot. The CRC's
-	// fixed-range coverage is [0, entryCRCOff).
+	entryHeaderSize = 2 + 4 + 8 + 8 + 8
+	// entryMetaOff / entryMACOff locate the meta word and the MAC slot. The MAC's
+	// covered fixed range is frame[0:entryMACOff] (keyLen, valLen, expiry, meta),
+	// plus the key and value bytes — everything except the MAC slot itself.
 	entryMetaOff = 14
-	entryCRCOff  = 22
+	entryMACOff  = 22
 	maxKeyLen    = 1<<16 - 1 // uint16 max
 	// maxValueLen is typed int64 (not the untyped-int default) because it is the
 	// uint32 max, 4294967295, which overflows the 32-bit `int` of a 386/arm/
@@ -79,8 +104,11 @@ var (
 	// errEntryTruncated indicates the source slice is shorter than the entry header
 	// claims, or the header itself is missing.
 	errEntryTruncated = errors.New("ringbuf: entry truncated")
-	// errCRCMismatch indicates the stored CRC does not match the computed CRC.
-	errCRCMismatch = errors.New("ringbuf: CRC mismatch")
+	// errMACMismatch indicates the stored MAC does not match the computed MAC — the
+	// frame is corrupt, was written under a different nonce/offset (a reused extent
+	// or a moved frame), or is a forgery a client planted in a value. Recovery and
+	// eviction treat all three the same: the frame is not this entry, resync past it.
+	errMACMismatch = errors.New("ringbuf: MAC mismatch")
 )
 
 // makeMeta packs a write sequence and the tombstone flag into an entry's meta word.
@@ -114,46 +142,67 @@ func entryMetaAt(src []byte) uint64 {
 	if len(src) < entryHeaderSize {
 		return 0
 	}
-	return binary.LittleEndian.Uint64(src[entryMetaOff:entryCRCOff])
+	return binary.LittleEndian.Uint64(src[entryMetaOff:entryMACOff])
 }
 
-// crcTable is shared; crc32.IEEETable is a stable global.
-var crcTable = crc32.IEEETable
+// entryMAC computes the keyed frame MAC. header22 is the fixed frame prefix
+// frame[0:entryMACOff] (keyLen, valLen, expiry, meta) and payload is the contiguous
+// key‖value bytes. The nonce and offset are folded in AHEAD of the frame bytes so
+// the same key/value/header verify ONLY at the (page-life, position) they were
+// written at — copying a genuine frame to another offset, or into an extent whose
+// nonce has since rotated, changes the MAC input and the copy fails to verify. This
+// is what makes forward resync safe: a frame only verifies where it genuinely
+// belongs. framingKey is the 16-byte per-file secret.
+//
+// Streamed through sipHasher so no contiguous nonce‖offset‖header‖payload buffer is
+// allocated on the write path (one MAC per stored entry).
+func entryMAC(framingKey []byte, nonce uint64, offset uint32, header22, payload []byte) uint64 {
+	k0, k1 := sipKeyHalves(framingKey)
+	h := newSipHasher(k0, k1)
+	var pre [12]byte
+	binary.LittleEndian.PutUint64(pre[0:8], nonce)
+	binary.LittleEndian.PutUint32(pre[8:12], offset)
+	h.write(pre[:])
+	h.write(header22)
+	h.write(payload)
+	return h.sum()
+}
 
-// encodeEntry writes an entry into dst starting at index 0.
-// Returns the number of bytes written. Computes the CRC so a future
-// rebuildIndexFromPages can validate the entry; for heap-mode shards
-// (no rebuild path) use [encodeEntryNoCRC] to skip the per-Put CRC
-// cost.
-func encodeEntry(dst []byte, key, value []byte, expiryMs, meta uint64) (int, error) {
+// encodeEntry writes an entry into dst starting at index 0 and stamps its keyed
+// MAC, computed at (nonce, offset) under framingKey. Returns the number of bytes
+// written. This is the mmap/durable write path (reached through page.Write, which
+// threads its page nonce and the entry's in-page offset in); heap-mode shards use
+// [encodeEntryNoCRC], which lays down no integrity field because a heap page is
+// never persisted and never participates in recovery.
+func encodeEntry(dst, key, value []byte, expiryMs, meta uint64, framingKey []byte, nonce uint64, offset uint32) (int, error) {
 	n, err := encodeEntryHeader(dst, key, value, expiryMs, meta)
 	if err != nil {
 		return 0, err
 	}
-	// CRC covers everything except the CRC slot itself. encodeEntryHeader
-	// returned without error, which guarantees len(dst) >= total == n and
-	// total >= entryHeaderSize (26), so all three fixed offsets below
-	// (entryCRCOff, entryHeaderSize, n) are provably within dst.
-	crc := crc32.Checksum(dst[0:entryCRCOff], crcTable)                  //nolint:gosec // len(dst) >= entryHeaderSize after encodeEntryHeader; bounds are invariant
-	crc = crc32.Update(crc, crcTable, dst[entryHeaderSize:n])            //nolint:gosec // entryHeaderSize <= n <= len(dst) after encodeEntryHeader; bounds are invariant
-	binary.LittleEndian.PutUint32(dst[entryCRCOff:entryHeaderSize], crc) //nolint:gosec // len(dst) >= entryHeaderSize after encodeEntryHeader; bounds are invariant
+	// The MAC covers the fixed header prefix [0:entryMACOff) and the key+value bytes
+	// [entryHeaderSize:n) — everything except the MAC slot itself. encodeEntryHeader
+	// returned without error, which guarantees len(dst) >= n and n >= entryHeaderSize,
+	// so all three fixed offsets are provably within dst.
+	mac := entryMAC(framingKey, nonce, offset, dst[0:entryMACOff], dst[entryHeaderSize:n]) //nolint:gosec // bounds invariant after encodeEntryHeader
+	binary.LittleEndian.PutUint64(dst[entryMACOff:entryHeaderSize], mac)                   //nolint:gosec // len(dst) >= entryHeaderSize after encodeEntryHeader
 	return n, nil
 }
 
-// encodeEntryNoCRC is encodeEntry minus the CRC computation. Safe for
-// heap-mode shards: the index is fully in memory, page bytes can't be
-// corrupted by anything external (no mmap, no disk), and the only path
-// that consumed the CRC field — rebuildIndexFromPages — never runs for
-// heap-backed pages. The CRC slot is left untouched (whatever bytes
-// the previous occupant left there); decodeEntryFast doesn't read it.
-func encodeEntryNoCRC(dst []byte, key, value []byte, expiryMs, meta uint64) (int, error) {
+// encodeEntryNoCRC writes an entry WITHOUT an integrity field. Safe for heap-mode
+// shards: the index is fully in memory, page bytes can't be corrupted by anything
+// external (no mmap, no disk), and the only path that consumes the MAC —
+// rebuildIndexFromPages / eviction resync — never runs for heap-backed pages. The
+// MAC slot is left untouched (whatever bytes the previous occupant left there);
+// decodeEntryFast doesn't read it. (The name is kept from the v4 CRC era; the field
+// it once skipped is now the MAC, and a heap page has neither.)
+func encodeEntryNoCRC(dst, key, value []byte, expiryMs, meta uint64) (int, error) {
 	return encodeEntryHeader(dst, key, value, expiryMs, meta)
 }
 
 // encodeEntryHeader writes the keyLen / valLen / expiry / meta / key / value
-// fields, returning the total bytes written. The CRC slot at
-// dst[entryCRCOff:entryHeaderSize] is left for the caller to fill (or skip).
-func encodeEntryHeader(dst []byte, key, value []byte, expiryMs, meta uint64) (int, error) {
+// fields, returning the total bytes written. The MAC slot at
+// dst[entryMACOff:entryHeaderSize] is left for the caller to fill (or skip).
+func encodeEntryHeader(dst, key, value []byte, expiryMs, meta uint64) (int, error) {
 	if len(key) > maxKeyLen {
 		return 0, errKeyTooLong
 	}
@@ -167,17 +216,20 @@ func encodeEntryHeader(dst []byte, key, value []byte, expiryMs, meta uint64) (in
 	binary.LittleEndian.PutUint16(dst[0:2], uint16(len(key)))   //nolint:gosec // len(key) <= maxKeyLen
 	binary.LittleEndian.PutUint32(dst[2:6], uint32(len(value))) //nolint:gosec // len(value) <= maxValueLen
 	binary.LittleEndian.PutUint64(dst[6:14], expiryMs)
-	binary.LittleEndian.PutUint64(dst[entryMetaOff:entryCRCOff], meta)
+	binary.LittleEndian.PutUint64(dst[entryMetaOff:entryMACOff], meta)
 	copy(dst[entryHeaderSize:entryHeaderSize+len(key)], key)
 	copy(dst[entryHeaderSize+len(key):total], value)
 	return total, nil
 }
 
-// decodeEntry reads an entry from src and returns its key, value, expiry and
-// meta (key/value reference into src — zero-copy). Verifies the stored CRC; use
-// decodeEntryFast on hot paths where the slabRef has already vouched for the
-// entry (see [decodeEntryFast]).
-func decodeEntry(src []byte) (key, value []byte, expiryMs, meta uint64, err error) {
+// decodeEntry reads an entry from src and returns its key, value, expiry and meta
+// (key/value reference into src — zero-copy), VERIFYING the keyed MAC at (nonce,
+// offset) under framingKey. It is the recovery/eviction decoder: rebuildIndexFromPages
+// and the drain resync it forward frame by frame, and a frame that does not verify at
+// the position it is being read from is rejected with errMACMismatch. Use
+// decodeEntryFast on hot paths where the slabRef has already vouched for the entry
+// (see [decodeEntryFast]).
+func decodeEntry(src, framingKey []byte, nonce uint64, offset uint32) (key, value []byte, expiryMs, meta uint64, err error) {
 	if len(src) < entryHeaderSize {
 		return nil, nil, 0, 0, errEntryTruncated
 	}
@@ -192,7 +244,7 @@ func decodeEntry(src []byte) (key, value []byte, expiryMs, meta uint64, err erro
 	if valLen < 0 {
 		return nil, nil, 0, 0, errEntryTruncated
 	}
-	// BOUND valLen BEFORE SUMMING IT. On 32-bit, a POSITIVE valLen within keyLen+26 of
+	// BOUND valLen BEFORE SUMMING IT. On 32-bit, a POSITIVE valLen within keyLen+30 of
 	// the int32 max still wraps the total negative, which then passes a
 	// `len(src) < total` test and panics on the slice below — at warm restart, where
 	// these bytes come straight off disk, on every restart. The subtraction cannot wrap:
@@ -202,15 +254,13 @@ func decodeEntry(src []byte) (key, value []byte, expiryMs, meta uint64, err erro
 		return nil, nil, 0, 0, errEntryTruncated
 	}
 	expiryMs = binary.LittleEndian.Uint64(src[6:14])
-	meta = binary.LittleEndian.Uint64(src[entryMetaOff:entryCRCOff])
-	storedCRC := binary.LittleEndian.Uint32(src[entryCRCOff:entryHeaderSize])
+	meta = binary.LittleEndian.Uint64(src[entryMetaOff:entryMACOff])
+	storedMAC := binary.LittleEndian.Uint64(src[entryMACOff:entryHeaderSize])
 
 	total := entryHeaderSize + keyLen + valLen
 
-	crc := crc32.Checksum(src[0:entryCRCOff], crcTable)
-	crc = crc32.Update(crc, crcTable, src[entryHeaderSize:total])
-	if crc != storedCRC {
-		return nil, nil, 0, 0, errCRCMismatch
+	if entryMAC(framingKey, nonce, offset, src[0:entryMACOff], src[entryHeaderSize:total]) != storedMAC {
+		return nil, nil, 0, 0, errMACMismatch
 	}
 
 	key = src[entryHeaderSize : entryHeaderSize+keyLen]
@@ -218,18 +268,19 @@ func decodeEntry(src []byte) (key, value []byte, expiryMs, meta uint64, err erro
 	return key, value, expiryMs, meta, nil
 }
 
-// decodeEntryFast reads an entry from src without verifying the stored CRC.
-// Use on the hot Get/Del/sweep paths: those reach an entry via the shard's
-// in-memory index, which itself was populated only after a successful
-// CRC-verified decode (at startup in rebuildIndexFromPages, or at write
-// time after encodeEntry laid down a fresh CRC). The CRC slot is still
-// written on encode so a future cold rebuild revalidates the page.
+// decodeEntryFast reads an entry from src without verifying the MAC. Use on the hot
+// Get/Del/sweep paths and on the write-path relocation walks: those reach an entry
+// via the shard's in-memory index, which itself was populated only after a
+// MAC-verified decode (at startup in rebuildIndexFromPages, or at write time after
+// encodeEntry laid down a fresh MAC). The MAC slot is still written on encode so a
+// future cold rebuild / eviction resync revalidates the frame.
 //
-// Its signature deliberately does NOT expose the meta word. Nothing on a read
-// path may consult the write sequence — a read resolves an entry through the
-// index, which already encodes recency — so the hot decode stays exactly the
-// three header loads plus two slices it has always been. Recovery-time callers
-// that DO need the meta take it from [entryMetaAt] separately.
+// Its signature deliberately does NOT expose the meta word OR take a framing key /
+// nonce / offset. Nothing on a read path may consult the write sequence or re-verify
+// the MAC — a read resolves an entry through the index, which already encodes recency
+// and integrity — so the hot decode stays exactly the three header loads plus two
+// slices it has always been. Recovery-time callers that DO need the meta take it from
+// [entryMetaAt] separately, and the ones that must VERIFY use [decodeEntry].
 func decodeEntryFast(src []byte) (key, value []byte, expiryMs uint64, err error) {
 	if len(src) < entryHeaderSize {
 		return nil, nil, 0, errEntryTruncated

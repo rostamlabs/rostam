@@ -34,9 +34,10 @@ const (
 // kept in the heapHead/heapTail fields. data is entirely entry bytes.
 //
 // In mmap mode: data is a slice of an mmap'd region. The first
-// pageHdrSize (8) bytes hold head (uint32 LE) + tail (uint32 LE).
-// Entries occupy data[pageHdrSize:]. Storing head/tail in the file lets
-// them survive process restart.
+// pageHdrSize (16) bytes hold head (uint32 LE) + tail (uint32 LE) + pageNonce
+// (uint64 LE). Entries occupy data[pageHdrSize:]. Storing head/tail in the file
+// lets them survive process restart; the nonce is folded into every entry MAC and
+// rotated when the extent is reused (see the nonce field / entryMAC).
 //
 // Layout invariant: 0 <= head() <= tail() <= len(entries()).
 // When head() == tail(), the page holds no live entries.
@@ -51,6 +52,23 @@ type page struct {
 	// to detect a retired page without reading its bytes. Never mutated after
 	// construction.
 	gen uint16
+
+	// nonce is the mmap page's per-page-life value folded into every entry MAC on
+	// this page (cache/ringbuf.go entryMAC). Seeded at open from the durable per-page
+	// header (attachMmapRegion) and rotated with crypto/rand whenever the extent is
+	// handed back to the write path (zeroDurableBoundsForReuseLocked), so old-life
+	// bytes left in a reused extent can never verify under the new nonce (reverse
+	// skew / a forged frame). Zero on a heap page and on a fresh mmap page's first
+	// life (the MAC is still keyed by the per-file secret). WRITE/RECOVERY-path state,
+	// mutated only under shard.mu; the lock-free read path never reads it, because
+	// decodeEntryFast does not verify the MAC.
+	nonce uint64
+
+	// framingKey aliases the shard's per-file 16-byte MAC secret (cache/file.go). Set
+	// when the page object is created over an mmap extent (attachMmapRegion, the
+	// compaction packer, the online-recycle swap); nil on a heap page, which stores no
+	// integrity field. Never mutated after the page is published.
+	framingKey []byte
 
 	// retired marks an mmap page whose live entries were all relocated OUT by online
 	// relocating compaction (cache/compact_online.go): no index slot addresses it any
@@ -155,6 +173,29 @@ func (p *page) projectBounds(head, tail int) {
 	binary.LittleEndian.PutUint32(p.data[4:8], uint32(tail)) //nolint:gosec // tail is bounded by entries length
 }
 
+// durableNonce reads the per-page-life nonce persisted in the mmap page header
+// (bytes [8:16]). Meaningful only for an mmap page; a heap page reports 0. Used at
+// open (attachMmapRegion) to seed the runtime nonce from what a prior process
+// durably wrote.
+func (p *page) durableNonce() uint64 {
+	if p.backing != backingMmap {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(p.data[8:16])
+}
+
+// projectNonce writes the per-page-life nonce into the mmap page header (bytes
+// [8:16]), leaving head/tail ([0:8]) untouched. A no-op on a heap page. It is
+// flushed to disk only at the reuse point (zeroDurableBoundsForReuseLocked), never
+// at a per-write sync point — the nonce is stable for a page's whole life, so the
+// ENTRIES→BOUNDS→WATERMARK ordering projectBounds participates in is unchanged.
+func (p *page) projectNonce(nonce uint64) {
+	if p.backing != backingMmap {
+		return
+	}
+	binary.LittleEndian.PutUint64(p.data[8:16], nonce)
+}
+
 // entries returns the slice of data that holds entry bytes (skipping
 // the mmap header if present). The mmap slice is capped at the page end
 // (3-index) so an append can never scribble past this page into the next one's
@@ -186,9 +227,14 @@ func (p *page) Empty() bool { return p.head() == p.tail() }
 
 // Write appends an entry. Returns the entry's offset and on-disk size.
 // Returns errPageFull when there isn't enough contiguous tail room.
-// Heap-backed pages skip the per-entry CRC32 — they can't be corrupted
-// by anything outside the Go runtime and never participate in the
-// rebuild path that would consume the CRC.
+// An mmap-backed page stamps the entry's keyed MAC at its append offset under this
+// page's nonce and the shard's per-file framing key (see cache/ringbuf.go entryMAC);
+// because the MAC binds the offset and nonce, a relocation/compaction that re-writes
+// an entry through this same method at a new offset (or into a reused extent with a
+// rotated nonce) recomputes a valid MAC for FREE — no separate re-signing step.
+// Heap-backed pages store no integrity field — they can't be corrupted by anything
+// outside the Go runtime and never participate in the rebuild/eviction resync path
+// that would consume the MAC.
 // meta is the entry's packed write sequence + flags (see cache/ringbuf.go). It is
 // passed through VERBATIM: cold compaction re-writes surviving entries through
 // this same method and must not alter their recency or tombstone bit.
@@ -202,16 +248,18 @@ func (p *page) Write(key, value []byte, expiryMs, meta uint64) (offset uint32, s
 		return 0, 0, errPageFull
 	}
 	tail := p.tail()
+	off := uint32(tail) //nolint:gosec // tail < PageSize which is validated ≤ MaxInt32
 	var n int
 	if p.backing == backingMmap {
-		n, err = encodeEntry(p.entries()[tail:], key, value, expiryMs, meta)
+		// The MAC binds this append OFFSET and the page nonce, so the entry verifies
+		// only where it lands on this page's current life.
+		n, err = encodeEntry(p.entries()[tail:], key, value, expiryMs, meta, p.framingKey, p.nonce, off)
 	} else {
 		n, err = encodeEntryNoCRC(p.entries()[tail:], key, value, expiryMs, meta)
 	}
 	if err != nil {
 		return 0, 0, err
 	}
-	off := uint32(tail) //nolint:gosec // tail < PageSize which is validated ≤ MaxInt32
 	// tail advances by the ENCODER'S length, while the room check above reserved the
 	// OCCUPANCY — this method's own half of the capacity/write rule (see entrySpan).
 	// The moment an append reserves more than it encodes, this is the line that must
