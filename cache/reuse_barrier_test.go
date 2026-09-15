@@ -78,6 +78,120 @@ func TestReuseBarrierDrainMsyncFailsClosed(t *testing.T) {
 	}
 }
 
+// TestReuseBarrierPoisonedExtentNotReusedUntilFlushSucceeds closes the drain-path
+// reuse residual. A drained extent has its RUNTIME bounds reset before the barrier
+// runs, so on a barrier failure the extent shows full FreeTail; without the poison
+// flag a LATER independent write would select it (its durable header reset not on
+// disk) — the exact window #154 Part 2 must close. Failing only the triggering write
+// is not enough.
+//
+// With the fault still active, the next write must NOT land in the poisoned extent
+// (the shard is otherwise full, so it fails closed). Then, once the fault clears, the
+// extent must come back into service via the retry-flush — no permanent capacity leak
+// on a transient failure.
+func TestReuseBarrierPoisonedExtentNotReusedUntilFlushSucceeds(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("mmap only on linux")
+	}
+	dir := t.TempDir()
+	c, err := New(relocMmapConfig(dir, 3, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	s := c.shards[0]
+
+	// Drive to the first eviction with the barrier working.
+	for n := 0; c.Stats().Evictions == 0; n++ {
+		if n > 10_000 {
+			t.Fatal("shard never reached its first eviction")
+		}
+		mustPut(t, c, fmt.Appendf(nil, "warm%06d", n), relocValue(n%256))
+	}
+
+	// Fault the barrier and force an eviction whose drain-to-empty barrier fails,
+	// poisoning the drained (now-empty) victim extent.
+	prev := msyncTestHook
+	msyncTestHook = func(_ *os.File, _ []byte) error { return errInjectedBarrier }
+	var putErr error
+	for i := 0; i < 10_000; i++ {
+		if putErr = c.Put(fmt.Appendf(nil, "a%06d", i), relocValue(i%256), 0); putErr != nil {
+			break
+		}
+	}
+	if !errors.Is(putErr, ErrReuseBarrier) {
+		msyncTestHook = prev
+		t.Fatalf("Put during barrier fault = %v; want ErrReuseBarrier", putErr)
+	}
+
+	// A page must now be poisoned (drained-empty, non-durably-reset).
+	s.mu.Lock()
+	var poisoned []int
+	for i := range s.pages {
+		if s.pages[i].reuseBarrierFailed {
+			poisoned = append(poisoned, i)
+		}
+	}
+	s.mu.Unlock()
+	if len(poisoned) == 0 {
+		msyncTestHook = prev
+		t.Fatal("no page was poisoned after the faulted drain — the residual guard is not armed")
+	}
+
+	// THE RESIDUAL. With the fault STILL active, the next write must not silently land in
+	// the poisoned empty extent. The shard is otherwise full, so a correct impl skips the
+	// poisoned page and fails closed; the pre-fix impl (no poison flag) writes straight
+	// into it and SUCCEEDS.
+	residualKey := []byte("residual-key")
+	rErr := c.Put(residualKey, relocValue(7), 0)
+	if rErr == nil {
+		msyncTestHook = prev
+		t.Fatal("Put landed in the poisoned extent (its durable reset is not on disk); " +
+			"it must be kept out of the writable set until the reset is durable")
+	}
+	if !errors.Is(rErr, ErrReuseBarrier) {
+		msyncTestHook = prev
+		t.Fatalf("residual Put = %v; want ErrReuseBarrier (poisoned extent unusable while the fault persists)", rErr)
+	}
+	if _, gErr := c.Get(residualKey); gErr != ErrNotFound {
+		msyncTestHook = prev
+		t.Fatalf("Get(residual) = %v; want ErrNotFound (must not have landed anywhere)", gErr)
+	}
+
+	// Capture every extent poisoned across the fault window (the residual write forces a
+	// second faulted drain), so we can prove each one comes back.
+	s.mu.Lock()
+	poisoned = poisoned[:0]
+	for i := range s.pages {
+		if s.pages[i].reuseBarrierFailed {
+			poisoned = append(poisoned, i)
+		}
+	}
+	s.mu.Unlock()
+
+	// Clear the fault: the poisoned extents must self-heal via a successful retry-flush
+	// the next time a selector wants them, so capacity returns and none stays stranded.
+	msyncTestHook = prev
+	allCleared := func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		for _, i := range poisoned {
+			if s.pages[i].reuseBarrierFailed {
+				return false
+			}
+		}
+		return true
+	}
+	healed := false
+	for i := 0; i < 10_000 && !healed; i++ {
+		_ = c.Put(fmt.Appendf(nil, "b%06d", i), relocValue(i%256), 0)
+		healed = allCleared()
+	}
+	if !healed {
+		t.Fatal("a poisoned extent was never reused after the fault cleared — capacity leak on a transient failure")
+	}
+}
+
 // TestReuseBarrierNonceRotationFailsClosed proves the SAME fail-closed propagation for
 // the crypto/rand half of the barrier: if the per-page nonce cannot be rotated on
 // reuse, the extent must stay unavailable and the op must error rather than proceed on

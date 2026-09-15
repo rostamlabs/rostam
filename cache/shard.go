@@ -2151,8 +2151,12 @@ func (s *shard) findOrMakePageLocked(need int) (int, error) {
 	if need > s.maxEntryBytes() {
 		return 0, errors.New("cache: entry larger than PageSize")
 	}
-	// Fast path: the current open page still has contiguous tail room.
-	if s.writeIdx < len(s.pages) && s.pages[s.writeIdx].FreeTail() >= need {
+	// Fast path: the current open page still has contiguous tail room. A page whose
+	// durable reuse barrier failed (page.reuseBarrierFailed) is excluded even here — it
+	// shows full FreeTail but its cleared header is not on disk, so it must not be
+	// written into; fall through to firstPageWithRoomLocked, which retry-clears or skips
+	// it and leaves s.writeIdx pointing at a page that IS safe to reuse.
+	if s.writeIdx < len(s.pages) && !s.pages[s.writeIdx].reuseBarrierFailed && s.pages[s.writeIdx].FreeTail() >= need {
 		return s.writeIdx, nil
 	}
 	// Any other already-allocated page with tail room? writeIdx only tracks the
@@ -2233,8 +2237,10 @@ func (s *shard) allocHeapPageLocked() int {
 
 // firstPageWithRoomLocked returns the index of the first page with at least
 // `need` bytes of contiguous tail room, or -1 if none. Must be called with s.mu
-// held (read or write). Shared by findOrMakePageLocked and evictUntilFitsLocked
-// so the all-pages free-space scan lives in one place.
+// held FOR WRITING (both callers, findOrMakePageLocked and evictUntilFitsLocked,
+// do): it may retry-clear a poisoned page's durable reset (see
+// clearReuseBarrierIfFlushableLocked), which mutates page state. Shared so the
+// all-pages free-space scan lives in one place.
 func (s *shard) firstPageWithRoomLocked(need int) int {
 	for i := range s.pages {
 		// Skip pages retired by online relocating compaction: their stale-framed bytes
@@ -2243,11 +2249,37 @@ func (s *shard) firstPageWithRoomLocked(need int) int {
 		if s.pages[i].retired {
 			continue
 		}
-		if s.pages[i].FreeTail() >= need {
-			return i
+		if s.pages[i].FreeTail() < need {
+			continue
 		}
+		// A page whose durable reuse barrier failed (page.reuseBarrierFailed) is empty in
+		// runtime — so it passes the FreeTail check above — but its cleared header is not
+		// on disk, so it must not be reused until the flush succeeds. Retry the flush
+		// here, at the one spot that would hand the page out: on success the poison is
+		// cleared and the page is used; on failure it is skipped and stays out of the
+		// writable set. Only fires when a poisoned page is an actual candidate (a
+		// failure-event state), never in the steady state.
+		if s.pages[i].reuseBarrierFailed && !s.clearReuseBarrierIfFlushableLocked(i) {
+			continue
+		}
+		return i
 	}
 	return -1
+}
+
+// clearReuseBarrierIfFlushableLocked retries the durable header flush for a page whose
+// reuse barrier previously failed (page.reuseBarrierFailed). The cleared (0,0) bounds
+// and rotated nonce are already in memory — only the msync failed — so a successful
+// retry is all that is needed to make the reset durable. On success it clears the
+// poison and returns true (the extent may be reused); on failure it leaves the poison
+// set and returns false (kept out of the writable set until the fault clears). Must
+// hold s.mu for writing.
+func (s *shard) clearReuseBarrierIfFlushableLocked(idx int) bool {
+	if err := s.msyncPageHeaderLocked(idx); err != nil {
+		return false
+	}
+	s.pages[idx].reuseBarrierFailed = false
+	return true
 }
 
 // evictUntilFitsLocked frees space until at least one page has `need` bytes
@@ -2567,10 +2599,16 @@ func (s *shard) drainPageLocked(victim int) error {
 	//
 	// FAIL CLOSED. If the barrier msync (or nonce rotation) fails, the extent's cleared
 	// header is not on disk, so returning it to the write path would risk a crash
-	// recovering its stale bytes. Propagate the error instead: the caller (eviction →
-	// findOrMakePageLocked → putAtExpLocked/delH) fails the op, keeping the pending
-	// durable write pending rather than committing into a non-durable extent.
-	return s.zeroDurableBoundsForReuseLocked(victim)
+	// recovering its stale bytes. POISON the now-empty extent (reuseBarrierFailed) so the
+	// write selectors keep it out of the writable set — the drain already reset its
+	// runtime bounds, so without this it would show full FreeTail and a later Put would
+	// reuse it before its header reset is durable — and propagate the error so the
+	// triggering op fails closed. The poison self-heals via a later retry-flush.
+	if err := s.zeroDurableBoundsForReuseLocked(victim); err != nil {
+		s.pages[victim].reuseBarrierFailed = true
+		return err
+	}
+	return nil
 }
 
 // dropDamagedSlotsLocked tombstones every index slot addressing an offset in the
@@ -2660,9 +2698,14 @@ func (s *shard) discardCorruptPageLocked(victim, discarded int, now uint64) erro
 	// REUSE ORDERING (see zeroDurableBoundsForReuseLocked). Reset cleared only the
 	// runtime bounds; the durable header still names the discarded extent's bytes.
 	// Zero and flush it before the write path can refill this now-empty page; on a
-	// barrier failure return the error so the caller fails closed rather than reusing
-	// a non-durable extent.
-	return s.zeroDurableBoundsForReuseLocked(victim)
+	// barrier failure POISON the extent (reuseBarrierFailed) so the write selectors keep
+	// it out of the writable set until a later retry-flush succeeds, and return the error
+	// so the caller fails closed rather than reusing a non-durable extent.
+	if err := s.zeroDurableBoundsForReuseLocked(victim); err != nil {
+		s.pages[victim].reuseBarrierFailed = true
+		return err
+	}
+	return nil
 }
 
 // runSweeper expires entries past their TTL on a fixed cadence.

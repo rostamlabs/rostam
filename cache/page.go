@@ -83,6 +83,31 @@ type page struct {
 	// shards, so those paths are byte-for-byte unchanged.
 	retired bool
 
+	// reuseBarrierFailed marks an mmap extent that was drained/discarded to empty but
+	// whose durable REUSE barrier then FAILED (zeroDurableBoundsForReuseLocked could not
+	// msync the cleared (0,0) header). Its runtime bounds are already reset, so it shows
+	// full FreeTail and would otherwise be the first page a later write selects — writing
+	// into an extent whose header reset is not on disk, which is exactly the
+	// torn-writeback window #154 closes. So while this flag is set the WRITE SELECTORS
+	// keep the page out of the writable set (firstPageWithRoomLocked skips it and the
+	// findOrMakePageLocked writeIdx fast path will not use it), and it is never handed to
+	// page.Write. The projected (0,0) bounds are already in memory (only the msync
+	// failed), so the poison SELF-HEALS: when a selector wants the page it retries the
+	// flush (clearReuseBarrierIfFlushableLocked) and, on success, clears this and lets
+	// the page be reused — a transient disk fault recovers with no capacity leak, a
+	// persistent one keeps the extent out of service (writes then fail closed rather
+	// than reuse a non-durable extent).
+	//
+	// DISTINCT FROM retired, and a different reader contract: retired holds an extent
+	// IMMUTABLE for the alias-drain quarantine so an in-flight lock-free READER stays
+	// valid, whereas this is purely a WRITE-path durability gate — no reader can alias a
+	// drained page (its index slots were dropped by the drain), so nothing waits on it;
+	// it exists only to stop the write path reusing a non-durably-reset extent. Like
+	// retired it is WRITE-PATH-ONLY state guarded by shard.mu and never read by the
+	// lock-free read path (which resolves pages through pageSlots + the generation
+	// gate). Always false on heap shards (their reuse barrier is a no-op).
+	reuseBarrierFailed bool
+
 	// vers holds the seqlock version counters guarding this page's entries when
 	// the shard reads through the seqlock (Config.InPlaceSeqlockReads); nil on
 	// every other page, which is every page on every other shard. Allocated by
