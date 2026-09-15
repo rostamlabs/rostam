@@ -9,6 +9,15 @@ import (
 	"hash/crc32"
 )
 
+// errFutureVersion is returned by validateHeader for a pages file whose on-disk
+// version is NEWER than this build writes (version > cacheVersion). It is a
+// distinguishable sentinel because newShard must handle it differently from every
+// other validation failure: a newer-format file is refused (the open fails) rather
+// than rotated aside, since rotating a file a future build wrote would be silent
+// data loss. Every other failure (bad magic, too-old version, CRC mismatch) stays
+// an ordinary rotatable error.
+var errFutureVersion = errors.New("unsupported future cache version")
+
 // Header layout (64 bytes total):
 //
 //	0..7    magic uint64 (little-endian)
@@ -248,7 +257,18 @@ func validateHeader(region []byte, expectedPageSize, expectedNumPages uint32) (a
 	if magic != cacheMagic {
 		return 0, false, fmt.Errorf("cache: bad magic %x (want %x)", magic, cacheMagic)
 	}
-	if version < minReadableCacheVersion || version > cacheVersion {
+	// A NEWER-than-known format is reported with a DISTINGUISHABLE sentinel. It is
+	// categorically different from every other validation failure: a bad magic, a
+	// too-old version, or a CRC mismatch names a file this build cannot read AND has
+	// no reason to preserve, so newShard rotates it aside and starts empty. A file
+	// from a FUTURE build is one this (older) build cannot read but MUST NOT destroy —
+	// rotating it aside would be silent data loss of a format a newer build wrote
+	// deliberately. newShard uses errors.Is(err, errFutureVersion) to refuse the open
+	// instead of rotating. See minReadableCacheVersion for the too-old direction.
+	if version > cacheVersion {
+		return 0, false, fmt.Errorf("cache: %w %d (this build writes %d)", errFutureVersion, version, cacheVersion)
+	}
+	if version < minReadableCacheVersion {
 		return 0, false, fmt.Errorf("cache: unsupported version %d (want %d..%d)", version, minReadableCacheVersion, cacheVersion)
 	}
 	if pageSize != expectedPageSize {

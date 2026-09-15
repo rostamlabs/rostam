@@ -111,41 +111,58 @@ func newMmapPage(region []byte) *page {
 	return &page{data: region, backing: backingMmap}
 }
 
-func (p *page) head() int {
-	if p.backing == backingMmap {
-		return int(binary.LittleEndian.Uint32(p.data[0:4]))
+// head/tail/setHead/setTail are the RUNTIME bounds, kept in heapHead/heapTail for
+// EVERY backing. They no longer touch the mmap header: after a torn HOST writeback
+// the mapped header could persist ahead of the entry bytes it names (a projected
+// setTail store has no ordering against the append that filled the tail), and
+// recovery walking [head,tail) over such an image indexes bytes from the page's
+// previous life. The mapped header is now the DURABLE copy only — a PROJECTION of
+// these runtime bounds, written by projectBounds at a sync point strictly AFTER the
+// data it names has been flushed, and seeded back into these fields once at open
+// (attachMmapRegion). durableBounds/projectBounds are the ONLY code that touches the
+// header bytes.
+func (p *page) head() int { return p.heapHead }
+
+func (p *page) tail() int { return p.heapTail }
+
+func (p *page) setHead(v int) { p.heapHead = v }
+
+func (p *page) setTail(v int) { p.heapTail = v }
+
+// durableBounds reads the head/tail persisted in the mmap page header — the copy
+// recovery trusts. Meaningful only for an mmap page; a heap page has no mapped
+// header, so it reports (0,0). Used at open (attachMmapRegion) to seed the runtime
+// bounds from what a prior process durably projected.
+func (p *page) durableBounds() (head, tail int) {
+	if p.backing != backingMmap {
+		return 0, 0
 	}
-	return p.heapHead
+	return int(binary.LittleEndian.Uint32(p.data[0:4])), int(binary.LittleEndian.Uint32(p.data[4:8]))
 }
 
-func (p *page) tail() int {
-	if p.backing == backingMmap {
-		return int(binary.LittleEndian.Uint32(p.data[4:8]))
-	}
-	return p.heapTail
-}
-
-func (p *page) setHead(v int) {
-	if p.backing == backingMmap {
-		binary.LittleEndian.PutUint32(p.data[0:4], uint32(v)) //nolint:gosec // v is bounded by entries length
+// projectBounds writes head/tail into the mmap page's durable header. It is the
+// ONLY writer of those bytes now that setHead/setTail operate purely on the runtime
+// fields. The durable header is a PROJECTION of the runtime bounds and must be
+// published only AFTER the entry bytes it names are on disk (see the sync points in
+// cache.go and the reuse-ordering zeroing in shard.go / compact_online.go), so that
+// a torn writeback can never leave a bound naming bytes that were not flushed. A
+// no-op on a heap page, which is never persisted.
+func (p *page) projectBounds(head, tail int) {
+	if p.backing != backingMmap {
 		return
 	}
-	p.heapHead = v
-}
-
-func (p *page) setTail(v int) {
-	if p.backing == backingMmap {
-		binary.LittleEndian.PutUint32(p.data[4:8], uint32(v)) //nolint:gosec // v is bounded by entries length
-		return
-	}
-	p.heapTail = v
+	binary.LittleEndian.PutUint32(p.data[0:4], uint32(head)) //nolint:gosec // head is bounded by entries length
+	binary.LittleEndian.PutUint32(p.data[4:8], uint32(tail)) //nolint:gosec // tail is bounded by entries length
 }
 
 // entries returns the slice of data that holds entry bytes (skipping
-// the mmap header if present).
+// the mmap header if present). The mmap slice is capped at the page end
+// (3-index) so an append can never scribble past this page into the next one's
+// bytes even if p.data's own capacity runs into the following region — pure
+// defense in depth; the tail-room check already keeps writes in bounds.
 func (p *page) entries() []byte {
 	if p.backing == backingMmap {
-		return p.data[pageHdrSize:]
+		return p.data[pageHdrSize:len(p.data):len(p.data)]
 	}
 	return p.data
 }
@@ -269,9 +286,9 @@ func (p *page) WriteAt(offset uint32, key, value []byte, expiryMs, meta uint64) 
 // compact_online.go, relocate_evict.go, relocate_reserve.go, shard.go) slices
 // entries[cursor:tail] — each of them holds s.mu, so tail is stable under it.
 // Read is called from the LOCK-FREE read path (indexTable.get / getSeq), which
-// holds nothing: p.tail() is a plain field on a heap page and plain header bytes
-// on an mmap one, both stored by an appending writer, so reading it here would be
-// an unsynchronised read of mutable state — a data race, not a tightening.
+// holds nothing: p.tail() is a plain runtime field on every backing, stored by an
+// appending writer, so reading it here would be an unsynchronised read of mutable
+// state — a data race, not a tightening.
 //
 // THE BOUND IS UNNECESSARY BECAUSE THE FRAMING IS IMMUTABLE, NOT BECAUSE NOTHING
 // RACES. Under Config.InPlaceSeqlockReads a heap page is read lock-free by getSeq
