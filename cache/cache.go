@@ -89,8 +89,13 @@ func (c *Cache) msyncLoop() {
 					// which the snapshot-before-flush order prevents.
 					snaps := s.snapshotPageBounds()
 					if err := msync(s.file, s.region); err != nil {
+						// Data not durable this tick: do NOT project the snapshot into
+						// the durable headers. Projecting a bound whose entries the
+						// failed flush did not capture is the forward-skew hazard; skip
+						// it and leave the last durable bounds in place (a safe lag).
 						failed++
 						lastErr = err
+						continue
 					}
 					s.projectSnapshotBounds(snaps)
 					if err := msync(s.file, s.region); err != nil {
@@ -453,7 +458,13 @@ func (c *Cache) SetPBFrontier(seq, epoch uint64) {
 		//    before the caller recorded seq, so its bytes are already dirty and this
 		//    flushes them; a concurrent higher-seq write only adds work.
 		if err := syncRegion(s.file, s.region); err != nil {
+			// Data not durable: STOP this shard's protocol here. Projecting bounds
+			// or stamping the frontier now would let a durable watermark name
+			// entries that never reached disk (over-report — the catastrophic
+			// direction). Leaving the old, lower frontier in place (in memory and on
+			// disk) is the safe under-report; a caller stamps again next interval.
 			slog.Warn("DURABILITY WARNING: page msync failed before pb frontier", "component", "cache", "pb_seq", seq, "pb_epoch", epoch, "err", err)
+			continue
 		}
 		// The ordering below is ENTRIES → BOUNDS → WATERMARK, each made durable by its
 		// OWN msync strictly after the previous. A single msync over bounds AND the
@@ -473,12 +484,17 @@ func (c *Cache) SetPBFrontier(seq, epoch uint64) {
 		//    the frontier is stamped. No frontier is on disk yet, so an interrupted
 		//    flush here just leaves the old (lower) frontier: the safe under-report.
 		if err := syncRegion(s.file, s.region); err != nil {
+			// Bounds not durable: same rule — do NOT stamp the frontier. The old
+			// frontier stays; recovery will under-report, never over-report.
 			slog.Warn("DURABILITY WARNING: bounds msync failed before pb frontier", "component", "cache", "pb_seq", seq, "pb_epoch", epoch, "err", err)
+			continue
 		}
 		// 5. Stamp the frontier and flush ONLY the 64-byte file header, strictly after
 		//    the bounds it depends on are durable. Now every write the frontier names
 		//    is both on disk (step 2) and recoverable under a durable bound (step 4)
-		//    before the frontier that names it reaches disk.
+		//    before the frontier that names it reaches disk. The in-memory frontier is
+		//    advanced only here, after the two data/bounds barriers succeeded, so it
+		//    can never advertise a seq whose entries are not durable.
 		s.mu.Lock()
 		setPBFrontier(s.region, seq, epoch)
 		s.pbFrontierSeq.Store(seq)
@@ -486,6 +502,10 @@ func (c *Cache) SetPBFrontier(seq, epoch uint64) {
 		err := syncRegion(s.file, s.region[:headerSize])
 		s.mu.Unlock()
 		if err != nil {
+			// Data and bounds are durable; only the frontier header did not land. On
+			// restart recovery sees the old frontier over durable data — under-report,
+			// safe. The in-memory frontier is advanced (its data IS durable), so a
+			// live report is correct; the next stamp re-persists it.
 			slog.Warn("DURABILITY WARNING: header msync failed for pb frontier", "component", "cache", "pb_seq", seq, "pb_epoch", epoch, "err", err)
 		}
 	}
@@ -533,28 +553,39 @@ func (c *Cache) SetAppliedIndex(idx uint64, force bool) {
 			// the watermark naming entries recovery cannot frame — fsm.Apply would then
 			// skip-replay entries that are not durably recoverable.
 			//
+			// A failed barrier STOPS the protocol: we must not project bounds over,
+			// or stamp/advance the index for, entries that are not durable. On any
+			// failure below the old, lower applied-index stays (in memory and on
+			// disk) — recovery under-reports, never over-reports.
+			//
 			// 1. Flush the page DATA so the bounds and watermark can't outrun the
 			//    entries they name.
+			dataOK := true
 			if err := syncRegion(s.file, s.region); err != nil {
 				slog.Warn("DURABILITY WARNING: page msync failed before applied-index", "component", "cache", "applied_index", idx, "err", err)
+				dataOK = false
 			}
-			// 2. Project every mmap page's runtime bounds into its durable header (they
-			//    are scattered at headerSize+i*PageSize) and flush them, BEFORE the
-			//    applied index is stamped. No new index is on disk yet, so an
-			//    interrupted flush here just leaves the old (lower) index — safe.
-			for _, p := range s.pages {
-				p.projectBounds(p.head(), p.tail())
-			}
-			if err := syncRegion(s.file, s.region); err != nil {
-				slog.Warn("DURABILITY WARNING: bounds msync failed before applied-index", "component", "cache", "applied_index", idx, "err", err)
-			}
-			// 3. Stamp the applied index and flush ONLY the 64-byte header, strictly
-			//    after the bounds it depends on are durable. The watermark now reaches
-			//    disk last, so it can never name entries a crash left unrecoverable.
-			setAppliedIndex(s.region, idx)
-			s.appliedIndex.Store(idx)
-			if err := syncRegion(s.file, s.region[:headerSize]); err != nil {
-				slog.Warn("DURABILITY WARNING: header msync failed for applied-index", "component", "cache", "applied_index", idx, "err", err)
+			if dataOK {
+				// 2. Project every mmap page's runtime bounds into its durable header
+				//    (they are scattered at headerSize+i*PageSize) and flush them,
+				//    BEFORE the applied index is stamped. No new index is on disk yet,
+				//    so an interrupted flush here just leaves the old (lower) index.
+				for _, p := range s.pages {
+					p.projectBounds(p.head(), p.tail())
+				}
+				if err := syncRegion(s.file, s.region); err != nil {
+					slog.Warn("DURABILITY WARNING: bounds msync failed before applied-index", "component", "cache", "applied_index", idx, "err", err)
+				} else {
+					// 3. Stamp the applied index and flush ONLY the 64-byte header,
+					//    strictly after the bounds it depends on are durable, and
+					//    advance the in-memory index only now — so it can never name
+					//    entries a crash left unrecoverable.
+					setAppliedIndex(s.region, idx)
+					s.appliedIndex.Store(idx)
+					if err := syncRegion(s.file, s.region[:headerSize]); err != nil {
+						slog.Warn("DURABILITY WARNING: header msync failed for applied-index", "component", "cache", "applied_index", idx, "err", err)
+					}
+				}
 			}
 		} else {
 			setAppliedIndex(s.region, idx)
