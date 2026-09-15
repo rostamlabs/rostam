@@ -144,7 +144,7 @@ const (
 	framingKeyCRCOff = 80
 )
 
-// readHeader parses the 64-byte header at the start of region. Returns
+// readHeader parses the 128-byte header at the start of region. Returns
 // the decoded fields and an error if the CRC is invalid or region is
 // too small.
 func readHeader(region []byte) (magic uint64, version, pageSize, numPages uint32, appliedIdx uint64, err error) {

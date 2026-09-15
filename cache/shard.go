@@ -2395,11 +2395,16 @@ func (s *shard) drainPageLocked(victim int) error {
 			s.corrupt.Add(1)
 			slog.Warn("corrupt entry during eviction; resynchronised to the next valid frame",
 				"component", "cache", "page", victim, "offset", off, "resume_at", resumeAt, "discarded_bytes", discarded, "err", derr)
-			// Drop the index slot that still addresses this exact physical copy, if any.
-			// The frame did not verify, so its key cannot be read — the slot is found by
-			// physical ref (O(index), acceptable for a corruption event) and no onRemove
-			// fires, since a key read from damaged bytes would misnotify a derived index.
-			s.dropDamagedSlotLocked(victim, p.gen, off)
+			// Drop EVERY index slot addressing any offset in the whole skipped gap
+			// [head, resumeAt), not just the head. When several consecutive frames fail,
+			// resyncForward jumps over all of them, so a slot pointing at any offset inside
+			// the gap would be left dangling — behind the advanced head, its bytes free to
+			// be overwritten on reuse — and a later Get would resolve it through
+			// decodeEntryFast (no MAC) into whatever now lies there. The frames did not
+			// verify, so their keys cannot be read: the slots are found by physical ref
+			// (O(index), acceptable for a corruption event) and no onRemove fires, since a
+			// key read from damaged bytes would misnotify a derived index.
+			s.dropDamagedSlotsLocked(victim, p.gen, off, uint32(resumeAt)) //nolint:gosec // head <= resumeAt <= tail <= PageSize
 			if resumeAt >= tail {
 				// Nothing valid remains; the page is now empty. Fall out of the loop so
 				// the reuse-ordering flush below runs, exactly as a clean drain-to-empty.
@@ -2452,33 +2457,38 @@ func (s *shard) drainPageLocked(victim int) error {
 	return nil
 }
 
-// dropDamagedSlotLocked tombstones the single index slot that addresses the exact
-// physical copy (victim, gen, off) of an entry the eviction drain could not verify,
-// if such a slot exists. It is the "drop only the damaged entry" counterpart to
-// discardCorruptPageLocked's whole-page sweep: a per-entry MAC failure now costs one
-// slot, not the page.
+// dropDamagedSlotsLocked tombstones every index slot addressing an offset in the
+// half-open range [lo, hi) of page victim's current generation — the gap the eviction
+// drain skipped when it resynced past one or more frames it could not verify. It is
+// the "drop only the damaged region" counterpart to discardCorruptPageLocked's
+// whole-page sweep: a resynced tear costs only the skipped slots, not the page.
 //
-// A physical ref is unique — at most one slot addresses a given (page, gen, offset) —
-// so the scan returns on the first match. It is O(index slots) but runs only on a
-// corruption event, never in the steady state. No onRemove fires and no key is read:
-// the frame did not verify, so its bytes cannot be trusted to name a key, and
-// notifying a derived index under a key read from damage would drop some unrelated
-// live key's postings (exactly the reasoning in discardCorruptPageLocked). The
-// eviction is still counted so the slot's disappearance is observable. Must hold mu.
-func (s *shard) dropDamagedSlotLocked(victim int, gen uint16, off uint32) {
+// THE WHOLE GAP, not just its first offset: resyncForward may jump over several
+// consecutive failed frames, and a slot left pointing anywhere inside the gap would be
+// stranded below the advanced head, its bytes free to be overwritten on reuse, and a
+// later Get would resolve it through the MAC-less decodeEntryFast into whatever now
+// lies there. It is O(index slots) but runs only on a corruption event, never in the
+// steady state. No onRemove fires and no key is read: the frames did not verify, so
+// their bytes cannot be trusted to name a key, and notifying a derived index under a
+// key read from damage would drop some unrelated live key's postings (exactly the
+// reasoning in discardCorruptPageLocked). Each dropped slot is counted as an eviction
+// so its disappearance is observable. Must hold mu.
+func (s *shard) dropDamagedSlotsLocked(victim int, gen uint16, lo, hi uint32) {
 	t := s.tab.Load()
-	want := makeSlabRef(uint16(victim), gen, off) //nolint:gosec // victim < MaxPagesPerShard (≤65535)
 	for i := range t.ctrl {
 		c := t.ctrl[i].Load()
 		if c == ctrlEmpty || c == ctrlTombstone {
 			continue
 		}
-		if slabRef(t.refs[i].Load()) != want {
+		ref := slabRef(t.refs[i].Load())
+		if int(ref.pageIdx()) != victim || ref.gen() != gen {
+			continue
+		}
+		if o := ref.offset(); o < lo || o >= hi {
 			continue
 		}
 		t.tombstone(uint64(i)) //nolint:gosec // i is a valid slot index
 		s.evictions.Add(1)
-		return
 	}
 }
 

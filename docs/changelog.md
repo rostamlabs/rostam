@@ -18,7 +18,11 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   v4 data file is upgraded to v5 automatically the first time this build opens it
   (the upgrade is crash-safe and leaves the original in place if it cannot
   complete); a v5 file cannot be opened by a build older than v0.7.0-beta5, which
-  refuses it rather than rewriting it.
+  refuses it rather than rewriting it. Because a v5 page reserves slightly more
+  per-page overhead than v4, a persistent shard that was packed essentially full
+  under v4 may not have room for the upgraded copy; the upgrade then fails closed
+  — it leaves the original v4 file untouched and refuses to open the shard until
+  capacity is raised — rather than losing any data.
 - **Security (GHSA-m63m-rp87-w4rf): a persistent cache no longer trusts a page's
   stored bounds after an unclean host shutdown.** On a power loss or kernel panic
   (not an ordinary process crash), a persistent (mmap) shard could recover a page

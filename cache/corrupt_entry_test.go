@@ -166,6 +166,68 @@ func TestCorruptDrainLeavesNoSlotPointingIntoTheResetPage(t *testing.T) {
 	}
 }
 
+// TestCorruptDrainResyncDropsEverySkippedSlot: when eviction's resync jumps over
+// SEVERAL consecutive damaged frames, it must drop the index slot of EACH of them,
+// not only the head one. A slot left addressing an offset inside the skipped gap is
+// stranded below the advanced head — its bytes free to be overwritten on reuse — and a
+// later Get resolves it through the MAC-less read path into whatever now lies there.
+// Two consecutive tears (k1, k2) force the gap; after the drain no live slot may
+// address the page, while the undamaged k0 and the resume target k3 evict normally.
+func TestCorruptDrainResyncDropsEverySkippedSlot(t *testing.T) {
+	s, removedKeys := corruptDrainShard(t)
+
+	keys := [][]byte{[]byte("k0"), []byte("k1"), []byte("k2"), []byte("k3")}
+	for _, k := range keys {
+		if err := s.Put(k, []byte("val"), 0); err != nil {
+			t.Fatalf("Put(%s): %v", k, err)
+		}
+	}
+
+	s.mu.Lock()
+	p := s.pages[0]
+	gen := p.gen
+	tab := s.tab.Load()
+	// Corrupt k1 AND k2 (two consecutive live entries) by flipping a payload byte in
+	// each, breaking their MACs so the drain's resync must skip both to reach k3.
+	for _, k := range [][]byte{[]byte("k1"), []byte("k2")} {
+		_, ref, ok := tab.findSlot(hashKey(k))
+		if !ok {
+			s.mu.Unlock()
+			t.Fatalf("no index slot for %s", k)
+		}
+		p.entries()[int(ref.offset())+entryHeaderSize] ^= 0xFF
+	}
+	if err := s.drainPageLocked(0); err != nil {
+		s.mu.Unlock()
+		t.Fatalf("drainPageLocked: %v", err)
+	}
+	// After a full drain no live slot may still address this page generation. Pre-fix,
+	// k2's slot (inside the skipped gap but not at its head) dangles here.
+	dangling := 0
+	tab = s.tab.Load()
+	for i := range tab.ctrl {
+		c := tab.ctrl[i].Load()
+		if c == ctrlEmpty || c == ctrlTombstone {
+			continue
+		}
+		if ref := slabRef(tab.refs[i].Load()); int(ref.pageIdx()) == 0 && ref.gen() == gen {
+			dangling++
+		}
+	}
+	s.mu.Unlock()
+	if dangling != 0 {
+		t.Errorf("%d index slot(s) still address the drained page; a multi-entry resync gap left them dangling", dangling)
+	}
+
+	rm := removedKeys()
+	if rm["k0"] != 1 || rm["k3"] != 1 {
+		t.Errorf("k0/k3 should evict normally (resync resumed at k3): removed=%v", rm)
+	}
+	if rm["k1"] != 0 || rm["k2"] != 0 {
+		t.Errorf("damaged k1/k2 must not fire onRemove (keys unreadable): removed=%v", rm)
+	}
+}
+
 // embeddedFrame is a complete, self-consistent v5 entry for key "forged" of exactly
 // 64 bytes, carrying a write sequence far above anything the test writes. It is
 // MAC'd under testFramingKey at offset 0 — a key the CLIENT chose, standing in for the
