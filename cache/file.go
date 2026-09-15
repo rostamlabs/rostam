@@ -3,6 +3,7 @@
 package cache
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -18,7 +19,7 @@ import (
 // an ordinary rotatable error.
 var errFutureVersion = errors.New("unsupported future cache version")
 
-// Header layout (64 bytes total):
+// Header layout (128 bytes total, version 5):
 //
 //	0..7    magic uint64 (little-endian)
 //	8..11   version uint32
@@ -31,6 +32,9 @@ var errFutureVersion = errors.New("unsupported future cache version")
 //	44..51  pbFrontierSeq uint64
 //	52..59  pbFrontierEpoch uint64
 //	60..63  pbFrontierCRC uint32 (CRC32-IEEE of bytes 44..59)
+//	64..79  framingKey [16]byte — per-file random MAC secret   (version 5+)
+//	80..83  framingKeyCRC uint32 (CRC32-IEEE of bytes 64..79)   (version 5+)
+//	84..127 reserved (zero)
 //
 // The stamp fields carry their OWN CRC rather than extending headerCRC's range,
 // so the bytes covered by headerCRC (0..27) are byte-identical between version 2
@@ -40,17 +44,21 @@ var errFutureVersion = errors.New("unsupported future cache version")
 // match), and a v3 file's applied index is readable by any build that ignores
 // bytes 32..63.
 //
-// The PB FRONTIER (44..63) follows that precedent EXACTLY and therefore carries
-// NO version bump: it consumes previously reserved (zero-filled) bytes, it is
-// guarded by its own CRC rather than by headerCRC, and nothing in readHeader /
-// validateHeader looks at it. A file written by a build that predates the field
-// has zeros there, whose CRC over sixteen zero bytes does not match zero, so it
-// restores as (0, 0) — the SAFE under-reporting answer (see readPBFrontier). A
-// file written WITH the field is byte-identical to one without it for every byte
-// any older build reads. Bumping cacheVersion would have been strictly worse:
-// minReadableCacheVersion == cacheVersion today, so a bump would rotate every
-// existing pages file aside and throw away the very data whose frontier this
-// field exists to describe.
+// The PB FRONTIER (44..63) followed that precedent and carried NO version bump: it
+// consumed previously reserved (zero-filled) bytes, guarded by its own CRC.
+//
+// THE FRAMING KEY (64..79) IS DIFFERENT AND FORCES v4→v5. Unlike the stamp and the
+// PB frontier — new HEADER fields that repurposed reserved space and left the ENTRY
+// codec alone — the framing key exists to key the per-entry MAC that REPLACED the
+// per-entry CRC (see cache/ringbuf.go). The entry codec changed, so v4 and v5 frames
+// are mutually unintelligible and the version gate must separate them; and in a v4
+// header bytes 64..79 are not reserved header space at all — the v4 header is only 64
+// bytes, so those bytes are the first of v4 page 0's data. The key is therefore read
+// (and its CRC checked) ONLY for a v5 header; a v4 file is upgraded to v5 on open
+// (cache/migrate.go), which writes a fresh random key into the new 128-byte header.
+// The key's own CRC guards a torn key write: a v5 file with an unreadable key cannot
+// verify any entry, so it is treated as a corrupt file (rotated aside) rather than
+// silently recovering nothing.
 const (
 	cacheMagic uint64 = 0x4843414D54534552 // "RSTMCACH" little-endian
 	// cacheVersion is the format this build WRITES. History:
@@ -77,25 +85,39 @@ const (
 	//	  (#12B). A v3 entry decoded with the v4 reader would frame garbage, so the
 	//	  two codecs are mutually unintelligible and the version gate below is the
 	//	  only thing separating them.
-	cacheVersion uint32 = 4
-	// minReadableCacheVersion is the oldest on-disk version this build opens in
-	// place instead of rotating aside.
 	//
-	// It equals cacheVersion: v4 changed the ENTRY codec, and there is no
-	// deployed persistent state to migrate, so a pre-v4 pages file is rotated
-	// aside (renamed .bad-<timestamp>) by the same tested path that handles a bad
-	// magic or a CRC failure, and the shard starts empty. On a replicated node the
-	// committed state is then rebuilt from the log — replay, or an InstallSnapshot
-	// from a peer. Nothing is lost that the cluster does not still hold, and the
-	// runtime never has to carry a second entry codec or a version branch on any
-	// path, hot or cold.
+	//	v4 → v5: the per-entry integrity field flipped from a 4-byte CRC32 to an
+	//	  8-byte keyed MAC (SipHash-2-4 over the page nonce, the entry's in-page
+	//	  offset, the frame header, key and value, under a per-file random secret),
+	//	  the entry header grew 26→30, the per-page header grew 8→16 (a per-page-life
+	//	  nonce joined head/tail), and the file header grew 64→128 (the framing key
+	//	  and its CRC). This is what makes recovery and eviction able to RESYNC past a
+	//	  damaged entry instead of discarding the rest of the page (issue #135): a
+	//	  keyed, position-bound MAC cannot be forged inside a client value nor replayed
+	//	  to another offset, so a forward scan can trust "the next frame that verifies"
+	//	  where a CRC never could. A v4 entry decoded with the v5 reader frames garbage,
+	//	  so a v4 file is UPGRADED to v5 on open (cache/migrate.go) rather than read in
+	//	  place — see minReadableCacheVersion.
+	cacheVersion uint32 = 5
+	// minReadableCacheVersion is the oldest on-disk version this build opens WITHOUT
+	// rotating it aside.
 	//
-	// The reverse direction has never been supported either: a v4 file opened by an
-	// older build trips that build's version gate and is rotated aside in exactly
-	// the same way. Downgrades reformat the DataDir.
+	// It stays 4 across the v5 bump: v4 is deployed persistent state (v0.7.0-beta*),
+	// so a v4 pages file must NOT be thrown away. newShard detects a v4 header and
+	// MIGRATES it to v5 in place — read via the v4 decoder, rewritten as a v5 file
+	// through the same crash-safe temp+rename+dir-fsync swap compaction uses, then
+	// mapped and served as v5 for the rest of its life (the hot path never branches on
+	// version). A pre-v4 file (v1/v2/v3) is still rotated aside: those changed the
+	// header/entry codec with no deployed state to preserve, so the same tested path
+	// that handles a bad magic or CRC renames it .bad-<timestamp> and the shard starts
+	// empty, to be rebuilt from the cluster log or a peer snapshot.
+	//
+	// The reverse direction is unchanged: a v5 file opened by an OLDER build trips
+	// that build's version gate (v5 > its cacheVersion) and is refused non-destructively
+	// via errFutureVersion. Downgrades below v4 reformat the DataDir.
 	minReadableCacheVersion uint32 = 4
-	headerSize              int    = 64
-	pageHdrSize             int    = 8 // head u32 + tail u32 stored at start of each mmap-backed page
+	headerSize              int    = 128
+	pageHdrSize             int    = 16 // head u32 + tail u32 + pageNonce u64, at the start of each mmap page
 
 	// hdrStampOff / hdrStampCRCOff locate the version-3 persisted logical clock.
 	hdrStampOff    = 32
@@ -107,10 +129,19 @@ const (
 	// index) a PB position is meaningless without its epoch, because Promote
 	// continues seq assignment from the promoted node's high-water and so REUSES
 	// seqs across epochs; the pair is stored and CRC'd as one unit for that
-	// reason. Occupies the last 16+4 previously-reserved header bytes.
+	// reason.
 	hdrPBSeqOff         = 44
 	hdrPBEpochOff       = 52
 	hdrPBFrontierCRCOff = 60
+
+	// framingKeyOff / framingKeyLen / framingKeyCRCOff locate the version-5 per-file
+	// MAC secret and its guard CRC. framingKeyLen is 16 bytes — the SipHash key
+	// width. The key is written once, with crypto/rand, by writeFramingKey when a
+	// fresh (or migrated) file's header is created, and never changes afterwards, so
+	// the mapped bytes are a stable secret every page's MAC is keyed by.
+	framingKeyOff    = 64
+	framingKeyLen    = 16
+	framingKeyCRCOff = 80
 )
 
 // readHeader parses the 64-byte header at the start of region. Returns
@@ -133,15 +164,18 @@ func readHeader(region []byte) (magic uint64, version, pageSize, numPages uint32
 	return magic, version, pageSize, numPages, appliedIdx, nil
 }
 
-// writeHeader writes a fresh header to region. Caller must ensure
-// region is at least headerSize bytes. Zero-fills bytes 32..63.
-func writeHeader(region []byte, pageSize, numPages uint32, appliedIdx uint64) {
+// writeHeader writes a fresh v5 header to region, INCLUDING a freshly generated
+// per-file framing key. Caller must ensure region is at least headerSize bytes.
+// Zero-fills bytes 32..127 before stamping the sub-fields. Returns an error only if
+// the framing key could not be generated (crypto/rand failure); a header with no
+// valid framing key must never be published, so the caller aborts the open.
+func writeHeader(region []byte, pageSize, numPages uint32, appliedIdx uint64) error {
 	binary.LittleEndian.PutUint64(region[0:8], cacheMagic)
 	binary.LittleEndian.PutUint32(region[8:12], cacheVersion)
 	binary.LittleEndian.PutUint32(region[12:16], pageSize)
 	binary.LittleEndian.PutUint32(region[16:20], numPages)
 	binary.LittleEndian.PutUint64(region[20:28], appliedIdx)
-	// Reserved bytes 32..63 stay zero.
+	// Reserved bytes 32..127 start zero; the sub-fields below overwrite their slots.
 	for i := 32; i < headerSize; i++ {
 		region[i] = 0
 	}
@@ -155,6 +189,47 @@ func writeHeader(region []byte, pageSize, numPages uint32, appliedIdx uint64) {
 	// valid checksum rather than an unreadable zero blob that merely DECODES to
 	// the same answer.
 	setPBFrontier(region, 0, 0)
+	// The v5 per-file MAC secret. Its own CRC guards a torn write.
+	return writeFramingKey(region)
+}
+
+// writeFramingKey generates a fresh random 16-byte framing key into the v5 header
+// and stamps its guard CRC. Called once per file, when a fresh (or migrated)
+// header is created. A crypto/rand failure is returned rather than swallowed: a
+// zero or partial key is a broken secret, so the file must not be published.
+func writeFramingKey(region []byte) error {
+	if _, err := rand.Read(region[framingKeyOff : framingKeyOff+framingKeyLen]); err != nil {
+		return fmt.Errorf("cache: generate framing key: %w", err)
+	}
+	crc := crc32.ChecksumIEEE(region[framingKeyOff : framingKeyOff+framingKeyLen])
+	binary.LittleEndian.PutUint32(region[framingKeyCRCOff:framingKeyCRCOff+4], crc)
+	return nil
+}
+
+// randomNonce draws a fresh 8-byte per-page-life nonce. Used at every extent-reuse
+// point to rotate the page nonce (see zeroDurableBoundsForReuseLocked).
+func randomNonce() (uint64, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return 0, fmt.Errorf("cache: generate page nonce: %w", err)
+	}
+	return binary.LittleEndian.Uint64(b[:]), nil
+}
+
+// readFramingKey returns the per-file MAC secret and true, or (nil, false) if the
+// key's guard CRC does not match (a torn key write, or a pre-v5 header whose bytes
+// 64..79 are not a key at all). The returned slice ALIASES region; callers that
+// must outlive the mapping (the shard, which survives a compaction remap) copy it.
+// Only meaningful on a v5 header — validateHeader gates the call on version.
+func readFramingKey(region []byte) ([]byte, bool) {
+	if len(region) < headerSize {
+		return nil, false
+	}
+	stored := binary.LittleEndian.Uint32(region[framingKeyCRCOff : framingKeyCRCOff+4])
+	if stored != crc32.ChecksumIEEE(region[framingKeyOff:framingKeyOff+framingKeyLen]) {
+		return nil, false
+	}
+	return region[framingKeyOff : framingKeyOff+framingKeyLen], true
 }
 
 // setPBFrontier writes the persisted PB applied frontier (seq, epoch) and its
@@ -276,6 +351,17 @@ func validateHeader(region []byte, expectedPageSize, expectedNumPages uint32) (a
 	}
 	if numPages != expectedNumPages {
 		return 0, false, fmt.Errorf("cache: numPages mismatch (file %d, config %d)", numPages, expectedNumPages)
+	}
+	// A CURRENT-version (v5) header must carry a readable framing key: every entry's
+	// MAC is keyed by it, so an unreadable key makes the whole file unverifiable.
+	// Treat a torn key as an ordinary rotatable corruption (like a bad entry CRC would
+	// have been), NOT as errFutureVersion. The check is gated on version because in a
+	// v4 header bytes 64..79 are page data, not a key — a v4 file validates here and is
+	// then migrated (newShard), never read in place.
+	if version == cacheVersion {
+		if _, ok := readFramingKey(region); !ok {
+			return 0, false, errors.New("cache: framing key CRC mismatch (torn or missing per-file MAC secret)")
+		}
 	}
 	return idx, false, nil
 }

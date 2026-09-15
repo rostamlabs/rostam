@@ -4,6 +4,7 @@ package cache
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -122,8 +123,14 @@ type shard struct {
 	sieve bool
 
 	// mmap-only state (nil/zero in heap mode). Guarded by mu.
-	file         *os.File
-	region       []byte
+	file   *os.File
+	region []byte
+	// framingKey is a COPY of the pages file's per-file 16-byte MAC secret (v5
+	// header, cache/file.go). A copy, not a slice of region, so it survives a
+	// compaction remap that unmaps the old region; every mmap page's framingKey
+	// aliases this slice. nil in heap mode. Set in newShard / remapPagesFile before
+	// attachMmapRegion, immutable for the mapping's life.
+	framingKey   []byte
 	appliedIndex atomic.Uint64
 
 	// dataDir is the shard's on-disk directory (the parent of pages.dat), or "" in
@@ -431,7 +438,50 @@ func newShard(cfg Config, dataDir string, onRemove *atomic.Pointer[func([]byte)]
 		appliedIdx = 0
 	}
 
-	s.attachMmapRegion(file, region)
+	// The on-disk format version decides how the file is brought up. A fresh or
+	// rotated-aside file is v5 by construction; an existing file's version is read from
+	// the header (validateHeader already proved it in [minReadable, cacheVersion] and,
+	// for a v5 file, that its framing key is readable). A v4 file validates here but
+	// must NOT be framed with the v5 reader — it is migrated first.
+	onDiskVersion := cacheVersion
+	if !fresh {
+		onDiskVersion = binary.LittleEndian.Uint32(region[8:12])
+	}
+
+	if fresh {
+		// Lay down the v5 header — INCLUDING a fresh random framing key — BEFORE
+		// attaching, so the pages built over the region pick the key up. A crypto/rand
+		// failure aborts the open rather than publishing a file with a broken secret.
+		if herr := writeHeader(region, uint32(cfg.PageSize), uint32(maxPages), 0); herr != nil { //nolint:gosec // PageSize and maxPages are validated positive
+			_ = munmapAndClose(file, region)
+			return nil, herr
+		}
+	}
+
+	if !fresh && onDiskVersion < cacheVersion {
+		// v4 → v5 MIGRATE-ON-OPEN, fail-closed. Reads the v4 file through the v4 decoder,
+		// stages a v5 rewrite (fresh header + framing key + per-page nonces + MAC frames)
+		// through the same crash-safe temp+rename+dir-fsync swap compaction uses, and
+		// remaps. On success s.file/s.region/s.framingKey name the v5 file and the shard
+		// falls through to the normal v5 rebuild below; on failure the intact v4 file is
+		// left in place (never rotated aside) and the open fails loudly. Consumes the v4
+		// mapping (file, region) internally.
+		if merr := s.migrateV4ToV5(dataDir, pagesPath, file, region, size, appliedIdx); merr != nil {
+			return nil, merr
+		}
+	} else {
+		// Fresh or already-v5: adopt the framing key and attach. A copy, so the shard's
+		// key survives a later compaction remap that unmaps this region.
+		fk, ok := readFramingKey(region)
+		if !ok {
+			// Unreachable — validateHeader proved a v5 key readable and the fresh branch
+			// just wrote one — but guard rather than frame every entry under a zero key.
+			_ = munmapAndClose(file, region)
+			return nil, fmt.Errorf("cache: framing key unreadable after open")
+		}
+		s.framingKey = append([]byte(nil), fk...)
+		s.attachMmapRegion(file, region)
+	}
 	s.appliedIndex.Store(appliedIdx)
 	// Restore the flush watermark BEFORE the index rebuild, so rebuildIndexFromPages
 	// can skip every entry a prior Cache.Flush() logically wiped (seq <= floor). Read
@@ -452,25 +502,24 @@ func newShard(cfg Config, dataDir string, onRemove *atomic.Pointer[func([]byte)]
 	}
 	s.flushedThroughSeq = flushedFloor
 	if !fresh {
-		// Restore the persisted LOGICAL clock (v3 header; 0 on a v2 file). This is
-		// what lets cold compaction judge TTL expiry deterministically on a
-		// replicated shard — see cache/compact.go for the full safety argument.
-		s.lastAppliedStampMs.Store(readAppliedStamp(region))
-		// Restore the persisted PB applied frontier. This is the ONLY
-		// thing that lets a restarted PB node describe the FSM it just warm-restarted
-		// from rebuildIndexFromPages: there is no PB log and no snapshot to re-derive
-		// a frontier from, so without it the engine would present (0,0) — a genesis
-		// claim — over real data. (0,0) here means "nothing was ever stamped", which
-		// is exactly what a Raft-mode or heap shard yields.
-		pbSeq, pbEpoch := readPBFrontier(region)
+		// Restore the persisted LOGICAL clock and PB frontier from the file now backing
+		// the shard (s.region — which after a v4 migration is the fresh v5 file, whose
+		// header migration carried these fields into). Read from s.region, never the
+		// local `region`, which a migration has unmapped.
+		//
+		// The LOGICAL clock lets cold compaction judge TTL expiry deterministically on a
+		// replicated shard (see cache/compact.go). The PB frontier is the ONLY thing that
+		// lets a restarted PB node describe the FSM it just warm-restarted from: there is
+		// no PB log or snapshot to re-derive it, so without it the engine would present
+		// (0,0) — a genesis claim — over real data.
+		s.lastAppliedStampMs.Store(readAppliedStamp(s.region))
+		pbSeq, pbEpoch := readPBFrontier(s.region)
 		s.pbFrontierSeq.Store(pbSeq)
 		s.pbFrontierEpoch.Store(pbEpoch)
 	}
 
 	writeIdx := -1
-	if fresh {
-		writeHeader(region, uint32(cfg.PageSize), uint32(maxPages), 0) //nolint:gosec // PageSize and maxPages are validated positive
-	} else {
+	if !fresh {
 		s.rebuildIndexFromPages()
 		// Cold compaction: reclaim ghost page BYTES by rewriting the pages file
 		// with only the live entries, then mapping the compacted result. Safe
@@ -528,6 +577,9 @@ func (s *shard) attachMmapRegion(file *os.File, region []byte) {
 		// never reach past this page into the next one's bytes through the region tail.
 		p := newMmapPage(region[offset : offset+s.cfg.PageSize : offset+s.cfg.PageSize])
 		p.gen = s.nextGen()
+		// Every entry on this page is MAC'd under the per-file secret; the page needs it
+		// to encode (append/relocate) and to verify (recovery/eviction resync).
+		p.framingKey = s.framingKey
 		// Seed the RUNTIME bounds from the DURABLE header. This is the one place the
 		// mapped header is read back into runtime: recovery (rebuildIndexFromPages)
 		// trusts the durable header bounds, so the runtime bounds head()/tail() serves
@@ -536,6 +588,12 @@ func (s *shard) attachMmapRegion(file *os.File, region []byte) {
 		// only by projectBounds at a flush point. A fresh file has a zeroed header, so
 		// this seeds (0,0) — correct for an empty page.
 		p.heapHead, p.heapTail = p.durableBounds()
+		// Seed the RUNTIME nonce from the DURABLE per-page header alongside the bounds:
+		// the entries already on this page were MAC'd under whatever nonce a prior
+		// process last wrote there (0 on a fresh page's first life, or a rotated value
+		// after a reuse), so verification here must key off exactly that. Rotated only
+		// at the reuse point from here on (zeroDurableBoundsForReuseLocked).
+		p.nonce = p.durableNonce()
 		s.pages[i] = p
 		s.pageSlots[i].Store(p) // mmap page objects are fixed; publish once
 		regionNotePage(s, p)    // compiled out unless the measurement build tag is set
@@ -612,20 +670,44 @@ func (s *shard) msyncPageHeaderLocked(idx int) error {
 	return msync(s.file, s.region[start:off+pageHdrSize])
 }
 
-// zeroDurableBoundsForReuseLocked zeroes mmap page idx's DURABLE header bounds and
-// flushes that header to disk. It is the REUSE-ORDERING guard: whenever an mmap
-// extent is reset to be handed back to the write path (drain-to-empty, corruption
-// discard, online recycle), its durable bound must reach disk at (0,0) BEFORE the
-// extent is republished, or the OS may write back the reused entry bytes while the
-// header still holds the OLD (larger) bound — recovery would then frame a previous
-// life's bytes (reverse skew / a forged frame). This is mandatory even on a
-// non-Durable mmap shard, whose pages the OS still flushes lazily. One small msync
-// per page RESET, not per write. A no-op on a heap shard. Must hold s.mu.
+// zeroDurableBoundsForReuseLocked rotates mmap page idx's per-page nonce, zeroes its
+// DURABLE header bounds, and flushes that header to disk. It is the REUSE-ORDERING
+// guard: whenever an mmap extent is reset to be handed back to the write path
+// (drain-to-empty, corruption discard, online recycle), its durable bound must reach
+// disk at (0,0) BEFORE the extent is republished, or the OS may write back the reused
+// entry bytes while the header still holds the OLD (larger) bound — recovery would
+// then frame a previous life's bytes (reverse skew / a forged frame).
+//
+// The NONCE ROTATION is the v5 second guard for that same window: a fresh random
+// nonce means any old-life entry still lying in the extent can no longer verify (its
+// MAC was computed under the previous nonce), so even a torn writeback that resurrects
+// a stale bound cannot make those bytes pass as this life's entries. The runtime
+// nonce is rotated too, so subsequent appends MAC under the new value. Both header
+// writes ([8:16] nonce, [0:8] zeroed bounds) are made durable by the single msync
+// below, strictly before the extent is republished; the nonce is otherwise stable for
+// a page's life, so projectBounds at the per-write sync points (which touch only
+// [0:8]) leave it intact and the ENTRIES→BOUNDS→WATERMARK ordering is unchanged.
+//
+// Mandatory even on a non-Durable mmap shard, whose pages the OS still flushes lazily.
+// One small msync per page RESET, not per write. A no-op on a heap shard. Must hold
+// s.mu.
 func (s *shard) zeroDurableBoundsForReuseLocked(idx int) {
 	if !s.isMmap || s.region == nil {
 		return
 	}
-	s.pages[idx].projectBounds(0, 0)
+	p := s.pages[idx]
+	// A crypto/rand failure is rare and non-fatal here: the zeroed (0,0) bounds are
+	// the primary guard (recovery frames nothing until a later sync point advances the
+	// tail over freshly-MAC'd bytes), so keep the old nonce and proceed rather than
+	// fail the reuse.
+	if n, err := randomNonce(); err != nil {
+		slog.Warn("DURABILITY WARNING: could not rotate page nonce on reuse; reverse-skew guard rests on zeroed bounds alone",
+			"component", "cache", "page", idx, "err", err)
+	} else {
+		p.nonce = n
+		p.projectNonce(n)
+	}
+	p.projectBounds(0, 0)
 	if err := s.msyncPageHeaderLocked(idx); err != nil {
 		slog.Warn("DURABILITY WARNING: msync of reset page header failed; a crash could recover stale bytes for this extent",
 			"component", "cache", "page", idx, "err", err)
@@ -1667,6 +1749,28 @@ func (s *shard) Close() error {
 
 // --- internals ---
 
+// resyncForward scans entries[start:tail] one byte at a time for the first offset c
+// whose v5 frame both stays in bounds AND verifies its keyed MAC at (nonce, c) under
+// framingKey. Returns (c, true) on the first such offset, or (tail, false) if none
+// verifies before tail.
+//
+// This is the shared engine of the issue-#135 resync used by recovery
+// (rebuildIndexFromPages) and eviction (drainPageLocked). Its safety rests entirely
+// on decodeEntry verifying a POSITION-BOUND MAC: a frame verifies at c only if it was
+// genuinely written at offset c on this page's current life, so the scan can never
+// resume on a look-alike frame a client embedded in a value nor on a genuine frame
+// copied/replayed to a different position. Byte-by-byte (not by any length field,
+// which after a tear is untrustworthy) is what makes it land exactly on the next
+// genuine frame boundary — the entry appended after the torn one.
+func resyncForward(entries []byte, start, tail int, framingKey []byte, nonce uint64) (int, bool) {
+	for c := start; c < tail; c++ {
+		if _, _, _, _, err := decodeEntry(entries[c:tail], framingKey, nonce, uint32(c)); err == nil { //nolint:gosec // c < PageSize
+			return c, true
+		}
+	}
+	return tail, false
+}
+
 // rebuildIndexFromPages rebuilds s.tab from the page bytes: it is what a WARM
 // RESTART recovers this node's state from, so what it decides here IS the node's
 // committed state (a gracefully restarted replica re-applies nothing below its
@@ -1751,52 +1855,49 @@ func (s *shard) rebuildIndexFromPages() {
 		}
 		cursor := head
 		for cursor < tail {
-			key, value, _, meta, err := decodeEntry(entries[cursor:tail])
+			key, value, _, meta, err := decodeEntry(entries[cursor:tail], p.framingKey, p.nonce, uint32(cursor)) //nolint:gosec // cursor < PageSize
 			if err != nil {
-				// Corrupt entry (e.g. a crash-torn write): the rest of this page
-				// is unreadable. Record it so recovery-time loss is observable —
-				// consistent with the runtime read paths (getH/getIntoH) that also
-				// bump s.corrupt — rather than swallowing it silently.
-				s.corruptBytes.Add(uint64(tail - cursor)) //nolint:gosec // bounds validated above; cursor < tail inside this loop
+				// A frame that does not verify at this offset (torn write, bit rot, or a
+				// look-alike frame planted in some earlier value). RESYNC FORWARD to the
+				// next offset whose frame verifies, and drop only the bytes in between.
+				//
+				// WHY A FORWARD RESYNC IS NOW SAFE (it was not under the v4 CRC — issue
+				// #135). The integrity field is a KEYED, POSITION-BOUND MAC (cache/ringbuf.go):
+				// SipHash over the page nonce, the candidate OFFSET, and the frame, under a
+				// per-file secret. A CRC bounds a RANDOM false match but not a CHOSEN one, so
+				// a value — which is attacker-chosen bytes — could carry a complete, correctly
+				// CRC'd frame with a chosen sequence, and a v4 forward scan would adopt it:
+				// a key nobody wrote, served with a value nobody stored, its sequence set high
+				// enough to win the max-seq contest below and lift writeSeq. The MAC removes
+				// that: a client cannot compute it (no secret), and even a byte-perfect copy of
+				// a GENUINE frame fails to verify unless it sits at the exact offset and page
+				// nonce it was written under. So a candidate that verifies here genuinely began
+				// at that offset — the scan resumes on the page's own append log, never on a
+				// forged or replayed frame. resyncForward starts one byte past the failure so it
+				// cannot re-adopt the frame that just failed.
+				resumeAt, found := resyncForward(entries, cursor+1, tail, p.framingKey, p.nonce)
+				discarded := resumeAt - cursor
+				s.corruptBytes.Add(uint64(discarded)) //nolint:gosec // resumeAt >= cursor, both in [head,tail]
 				s.corrupt.Add(1)
-				slog.Warn("corrupt entry during recovery; truncating page tail",
-					"component", "cache", "page", pageIdx, "offset", cursor, "tail", tail, "err", err, "truncate_to", cursor, "discarded_bytes", tail-cursor)
-				// Truncate the page's persisted framing to the validated prefix so
-				// the torn region is excluded from every future eviction walk
-				// (EvictFront frames entries from raw bytes without a CRC). Reset if
+				if found {
+					// Only the damaged bytes [cursor, resumeAt) are dropped; the page keeps
+					// framing [head, tail) and the walk resumes at the genuine next frame.
+					// The durable bounds are unchanged — the torn bytes stay in the framed
+					// range, harmless because the index never points at them and every later
+					// walk (drain, cold compaction) resyncs past them the same way; a later
+					// compaction is what physically removes them.
+					slog.Warn("corrupt entry during recovery; resynchronised to the next valid frame",
+						"component", "cache", "page", pageIdx, "offset", cursor, "resume_at", resumeAt, "discarded_bytes", discarded)
+					cursor = resumeAt
+					continue
+				}
+				// Nothing verified before tail: this was the last (or only) live frame on
+				// the page, or the whole tail is damage. Truncate the page's persisted
+				// framing to the validated prefix — the pre-v5 behaviour for the remainder —
+				// so the torn region is excluded from every future eviction walk. Reset if
 				// nothing valid preceded the corruption.
-				//
-				// WHY THE WHOLE TAIL, AND NOT A RESYNC PAST THIS ONE ENTRY. Resyncing means
-				// finding where the next entry starts without the framing that says so, and
-				// the only evidence available is the bytes themselves. They cannot carry that
-				// weight, because a VALUE IS CLIENT BYTES: nothing stops a client storing a
-				// complete, correctly checksummed entry inside a value, and every field of
-				// such a frame — lengths, CRC, write sequence — is chosen by whoever wrote it.
-				// CRC32 bounds a RANDOM false match at 2^-32 per candidate; it bounds a chosen
-				// one not at all, and no plausibility test on attacker-chosen bytes restores
-				// the bound. A forward scan adopts a frame planted anywhere in the torn
-				// entry's own value; skipping by the torn entry's own lengths adopts one
-				// wherever a flipped length bit lands.
-				//
-				// Adopting one is worse than losing the page. It indexes a key nobody wrote
-				// with a value nobody stored, and its sequence is chosen too: set high, it
-				// beats the genuine copy of any key in the max-seq contest below and lifts
-				// writeSeq to wherever it says. The sequence is therefore no cross-check —
-				// it is part of what would be forged. The prefix walk is immune: it only
-				// ever steps by lengths that passed a CRC over a header whose sequence and
-				// expiry were assigned by this shard, so it never reads a value as framing.
-				//
-				// The loss is also narrower than it looks for the common cause. A mmap page
-				// is never rewritten where it lies, only appended to and drained, so a crash
-				// can tear only bytes written since the last writeback. What follows such a
-				// tear is either an entry appended AFTER the torn one — truncating is then
-				// recovering the longest valid prefix of that page's append log — or, when a
-				// drain's reset framing did not reach disk, entries that drain had already
-				// evicted. Entries durable long before the damage are lost only to damage
-				// arriving later, bit rot or a stray write, and how much that cost is
-				// reported in Stats.CorruptionBytesDiscarded. A sound resync needs framing a
-				// client cannot forge (a checksum keyed by a per-file secret, or out-of-band
-				// entry boundaries), which is a format change.
+				slog.Warn("corrupt entry during recovery; truncating page tail",
+					"component", "cache", "page", pageIdx, "offset", cursor, "tail", tail, "err", err, "truncate_to", cursor, "discarded_bytes", discarded)
 				if cursor == head {
 					p.Reset()
 				} else {
@@ -2274,32 +2375,50 @@ func (s *shard) drainPageLocked(victim int) error {
 			s.discardCorruptPageLocked(victim, len(p.entries()), now)
 			return nil
 		}
-		// Capture the entry's offset BEFORE EvictFront advances head, so we
-		// can reconstruct the slabRef of the copy being physically removed.
-		off := uint32(s.pages[victim].head()) //nolint:gosec // 0 <= head <= len(entries) is established above
-		// Read the expiry BEFORE evicting: EvictFront returns only the key, and
-		// evictionsLive must not count an entry that had already expired.
-		var headExpiryMs uint64
-		if ent := s.pages[victim].entries(); int(off) < s.pages[victim].tail() {
-			if _, _, exp, derr := decodeEntryFast(ent[off:s.pages[victim].tail()]); derr == nil {
-				headExpiryMs = exp
+		p := s.pages[victim]
+		head, tail := p.head(), p.tail()
+		off := uint32(head) //nolint:gosec // 0 <= head <= len(entries) is established above
+		ent := p.entries()
+		// VERIFY THE HEAD FRAME'S MAC before trusting its framing (this is the eviction
+		// verify site, issue #135). A CRC-era drain framed the entry from raw bytes and
+		// reset the WHOLE page on any framing error, losing every durable record after
+		// the damage. With a keyed, position-bound MAC a damaged frame can be told from
+		// a genuine one, so a tear now costs only the damaged entry: resync forward to
+		// the next frame that verifies and keep evicting.
+		evictedKey, evictedVal, headExpiryMs, _, derr := decodeEntry(ent[head:tail], p.framingKey, p.nonce, off)
+		if derr != nil {
+			// Damaged head entry. Find where the next genuine frame begins and drop only
+			// the bytes in between; the frames after it are still evicted normally.
+			resumeAt, _ := resyncForward(ent, head+1, tail, p.framingKey, p.nonce)
+			discarded := resumeAt - head
+			s.corruptBytes.Add(uint64(discarded)) //nolint:gosec // resumeAt >= head, both in [head,tail]
+			s.corrupt.Add(1)
+			slog.Warn("corrupt entry during eviction; resynchronised to the next valid frame",
+				"component", "cache", "page", victim, "offset", off, "resume_at", resumeAt, "discarded_bytes", discarded, "err", derr)
+			// Drop the index slot that still addresses this exact physical copy, if any.
+			// The frame did not verify, so its key cannot be read — the slot is found by
+			// physical ref (O(index), acceptable for a corruption event) and no onRemove
+			// fires, since a key read from damaged bytes would misnotify a derived index.
+			s.dropDamagedSlotLocked(victim, p.gen, off)
+			if resumeAt >= tail {
+				// Nothing valid remains; the page is now empty. Fall out of the loop so
+				// the reuse-ordering flush below runs, exactly as a clean drain-to-empty.
+				p.setHead(0)
+				p.setTail(0)
+			} else {
+				p.setHead(resumeAt)
 			}
+			continue
 		}
-		evictedKey, _, err := s.pages[victim].EvictFront()
-		if err != nil {
-			// The bounds passed the check above, so off <= tail and this is the size of
-			// the region the drain can no longer walk.
-			discarded := s.pages[victim].tail() - int(off)
-			slog.Warn("corrupt entry during eviction; resetting page", "component", "cache", "page", victim, "offset", off, "discarded_bytes", discarded, "err", err)
-			s.discardCorruptPageLocked(victim, discarded, now)
-			return nil
-		}
+		// Advance head past the verified entry. entrySpanExact frames it from the lengths
+		// the MAC just vouched for, so this matches what EvictFront would have computed.
+		newHead := head + entrySpanExact(len(evictedKey), len(evictedVal))
 		// Only drop the index slot if it still points at THIS physical copy.
 		// A later Put may have overwritten the key with a newer entry in a
 		// different page (leaving these bytes as a dead duplicate), or an
 		// unrelated key may collide on this hash. Deleting unconditionally
 		// would silently evict live data. Mirror the cur == ref guard in getH.
-		ref := makeSlabRef(uint16(victim), s.pages[victim].gen, off) //nolint:gosec // victim bounded by MaxPagesPerShard (≤65535)
+		ref := makeSlabRef(uint16(victim), p.gen, off) //nolint:gosec // victim bounded by MaxPagesPerShard (≤65535)
 		h := hashKey(evictedKey)
 		t := s.tab.Load()
 		if slot, cur, ok := t.findSlot(h); ok && cur == ref {
@@ -2315,6 +2434,12 @@ func (s *shard) drainPageLocked(victim int) error {
 			s.fireOnRemove(evictedKey)
 		}
 		s.evictions.Add(1)
+		if newHead >= tail {
+			p.setHead(0)
+			p.setTail(0)
+		} else {
+			p.setHead(newHead)
+		}
 	}
 	// REUSE ORDERING. The drain emptied this mmap extent (EvictFront's last step reset
 	// the runtime head/tail to 0); the write path may now refill it from offset 0.
@@ -2325,6 +2450,36 @@ func (s *shard) drainPageLocked(victim int) error {
 	// header the same way after its Reset.
 	s.zeroDurableBoundsForReuseLocked(victim)
 	return nil
+}
+
+// dropDamagedSlotLocked tombstones the single index slot that addresses the exact
+// physical copy (victim, gen, off) of an entry the eviction drain could not verify,
+// if such a slot exists. It is the "drop only the damaged entry" counterpart to
+// discardCorruptPageLocked's whole-page sweep: a per-entry MAC failure now costs one
+// slot, not the page.
+//
+// A physical ref is unique — at most one slot addresses a given (page, gen, offset) —
+// so the scan returns on the first match. It is O(index slots) but runs only on a
+// corruption event, never in the steady state. No onRemove fires and no key is read:
+// the frame did not verify, so its bytes cannot be trusted to name a key, and
+// notifying a derived index under a key read from damage would drop some unrelated
+// live key's postings (exactly the reasoning in discardCorruptPageLocked). The
+// eviction is still counted so the slot's disappearance is observable. Must hold mu.
+func (s *shard) dropDamagedSlotLocked(victim int, gen uint16, off uint32) {
+	t := s.tab.Load()
+	want := makeSlabRef(uint16(victim), gen, off) //nolint:gosec // victim < MaxPagesPerShard (≤65535)
+	for i := range t.ctrl {
+		c := t.ctrl[i].Load()
+		if c == ctrlEmpty || c == ctrlTombstone {
+			continue
+		}
+		if slabRef(t.refs[i].Load()) != want {
+			continue
+		}
+		t.tombstone(uint64(i)) //nolint:gosec // i is a valid slot index
+		s.evictions.Add(1)
+		return
+	}
 }
 
 // discardCorruptPageLocked is drainPageLocked's response to a page it cannot walk: it

@@ -38,8 +38,8 @@ func writeVersion1BigEndianFile(t *testing.T, path string, pageSize, numPages in
 	binary.BigEndian.PutUint64(buf[e+6:e+14], 0)
 	copy(buf[e+entryHeaderSize:], key)
 	copy(buf[e+entryHeaderSize+len(key):], val)
-	crc := crc32.Checksum(buf[e:e+14], crcTable)
-	crc = crc32.Update(crc, crcTable, buf[e+entryHeaderSize:e+entryHeaderSize+len(key)+len(val)])
+	crc := crc32.Checksum(buf[e:e+14], crc32.IEEETable)
+	crc = crc32.Update(crc, crc32.IEEETable, buf[e+entryHeaderSize:e+entryHeaderSize+len(key)+len(val)])
 	binary.BigEndian.PutUint32(buf[e+14:e+18], crc)
 
 	// Page 0 head/tail (little-endian, unchanged across the codec flip).
@@ -61,14 +61,22 @@ func writeCurrentFileWithEntries(t *testing.T, path string, pageSize, numPages i
 	t.Helper()
 	total := headerSize + numPages*pageSize
 	buf := make([]byte, total)
-	writeHeader(buf, uint32(pageSize), uint32(numPages), 0)
+	if err := writeHeader(buf, uint32(pageSize), uint32(numPages), 0); err != nil {
+		t.Fatalf("writeHeader: %v", err)
+	}
+	// The v5 encoder MACs each entry under the file's own framing key at its in-page
+	// offset (page 0's nonce is 0 on a fresh file), so recovery verifies it.
+	fk, ok := readFramingKey(buf)
+	if !ok {
+		t.Fatal("fresh header has no readable framing key")
+	}
 
 	base := headerSize + pageHdrSize
 	cursor := 0
 	offsets := make([]int, 0, len(entries))
 	for i, kv := range entries {
 		offsets = append(offsets, cursor)
-		n, err := encodeEntry(buf[base+cursor:], kv[0], kv[1], 0, makeMeta(uint64(i+1), false))
+		n, err := encodeEntry(buf[base+cursor:], kv[0], kv[1], 0, makeMeta(uint64(i+1), false), fk, 0, uint32(cursor))
 		if err != nil {
 			t.Fatalf("encode entry %d: %v", i, err)
 		}
@@ -119,9 +127,11 @@ func TestRecoverRejectsVersion1File(t *testing.T) {
 	}
 }
 
-// TestRebuildCountsCorruptEntries covers the observability gap: a torn entry in
-// a recovered page must bump CorruptionErrors and be logged, not swallowed by a
-// bare break. Live entries indexed before the corruption stay reachable.
+// TestRebuildCountsCorruptEntries covers the observability gap AND the v5 resync: a
+// torn entry in a recovered page must bump CorruptionErrors and be logged, entries
+// before it stay reachable, and — the issue-#135 change — entries AFTER it are
+// recovered too (recovery resyncs forward to the next frame that verifies), losing
+// only the damaged entry rather than the whole page tail.
 func TestRebuildCountsCorruptEntries(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.NumShards = 1
@@ -163,12 +173,14 @@ func TestRebuildCountsCorruptEntries(t *testing.T) {
 	if v, err := s.Get([]byte("k0")); err != nil || !bytes.Equal(v, []byte("AAAA")) {
 		t.Errorf("Get(k0) = %q,%v; want AAAA,nil", v, err)
 	}
-	// The corrupt entry and everything after it in the page were dropped.
+	// The corrupt entry itself is lost.
 	if _, err := s.Get([]byte("k1")); err != ErrNotFound {
 		t.Errorf("Get(k1) = %v, want ErrNotFound (corrupt)", err)
 	}
-	if _, err := s.Get([]byte("k2")); err != ErrNotFound {
-		t.Errorf("Get(k2) = %v, want ErrNotFound (after corruption)", err)
+	// The entry AFTER the corruption is recovered: v5 resync skips only the damaged
+	// frame and resumes at the next frame that verifies (a v4 build lost the tail).
+	if v, err := s.Get([]byte("k2")); err != nil || !bytes.Equal(v, []byte("CCCC")) {
+		t.Errorf("Get(k2) = %q,%v; want CCCC,nil (recovered by resync past the tear)", v, err)
 	}
 }
 

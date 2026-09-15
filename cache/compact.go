@@ -197,9 +197,14 @@ func (s *shard) entryIsLiveAtOpen(t *indexTable, pageIdx int, gen uint16, cursor
 // to. visit returns false to abort the walk. Construction-time only (no lock):
 // the shard is not yet shared.
 //
-// A framing error stops that page's walk without touching the rest, mirroring
-// rebuildIndexFromPages, which already truncated any torn tail before this runs
-// — so in practice every byte in [head, tail) decodes.
+// A framing error RESYNCS FORWARD to the next frame that verifies, exactly as
+// rebuildIndexFromPages does — and it MUST, for the same reason: recovery now keeps
+// (indexes) the entries after a torn frame instead of truncating the page tail, so a
+// cold compaction that merely broke on the tear would silently drop every entry
+// recovery had recovered past it. Both walks resync the same way (the MAC makes it
+// safe — see resyncForward), so this visits exactly the physical copies the index it
+// consults was built over. If nothing verifies before tail, the page's walk ends there.
+//
 // The visit callback receives the entry's META word so the rewrite can carry it
 // through VERBATIM. That is an invariant, not a convenience: compaction must never
 // alter a surviving entry's write sequence, or the next warm restart would resolve
@@ -211,11 +216,15 @@ func (s *shard) walkLiveAtOpen(dropClock uint64, visit func(key, value []byte, e
 		tail := p.tail()
 		entries := p.entries()
 		for cursor := p.head(); cursor < tail; {
-			key, value, exp, err := decodeEntryFast(entries[cursor:tail])
+			key, value, exp, meta, err := decodeEntry(entries[cursor:tail], p.framingKey, p.nonce, uint32(cursor)) //nolint:gosec // cursor < PageSize
 			if err != nil {
-				break
+				resumeAt, found := resyncForward(entries, cursor+1, tail, p.framingKey, p.nonce)
+				if !found {
+					break
+				}
+				cursor = resumeAt
+				continue
 			}
-			meta := entryMetaAt(entries[cursor:tail])
 			// EXACT, and NOT HEAP-REACHABLE. Cold compaction is the mmap pages file's
 			// open-time rewrite (see the header of this file); a heap shard never gets
 			// here. The figure is both the cursor advance over already-encoded bytes
@@ -310,11 +319,24 @@ func (s *shard) packLiveInto(dst []byte, dropClock uint64) (int, bool) {
 	// bounds and the entries they name reach disk together before the file is ever
 	// published, and the entries-before-bounds ordering the runtime paths need does
 	// not apply to a file nothing has yet mapped.
+	// The staging file carries its OWN fresh framing key (writeHeader wrote it before
+	// this runs). Every entry packed here is re-encoded through page.Write, so it is
+	// MAC'd under THAT key at its new offset with a fresh (zero) page nonce — the
+	// compacted file is a self-consistent v5 file, verifiable on its own terms, with no
+	// dependence on the source file's key or nonces. A torn/missing staged key is a
+	// programming error here (writeHeader just wrote it); fall back to the source key
+	// rather than pack unverifiable entries, which the abort/fits path would then catch.
+	stageKey := s.framingKey
+	if fk, ok := readFramingKey(dst); ok {
+		stageKey = fk
+	}
 	var dstPages []*page
 	dstPage := func(i int) *page {
 		off := headerSize + i*s.cfg.PageSize
 		p := newMmapPage(dst[off : off+s.cfg.PageSize : off+s.cfg.PageSize])
-		p.Reset() // the file is fresh (zero-filled); be explicit anyway
+		p.framingKey = stageKey // MAC the packed entries under the staging file's key
+		p.nonce = 0             // a fresh page's first life; the durable header nonce is already 0
+		p.Reset()               // the file is fresh (zero-filled); be explicit anyway
 		dstPages = append(dstPages, p)
 		return p
 	}
@@ -440,7 +462,17 @@ func (s *shard) compactAtOpen(dataDir, pagesPath string, size int64) (int, error
 		return -1, nil
 	}
 	//nolint:gosec // PageSize and MaxPagesPerShard are validated positive
-	writeHeader(tmpRegion, uint32(s.cfg.PageSize), uint32(s.cfg.MaxPagesPerShard()), s.appliedIndex.Load())
+	if herr := writeHeader(tmpRegion, uint32(s.cfg.PageSize), uint32(s.cfg.MaxPagesPerShard()), s.appliedIndex.Load()); herr != nil {
+		// Could not generate the staging file's framing key (crypto/rand). Abandon the
+		// compaction and keep serving the intact original, exactly as a staging I/O
+		// failure does — the original file and its mapping are untouched at this point.
+		_ = munmapAndClose(tmpFile, tmpRegion)
+		_ = os.Remove(tmpPath)
+		s.compactAborts.Add(1)
+		slog.Warn("cold compaction: cannot generate staging framing key; continuing uncompacted",
+			"component", "cache", "path", tmpPath, "err", herr)
+		return -1, nil
+	}
 	setAppliedStamp(tmpRegion, s.lastAppliedStampMs.Load())
 	// Carry the PB applied frontier across the rewrite. Compaction preserves the
 	// LIVE entry set exactly, so the compacted file materializes the same writes the
@@ -541,6 +573,17 @@ func (s *shard) remapPagesFile(pagesPath string, size int64) error {
 		}
 		return fmt.Errorf("cache: %s failed validation after compaction: %w", pagesPath, verr)
 	}
+	// The compacted file carries a FRESH framing key (writeHeader in compactAtOpen /
+	// migrateV4ToV5). Adopt it BEFORE attachMmapRegion, which copies s.framingKey onto
+	// every rebuilt page; the entries were re-encoded under this key, so recovery below
+	// must verify against it, not the pre-compaction key. validateHeader already proved
+	// the key readable.
+	fk, ok := readFramingKey(region)
+	if !ok {
+		_ = munmapAndClose(file, region)
+		return fmt.Errorf("cache: %s framing key unreadable after compaction", pagesPath)
+	}
+	s.framingKey = append([]byte(nil), fk...)
 	s.attachMmapRegion(file, region)
 	s.appliedIndex.Store(appliedIdx)
 	s.lastAppliedStampMs.Store(readAppliedStamp(region))

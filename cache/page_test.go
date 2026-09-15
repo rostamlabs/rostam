@@ -119,6 +119,7 @@ func TestEvictFrontRejectsTornEntry(t *testing.T) {
 func TestPageMmapWriteRead(t *testing.T) {
 	region := make([]byte, 4096)
 	p := newMmapPage(region)
+	p.framingKey = testFramingKey // mmap pages MAC their entries; production sets this at attach
 	off, _, err := p.Write([]byte("k"), []byte("v"), 0, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -135,6 +136,7 @@ func TestPageMmapWriteRead(t *testing.T) {
 func TestPageMmapBoundsSurviveOnlyViaProjection(t *testing.T) {
 	region := make([]byte, 4096)
 	p1 := newMmapPage(region)
+	p1.framingKey = testFramingKey
 	off, sz, _ := p1.Write([]byte("k"), []byte("v"), 0, 0)
 
 	// A bare re-wrap on the same region does NOT inherit the runtime bounds: after
@@ -167,6 +169,7 @@ func TestPageMmapBoundsSurviveOnlyViaProjection(t *testing.T) {
 func TestPageMmapWriteLeavesDurableHeaderToProjection(t *testing.T) {
 	region := make([]byte, 4096)
 	p := newMmapPage(region)
+	p.framingKey = testFramingKey
 	if _, _, err := p.Write([]byte("k"), []byte("v"), 0, 0); err != nil {
 		t.Fatal(err)
 	}

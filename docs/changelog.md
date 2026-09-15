@@ -5,6 +5,20 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **The persistent cache on-disk format is now v5, with keyed per-entry frame
+  integrity, so recovery and eviction lose only a damaged entry instead of the
+  rest of the page.** Each entry is now protected by a keyed message
+  authentication code, bound to the entry's position, rather than a plain
+  checksum. When a persistent (mmap) shard meets a corrupted or torn entry — at
+  warm restart or during eviction — it now skips just that entry and continues
+  with the entries after it, where before a single damaged entry discarded
+  everything following it on the page. Because the integrity code is keyed by a
+  per-file secret and tied to position, a value crafted to look like a stored
+  entry cannot be mistaken for one during this recovery. **Upgrade/downgrade:** a
+  v4 data file is upgraded to v5 automatically the first time this build opens it
+  (the upgrade is crash-safe and leaves the original in place if it cannot
+  complete); a v5 file cannot be opened by a build older than v0.7.0-beta5, which
+  refuses it rather than rewriting it.
 - **Security (GHSA-m63m-rp87-w4rf): a persistent cache no longer trusts a page's
   stored bounds after an unclean host shutdown.** On a power loss or kernel panic
   (not an ordinary process crash), a persistent (mmap) shard could recover a page

@@ -489,7 +489,7 @@ func (c *Cache) SetPBFrontier(seq, epoch uint64) {
 			slog.Warn("DURABILITY WARNING: bounds msync failed before pb frontier", "component", "cache", "pb_seq", seq, "pb_epoch", epoch, "err", err)
 			continue
 		}
-		// 5. Stamp the frontier and flush ONLY the 64-byte file header, strictly after
+		// 5. Stamp the frontier and flush ONLY the 128-byte file header, strictly after
 		//    the bounds it depends on are durable. Now every write the frontier names
 		//    is both on disk (step 2) and recoverable under a durable bound (step 4)
 		//    before the frontier that names it reaches disk. The in-memory frontier is
@@ -576,7 +576,7 @@ func (c *Cache) SetAppliedIndex(idx uint64, force bool) {
 				if err := syncRegion(s.file, s.region); err != nil {
 					slog.Warn("DURABILITY WARNING: bounds msync failed before applied-index", "component", "cache", "applied_index", idx, "err", err)
 				} else {
-					// 3. Stamp the applied index and flush ONLY the 64-byte header,
+					// 3. Stamp the applied index and flush ONLY the 128-byte header,
 					//    strictly after the bounds it depends on are durable, and
 					//    advance the in-memory index only now — so it can never name
 					//    entries a crash left unrecoverable.
