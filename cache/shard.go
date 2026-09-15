@@ -1762,8 +1762,44 @@ func (s *shard) Close() error {
 // copied/replayed to a different position. Byte-by-byte (not by any length field,
 // which after a tear is untrustworthy) is what makes it land exactly on the next
 // genuine frame boundary — the entry appended after the torn one.
+//
+// BOUNDED MAC WORK. A candidate offset costs a SipHash over its whole claimed frame
+// (key+value) before it can be rejected, and a page's value bytes can encode a large
+// in-bounds frame length at MANY offsets, so verifying every candidate would hash
+// O(sum of candidate lengths) = O(page^2) bytes — a crafted-then-crashed (or unluckily
+// corrupted) page could stall recovery/eviction for a very long time. That is an
+// availability bug, so the total MAC input is capped by a per-call BYTE BUDGET of
+// 2*len(entries): a header whose length does not fit is skipped for FREE (no hash,
+// mirroring decodeEntry's own 32-bit-safe bounds), and only a candidate whose frame
+// fits is charged its length and MAC-verified. The budget is a small multiple of the
+// page so the common case (a genuine frame a few entries past a single tear) always
+// fits, while a page that exceeds it is declared unrecoverable past the tear and
+// truncated — the pre-v5 behaviour, and safe. Worst-case hashed input is
+// budget + one page = O(PageSize). The MAC safety is unchanged: every candidate the
+// budget does allow is still verified at (nonce, c).
 func resyncForward(entries []byte, start, tail int, framingKey []byte, nonce uint64) (int, bool) {
+	budget := 2 * len(entries)
+	hashed := 0
 	for c := start; c < tail; c++ {
+		// Cheap peek: a candidate whose header does not fit, or whose claimed total runs
+		// past tail, cannot be a frame at c — skip it without hashing. These are exactly
+		// decodeEntry's bounds guards (including the 32-bit valLen-overflow checks), so a
+		// candidate that survives here is one decodeEntry would actually MAC.
+		if c+entryHeaderSize > tail {
+			continue
+		}
+		keyLen := int(binary.LittleEndian.Uint16(entries[c : c+2]))
+		valLen := int(binary.LittleEndian.Uint32(entries[c+2 : c+6]))
+		if valLen < 0 || valLen > tail-c-entryHeaderSize-keyLen {
+			continue
+		}
+		total := entryHeaderSize + keyLen + valLen
+		// Charge the frame's length before hashing it. If the budget is spent, give up:
+		// the caller truncates the remainder (pre-v5 behaviour) rather than hang.
+		hashed += total
+		if hashed > budget {
+			return tail, false
+		}
 		if _, _, _, _, err := decodeEntry(entries[c:tail], framingKey, nonce, uint32(c)); err == nil { //nolint:gosec // c < PageSize
 			return c, true
 		}

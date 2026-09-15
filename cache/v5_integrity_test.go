@@ -67,6 +67,52 @@ func TestRecoveryResyncDiscardsOnlyTheDamagedEntry(t *testing.T) {
 	}
 }
 
+// TestResyncForwardIsBudgeted pins the availability guard on the resync: its total
+// MAC work is capped by a per-call byte budget, so it cannot be driven quadratic by a
+// page that presents a valid frame length at many offsets. A genuine frame within the
+// budget's reach is still found (the common case is unaffected); a genuine frame only
+// reachable past the budget is NOT adopted — the scan gives up and the caller
+// truncates. The beyond-budget assertion fails PRE-FIX: an unbudgeted scan runs the
+// whole page and finds the far frame.
+func TestResyncForwardIsBudgeted(t *testing.T) {
+	const n = 1 << 16 // a modest page so the test is fast
+	const nonce = uint64(0)
+
+	// A zero-filled buffer with one genuine frame at offset g. Every zero offset is a
+	// tiny in-bounds candidate (keyLen=valLen=0) that costs one header's worth of MAC,
+	// so the budget (2*n) is reached after ~2*n/entryHeaderSize offsets.
+	build := func(g int) []byte {
+		buf := make([]byte, n)
+		frame := make([]byte, entrySpanExact(len("real"), len("value")))
+		if _, err := encodeEntry(frame, []byte("real"), []byte("value"), 0, makeMeta(1, false), testFramingKey, nonce, uint32(g)); err != nil {
+			t.Fatal(err)
+		}
+		copy(buf[g:], frame)
+		return buf
+	}
+
+	// WITHIN budget: a genuine frame a short way in is found and adopted.
+	if at, found := resyncForward(build(300), 0, n, testFramingKey, nonce); !found || at != 300 {
+		t.Errorf("within-budget: resyncForward = (%d,%v), want (300,true)", at, found)
+	}
+
+	// BEYOND budget: the same frame near the end is not reached — the budget is spent
+	// first and the scan truncates. Pre-fix (no budget) this returns (near-end, true).
+	if at, found := resyncForward(build(n-100), 0, n, testFramingKey, nonce); found || at != n {
+		t.Errorf("beyond-budget: resyncForward = (%d,%v), want (%d,false)", at, found, n)
+	}
+
+	// LARGE candidates: a single maximal in-bounds frame claimed at offset 0 alone
+	// charges ~a whole page of MAC input — the shape that makes an unbudgeted scan
+	// quadratic. With a genuine frame beyond, the budget still gives up.
+	buf := build(n - 100)
+	binary.LittleEndian.PutUint16(buf[0:2], 0)                         // keyLen = 0
+	binary.LittleEndian.PutUint32(buf[2:6], uint32(n-entryHeaderSize)) // valLen fills the page
+	if at, found := resyncForward(buf, 0, n, testFramingKey, nonce); found || at != n {
+		t.Errorf("large-candidate beyond-budget: resyncForward = (%d,%v), want (%d,false)", at, found, n)
+	}
+}
+
 // TestNonceRotatesAndRejectsReverseSkew pins the reverse-skew guard: when an mmap
 // extent is handed back to the write path, zeroDurableBoundsForReuseLocked rotates the
 // page nonce and persists it, so any old-life bytes still lying in the extent can no

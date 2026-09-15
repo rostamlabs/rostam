@@ -252,9 +252,15 @@ func (s *shard) migrateV4ToV5(dataDir, pagesPath string, v4file *os.File, v4regi
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("cache: migrate v4→v5: publish rename (v4 file left intact): %w", rerr)
 	}
+	// The directory fsync makes the rename durable. Unlike cold compaction — where a
+	// lost rename merely reappears as the intact original and losing it costs only the
+	// compaction — this is a MIGRATION of committed v4 data, so we must fail closed: if
+	// the fsync fails the rename may not survive a crash. Return the error and abort the
+	// open. On the next open the shard finds either the intact v4 file (rename lost, it
+	// re-migrates) or the complete v5 file (rename held) — both are whole files, so
+	// failing this open loses nothing.
 	if derr := syncDir(dataDir); derr != nil {
-		slog.Warn("cache: migrate v4→v5: directory fsync failed; the swap may not survive a crash",
-			"component", "cache", "dir", dataDir, "err", derr)
+		return fmt.Errorf("cache: migrate v4→v5: directory fsync after publish (retry the open): %w", derr)
 	}
 
 	// MAP + ATTACH the v5 file (no rebuild here — newShard rebuilds it next, on the
