@@ -2471,6 +2471,15 @@ func (s *shard) retirePageLocked(idx int) {
 // space-needing Put (see discardCorruptPageLocked).
 // Must be called with s.mu held for writing.
 //
+// POISONED-DRAIN DEGRADATION (fail-closed, not data loss). The victim's entries are
+// evicted from the index BEFORE the reuse barrier runs at the end, so if that barrier
+// fails the eviction has already happened — the page is empty — and the extent is
+// poisoned (reuseBarrierFailed) to keep it out of the writable set. Under a PERSISTENT
+// barrier fault each failed Put therefore still spends one victim page's eviction
+// before failing closed with ErrReuseBarrier. That is intended degradation (writes
+// fail rather than reuse a non-durable extent), not lost committed data: eviction only
+// drops cache entries the ringbuf policy was already free to discard.
+//
 // RESETTING WITHOUT SKIPPING LOSES NOTHING A DRAIN WOULD HAVE KEPT. This function
 // empties the page whether or not it meets a tear, and relocating eviction takes its
 // rescues off a page one eviction BEFORE the drain that empties it

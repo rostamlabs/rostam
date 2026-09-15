@@ -597,6 +597,12 @@ func (s *shard) findRelocDestLocked(need, srcIdx int) int {
 		if s.pages[i].retired {
 			continue // stranded extent awaiting a recycle stage; not writable.
 		}
+		if s.pages[i].reuseBarrierFailed {
+			// Poisoned: empty with full FreeTail, so a prime destination, but its cleared
+			// header is not yet on disk — it must not receive writes until the reset is
+			// durable, same reason firstPageWithRoomLocked skips it.
+			continue
+		}
 		if s.pages[i].FreeTail() >= need {
 			return i
 		}

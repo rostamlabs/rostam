@@ -364,3 +364,69 @@ func TestReuseBarrierRecycleSkipsPublishOnFault(t *testing.T) {
 		t.Fatal("a retired page was published/cleared despite the barrier failure; it must stay retired for a later tick")
 	}
 }
+
+// TestReuseBarrierRecoveryFlushFailsOpenWithColdCompaction is the cold-compaction-
+// ENABLED counterpart of TestReuseBarrierRecoveryFlushFailsOpen (which disables it).
+// With cold compaction enabled, newShard runs rebuildIndexFromPages and then
+// compactAtOpen -> remapPagesFile, both of which now propagate a recovery-flush error.
+// A corrupt page bound is corrected (and its flush faulted) by the FIRST rebuild, so
+// the open must still fail closed with ErrReuseBarrier and, crucially, must NOT rotate
+// the file aside (a barrier failure is a transient durability fault, not a bad file):
+// a .bad-* sibling would discard recoverable data, and the intact file must remain for
+// a retry once the fault clears.
+func TestReuseBarrierRecoveryFlushFailsOpenWithColdCompaction(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("mmap only on linux")
+	}
+	cfg := DefaultConfig()
+	cfg.NumShards = 1
+	cfg.PageSize = 1 << 20
+	cfg.MaxMemoryPerShard = 1 << 20
+	cfg.TTLSweepIntervalMs = 0
+	cfg.DisableColdCompaction = false // the point of this variant: exercise the open path with compaction on
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pages.dat")
+	writeCurrentFileWithEntries(t, path, cfg.PageSize, 1, [][2][]byte{
+		{[]byte("k0"), []byte("AAAA")},
+		{[]byte("k1"), []byte("BBBB")},
+	})
+
+	// Corrupt page 0's durable TAIL to an out-of-range value so recovery rejects the
+	// head/tail pair, resets the page, and must FLUSH the (0,0) correction — the flush
+	// we fault.
+	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], 0xFFFFFFF0)
+	if _, err := f.WriteAt(b[:], int64(headerSize+4)); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	prev := msyncTestHook
+	msyncTestHook = func(_ *os.File, _ []byte) error { return errInjectedBarrier }
+	defer func() { msyncTestHook = prev }()
+
+	s, err := newShard(cfg, dir, nil)
+	if err == nil {
+		_ = s.Close()
+		t.Fatal("newShard succeeded with cold compaction enabled despite a non-durable recovery correction; want fail-closed")
+	}
+	if !errors.Is(err, ErrReuseBarrier) {
+		t.Fatalf("newShard err = %v; want it to wrap ErrReuseBarrier", err)
+	}
+	// The file must be left intact — a durability fault is not a bad file, so it is not
+	// rotated aside; a retry after the fault clears must find it.
+	bad, _ := filepath.Glob(filepath.Join(dir, "pages.dat.bad-*"))
+	if len(bad) != 0 {
+		t.Fatalf("file was rotated aside on a barrier fault (%v); a transient durability fault must leave it intact", bad)
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Fatalf("pages.dat missing after a failed open: %v", statErr)
+	}
+}
