@@ -593,7 +593,12 @@ func (s *shard) remapPagesFile(pagesPath string, size int64) error {
 	// The pre-compaction index refers to page objects and offsets that no longer
 	// exist; rebuild it from the file now backing the shard.
 	s.tab.Store(newIndexTable(0))
-	s.rebuildIndexFromPages()
+	// A recovery-flush failure fails the remap, which fails the open (this runs only
+	// at construction time): a corrected durable bound that could not be flushed must
+	// not be served (see rebuildIndexFromPages).
+	if rerr := s.rebuildIndexFromPages(); rerr != nil {
+		return fmt.Errorf("cache: rebuild after compaction remap of %s: %w", pagesPath, rerr)
+	}
 	return nil
 }
 

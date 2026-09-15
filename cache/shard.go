@@ -48,6 +48,21 @@ var ErrCannotEvict = errors.New("cache: nothing left to evict and still no room"
 // errors.Is it through the apply path's multi-%w wrapping.
 var ErrFlushNotDurable = errors.New("cache: flush watermark not durable")
 
+// ErrReuseBarrier marks a write that could not proceed because the durable
+// REUSE-ORDERING barrier for an mmap extent failed — either the crypto/rand nonce
+// rotation or the msync of the reset (0,0)-bounds header (zeroDurableBoundsForReuseLocked).
+// It is NON-DETERMINISTIC across replicas: a local disk/entropy fault on one node
+// need not occur on its peers. The barrier is what makes a reused extent's cleared
+// header durable BEFORE the write path refills it, so failing it leaves a pending
+// durable-write obligation unmet; rather than write into a non-durable extent (which
+// a later crash could reopen as the torn-writeback resurrection/forge window), the
+// operation fails CLOSED and the extent stays unavailable. It surfaces from
+// putAtExpLocked / delH when an eviction of the victim page hits the barrier, so the
+// replicated apply path must treat it as fatal for the same reason ErrFull is (see
+// shard/apply_class.go). A client may retry — a transient fault clears and the write
+// then lands in a durably-reset extent.
+var ErrReuseBarrier = errors.New("cache: could not make reused page header durable")
+
 // shard is one independent slice of the cache: its own page list, lock,
 // and index. Shards do not share state and are safe to use concurrently
 // across goroutines.
@@ -520,7 +535,13 @@ func newShard(cfg Config, dataDir string, onRemove *atomic.Pointer[func([]byte)]
 
 	writeIdx := -1
 	if !fresh {
-		s.rebuildIndexFromPages()
+		// A recovery-flush failure REFUSES THE OPEN: a corrected/truncated durable
+		// bound that could not be made durable would let the next crash resurrect the
+		// stale bytes this rebuild just excluded (see rebuildIndexFromPages).
+		if rerr := s.rebuildIndexFromPages(); rerr != nil {
+			_ = munmapAndClose(s.file, s.region)
+			return nil, rerr
+		}
 		// Cold compaction: reclaim ghost page BYTES by rewriting the pages file
 		// with only the live entries, then mapping the compacted result. Safe
 		// precisely because it happens HERE — the shard has not been published to
@@ -667,7 +688,10 @@ func (s *shard) msyncPageHeaderLocked(idx int) error {
 	}
 	off := headerSize + idx*s.cfg.PageSize
 	start := off &^ (os.Getpagesize() - 1)
-	return msync(s.file, s.region[start:off+pageHdrSize])
+	// Routed through syncRegion (the msyncTestHook seam) so a test can fault-inject a
+	// reuse/recovery-barrier msync failure and assert the fail-closed behavior. The
+	// only production cost is one nil-pointer load per header flush.
+	return syncRegion(s.file, s.region[start:off+pageHdrSize])
 }
 
 // zeroDurableBoundsForReuseLocked rotates mmap page idx's per-page nonce, zeroes its
@@ -691,27 +715,47 @@ func (s *shard) msyncPageHeaderLocked(idx int) error {
 // Mandatory even on a non-Durable mmap shard, whose pages the OS still flushes lazily.
 // One small msync per page RESET, not per write. A no-op on a heap shard. Must hold
 // s.mu.
-func (s *shard) zeroDurableBoundsForReuseLocked(idx int) {
+//
+// FAILS CLOSED (returns an error). The nonce rotation and the header msync are a
+// SINGLE durable-write obligation, not a best-effort courtesy: dropping either one
+// reopens the torn-writeback window this guard exists to close (a crash could then
+// recover the extent's stale bytes under the old, larger bound / old nonce). So a
+// failure of the crypto/rand nonce draw or of the msync is RETURNED, and every caller
+// treats a non-nil return as "this extent is NOT safe to republish": the write path
+// leaves it unavailable and fails the operation, keeping the pending durable write
+// pending rather than committing it into a non-durable extent. The in-memory
+// projection is still made (as before) so the runtime bounds/nonce are correct if the
+// caller chooses to retry; what changes is only that a failed flush no longer lets the
+// extent go back into service.
+func (s *shard) zeroDurableBoundsForReuseLocked(idx int) error {
 	if !s.isMmap || s.region == nil {
-		return
+		return nil
 	}
 	p := s.pages[idx]
-	// A crypto/rand failure is rare and non-fatal here: the zeroed (0,0) bounds are
-	// the primary guard (recovery frames nothing until a later sync point advances the
-	// tail over freshly-MAC'd bytes), so keep the old nonce and proceed rather than
-	// fail the reuse.
-	if n, err := randomNonce(); err != nil {
-		slog.Warn("DURABILITY WARNING: could not rotate page nonce on reuse; reverse-skew guard rests on zeroed bounds alone",
-			"component", "cache", "page", idx, "err", err)
-	} else {
-		p.nonce = n
-		p.projectNonce(n)
+	// NONCE FIRST, and do NOT proceed on the old one. A crypto/rand failure leaves us
+	// with no fresh nonce, and reusing the extent under the PREVIOUS nonce would let a
+	// torn writeback that resurrects a stale bound present old-life bytes that still
+	// verify — exactly the forge window the rotation closes. Return before touching the
+	// bounds so the caller does not republish.
+	n, err := randomNonce()
+	if h := randomNonceTestHook; h != nil {
+		n, err = h()
 	}
+	if err != nil {
+		return fmt.Errorf("%w: rotate page nonce on reuse (page %d): %w", ErrReuseBarrier, idx, err)
+	}
+	p.nonce = n
+	p.projectNonce(n)
 	p.projectBounds(0, 0)
+	// The single msync makes both header writes ([8:16] nonce, [0:8] zeroed bounds)
+	// durable strictly BEFORE the extent is republished. If it fails, the durable
+	// header still names the extent's former (larger) bound and old nonce, so a later
+	// crash could frame its stale contents — return the error and leave the extent
+	// unavailable rather than logging and continuing into a non-durable reuse.
 	if err := s.msyncPageHeaderLocked(idx); err != nil {
-		slog.Warn("DURABILITY WARNING: msync of reset page header failed; a crash could recover stale bytes for this extent",
-			"component", "cache", "page", idx, "err", err)
+		return fmt.Errorf("%w: msync reset page header (page %d): %w", ErrReuseBarrier, idx, err)
 	}
+	return nil
 }
 
 // flushRecoveredBoundsLocked projects mmap page idx's CURRENT runtime bounds into
@@ -724,16 +768,26 @@ func (s *shard) zeroDurableBoundsForReuseLocked(idx int) {
 // bytes the corrected bounds name are already on disk (they decoded from it), so
 // there is no entries-before-bounds ordering to respect here. A no-op on a heap
 // shard / where the platform has no msync.
-func (s *shard) flushRecoveredBoundsLocked(idx int) {
+//
+// FAILS CLOSED (returns an error). If the msync fails, the corrected bound is only in
+// runtime while the durable header still holds the stale/torn one — so the next open
+// (or a reuse before the first sync point) would trust the bad bound again, and the
+// resurrection/truncation window recovery just closed would reopen on the next crash.
+// Returning the error lets shard construction REFUSE TO OPEN rather than serve a shard
+// whose recovered bound is not durable. That is an intentional availability-for-
+// integrity trade: a shard that cannot make its own recovery correction durable is
+// one whose next restart could silently resurrect stale bytes, so a loud open failure
+// (visible, retriable once the disk fault clears) is preferable to a silent one.
+func (s *shard) flushRecoveredBoundsLocked(idx int) error {
 	if !s.isMmap || s.region == nil {
-		return
+		return nil
 	}
 	p := s.pages[idx]
 	p.projectBounds(p.head(), p.tail())
 	if err := s.msyncPageHeaderLocked(idx); err != nil {
-		slog.Warn("DURABILITY WARNING: msync of recovered page header failed; a stale bound may persist on disk",
-			"component", "cache", "page", idx, "err", err)
+		return fmt.Errorf("%w: msync recovered page header (page %d): %w", ErrReuseBarrier, idx, err)
 	}
+	return nil
 }
 
 // now returns the wall-clock time in ms for the non-apply expiry sites (client
@@ -1851,7 +1905,18 @@ func resyncForward(entries []byte, start, tail int, framingKey []byte, nonce uin
 //
 // It also recovers writeSeq as max(seq) over every CRC-valid entry (see the field
 // doc): a torn tail fails its CRC and is rejected before it can contribute.
-func (s *shard) rebuildIndexFromPages() {
+//
+// FAILS CLOSED ON A RECOVERY-FLUSH FAILURE (returns an error). When it corrects a
+// page's durable bound — rejecting a corrupt head/tail or truncating a torn tail — it
+// must make that correction durable through flushRecoveredBoundsLocked, or the next
+// open (or a reuse before the first sync point) would trust the stale on-disk bound
+// again and reopen the resurrection/truncation window this rebuild just closed. If
+// that flush fails, the correction is not durable, so the rebuild returns the error
+// and shard construction REFUSES TO OPEN. This is an intentional availability-for-
+// integrity trade: a shard that cannot make its own recovery correction durable is
+// one whose next restart could silently resurrect stale bytes, and a loud open
+// failure (retriable once the disk fault clears) is preferable to serving it.
+func (s *shard) rebuildIndexFromPages() error {
 	now := s.now()
 	var maxSeq uint64
 	for pageIdx, p := range s.pages {
@@ -1882,8 +1947,11 @@ func (s *shard) rebuildIndexFromPages() {
 			// corrupt bound on disk — and the next open (or a reuse before the first
 			// sync point) would trust it again. Project (0,0) and flush this page's
 			// header now. The entries it named are being dropped, so nothing durable
-			// depends on ordering here.
-			s.flushRecoveredBoundsLocked(pageIdx)
+			// depends on ordering here. A flush failure fails the open (see the
+			// function doc): the correction would otherwise not survive the next crash.
+			if ferr := s.flushRecoveredBoundsLocked(pageIdx); ferr != nil {
+				return ferr
+			}
 			continue
 		}
 		if head == tail {
@@ -1944,8 +2012,11 @@ func (s *shard) rebuildIndexFromPages() {
 				// prefix [head, cursor) is already durable (its bytes decoded from disk),
 				// so reducing the durable tail to cursor names only on-disk bytes and,
 				// crucially, drops the torn region from the durable framing so a reuse
-				// before the first sync point cannot re-expose it.
-				s.flushRecoveredBoundsLocked(pageIdx)
+				// before the first sync point cannot re-expose it. A flush failure fails
+				// the open (see the function doc).
+				if ferr := s.flushRecoveredBoundsLocked(pageIdx); ferr != nil {
+					return ferr
+				}
 				break
 			}
 			// EXACT, and NOT HEAP-REACHABLE: rebuildIndexFromPages runs in mmap mode
@@ -1996,6 +2067,7 @@ func (s *shard) rebuildIndexFromPages() {
 	if maxSeq > s.writeSeq {
 		s.writeSeq = maxSeq
 	}
+	return nil
 }
 
 // indexedSeqAtLeast reports whether the index already resolves hash h to a
@@ -2408,8 +2480,11 @@ func (s *shard) drainPageLocked(victim int) error {
 			// bounds it rejects.
 			slog.Warn("corrupt page head/tail during eviction; resetting page",
 				"component", "cache", "page", victim, "head", p.head(), "tail", p.tail(), "cap", len(p.entries()))
-			s.discardCorruptPageLocked(victim, len(p.entries()), now)
-			return nil
+			// discardCorruptPageLocked resets the page and re-runs the durable
+			// reuse barrier; if that barrier fails, the page is NOT safely reset and
+			// the error propagates so this eviction (and the write that triggered it)
+			// fails closed rather than treating a non-durable extent as available.
+			return s.discardCorruptPageLocked(victim, len(p.entries()), now)
 		}
 		p := s.pages[victim]
 		head, tail := p.head(), p.tail()
@@ -2489,8 +2564,13 @@ func (s *shard) drainPageLocked(victim int) error {
 	// bound — recovery would then frame the extent's former contents. The corrupt-page
 	// exits above route through discardCorruptPageLocked, which zeroes the durable
 	// header the same way after its Reset.
-	s.zeroDurableBoundsForReuseLocked(victim)
-	return nil
+	//
+	// FAIL CLOSED. If the barrier msync (or nonce rotation) fails, the extent's cleared
+	// header is not on disk, so returning it to the write path would risk a crash
+	// recovering its stale bytes. Propagate the error instead: the caller (eviction →
+	// findOrMakePageLocked → putAtExpLocked/delH) fails the op, keeping the pending
+	// durable write pending rather than committing into a non-durable extent.
+	return s.zeroDurableBoundsForReuseLocked(victim)
 }
 
 // dropDamagedSlotsLocked tombstones every index slot addressing an offset in the
@@ -2532,7 +2612,12 @@ func (s *shard) dropDamagedSlotsLocked(victim int, gen uint16, lo, hi uint32) {
 // records the loss, drops every index slot still addressing the page, and resets it.
 // discarded must be non-negative — the caller has already decided what an honest
 // figure is for its case. Must hold mu for writing.
-func (s *shard) discardCorruptPageLocked(victim, discarded int, now uint64) {
+//
+// Returns the reuse-barrier error: the Reset clears only the RUNTIME bounds, and the
+// durable header is not safely cleared until zeroDurableBoundsForReuseLocked flushes
+// it. If that flush fails the page is NOT a safely-reset extent, so the caller must
+// not treat it as available — the error propagates to fail the triggering op closed.
+func (s *shard) discardCorruptPageLocked(victim, discarded int, now uint64) error {
 	p := s.pages[victim]
 	// Bytes before the incident: snapshot() loads the incident count first, so a
 	// concurrent snapshot can see the bytes of an incident it does not yet count, but
@@ -2574,8 +2659,10 @@ func (s *shard) discardCorruptPageLocked(victim, discarded int, now uint64) {
 	p.Reset()
 	// REUSE ORDERING (see zeroDurableBoundsForReuseLocked). Reset cleared only the
 	// runtime bounds; the durable header still names the discarded extent's bytes.
-	// Zero and flush it before the write path can refill this now-empty page.
-	s.zeroDurableBoundsForReuseLocked(victim)
+	// Zero and flush it before the write path can refill this now-empty page; on a
+	// barrier failure return the error so the caller fails closed rather than reusing
+	// a non-durable extent.
+	return s.zeroDurableBoundsForReuseLocked(victim)
 }
 
 // runSweeper expires entries past their TTL on a fixed cadence.

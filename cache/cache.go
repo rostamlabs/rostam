@@ -385,15 +385,18 @@ func (c *Cache) PBFrontier() (seq, epoch uint64) {
 }
 
 // msyncTestHook, when non-nil, is invoked in place of the real msync at the
-// watermark sync points (SetPBFrontier / SetAppliedIndex). It is a TEST-ONLY seam —
-// nil in production, so the only production cost is one nil-pointer load per flush —
-// and it lets a test observe the ORDER and coverage of those paths' flushes, which
-// is where the entries→bounds→watermark ordering is enforced. A hook must call the
+// watermark sync points (SetPBFrontier / SetAppliedIndex) AND at the per-page
+// reuse/recovery barrier (msyncPageHeaderLocked). It is a TEST-ONLY seam — nil in
+// production, so the only production cost is one nil-pointer load per flush — and it
+// lets a test observe the ORDER and coverage of the watermark flushes (where the
+// entries→bounds→watermark ordering is enforced) and fault-inject a barrier msync
+// failure to assert the reuse/recovery fail-closed behavior. A hook must call the
 // real msync itself if durability is wanted.
 var msyncTestHook func(f *os.File, region []byte) error
 
-// syncRegion is msync routed through the test seam. Only the watermark paths use it,
-// because they are the only ones whose flush ORDERING a test needs to verify.
+// syncRegion is msync routed through the test seam. Used by the watermark paths (whose
+// flush ORDERING a test needs to verify) and by msyncPageHeaderLocked (whose failure a
+// test needs to fault-inject to exercise the fail-closed reuse/recovery barrier).
 func syncRegion(f *os.File, region []byte) error {
 	if h := msyncTestHook; h != nil {
 		return h(f, region)
