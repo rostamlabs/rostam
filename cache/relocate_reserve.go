@@ -365,6 +365,20 @@ func (s *shard) reserveValidateVictimLocked(victim int, p *page) bool {
 // and the SUCCESS that ends a tick: the victim was evacuated and left in place —
 // PREPARED, so that whatever drains it next, a write-path eviction or the next tick's
 // first round, finds only dead versions.
+// reserveSkipPrepared reports whether this round has nothing to do on this page: it
+// was already walked end to end with everything movable moved, its bytes have not
+// changed since, and the shard is not short of room, so there is nothing to retire.
+//
+// Both halves are needed. Without the retire check a page would be skipped when the
+// shard actually needs it freed; without the tail check a page that has since been
+// appended to would be skipped with its new entries never examined. See
+// page.preparedTail for why the tail is the whole of the invalidation.
+//
+// Must be called with mu held: it reads page state the write path owns.
+func reserveSkipPrepared(retire bool, p *page) bool {
+	return !retire && p.preparedTail > 0 && p.preparedTail == p.tail()
+}
+
 func (s *shard) reserveEvacuateVictim(budget int) (int, bool) {
 	s.mu.Lock()
 	if len(s.pages) < s.cfg.MaxPagesPerShard() {
@@ -387,6 +401,22 @@ func (s *shard) reserveEvacuateVictim(budget int) (int, bool) {
 		return 0, false
 	}
 	p := s.pages[victim]
+	// ALREADY PREPARED, and the shard is not short of room. Walking it again would
+	// decode every entry and probe the index for each to reach the same conclusion
+	// the last walk reached, and the rotation cursor cannot move off it either:
+	// nextVictim only advances when a page is RETIRED, which needs `retire`. Left
+	// alone, that is one full page walk per tick, per shard, indefinitely — and the
+	// bigger the budget the longer it lasts, because freeRoomLocked sums free tail
+	// across more pages and holds `retire` false for longer.
+	//
+	// Skipping is safe precisely while the page's bytes are unchanged; see
+	// page.preparedTail for why nothing else can invalidate the conclusion. When the
+	// shard does run short, `retire` flips, this returns to the walk, and the page is
+	// retired on the round that follows.
+	if reserveSkipPrepared(retire, p) {
+		s.mu.Unlock()
+		return 0, false
+	}
 	s.mu.Unlock()
 	return s.reserveMoveVictim(victim, p, budget, retire)
 }
@@ -555,6 +585,12 @@ func (s *shard) reserveMoveVictim(victim int, p *page, budget int, retire bool) 
 			}
 		}
 		freed := false
+		if !stop && !skippedLive && cursor >= tail && !retire {
+			// Walked to the end with everything movable moved, but the shard has room
+			// so there is nothing to retire yet. Record where that finished, so the
+			// next tick does not repeat the walk for the same answer.
+			p.preparedTail = tail
+		}
 		if !stop && !skippedLive && cursor >= tail && retire {
 			// tail - relocatedOut >= minGain holds by construction: the loop above stops
 			// the moment it does not, so reaching the end of the page with stop unset is
