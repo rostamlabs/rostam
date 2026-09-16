@@ -444,6 +444,12 @@ func (s *shard) reserveMoveVictim(victim int, p *page, budget int, retire bool) 
 	// to false at every lock re-acquisition, which put the retire back exactly where the
 	// flag was added to stop it: dropping a live record, one chunk later.
 	skippedLive := false
+	// Set when an EXPIRED record is stepped over. Such a record is still in the index —
+	// findSlot found this very ref — so the page still holds something the retire walk
+	// would have tombstoned, and the walk is not finished with it the way skipping a
+	// superseded copy leaves it finished. Scoped to the whole walk for the same reason
+	// skippedLive is.
+	skippedExpired := false
 	for {
 		chunkEntries, chunkBytes, scanned, stop := 0, 0, 0, false
 		s.mu.Lock()
@@ -499,6 +505,7 @@ func (s *shard) reserveMoveVictim(victim int, p *page, budget int, retire bool) 
 			if isExpired(expiryMs, now) {
 				// The retire walk's to tombstone, exactly as today; carrying a corpse
 				// forward would spend budget to keep nothing.
+				skippedExpired = true
 				cursor += size
 				continue
 			}
@@ -585,7 +592,7 @@ func (s *shard) reserveMoveVictim(victim int, p *page, budget int, retire bool) 
 			}
 		}
 		freed := false
-		if !stop && !skippedLive && cursor >= tail && !retire {
+		if !stop && !skippedLive && !skippedExpired && cursor >= tail && !retire {
 			// Walked to the end with everything movable moved, but the shard has room
 			// so there is nothing to retire yet. Record where that finished, so the
 			// next tick does not repeat the walk for the same answer.
