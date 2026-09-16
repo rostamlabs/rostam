@@ -140,6 +140,33 @@ type page struct {
 	// contributes to it without consulting it, since its own budget is per-eviction.
 	// WRITE-PATH-ONLY state, guarded by shard.mu; zero on a shard neither pass runs on.
 	relocatedOut int
+
+	// preparedTail is the tail this page had when the background reserve last
+	// walked it end to end with nothing left to carry off (cache/relocate_reserve.go).
+	// It exists to stop the reserve re-walking a page it has already finished.
+	//
+	// WHY A TAIL AND NOT A FLAG. The walk's conclusion stays true for exactly as long
+	// as the page's bytes do. Appending to the page moves tail and can add live records,
+	// so the conclusion lapses and the walk must run again; nothing else can invalidate
+	// it. An entry can only go live -> dead (a later Put supersedes it, and a slabRef
+	// naming this page, generation and offset can never become current again), which
+	// leaves strictly LESS to carry off, and an in-place same-size update rewrites an
+	// entry where it lies, keeping its page, offset and generation, so it changes no
+	// liveness at all. Comparing tails therefore invalidates exactly when it must.
+	//
+	// EXPIRY IS THE ONE THING THE WALK CANNOT CONCLUDE ON. An entry the walk stepped
+	// over because it had expired is still in the index, so the page still holds
+	// something a retire would tombstone, and "nothing left to carry off" is not true
+	// of it. Expiry is also the one liveness test that is not a property of the page:
+	// it is read off a clock the page cannot see, and SetNowFunc makes that clock
+	// settable. So the reserve does not mark a page it stepped over an expired entry
+	// on — see relocate_reserve.go's skippedExpired.
+	//
+	// Zero means "never prepared", which is also every page's state on a shard the
+	// reserve does not run on. Cleared by Reset along with relocatedOut, since a reused
+	// page shares nothing with the one it replaces. WRITE-PATH-ONLY state, guarded by
+	// shard.mu.
+	preparedTail int
 }
 
 // newHeapPage allocates a heap-backed page of size bytes.
@@ -477,4 +504,5 @@ func (p *page) Reset() {
 	p.setHead(0)
 	p.setTail(0)
 	p.relocatedOut = 0
+	p.preparedTail = 0
 }
