@@ -76,8 +76,15 @@ type epollConn struct {
 // epollWriteBatchBytes is the soft ceiling on accumulated responses before the
 // drain loop writes them out. Without it a client that pipelines faster than the
 // socket drains could grow outBuf without bound, since one frame may be up to
-// MaxFrameSize. It sits below connBufRetainCap so a batch that overshoots it by
-// a frame is still small enough to keep, rather than reallocating on every read.
+// MaxFrameSize.
+//
+// It sits below connBufRetainCap so that a batch of ORDINARY replies overshoots
+// the threshold by little enough to stay retainable, which is what keeps a
+// steadily pipelining connection off the allocator. That is a property of small
+// replies, not a guarantee: MaxFrameSize is 16 MiB against a 64 KiB retain cap,
+// so a single large reply can push outBuf past it and the buffer is then
+// dropped rather than pinned -- the same trade the per-frame encode made for an
+// oversized response.
 const epollWriteBatchBytes = 32 << 10
 
 // appendResponse appends the response frame for (status, payload) to dst.
@@ -89,12 +96,20 @@ func appendResponse(dst []byte, status uint8, payload []byte) []byte {
 	return append(append(dst, hdr[:]...), payload...)
 }
 
+// epollWrites counts calls to gnet.Conn.Write from the drain loop. Read
+// boundaries on the far end do not identify a server's write calls -- TCP may
+// split one write across reads or coalesce several into one -- so a test that
+// counted client reads could pass on a per-frame implementation and fail on a
+// batching one. This is the only place the count is exact.
+var epollWrites atomic.Uint64
+
 // flushOut writes whatever has accumulated and empties the buffer, keeping its
 // array. Reports whether the connection is still usable.
 func flushOut(c gnet.Conn, out *[]byte) bool {
 	if len(*out) == 0 {
 		return true
 	}
+	epollWrites.Add(1)
 	_, err := c.Write(*out)
 	*out = (*out)[:0]
 	return err == nil

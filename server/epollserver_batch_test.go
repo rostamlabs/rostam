@@ -25,10 +25,10 @@ func frameBatch(args [][]byte) []byte {
 }
 
 // The point of accumulating responses is that a pipelined batch leaves in ONE
-// write, so the property under test is that a single client read carries all of
-// them. Writing per frame put each on its own syscall, and the client then saw
-// them one read at a time.
-func TestEpollBatchesPipelinedResponsesIntoOneRead(t *testing.T) {
+// write, so count the writes. Counting client READS cannot prove it: TCP may
+// split one write across several reads or coalesce several writes into one, so
+// that assertion can fail on this implementation and pass on the old one.
+func TestEpollBatchesPipelinedResponsesIntoOneWrite(t *testing.T) {
 	addr, stop := startEpoll(t, 0)
 	defer stop()
 
@@ -39,34 +39,21 @@ func TestEpollBatchesPipelinedResponsesIntoOneRead(t *testing.T) {
 	defer func() { _ = c.Close() }()
 
 	args := [][]byte{{1}, {2}, {3}, {4}}
+	before := epollWrites.Load()
 	if _, err := c.Write(frameBatch(args)); err != nil {
 		t.Fatal(err)
 	}
-
-	// 4 replies of "ok:" + 1 byte, each with a 9-byte frame header: 52 bytes, far
-	// below any segment boundary, so a split here means they were written apart.
-	want := 0
-	for range args {
-		want += 9 + len("ok:") + 1
-	}
-	if err := c.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	buf := make([]byte, 4096)
-	n, err := c.Read(buf)
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if n != want {
-		t.Fatalf("first read returned %d bytes, want all %d: the batch was not written in one syscall", n, want)
-	}
-
-	r := bytes.NewReader(buf[:n])
 	for i := range args {
-		status, payload := readResp(t, r)
+		status, payload := readResp(t, c)
 		if status != StatusOK || !bytes.Equal(payload, []byte{'o', 'k', ':', byte(i + 1)}) {
 			t.Fatalf("frame %d: status=%d payload=%q", i, status, payload)
 		}
+	}
+
+	// The four frames go out in one client write, so the server drains them in
+	// one pass. Anything above one write means a reply left on its own.
+	if n := epollWrites.Load() - before; n != 1 {
+		t.Errorf("%d server writes for a batch of %d frames, want 1", n, len(args))
 	}
 }
 
@@ -171,5 +158,43 @@ func TestAppendResponseFraming(t *testing.T) {
 	}
 	if r.Len() != 0 {
 		t.Errorf("%d trailing bytes after three frames", r.Len())
+	}
+}
+
+// The invalid-length exit changed from an immediate close to a break-and-flush,
+// and the flush-on-every-exit claim is only as good as its least-tested exit.
+// Replies earned before the bad frame must still arrive.
+func TestEpollFlushesRepliesEarnedBeforeAnInvalidFrame(t *testing.T) {
+	addr, stop := startEpoll(t, 0)
+	defer stop()
+
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// Two good frames, then a length the server must reject and close on.
+	batch := frameBatch([][]byte{{1}, {2}})
+	var bad [4]byte
+	binary.BigEndian.PutUint32(bad[:], uint32(MaxFrameSize+1))
+	if _, err := c.Write(append(batch, bad[:]...)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 2; i++ {
+		status, payload := readResp(t, c)
+		if status != StatusOK || !bytes.Equal(payload, []byte{'o', 'k', ':', byte(i)}) {
+			t.Fatalf("reply %d: status=%d payload=%q", i, status, payload)
+		}
+	}
+
+	// And the connection is then closed, rather than left open on a bad frame.
+	var scratch [1]byte
+	if _, err := c.Read(scratch[:]); err == nil {
+		t.Error("connection still readable after an invalid frame length")
 	}
 }
