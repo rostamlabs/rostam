@@ -48,7 +48,11 @@ type pipeConn struct {
 	authToken string
 	callT     time.Duration
 
-	mu     sync.Mutex
+	mu sync.Mutex
+	// queued counts callers blocked on mu with a frame to add. A caller holding
+	// the lock reads it to decide whether to pay for the flush itself or leave
+	// its bytes for the next writer to carry out with theirs.
+	queued atomic.Int32
 	w      *bufio.Writer
 	tcp    net.Conn
 	fifo   chan *pipeWaiter // cap == pipeline depth; a full fifo blocks the caller (backpressure)
@@ -85,6 +89,14 @@ func dialPipeConn(ctx context.Context, addr, authToken string, depth int, callT 
 	return pc, nil
 }
 
+// lockWrite takes the write lock, counting this caller as queued while it waits
+// so whoever holds the lock can see that another frame is about to follow.
+func (pc *pipeConn) lockWrite() {
+	pc.queued.Add(1)
+	pc.mu.Lock()
+	pc.queued.Add(-1)
+}
+
 // call sends op+args and blocks for its ordered response, ctx (or the
 // per-call timeout) cancellation, or the connection dying. On ctx cancel the
 // waiter is deliberately LEFT in the fifo: the reader still delivers this
@@ -100,7 +112,7 @@ func (pc *pipeConn) call(ctx context.Context, op string, args []byte) (uint8, []
 	}
 	w := &pipeWaiter{done: make(chan pipeResp, 1)}
 
-	pc.mu.Lock()
+	pc.lockWrite()
 	if pc.dead.Load() {
 		pc.mu.Unlock()
 		return 0, nil, errPipeDead
@@ -110,20 +122,37 @@ func (pc *pipeConn) call(ctx context.Context, op string, args []byte) (uint8, []
 	select {
 	case pc.fifo <- w:
 	default:
-		// Window full: block for a slot, but honor ctx so a stuck peer cannot
-		// pin the caller forever.
-		pc.mu.Unlock()
+		// Window full. Wait for a slot WITHOUT releasing the write lock: a caller
+		// that dropped the lock here could be overtaken by one that enqueued
+		// later but wrote first, and since responses are matched by fifo position
+		// rather than by a request id, that hands a caller someone else's answer.
+		//
+		// Holding the lock is only safe because the buffer is flushed first: the
+		// responses that free a slot are the ones for frames already written, so
+		// leaving them unflushed would wait for a slot that nothing can free.
+		if ferr := pc.w.Flush(); ferr != nil {
+			pc.mu.Unlock()
+			pc.fail(ferr)
+			return 0, nil, ferr
+		}
 		select {
 		case pc.fifo <- w:
-			pc.mu.Lock()
 		case <-ctx.Done():
+			pc.mu.Unlock()
 			return 0, nil, ctx.Err()
 		case <-pc.closed:
+			pc.mu.Unlock()
 			return 0, nil, errPipeDead
 		}
 	}
 	_, werr := pc.w.Write(frame)
-	if werr == nil {
+	// Flush only when nobody is queued behind us. A caller already blocked on mu
+	// is about to write into this same buffer, and its flush carries our bytes
+	// out with its own -- so a burst of concurrent calls costs ONE write syscall
+	// instead of one each. Every burst ends with a caller that sees zero queued,
+	// so nothing is ever left unflushed, and the wait is bounded by the mutex
+	// hand-off rather than by a timer.
+	if werr == nil && pc.queued.Load() == 0 {
 		werr = pc.w.Flush()
 	}
 	pc.mu.Unlock()
