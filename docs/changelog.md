@@ -11,6 +11,24 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   the point where the cache itself is cheap. The wire is byte for byte what it
   was and replies keep request order, so a client cannot tell except by counting
   reads. Nothing changes for a client that sends one request at a time.
+
+- **`PipelineDepth` now applies to `CallFunc`, not just `Call`.** Setting it
+  previously did nothing at all for a `CallFunc` caller: the client opened the
+  usual pooled connections, kept one request in flight on each, and reported no
+  error, so the knob looked enabled and was not. If you set `PipelineDepth` and
+  measured no change, this is why, and you will see a change now. Note what
+  comes with it: pipelined requests are concurrently in flight, so two writes to
+  the same key on one connection may apply in either order. On the pipelined
+  path the payload `CallFunc` hands to `fn` is that response's own allocation
+  rather than a slice of the connection's read buffer; the contract is unchanged
+  (valid only for the duration of `fn`), but the reason differs.
+- **Concurrent pipelined calls now share a write.** A pipelined connection
+  flushed after every frame, so pipelining removed the wait for a response but
+  not the syscall per request. Callers whose writes overlap now leave in one
+  write. The saving needs concurrency ON ONE connection: spreading the same rate
+  over more pipelined connections drops each below one concurrent caller and
+  there is nothing left to combine, so `PipelineConns` wants to be small.
+
 - **A persistent cache now fails closed if it cannot make a reused or recovered
   page's cleared header durable.** When the cache hands a page back to the write
   path (after emptying, discarding a corrupt page, or reclaiming dead space) it

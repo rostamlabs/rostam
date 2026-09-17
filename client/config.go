@@ -61,13 +61,20 @@ type Config struct {
 	// requests are concurrently in flight, so two writes to the SAME key on one
 	// connection may apply in either order — do not pipeline order-dependent
 	// writes (see client/pipeline.go). NotLeader auto-retry still applies. A
-	// reasonable value is 32–64. Pipelining routes the Call path only; CallFunc
-	// keeps the pooled path.
+	// reasonable value is 32–64. Both Call and CallFunc take the pipelined path.
 	PipelineDepth int32
 
 	// PipelineConns is the number of pipelined connections per server (round-
 	// robin) when PipelineDepth > 0. Default 4. More conns spread concurrent
 	// Calls and cap head-of-line blocking behind a slow response.
+	//
+	// It cuts the other way too, and the trade is easy to get backwards. Writes
+	// from callers that are in flight AT THE SAME INSTANT on the SAME connection
+	// leave in one syscall; spreading the same rate over more connections drops
+	// the concurrency on each, and below roughly one concurrent caller per
+	// connection there is nothing left to combine. Pipelining is what lets a
+	// client serve its load from FEWER connections -- keeping the pooled count
+	// while enabling it gives up that saving for no benefit.
 	PipelineConns int32
 
 	// Ops is the routing-only op registry for smart routing. If nil, the

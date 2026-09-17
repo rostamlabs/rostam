@@ -55,7 +55,12 @@ type pipeConn struct {
 	queued atomic.Int32
 	w      *bufio.Writer
 	tcp    net.Conn
-	fifo   chan *pipeWaiter // cap == pipeline depth; a full fifo blocks the caller (backpressure)
+	fifo   chan *pipeWaiter // cap == pipeline depth; holds waiters in wire order
+	// slots is the window itself: one token per in-flight request, taken before
+	// the write lock and handed back when the reader matches a response. It is
+	// what fifo's capacity used to do, split out so the WAIT for room happens
+	// where a caller can still be cancelled.
+	slots  chan struct{}
 	dead   atomic.Bool
 	closed chan struct{}
 }
@@ -83,6 +88,7 @@ func dialPipeConn(ctx context.Context, addr, authToken string, depth int, callT 
 		w:         bufio.NewWriterSize(tcp, 64<<10),
 		tcp:       tcp,
 		fifo:      make(chan *pipeWaiter, depth),
+		slots:     make(chan struct{}, depth),
 		closed:    make(chan struct{}),
 	}
 	go pc.readLoop(tcp)
@@ -96,6 +102,36 @@ func (pc *pipeConn) lockWrite() {
 	pc.mu.Lock()
 	pc.queued.Add(-1)
 }
+
+// reserve takes one of the connection's in-flight slots, waiting when the
+// window is full. Nothing is held while it waits, so a caller can still honour
+// its ctx, and the wait is bounded by the same per-call timeout the response
+// wait uses -- a caller should not queue for a slot longer than it would have
+// waited for the answer.
+func (pc *pipeConn) reserve(ctx context.Context) error {
+	select {
+	case pc.slots <- struct{}{}:
+		return nil
+	default:
+	}
+	t := time.NewTimer(pc.callT)
+	defer t.Stop()
+	select {
+	case pc.slots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return context.DeadlineExceeded
+	case <-pc.closed:
+		return errPipeDead
+	}
+}
+
+// release hands a slot back. Every reserve is paired with exactly one release:
+// the reader releases when it matches a response to its waiter, and call
+// releases on the one path that reserves without enqueueing.
+func (pc *pipeConn) release() { <-pc.slots }
 
 // call sends op+args and blocks for its ordered response, ctx (or the
 // per-call timeout) cancellation, or the connection dying. On ctx cancel the
@@ -112,39 +148,29 @@ func (pc *pipeConn) call(ctx context.Context, op string, args []byte) (uint8, []
 	}
 	w := &pipeWaiter{done: make(chan pipeResp, 1)}
 
+	// Take a window slot BEFORE the write lock. Waiting here is selectable, so
+	// the caller's ctx and its own call timeout stay live; waiting for one while
+	// HOLDING the write lock would make every caller behind it uncancellable,
+	// because sync.Mutex has no ctx-aware acquire and their deadlines cannot fire
+	// while a stalled peer keeps the holder parked.
+	if rerr := pc.reserve(ctx); rerr != nil {
+		return 0, nil, rerr
+	}
+
 	pc.lockWrite()
 	if pc.dead.Load() {
 		pc.mu.Unlock()
+		pc.release()
 		return 0, nil, errPipeDead
 	}
 	// Enqueue the waiter and write the frame under the SAME lock so wire order
-	// and fifo order are identical (the server replies in wire order).
-	select {
-	case pc.fifo <- w:
-	default:
-		// Window full. Wait for a slot WITHOUT releasing the write lock: a caller
-		// that dropped the lock here could be overtaken by one that enqueued
-		// later but wrote first, and since responses are matched by fifo position
-		// rather than by a request id, that hands a caller someone else's answer.
-		//
-		// Holding the lock is only safe because the buffer is flushed first: the
-		// responses that free a slot are the ones for frames already written, so
-		// leaving them unflushed would wait for a slot that nothing can free.
-		if ferr := pc.w.Flush(); ferr != nil {
-			pc.mu.Unlock()
-			pc.fail(ferr)
-			return 0, nil, ferr
-		}
-		select {
-		case pc.fifo <- w:
-		case <-ctx.Done():
-			pc.mu.Unlock()
-			return 0, nil, ctx.Err()
-		case <-pc.closed:
-			pc.mu.Unlock()
-			return 0, nil, errPipeDead
-		}
-	}
+	// and fifo order are identical: the server replies in wire order and a
+	// response is matched to its waiter by fifo POSITION, there being no request
+	// id on the wire. A caller that dropped the lock between the two could be
+	// overtaken by one that enqueued later but wrote first, and be handed
+	// someone else's answer. The send cannot block -- the reservation above is
+	// exactly the guarantee that fifo has room.
+	pc.fifo <- w
 	_, werr := pc.w.Write(frame)
 	// Flush only when nobody is queued behind us. A caller already blocked on mu
 	// is about to write into this same buffer, and its flush carries our bytes
@@ -195,6 +221,7 @@ func (pc *pipeConn) readLoop(tcp net.Conn) {
 		}
 		status, payload, derr := decodeResponse(body)
 		w := <-pc.fifo // FIFO: this response belongs to the oldest outstanding request
+		pc.release()   // the window has room again
 		w.done <- pipeResp{status: status, payload: payload, err: derr}
 	}
 }

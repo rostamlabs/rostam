@@ -758,10 +758,13 @@ func (e *errNotLeader) Error() string {
 	return fmt.Sprintf("client: not leader (hint: %q)", e.leaderAddr)
 }
 
-// CallFunc is like Call but invokes fn with the response payload while
-// the connection is still held — payload aliases the connection's read
-// buffer and is valid ONLY for the duration of fn. Use this to skip the
-// per-Call defensive copy when the response is consumed in place
+// CallFunc is like Call but invokes fn with the response payload before the
+// payload's owner moves on — payload is valid ONLY for the duration of fn. On
+// the pooled path it aliases the connection's read buffer, which is still held;
+// on the pipelined path (PipelineDepth > 0) it is that response's own
+// allocation, which the reader drops on return. Either way fn must not retain
+// it. Use this to skip the per-Call defensive copy when the response is
+// consumed in place
 // (e.g., parsed, written to an io.Writer, or copied into a caller-owned
 // buffer). fn is not invoked on non-OK statuses; the appropriate error
 // is returned instead. fn may be nil to discard the payload.
@@ -913,7 +916,9 @@ func (c *Client) callAddrPipelinedFunc(ctx context.Context, op string, args []by
 
 // callAddrFunc is the CallFunc core. It acquires a pooled conn, sends the
 // request, and on StatusOK invokes fn while still holding the conn so fn
-// can read payload zero-copy.
+// can read payload zero-copy. With PipelineDepth > 0 it hands off to
+// callAddrPipelinedFunc instead, which reaches the same contract by a
+// different route.
 func (c *Client) callAddrFunc(ctx context.Context, op string, args []byte, addr string, fn func([]byte) error) error {
 	if c.pipelining() {
 		return c.callAddrPipelinedFunc(ctx, op, args, addr, fn)

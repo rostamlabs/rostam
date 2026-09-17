@@ -3,12 +3,15 @@
 package client
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -227,5 +230,156 @@ func TestCallFuncHonoursPipelineDepth(t *testing.T) {
 	c.pipeMu.Unlock()
 	if sets == 0 {
 		t.Error("CallFunc opened no pipelined set: it took the pooled path despite PipelineDepth > 0")
+	}
+}
+
+// countingConn records how many times the transport was WRITTEN to, which is
+// the only honest place to count coalescing: TCP read boundaries on the far end
+// do not identify the caller's write calls. The delay makes the measurement
+// deterministic rather than scheduler-dependent -- while one caller is inside a
+// write, the others necessarily queue on the write lock, which is exactly the
+// condition the flush decision is supposed to detect.
+type countingConn struct {
+	net.Conn
+	delay  time.Duration
+	writes atomic.Int64
+}
+
+func (c *countingConn) Write(b []byte) (int, error) {
+	c.writes.Add(1)
+	if c.delay > 0 {
+		time.Sleep(c.delay)
+	}
+	return c.Conn.Write(b)
+}
+
+// newTestPipeConn builds a pipeConn over a caller-supplied transport. dialPipeConn
+// owns its dialer, so a test that needs to see the transport has to assemble one.
+func newTestPipeConn(t *testing.T, tcp net.Conn, depth int, callT time.Duration) *pipeConn {
+	t.Helper()
+	pc := &pipeConn{
+		callT:  callT,
+		w:      bufio.NewWriterSize(tcp, 64<<10),
+		tcp:    tcp,
+		fifo:   make(chan *pipeWaiter, depth),
+		slots:  make(chan struct{}, depth),
+		closed: make(chan struct{}),
+	}
+	go pc.readLoop(tcp)
+	t.Cleanup(pc.close)
+	return pc
+}
+
+// The point of the change is fewer writes, so count them. Without coalescing
+// this is one write per call.
+func TestPipelineCoalescesTransportWrites(t *testing.T) {
+	s := startPipeEchoServer(t)
+	raw, err := net.Dial("tcp", s.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cc := &countingConn{Conn: raw, delay: 5 * time.Millisecond}
+	pc := newTestPipeConn(t, cc, 64, 5*time.Second)
+
+	const callers = 24
+	var wg sync.WaitGroup
+	errs := make(chan error, callers)
+	start := make(chan struct{})
+	for i := range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			want := fmt.Appendf(nil, "w-%03d", i)
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			_, got, err := pc.call(ctx, "echo", want)
+			if err != nil {
+				errs <- fmt.Errorf("caller %d: %w", i, err)
+			} else if !bytes.Equal(got, want) {
+				errs <- fmt.Errorf("caller %d: got %q want %q", i, got, want)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+
+	writes := cc.writes.Load()
+	t.Logf("%d calls became %d transport writes", callers, writes)
+	if writes >= callers {
+		t.Errorf("%d transport writes for %d calls: nothing coalesced", writes, callers)
+	}
+}
+
+// stalledListener accepts and then says nothing, so a caller that got its frame
+// onto the wire waits for a response that never comes.
+func startStalledServer(t *testing.T) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() { _, _ = io.Copy(io.Discard, c) }() // drain, never reply
+		}
+	}()
+	t.Cleanup(func() { _ = ln.Close() })
+	return ln
+}
+
+// A full window must not make OTHER callers uncancellable.
+//
+// The window wait used to happen while holding the write lock. sync.Mutex has no
+// ctx-aware acquire, so every caller behind the parked one was stuck on
+// mu.Lock() and could not honour its own deadline: one stalled peer wedged the
+// whole connection indefinitely. Reserving the slot BEFORE the lock is what
+// makes the wait selectable.
+func TestPipelineFullWindowStillHonoursContext(t *testing.T) {
+	ln := startStalledServer(t)
+	raw, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// callT is deliberately far above the guard below. The slot wait is bounded
+	// by callT, so a guard at or near it would be satisfied by that bound rather
+	// than by the caller's own ctx -- and the test would pass even with the wait
+	// back inside the lock.
+	pc := newTestPipeConn(t, raw, 1, 30*time.Second) // depth 1: one call fills the window
+
+	// Filler takes the only slot and waits forever for a reply.
+	go func() {
+		_, _, _ = pc.call(context.Background(), "echo", []byte("filler"))
+	}()
+	// Parked never gives up its wait for a slot, so it is what a later caller
+	// would have been stuck behind.
+	go func() {
+		_, _, _ = pc.call(context.Background(), "echo", []byte("parked"))
+	}()
+	time.Sleep(150 * time.Millisecond) // let both reach their waits
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, _, callErr := pc.call(ctx, "echo", []byte("cancellable"))
+		done <- callErr
+	}()
+
+	select {
+	case callErr := <-done:
+		if callErr == nil {
+			t.Fatal("call succeeded against a server that never replies")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a caller could not honour its own deadline while the window was full")
 	}
 }
