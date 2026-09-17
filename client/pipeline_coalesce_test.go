@@ -189,3 +189,43 @@ func TestPipelineConcurrentCallsKeepTheirOwnAnswers(t *testing.T) {
 		t.Errorf("server saw %d frames, want %d", frames, callers)
 	}
 }
+
+// CallFunc is the zero-copy path the latency-sensitive callers use, and it had
+// its own connection-acquire that never consulted PipelineDepth. So a caller
+// could set the knob, see 64 pooled connections, and measure no change --
+// pipelining was simply off for it. Nothing else pins this.
+func TestCallFuncHonoursPipelineDepth(t *testing.T) {
+	s := startPipeEchoServer(t)
+	c, err := New(Config{
+		Servers:           []string{s.ln.Addr().String()},
+		PipelineDepth:     8,
+		PipelineConns:     1,
+		MaxConnsPerServer: 16,
+		CallTimeout:       5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	want := []byte("through-the-pipe")
+	var got []byte
+	if err := c.CallFunc(ctx, "echo", want, func(payload []byte) error {
+		got = append(got[:0], payload...) // payload is only ours for the callback
+		return nil
+	}); err != nil {
+		t.Fatalf("CallFunc: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("got %q want %q", got, want)
+	}
+
+	c.pipeMu.Lock()
+	sets := len(c.pipeSets)
+	c.pipeMu.Unlock()
+	if sets == 0 {
+		t.Error("CallFunc opened no pipelined set: it took the pooled path despite PipelineDepth > 0")
+	}
+}

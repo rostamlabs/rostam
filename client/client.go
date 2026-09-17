@@ -868,10 +868,56 @@ func (c *Client) callAddr(ctx context.Context, op string, args []byte, addr stri
 	}
 }
 
+// callAddrPipelinedFunc is callAddrFunc over a pipelined connection.
+//
+// It hands the payload to fn WITHOUT the defensive copy callAddrPipelined
+// makes, which is the whole point of the CallFunc path. That is safe here for a
+// reason specific to pipelining: the reader allocates a fresh body per response
+// because it cannot reuse one across responses in flight, so the payload is not
+// a shared connection buffer and nothing else can observe it.
+//
+// There is no conn to release: a pipelined connection is shared, not checked
+// out, and the reader has already moved on to the next response.
+func (c *Client) callAddrPipelinedFunc(ctx context.Context, op string, args []byte, addr string, fn func([]byte) error) error {
+	pc, err := c.getPipeSet(addr).pick(ctx)
+	if err != nil {
+		return err
+	}
+	status, payload, callErr := pc.call(ctx, op, args)
+	if callErr != nil {
+		// Post-transmission: the request may have committed before its response
+		// was lost, so mark it ambiguous and let CallFunc's retry guard refuse to
+		// replay a conditional write. pick() above is pre-transmission.
+		return &ambiguousError{err: callErr}
+	}
+	switch status {
+	case StatusOK:
+		if fn != nil {
+			return fn(payload)
+		}
+		return nil
+	case StatusNotFound:
+		return ErrNotFound
+	case StatusNotLeader:
+		hint, _ := decodeLeaderAddr(payload)
+		return &errNotLeader{leaderAddr: hint}
+	case StatusError:
+		msg, _ := decodeErrorMsg(payload)
+		return &RemoteError{Op: op, Msg: msg}
+	case StatusUnauthorized:
+		return ErrUnauthorized
+	default:
+		return fmt.Errorf("client: unknown response status %d", status)
+	}
+}
+
 // callAddrFunc is the CallFunc core. It acquires a pooled conn, sends the
 // request, and on StatusOK invokes fn while still holding the conn so fn
 // can read payload zero-copy.
 func (c *Client) callAddrFunc(ctx context.Context, op string, args []byte, addr string, fn func([]byte) error) error {
+	if c.pipelining() {
+		return c.callAddrPipelinedFunc(ctx, op, args, addr, fn)
+	}
 	pool, err := c.getOrCreatePool(addr)
 	if err != nil {
 		return err
