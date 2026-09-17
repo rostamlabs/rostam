@@ -241,10 +241,7 @@ func (s *EpollServer) OnTraffic(c gnet.Conn) gnet.Action {
 	// Every exit runs the same flush below, so a frame answered before the loop
 	// stopped is written whatever stopped it, exactly as writing per frame did.
 	action := gnet.None
-	for {
-		if c.InboundBuffered() < 4 {
-			break // not even a length prefix yet
-		}
+	for c.InboundBuffered() >= 4 { // stop once there is not even a length prefix
 		hdr, _ := c.Peek(4)
 		n := int(binary.BigEndian.Uint32(hdr))
 		if n <= 0 || n > MaxFrameSize {
