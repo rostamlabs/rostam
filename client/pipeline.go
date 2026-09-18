@@ -105,16 +105,16 @@ func (pc *pipeConn) lockWrite() {
 
 // reserve takes one of the connection's in-flight slots, waiting when the
 // window is full. Nothing is held while it waits, so a caller can still honour
-// its ctx, and the wait is bounded by the same per-call timeout the response
-// wait uses -- a caller should not queue for a slot longer than it would have
-// waited for the answer.
-func (pc *pipeConn) reserve(ctx context.Context) error {
+// its ctx, and the wait ends at the call's own deadline: queueing for a slot and
+// waiting for the answer are two phases of ONE call, so the budget is shared
+// rather than granted twice.
+func (pc *pipeConn) reserve(ctx context.Context, budget time.Time) error {
 	select {
 	case pc.slots <- struct{}{}:
 		return nil
 	default:
 	}
-	t := time.NewTimer(pc.callT)
+	t := time.NewTimer(time.Until(budget))
 	defer t.Stop()
 	select {
 	case pc.slots <- struct{}{}:
@@ -148,12 +148,17 @@ func (pc *pipeConn) call(ctx context.Context, op string, args []byte) (uint8, []
 	}
 	w := &pipeWaiter{done: make(chan pipeResp, 1)}
 
+	// ONE deadline for the whole call. Queueing for a window slot and waiting for
+	// the answer are phases of the same call, so giving each its own callT would
+	// let a call run to twice what CallTimeout documents as its cap.
+	budget := time.Now().Add(pc.callT)
+
 	// Take a window slot BEFORE the write lock. Waiting here is selectable, so
 	// the caller's ctx and its own call timeout stay live; waiting for one while
 	// HOLDING the write lock would make every caller behind it uncancellable,
 	// because sync.Mutex has no ctx-aware acquire and their deadlines cannot fire
 	// while a stalled peer keeps the holder parked.
-	if rerr := pc.reserve(ctx); rerr != nil {
+	if rerr := pc.reserve(ctx, budget); rerr != nil {
 		return 0, nil, rerr
 	}
 
@@ -187,7 +192,7 @@ func (pc *pipeConn) call(ctx context.Context, op string, args []byte) (uint8, []
 		return 0, nil, werr
 	}
 
-	deadline := time.NewTimer(pc.callT)
+	deadline := time.NewTimer(time.Until(budget)) // what is LEFT of the budget
 	defer deadline.Stop()
 	select {
 	case r := <-w.done:

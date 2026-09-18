@@ -44,7 +44,9 @@ type Config struct {
 	DialTimeout time.Duration
 
 	// CallTimeout caps how long an individual Call can take (when ctx has
-	// no deadline). Default 5s.
+	// no deadline). Default 5s. It is one budget for the WHOLE call: under
+	// PipelineDepth a call that has to queue for an in-flight slot spends part
+	// of this waiting for one, and the rest waiting for its answer.
 	CallTimeout time.Duration
 
 	// MaxNotLeaderHops bounds how many NotLeader hints the client follows

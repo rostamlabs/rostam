@@ -22,6 +22,12 @@ import (
 // coalescing this file is about.
 type pipeEchoServer struct {
 	ln net.Listener
+	// replyDelay holds each reply back, and maxReplies (0 = unlimited) stops
+	// answering after that many frames -- together they let a test free a window
+	// slot at a known moment and then leave the next caller waiting.
+	replyDelay time.Duration
+	maxReplies int
+	sent       int
 
 	mu       sync.Mutex
 	reads    int
@@ -82,7 +88,16 @@ func (s *pipeEchoServer) serve(c net.Conn) {
 				if batch > s.maxBatch {
 					s.maxBatch = batch
 				}
+				quiet := s.maxReplies > 0 && s.sent >= s.maxReplies
+				s.sent += batch
+				delay := s.replyDelay
 				s.mu.Unlock()
+				if quiet {
+					continue
+				}
+				if delay > 0 {
+					time.Sleep(delay)
+				}
 				if _, werr := c.Write(out); werr != nil {
 					return
 				}
@@ -381,5 +396,43 @@ func TestPipelineFullWindowStillHonoursContext(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("a caller could not honour its own deadline while the window was full")
+	}
+}
+
+// CallTimeout caps a CALL, not each phase of one. Queueing for a window slot and
+// waiting for the answer both used to start a fresh timer, so a call that waited
+// for a slot could run to nearly twice the documented cap.
+//
+// The server answers the first request after a delay and then goes silent: the
+// first caller frees the window part-way through the second caller's budget, and
+// the second then waits for an answer that never comes. With a shared budget it
+// gives up at the cap; with a timer per phase it runs well past it.
+func TestPipelineOneTimeoutBudgetForTheWholeCall(t *testing.T) {
+	s := startPipeEchoServer(t)
+	s.mu.Lock()
+	s.replyDelay, s.maxReplies = 600*time.Millisecond, 1
+	s.mu.Unlock()
+
+	raw, err := net.Dial("tcp", s.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const callT = time.Second
+	pc := newTestPipeConn(t, raw, 1, callT) // depth 1: the second caller must queue
+
+	go func() { _, _, _ = pc.call(context.Background(), "echo", []byte("first")) }()
+	time.Sleep(50 * time.Millisecond) // let it take the only slot
+
+	start := time.Now()
+	_, _, callErr := pc.call(context.Background(), "echo", []byte("second"))
+	elapsed := time.Since(start)
+
+	if callErr == nil {
+		t.Fatal("call succeeded although the server answered only the first request")
+	}
+	// The slot frees at ~600ms, leaving ~400ms of the 1s budget. A fresh timer
+	// would instead run to ~1.6s.
+	if elapsed > callT+300*time.Millisecond {
+		t.Errorf("call took %v against a %v cap: the slot wait and the response wait each got their own budget", elapsed, callT)
 	}
 }
