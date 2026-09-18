@@ -57,37 +57,62 @@ type EpollServer struct {
 
 // epollConn is per-connection state. lastActiveNanos is updated on every OnTraffic
 // (event-loop goroutine) and read by the idle sweep (ticker goroutine), so it is
-// an atomic. respBuf is a reused response scratch buffer — safe because gnet's
-// Conn.Write does not retain the caller's slice (it writes synchronously or copies
-// the remainder into its outbound buffer). Only the connection's own event loop
-// touches respBuf, so it needs no synchronization.
+// an atomic. The buffers are touched only by the connection's own event loop, so
+// they need no synchronization, and reusing them is safe because gnet's Conn.Write
+// does not retain the caller's slice (it writes synchronously or copies the
+// remainder into its outbound buffer).
 type epollConn struct {
 	lastActiveNanos atomic.Int64
-	respBuf         []byte
+	// outBuf accumulates the responses to every frame drained in ONE OnTraffic, so
+	// a pipelined batch costs one write syscall instead of one per frame.
+	outBuf []byte
 	// payloadBuf is the reply buffer handed to dispatchInto, reused across every
-	// frame on this connection. encode() COPIES the payload into respBuf before
-	// the loop reads the next request, so overwriting it on the next iteration is
-	// safe; see AppendDispatcher.
+	// frame on this connection. appendResponse COPIES the payload into outBuf
+	// before the loop reads the next request, so overwriting it on the next
+	// iteration is safe; see AppendDispatcher.
 	payloadBuf []byte
 }
 
-// encode writes the response frame into the connection's reused buffer and returns
-// it (valid until the next encode on this connection). Responses larger than the
-// retain cap are one-off allocations so a single huge reply is not pinned per conn.
-func (m *epollConn) encode(status uint8, payload []byte) []byte {
-	need := 9 + len(payload)
-	if need > connBufRetainCap {
-		return encodeResponse(status, payload)
+// epollWriteBatchBytes is the soft ceiling on accumulated responses before the
+// drain loop writes them out. Without it a client that pipelines faster than the
+// socket drains could grow outBuf without bound, since one frame may be up to
+// MaxFrameSize.
+//
+// It sits below connBufRetainCap so that a batch of ORDINARY replies overshoots
+// the threshold by little enough to stay retainable, which is what keeps a
+// steadily pipelining connection off the allocator. That is a property of small
+// replies, not a guarantee: MaxFrameSize is 16 MiB against a 64 KiB retain cap,
+// so a single large reply can push outBuf past it and the buffer is then
+// dropped rather than pinned -- the same trade the per-frame encode made for an
+// oversized response.
+const epollWriteBatchBytes = 32 << 10
+
+// appendResponse appends the response frame for (status, payload) to dst.
+func appendResponse(dst []byte, status uint8, payload []byte) []byte {
+	var hdr [9]byte
+	binary.BigEndian.PutUint32(hdr[0:4], uint32(1+4+len(payload))) //nolint:gosec // bounded by clampResponse
+	hdr[4] = status
+	binary.BigEndian.PutUint32(hdr[5:9], uint32(len(payload))) //nolint:gosec // bounded above
+	return append(append(dst, hdr[:]...), payload...)
+}
+
+// epollWrites counts calls to gnet.Conn.Write from the drain loop. Read
+// boundaries on the far end do not identify a server's write calls -- TCP may
+// split one write across reads or coalesce several into one -- so a test that
+// counted client reads could pass on a per-frame implementation and fail on a
+// batching one. This is the only place the count is exact.
+var epollWrites atomic.Uint64
+
+// flushOut writes whatever has accumulated and empties the buffer, keeping its
+// array. Reports whether the connection is still usable.
+func flushOut(c gnet.Conn, out *[]byte) bool {
+	if len(*out) == 0 {
+		return true
 	}
-	if cap(m.respBuf) < need {
-		m.respBuf = make([]byte, need)
-	}
-	b := m.respBuf[:need]
-	binary.BigEndian.PutUint32(b[0:4], uint32(1+4+len(payload))) //nolint:gosec // bounded by MaxFrameSize on write
-	b[4] = status
-	binary.BigEndian.PutUint32(b[5:9], uint32(len(payload))) //nolint:gosec // bounded above
-	copy(b[9:], payload)
-	return b
+	epollWrites.Add(1)
+	_, err := c.Write(*out)
+	*out = (*out)[:0]
+	return err == nil
 }
 
 // NewEpollServer builds an epoll transport bound to the given Dispatcher/Authenticator.
@@ -201,26 +226,31 @@ func (s *EpollServer) OnTick() (time.Duration, gnet.Action) {
 }
 
 // OnTraffic drains every COMPLETE frame currently buffered for c, dispatches each,
-// and queues its response. Partial frames stay in gnet's inbound buffer until the
-// rest arrives (OnTraffic fires again). Returning gnet.None keeps the connection;
-// gnet flushes queued writes after this returns.
+// and appends its response to one buffer, written out in a single syscall when the
+// drain finishes. Partial frames stay in gnet's inbound buffer until the rest
+// arrives (OnTraffic fires again). Returning gnet.None keeps the connection.
 func (s *EpollServer) OnTraffic(c gnet.Conn) gnet.Action {
-	m, _ := c.Context().(*epollConn) // set in OnOpen; holds the reused response buffer
+	m, _ := c.Context().(*epollConn) // set in OnOpen; holds the reused buffers
 	if m != nil && s.idleTimeout > 0 {
 		m.lastActiveNanos.Store(time.Now().UnixNano()) // same-loop write; idle sweep reads atomically
 	}
-	for {
-		if c.InboundBuffered() < 4 {
-			return gnet.None // not even a length prefix yet
-		}
+	var out []byte
+	if m != nil {
+		out = m.outBuf[:0]
+	}
+	// Every exit runs the same flush below, so a frame answered before the loop
+	// stopped is written whatever stopped it, exactly as writing per frame did.
+	action := gnet.None
+	for c.InboundBuffered() >= 4 { // stop once there is not even a length prefix
 		hdr, _ := c.Peek(4)
 		n := int(binary.BigEndian.Uint32(hdr))
 		if n <= 0 || n > MaxFrameSize {
 			slog.Warn("epoll invalid frame length", "transport", "tcp", "len", n)
-			return gnet.Close
+			action = gnet.Close
+			break
 		}
 		if c.InboundBuffered() < 4+n {
-			return gnet.None // body not fully arrived; wait for more
+			break // body not fully arrived; wait for more
 		}
 		// Consume the whole frame. buf aliases gnet's inbound buffer and is only
 		// valid until the next read on c — we finish with it (copy payload into the
@@ -250,19 +280,22 @@ func (s *EpollServer) OnTraffic(c gnet.Conn) gnet.Action {
 		// request, forever. `appended` excludes the freshly built error and
 		// not-leader frames that aliasing used to screen out.
 		if m != nil && appended && cap(payload) > cap(m.payloadBuf) && cap(payload) <= connBufRetainCap {
-			m.payloadBuf = payload // keep the larger array; bounded like respBuf
+			m.payloadBuf = payload // keep the larger array; bounded like outBuf
 		}
 		status, payload = clampResponse(status, payload) // match Server.writeResponse's MaxFrameSize bound
-		var resp []byte
-		if m != nil {
-			resp = m.encode(status, payload) // reuses the per-conn buffer (gnet.Write doesn't retain it)
-		} else {
-			resp = encodeResponse(status, payload)
-		}
-		if _, err := c.Write(resp); err != nil {
-			return gnet.Close
+		out = appendResponse(out, status, payload)
+		if len(out) >= epollWriteBatchBytes && !flushOut(c, &out) {
+			action = gnet.Close
+			break
 		}
 	}
+	if !flushOut(c, &out) {
+		action = gnet.Close
+	}
+	if m != nil && cap(out) <= connBufRetainCap {
+		m.outBuf = out // drop an array a huge reply grew, as the per-frame encode did
+	}
+	return action
 }
 
 // clampResponse enforces the same MaxFrameSize bound Server.writeResponse applies
@@ -275,17 +308,4 @@ func clampResponse(status uint8, payload []byte) (uint8, []byte) {
 		return StatusError, EncodeErrorPayload("response exceeds MaxFrameSize")
 	}
 	return status, payload
-}
-
-// encodeResponse builds one response frame: {bodyLen u32}{status u8}{payloadLen u32}{payload}.
-// Mirrors writeResponse but returns bytes (gnet writes buffers, not a bufio.Writer).
-// Callers pass MaxFrameSize-bounded payloads (see clampResponse).
-func encodeResponse(status uint8, payload []byte) []byte {
-	bodyLen := 1 + 4 + len(payload)
-	resp := make([]byte, 9+len(payload))
-	binary.BigEndian.PutUint32(resp[0:4], uint32(bodyLen)) //nolint:gosec // bounded by MaxFrameSize on write
-	resp[4] = status
-	binary.BigEndian.PutUint32(resp[5:9], uint32(len(payload))) //nolint:gosec // bounded above
-	copy(resp[9:], payload)
-	return resp
 }

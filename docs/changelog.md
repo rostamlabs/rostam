@@ -5,6 +5,12 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **The TCP server answers a pipelined batch with one write instead of one per
+  frame.** A client that sends several requests in a single write now gets its
+  replies back in a single write, which is a large share of the server's CPU at
+  the point where the cache itself is cheap. The wire is byte for byte what it
+  was and replies keep request order, so a client cannot tell except by counting
+  reads. Nothing changes for a client that sends one request at a time.
 - **A persistent cache now fails closed if it cannot make a reused or recovered
   page's cleared header durable.** When the cache hands a page back to the write
   path (after emptying, discarding a corrupt page, or reclaiming dead space) it
