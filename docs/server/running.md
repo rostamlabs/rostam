@@ -58,7 +58,7 @@ This is what makes a container or a Kubernetes ConfigMap workable — otherwise
 59 flags have to be assembled into one command line.
 
 ```sh
-docker run -p 8080:8080 \
+docker run -p 127.0.0.1:8080:8080 \
   -e ROSTAM_API_KEY=secret \
   -e ROSTAM_SHARDS=16 \
   rostam-server

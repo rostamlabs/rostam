@@ -76,7 +76,7 @@ runtime dependencies.
 === "Docker"
 
     ```sh
-    docker run -p 8080:8080 -e ROSTAM_API_KEY=secret ghcr.io/rostamlabs/rostam
+    docker run -p 127.0.0.1:8080:8080 -e ROSTAM_API_KEY=secret ghcr.io/rostamlabs/rostam
     ```
 
     Multi-arch (amd64/arm64). The image binds `0.0.0.0`, so it **requires** a
@@ -90,7 +90,7 @@ runtime dependencies.
     REST; add TCP for the Go client, which speaks only the binary protocol:
 
     ```sh
-    docker run -p 8080:8080 -p 7000:7000 -e ROSTAM_API_KEY=secret \
+    docker run -p 127.0.0.1:8080:8080 -p 127.0.0.1:7000:7000 -e ROSTAM_API_KEY=secret \
       ghcr.io/rostamlabs/rostam
     ```
 
