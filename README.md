@@ -278,8 +278,8 @@ curl -s localhost:8080/v1/collections/docs/points/search \
 ### Or in a container
 
 The image binds `0.0.0.0`, so it **requires authentication** — pass the token by
-environment variable, which keeps it out of the process table and out of
-`docker inspect`:
+environment variable, which keeps it out of the process table (though
+`docker inspect` still shows it under `Config.Env`):
 
 ```sh
 docker build -f cmd/rostam-server/Dockerfile -t rostam-server .
