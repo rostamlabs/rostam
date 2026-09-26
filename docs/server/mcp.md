@@ -152,10 +152,10 @@ Rostam has a third embedder option — an in-process model — alongside BM25-on
 and `ROSTAM_EMBED_ENDPOINT`. No cloud API, no network call per embed. It is
 **pure Go** ([rembed](https://github.com/rostamlabs/rembed)): no cgo, no ONNX
 Runtime, no shared library to install, and no build tag — it is compiled into
-every binary and image. Nothing to build:
+every binary and image. Nothing to build — just set the model:
 
 ```sh
-go build ./cmd/rostam-server   # local embeddings are already in
+ROSTAM_EMBED_LOCAL=minilm-l6-v2 rostam-server -http 127.0.0.1:8080 -data ./data
 ```
 
 ### Docker

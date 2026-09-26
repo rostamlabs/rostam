@@ -258,7 +258,7 @@ See [Local embeddings](docs/server/mcp.md) for the model catalog and configurati
 ## Quick start — run the server
 
 ```sh
-go run ./cmd/rostam-server -http 127.0.0.1:8080 -data ./data
+rostam-server -http 127.0.0.1:8080 -data ./data
 ```
 
 With no authenticator configured the server **refuses to bind a reachable
