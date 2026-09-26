@@ -7,10 +7,10 @@ are identical regardless of how you connect.
 ```sh
 # install the release binary (verifies the checksum), then run it
 curl -fsSL https://rostamlabs.com/install.sh | sh
-rostam-server -http 127.0.0.1:8080 -grpc 127.0.0.1:9090 -tcp 127.0.0.1:7000 -data ./data
+~/.local/bin/rostam-server -http 127.0.0.1:8080 -grpc 127.0.0.1:9090 -tcp 127.0.0.1:7000 -data ./data
 
-# or run the container image
-docker run -p 8080:8080 -e ROSTAM_API_KEY=secret ghcr.io/rostamlabs/rostam
+# or run the container image (published on loopback only)
+docker run -p 127.0.0.1:8080:8080 -e ROSTAM_API_KEY=secret ghcr.io/rostamlabs/rostam
 ```
 
 Building from source instead is covered in the
