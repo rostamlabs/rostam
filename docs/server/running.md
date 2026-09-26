@@ -5,13 +5,16 @@ compact binary TCP protocol — all dispatching into the same store, so semantic
 are identical regardless of how you connect.
 
 ```sh
-# from a repo clone
-go run ./cmd/rostam-server -http 127.0.0.1:8080 -data ./data
+# install the release binary (verifies the checksum), then run it
+curl -fsSL https://rostamlabs.com/install.sh | sh
+~/.local/bin/rostam-server -http 127.0.0.1:8080 -grpc 127.0.0.1:9090 -tcp 127.0.0.1:7000 -data ./data
 
-# or build a binary
-go build -o rostam-server ./cmd/rostam-server
-./rostam-server -http 127.0.0.1:8080 -grpc 127.0.0.1:9090 -tcp 127.0.0.1:7000 -data ./data
+# or run the container image (published on loopback only)
+docker run -p 127.0.0.1:8080:8080 -e ROSTAM_API_KEY=secret ghcr.io/rostamlabs/rostam
 ```
+
+Building from source instead is covered in the
+[Quickstart](../quickstart.md#install-the-server).
 
 !!! warning "A bare `:8080` will not start without authentication"
 
@@ -55,7 +58,7 @@ This is what makes a container or a Kubernetes ConfigMap workable — otherwise
 59 flags have to be assembled into one command line.
 
 ```sh
-docker run -p 8080:8080 \
+docker run -p 127.0.0.1:8080:8080 \
   -e ROSTAM_API_KEY=secret \
   -e ROSTAM_SHARDS=16 \
   rostam-server

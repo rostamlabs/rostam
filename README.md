@@ -212,7 +212,7 @@ curl -fsSL https://raw.githubusercontent.com/rostamlabs/rostam/main/install.sh \
   | ROSTAM_INSTALL_DIR=/usr/local/bin sh
 
 # Container (amd64 + arm64)
-docker run -p 8080:8080 -e ROSTAM_API_KEY=secret ghcr.io/rostamlabs/rostam:latest
+docker run -p 127.0.0.1:8080:8080 -e ROSTAM_API_KEY=secret ghcr.io/rostamlabs/rostam:latest
 
 # Go toolchain
 go install github.com/rostamlabs/rostam/cmd/rostam-server@latest   # the server
@@ -243,7 +243,7 @@ no cgo, no ONNX Runtime, nothing to install — so they are built into every
 binary and image. Just point at a model:
 
 ```sh
-docker run -p 8080:8080 -e ROSTAM_API_KEY=secret \
+docker run -p 127.0.0.1:8080:8080 -e ROSTAM_API_KEY=secret \
   -e ROSTAM_EMBED_LOCAL=minilm-l6-v2 -e REMBED_CACHE=/models -v rostam-models:/models \
   ghcr.io/rostamlabs/rostam:latest
 ```
@@ -258,7 +258,7 @@ See [Local embeddings](docs/server/mcp.md) for the model catalog and configurati
 ## Quick start — run the server
 
 ```sh
-go run ./cmd/rostam-server -http 127.0.0.1:8080 -data ./data
+rostam-server -http 127.0.0.1:8080 -data ./data
 ```
 
 With no authenticator configured the server **refuses to bind a reachable
@@ -278,12 +278,12 @@ curl -s localhost:8080/v1/collections/docs/points/search \
 ### Or in a container
 
 The image binds `0.0.0.0`, so it **requires authentication** — pass the token by
-environment variable, which keeps it out of the process table and out of
-`docker inspect`:
+environment variable, which keeps it out of the process table (though
+`docker inspect` still shows it under `Config.Env`):
 
 ```sh
 docker build -f cmd/rostam-server/Dockerfile -t rostam-server .
-docker run -p 8080:8080 -e ROSTAM_API_KEY=secret rostam-server
+docker run -p 127.0.0.1:8080:8080 -e ROSTAM_API_KEY=secret rostam-server
 
 curl -s localhost:8080/v1/collections -H 'Authorization: Bearer secret' \
   -d '{"name":"docs","config":{"dim":4,"metric":"cosine"}}'
