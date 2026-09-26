@@ -5,7 +5,7 @@ go 1.26.5
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/jackc/puddle/v2 v2.2.2
-	github.com/rostamlabs/rostam/sdk v0.1.0
+	github.com/rostamlabs/rostam/sdk v0.2.0
 )
 
 require (
