@@ -27,7 +27,7 @@ require (
 	github.com/mattn/go-colorable v0.1.12 // indirect
 	github.com/mattn/go-isatty v0.0.14 // indirect
 	github.com/panjf2000/ants/v2 v2.12.1 // indirect
-	github.com/rostamlabs/rostam/client v0.0.0-00010101000000-000000000000
+	github.com/rostamlabs/rostam/client v0.2.0
 	github.com/rostamlabs/rostam/sdk v0.2.0
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
@@ -38,7 +38,3 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 )
-
-replace github.com/rostamlabs/rostam/sdk => ./sdk
-
-replace github.com/rostamlabs/rostam/client => ./client

@@ -1,0 +1,41 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.rostamlabs/rostam",
+  "title": "Rostam",
+  "description": "Persistent agent memory and vector search. Built-in BM25, no embedding API key needed.",
+  "repository": {
+    "url": "https://github.com/rostamlabs/rostam",
+    "source": "github"
+  },
+  "websiteUrl": "https://docs.rostamlabs.com/rostam/server/mcp/",
+  "version": "0.7.0",
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/rostamlabs/rostam:0.7.0",
+      "runtimeHint": "docker",
+      "runtimeArguments": [
+        {
+          "type": "positional",
+          "value": "-i",
+          "description": "Keep stdin open; the stdio server exits when it closes"
+        },
+        {
+          "type": "named",
+          "name": "-v",
+          "value": "rostam-memory:/home/rostam/.rostam",
+          "description": "Named volume so memory survives container restarts"
+        }
+      ],
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ],
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

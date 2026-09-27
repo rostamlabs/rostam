@@ -27,6 +27,9 @@ COPY --from=ui /ui/dist/. ./dashboard/dist/
 RUN CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o /out/rostam-server ./cmd/rostam-server
 
 FROM debian:bookworm-slim
+# Proves to the official MCP Registry that this image is the one server.json
+# lists (`docker run -i --rm <image> mcp` is the stdio server).
+LABEL io.modelcontextprotocol.server.name="io.github.rostamlabs/rostam"
 RUN useradd -m -u 10001 rostam && mkdir -p /data && chown rostam:rostam /data
 COPY --from=build /out/rostam-server /usr/local/bin/rostam-server
 USER rostam

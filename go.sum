@@ -130,6 +130,10 @@ github.com/prometheus/procfs v0.1.3/go.mod h1:lV6e/gmhEcM9IjHGsFOCxxuZ+z1YqCvr4O
 github.com/prometheus/procfs v0.6.0/go.mod h1:cz+aTbrPOrUb4q7XlbU9ygM+/jj0fzG6c1xBZuNvfVA=
 github.com/rostamlabs/rembed v0.3.0 h1:V0KjiI69fgks2xZWj3TSTuPpAgvH2JMqsjB5UG0y8zY=
 github.com/rostamlabs/rembed v0.3.0/go.mod h1:eZcykwOQ80C5GI//n3O3J1DZwGkOuDU2iSEgSMoMViA=
+github.com/rostamlabs/rostam/client v0.2.0 h1:GF+X6RadTPyYKhmnThrKL+MkbQ4l5bLpBsw3IjMQjOo=
+github.com/rostamlabs/rostam/client v0.2.0/go.mod h1:v1uW9S1dKMKfp+aQqKdx0TG9wGZRKT2ziAZ0egIyG6I=
+github.com/rostamlabs/rostam/sdk v0.2.0 h1:Oppn83y+XJUNU62DuDHoK3OOgCxAH4QZSbWh12bLRX8=
+github.com/rostamlabs/rostam/sdk v0.2.0/go.mod h1:L81fTu9ATOIDKbxI7cH2MmsZbdRxCpZpSdjurs3oNoc=
 github.com/sirupsen/logrus v1.2.0/go.mod h1:LxeOpSwHxABJmUn/MG1IvRgCAasNZTLOkJPxbbu5VWo=
 github.com/sirupsen/logrus v1.4.2/go.mod h1:tLMulIdttU9McNUspp0xgXVQah82FyeX6MwdIuYE2rE=
 github.com/sirupsen/logrus v1.6.0/go.mod h1:7uNnSEd1DgxDLC74fIahvMZmmYsHGZGEOFrfsX/uA88=

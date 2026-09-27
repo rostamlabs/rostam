@@ -5,6 +5,20 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+## v0.7.0 — 2026-09-27
+
+- **`go install …/cmd/rostam-server@v0.7.0` and `go get github.com/rostamlabs/rostam`
+  work outside the repo.** Earlier tags could not be installed with the Go
+  toolchain: the root `go.mod` carried `replace` directives, which `go install`
+  rejects, and required an `sdk` version that predated packages the engine
+  imports. The root module now requires tagged `sdk/v0.2.0` and `client/v0.2.0`
+  and has no `replace` directives.
+
+- **The container image carries the official MCP Registry label** for
+  `io.github.rostamlabs/rostam`, and the repo ships the matching `server.json`,
+  so the image can be published to the registry.
+  `docker run -i --rm ghcr.io/rostamlabs/rostam mcp` is the stdio server.
+
 - **The TCP server answers a pipelined batch with one write instead of one per
   frame.** A client that sends several requests in a single write now gets its
   replies back in a single write, which is a large share of the server's CPU at
