@@ -96,11 +96,11 @@ release:
     go install github.com/rostamlabs/rostam/cmd/rostam-server@{{ .Tag }}
 
     # Container (always a cgo build; authentication is required)
-    docker run -p 8080:8080 -e ROSTAM_API_KEY=secret ghcr.io/rostamlabs/rostam:{{ .Tag }}
+    docker run -p 127.0.0.1:8080:8080 -e ROSTAM_API_KEY=secret ghcr.io/rostamlabs/rostam:{{ .Tag }}
 
     # In-process local embeddings (pure Go, no ONNX Runtime): just set the model
     # (REMBED_CACHE on a mounted volume persists downloaded weights across restarts)
-    docker run -p 8080:8080 -e ROSTAM_API_KEY=secret \
+    docker run -p 127.0.0.1:8080:8080 -e ROSTAM_API_KEY=secret \
       -e ROSTAM_EMBED_LOCAL=minilm-l6-v2 -e REMBED_CACHE=/models -v rostam-models:/models \
       ghcr.io/rostamlabs/rostam:{{ .Tag }}
     ```

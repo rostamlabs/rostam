@@ -12,9 +12,17 @@ tagged versions. Tag in this order so a `go get` never sees a broken graph:
 2. **Tag `sdk`:** `git tag sdk/vX.Y.Z && git push origin sdk/vX.Y.Z`.
 3. **Point `client` (and root) at the tag:** in `client/go.mod` and root
    `go.mod`, set `require github.com/rostamlabs/rostam/sdk vX.Y.Z`. Keep the
-   local `replace ... => ./sdk` (`../sdk` for client) for in-repo builds —
+   `replace ... => ../sdk` in `client/go.mod` for its standalone CI job —
    external consumers ignore it. Commit + merge.
 4. **Tag `client`:** `git tag client/vX.Y.Z && git push origin client/vX.Y.Z`.
+5. **Point root at the `client` tag:** set
+   `require github.com/rostamlabs/rostam/client vX.Y.Z` in root `go.mod`, then
+   tag the engine release (`vX.Y.Z`).
+
+The root `go.mod` must carry **no `replace` directives**: `go install
+github.com/rostamlabs/rostam/cmd/rostam-server@vX.Y.Z` refuses to build a module
+that has any. In-repo builds get the working-tree `sdk` and `client` from
+`go.work` instead.
 
 Only after steps 2 **and** 4 does
 `go get github.com/rostamlabs/rostam/client@vX.Y.Z` resolve for an external
