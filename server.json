@@ -16,6 +16,11 @@
       "runtimeHint": "docker",
       "runtimeArguments": [
         {
+          "type": "positional",
+          "value": "-i",
+          "description": "Keep stdin open; the stdio server exits when it closes"
+        },
+        {
           "type": "named",
           "name": "-v",
           "value": "rostam-memory:/home/rostam/.rostam",
