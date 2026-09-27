@@ -28,7 +28,7 @@ require (
 	github.com/mattn/go-isatty v0.0.14 // indirect
 	github.com/panjf2000/ants/v2 v2.12.1 // indirect
 	github.com/rostamlabs/rostam/client v0.0.0-00010101000000-000000000000
-	github.com/rostamlabs/rostam/sdk v0.1.0
+	github.com/rostamlabs/rostam/sdk v0.2.0
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.28.0 // indirect
