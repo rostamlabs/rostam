@@ -23,7 +23,7 @@
         {
           "type": "named",
           "name": "-v",
-          "value": "rostam-memory:/home/rostam/.rostam",
+          "value": "rostam-memory:/data",
           "description": "Named volume so memory survives container restarts"
         }
       ],
@@ -31,6 +31,11 @@
         {
           "type": "positional",
           "value": "mcp"
+        },
+        {
+          "type": "named",
+          "name": "-data",
+          "value": "/data"
         }
       ],
       "transport": {
