@@ -69,3 +69,11 @@ func saveInjected(dir, sessionID string, ids map[uint64]bool) {
 		_ = os.Remove(tmp.Name())
 	}
 }
+
+// resetInjected forgets everything injected for sessionID.
+func resetInjected(dir, sessionID string) {
+	if dir == "" || sessionID == "" {
+		return
+	}
+	_ = os.Remove(stateFile(dir, sessionID))
+}

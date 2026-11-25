@@ -473,3 +473,89 @@ func TestHookEmptyHomeSilent(t *testing.T) {
 		t.Fatal("wrote .rostam relative to cwd")
 	}
 }
+
+func (e hookEnv) startPayload(session, source string) string {
+	b, _ := json.Marshal(map[string]any{
+		"session_id": session, "cwd": e.root, "hook_event_name": "SessionStart", "source": source,
+	})
+	return string(b)
+}
+
+func hookCtx(t *testing.T, out string) string {
+	t.Helper()
+	if out == "" {
+		return ""
+	}
+	return parseHookOut(t, out).HookSpecificOutput.AdditionalContext
+}
+
+func TestHookSessionStartSourceReset(t *testing.T) {
+	for _, tc := range []struct {
+		source string
+		reinj  bool
+	}{{"compact", true}, {"clear", true}, {"startup", false}, {"resume", false}, {"", false}} {
+		t.Run("source="+tc.source, func(t *testing.T) {
+			e := newHookEnv(t)
+			hookRemember(t, e.st, e.root, map[string]any{"content": "project fact", "namespace": e.ns()})
+			hookRemember(t, e.st, e.root, map[string]any{"content": "file fact", "namespace": e.ns(), "path": "a.go"})
+			ss, pt := e.deps("session-start"), e.deps("pre-tool-use")
+			// Pre-seed the seen-set: both memories injected earlier.
+			if !strings.Contains(hookCtx(t, runHookStr(t, pt, e.payload("s", "Read", "a.go"))), "file fact") {
+				t.Fatal("initial file injection missing")
+			}
+			if !strings.Contains(hookCtx(t, runHookStr(t, ss, e.startPayload("s", "startup"))), "project fact") {
+				t.Fatal("initial session-start injected nothing")
+			}
+			got := hookCtx(t, runHookStr(t, ss, e.startPayload("s", tc.source)))
+			if has := strings.Contains(got, "project fact"); has != tc.reinj {
+				t.Fatalf("session-start re-injected = %v, want %v (%q)", has, tc.reinj, got)
+			}
+			again := hookCtx(t, runHookStr(t, pt, e.payload("s", "Read", "a.go")))
+			// The recent-memories list may already carry the file memory again.
+			if has := strings.Contains(got+again, "file fact"); has != tc.reinj {
+				t.Fatalf("file memory re-injected = %v, want %v (%q, %q)", has, tc.reinj, got, again)
+			}
+		})
+	}
+}
+
+func TestHookCompactConcurrentWithPreToolUse(t *testing.T) {
+	e := newHookEnv(t)
+	hookRemember(t, e.st, e.root, map[string]any{"content": "file fact", "namespace": e.ns(), "path": "a.go"})
+	runHookStr(t, e.deps("pre-tool-use"), e.payload("s", "Read", "a.go"))
+	const n = 8
+	outs := make([]string, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if i == 0 {
+				runHookStr(t, e.deps("session-start"), e.startPayload("s", "compact"))
+				return
+			}
+			outs[i] = runHookStr(t, e.deps("pre-tool-use"), e.payload("s", "Read", "a.go"))
+		}(i)
+	}
+	wg.Wait()
+	c := 0
+	for _, o := range outs {
+		if strings.Contains(hookCtx(t, o), "file fact") {
+			c++
+		}
+	}
+	if c > 1 {
+		t.Fatalf("file fact injected %d times after one compact, want at most 1", c)
+	}
+}
+
+func TestHookSessionStartPointerIsNotFileScoped(t *testing.T) {
+	e := newHookEnv(t)
+	for i := 0; i < 8; i++ {
+		hookRemember(t, e.st, e.root, map[string]any{"content": fmt.Sprintf("fact-%d", i), "namespace": e.ns()})
+	}
+	ctx := hookCtx(t, runHookStr(t, e.deps("session-start"), e.startPayload("s", "startup")))
+	if strings.Contains(ctx, "recall_for_file") || !strings.HasSuffix(ctx, "(more: call recall)") {
+		t.Fatalf("session-start context = %q", ctx)
+	}
+}

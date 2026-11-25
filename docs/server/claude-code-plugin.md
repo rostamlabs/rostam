@@ -33,12 +33,17 @@ returns everything linked to one file, newest first.
 
 | Hook | When | What it adds |
 |---|---|---|
-| `session-start` | A session starts, resumes, clears or compacts | The project's most recently updated memories |
+| `session-start` | A session starts, resumes, clears or compacts (see below) | The project's most recently updated memories |
 | `pre-tool-use` | Before `Read`, `Edit`, `Write` or `MultiEdit` | Memories linked to the file about to be touched |
+
+After a compaction or a clear the earlier injections are gone from Claude's
+context, so those two start the session's "already injected" record afresh and
+everything, including file-linked memories, can be injected again. A resumed
+session keeps the same transcript, so its record is kept and nothing is repeated.
 
 Each injection is capped at 5 memories and 1,500 characters, and a given memory
 is injected at most once per session. When more exist, the injection ends with a
-pointer to `recall_for_file`. The text is labelled as recalled data to verify,
+pointer to `recall_for_file` (to `recall` for the session-start list). The text is labelled as recalled data to verify,
 not as instructions.
 
 **Stale marking.** A linked memory is still shown when its file has changed, but
