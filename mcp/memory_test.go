@@ -960,7 +960,13 @@ func TestEmbedderIdentityMismatchFailsStartup(t *testing.T) {
 	c.callTool("remember", map[string]any{"content": "seed"}, nil, false)
 
 	// Reopening the same store with a real embedder must fail loudly.
-	if _, err := NewServer(context.Background(), Config{Store: st, Embedder: fakeEmbedder{}}); err == nil {
+	_, err := NewServer(context.Background(), Config{Store: st, Embedder: fakeEmbedder{}})
+	if err == nil {
 		t.Fatal("expected embedder-identity mismatch error")
+	}
+	// Callers (mcp -autostart) add mode-specific advice, so the error must be
+	// recognisable, and its own advice must name the env that selects it.
+	if !errors.Is(err, ErrEmbedderMismatch) || !strings.Contains(err.Error(), "ROSTAM_EMBED_") {
+		t.Fatalf("mismatch error must wrap ErrEmbedderMismatch and name ROSTAM_EMBED_*: %v", err)
 	}
 }

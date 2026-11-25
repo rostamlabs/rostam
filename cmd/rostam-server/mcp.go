@@ -197,10 +197,7 @@ func runMcpCmd(args []string) {
 		unlock, lerr = claimDataDir(fl.data)
 		switch {
 		case errors.Is(lerr, errDataDirBusy):
-			fatal("mcp: another rostam-server mcp process is using this data directory; "+
-				"a data dir has one writer, so concurrent clients must share one server over -connect "+
-				"instead of each embedding their own",
-				"dir", fl.data, "err", lerr)
+			fatal(dataDirBusyMsg(fl.data), "dir", fl.data, "err", lerr)
 		case lerr != nil:
 			// Not a conflict — a path that cannot be created, a read-only
 			// filesystem, a full disk. Reporting it as "another process is
@@ -232,7 +229,8 @@ func runMcpCmd(args []string) {
 	if err != nil {
 		_ = rt.store.Close()
 		_ = unlock()
-		fatal("mcp: server init failed", "err", err)
+		memDir, _ := defaultMemoryDir()
+		fatal("mcp: server init failed", "err", mcpInitErr(err, *autostart, memDir))
 	}
 
 	// An MCP client that goes away closes stdin and Serve returns on its own.

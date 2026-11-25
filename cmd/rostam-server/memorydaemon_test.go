@@ -5,7 +5,9 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -20,6 +22,7 @@ import (
 
 	rostam "github.com/rostamlabs/rostam"
 	"github.com/rostamlabs/rostam/authz"
+	"github.com/rostamlabs/rostam/mcp"
 	"github.com/rostamlabs/rostam/ops"
 )
 
@@ -431,4 +434,73 @@ func TestIsDaemonArgs(t *testing.T) {
 func withAuth(c rostam.ServerConfig, a authz.Authenticator) rostam.ServerConfig {
 	c.Authenticator = a
 	return c
+}
+
+func TestAutostartEmbedderMismatchAdvice(t *testing.T) {
+	base := fmt.Errorf("x: %w", mcp.ErrEmbedderMismatch)
+	msg := mcpInitErr(base, true, "/home/u/.rostam/memory").Error()
+	for _, want := range []string{"ROSTAM_EMBED_", "memory-daemon -stop", "/home/u/.rostam/memory"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("autostart advice missing %q: %s", want, msg)
+		}
+	}
+	if got := mcpInitErr(base, false, "/d"); got != base {
+		t.Errorf("embedded mode must keep the error as is, got %v", got)
+	}
+	other := errors.New("boom")
+	if got := mcpInitErr(other, true, "/d"); got != other {
+		t.Errorf("unrelated errors pass through, got %v", got)
+	}
+}
+
+// An embedded `mcp` holding the data-dir lock (no daemon pid file) is named
+// as such, and no daemon is spawned to lose the lock race.
+func TestEnsureDaemonRefusesEmbeddedHolder(t *testing.T) {
+	data := filepath.Join(t.TempDir(), "memory")
+	if _, err := ensureToken(data); err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := lockDataDir(data) // stands in for an embedded `rostam-server mcp`
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	fd := newFakeDaemon(t, "never-started")
+
+	spawn := func() error { t.Error("spawn must not be called while an embedded mcp holds the dir"); return nil }
+	start := time.Now()
+	err = ensureDaemonWith(context.Background(), data, fd.addr(), spawn, fakeProbe, 3*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "embedded") || !strings.Contains(err.Error(), data) {
+		t.Fatalf("err = %v, want the embedded-holder error naming %s", err, data)
+	}
+	if el := time.Since(start); el > 2*time.Second {
+		t.Errorf("took %v; the embedded holder must be reported without waiting out the startup budget", el)
+	}
+
+	// With a daemon pid file the lock is a (starting) daemon's: normal path.
+	if err := os.WriteFile(filepath.Join(data, daemonPidName), []byte("1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var spawns atomic.Int32
+	err = ensureDaemonWith(context.Background(), data, fd.addr(),
+		func() error { spawns.Add(1); return nil }, fakeProbe, 300*time.Millisecond)
+	if err == nil || strings.Contains(err.Error(), "embedded") {
+		t.Fatalf("with a daemon pid file: err = %v, want the ordinary not-ready error", err)
+	}
+	if spawns.Load() != 1 {
+		t.Fatalf("spawn called %d times, want 1", spawns.Load())
+	}
+}
+
+func TestDataDirBusyMessage(t *testing.T) {
+	dir := t.TempDir()
+	if msg := dataDirBusyMsg(dir); !strings.Contains(msg, "-connect") || strings.Contains(msg, "memory-daemon -stop") {
+		t.Errorf("no daemon: %s", msg)
+	}
+	if err := os.WriteFile(filepath.Join(dir, daemonPidName), []byte("1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if msg := dataDirBusyMsg(dir); !strings.Contains(msg, "memory-daemon -stop") || !strings.Contains(msg, "-autostart") {
+		t.Errorf("daemon pid file present: %s", msg)
+	}
 }

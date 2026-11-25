@@ -50,6 +50,10 @@ const (
 	identityReadBackoff  = 50 * time.Millisecond
 )
 
+// ErrEmbedderMismatch is wrapped by NewServer's error when the store's memory
+// was created with a different embedder than this run's.
+var ErrEmbedderMismatch = errors.New("mcp: embedder mismatch")
+
 // checkEmbedderIdentity compares the configured embedder against the one
 // recorded in KV, if any. No record yet means the memory collection has
 // never been bootstrapped, so there is nothing to conflict with.
@@ -74,8 +78,8 @@ func (s *Server) matchStoredIdentity(raw []byte) error {
 	}
 	want := embedIdentity{Model: s.emb.Model(), Dim: s.emb.Dim(), Hybrid: s.hybrid}
 	if stored != want {
-		return fmt.Errorf("mcp: embedder mismatch: this data dir's memory was bootstrapped with model=%q dim=%d hybrid=%v, but this run is configured with model=%q dim=%d hybrid=%v; unset the embedder configuration to go back to the original mode, point -data at a different directory, or wipe the existing data dir to start over",
-			stored.Model, stored.Dim, stored.Hybrid, want.Model, want.Dim, want.Hybrid)
+		return fmt.Errorf("%w: this store's memory was bootstrapped with model=%q dim=%d hybrid=%v, but this run is configured with model=%q dim=%d hybrid=%v; set the same ROSTAM_EMBED_* environment the store was created with (none at all for model \"stub\"), or use a different store",
+			ErrEmbedderMismatch, stored.Model, stored.Dim, stored.Hybrid, want.Model, want.Dim, want.Hybrid)
 	}
 	return nil
 }

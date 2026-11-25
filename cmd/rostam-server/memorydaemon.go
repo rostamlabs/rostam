@@ -17,6 +17,7 @@ import (
 
 	rostam "github.com/rostamlabs/rostam"
 	"github.com/rostamlabs/rostam/client"
+	"github.com/rostamlabs/rostam/mcp"
 	"github.com/rostamlabs/rostam/ops"
 )
 
@@ -210,6 +211,9 @@ func ensureDaemonWith(ctx context.Context, data, addr string, spawn func() error
 			if ok, err := up(); ok || err != nil {
 				return err
 			}
+			if err := embeddedHolderErr(data); err != nil {
+				return err
+			}
 			if err := spawn(); err != nil {
 				return fmt.Errorf("starting memory daemon: %w (see %s)", err, logPath)
 			}
@@ -310,4 +314,49 @@ func mcpDefaultNamespace(resolved, flagNS string, nsGiven, autostart, rootGiven 
 // for our executable name.
 func isDaemonArgs(args []string, exeBase string) bool {
 	return len(args) >= 2 && filepath.Base(args[0]) == exeBase && args[1] == "memory-daemon"
+}
+
+// mcpInitErr adds -autostart's remedies to an embedder-identity mismatch: the
+// store there is the shared daemon's directory, which -data cannot change.
+func mcpInitErr(err error, autostart bool, dir string) error {
+	if !autostart || !errors.Is(err, mcp.ErrEmbedderMismatch) {
+		return err
+	}
+	return fmt.Errorf("%w. Under -autostart the store is the shared daemon's %s: either set the same ROSTAM_EMBED_* variables in the environment your MCP client (Claude Code) is started from, "+
+		"or stop the daemon (rostam-server memory-daemon -stop) and move %s aside to start a fresh store", err, dir, dir)
+}
+
+// daemonPidFileExists reports whether dir holds a memory daemon's pid file:
+// the supervisor writes it once its server is started and removes it on exit.
+func daemonPidFileExists(dir string) bool {
+	_, err := os.Stat(filepath.Join(dir, daemonPidName))
+	return err == nil
+}
+
+// dataDirBusyMsg is the embedded `mcp` error for a data dir whose lock is held,
+// naming the daemon when it is the likely holder.
+func dataDirBusyMsg(dir string) string {
+	if daemonPidFileExists(dir) {
+		return "mcp: the shared memory daemon is using this data directory; use -autostart to connect to it, " +
+			"or stop it first with \"rostam-server memory-daemon -stop\""
+	}
+	return "mcp: another rostam-server mcp process is using this data directory; " +
+		"a data dir has one writer, so concurrent clients must share one server over -connect " +
+		"(or -autostart, the shared local daemon) instead of each embedding their own"
+}
+
+// embeddedHolderErr reports an embedded `rostam-server mcp` holding data: the
+// data-dir lock is taken and no daemon pid file exists. Spawning a daemon then
+// cannot succeed (it would lose the lock), so ensureDaemon says so instead of
+// timing out.
+func embeddedHolderErr(data string) error {
+	unlock, err := lockDataDir(data)
+	if err == nil {
+		_ = unlock()
+		return nil
+	}
+	if !errors.Is(err, errDataDirBusy) || daemonPidFileExists(data) {
+		return nil
+	}
+	return fmt.Errorf("an embedded `rostam-server mcp` is using %s; stop it or remove the old MCP server entry that runs it, then retry", data)
 }

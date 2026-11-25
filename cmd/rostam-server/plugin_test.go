@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -36,14 +37,30 @@ func TestPluginFilesValid(t *testing.T) {
 
 	var mcp struct {
 		Servers map[string]struct {
-			Command string   `json:"command"`
-			Args    []string `json:"args"`
+			Command string            `json:"command"`
+			Args    []string          `json:"args"`
+			Env     map[string]string `json:"env"`
 		} `json:"mcpServers"`
 	}
 	readJSON(t, filepath.Join(pluginDir, ".mcp.json"), &mcp)
 	srv, ok := mcp.Servers["rostam"]
 	if !ok || srv.Command != "rostam-server" || !reflect.DeepEqual(srv.Args, []string{"mcp", "-autostart"}) {
 		t.Fatalf(".mcp.json rostam server = %+v", srv)
+	}
+	// The embedder env is passed through with an empty default, and an empty
+	// value must behave exactly like an unset one (BM25-only, no error).
+	empty := map[string]string{}
+	for k, v := range srv.Env {
+		if !strings.HasPrefix(k, "ROSTAM_EMBED_") || v != "${"+k+":-}" {
+			t.Errorf(".mcp.json env %s=%q, want ${%s:-}", k, v, k)
+		}
+		empty[k] = ""
+	}
+	if _, ok := srv.Env["ROSTAM_EMBED_LOCAL"]; !ok {
+		t.Error(".mcp.json must pass ROSTAM_EMBED_LOCAL through")
+	}
+	if emb, err := embedderFromEnv(func(k string) (string, bool) { v, ok := empty[k]; return v, ok }); emb != nil || err != nil {
+		t.Errorf("all-empty embedder env = %v, %v; want BM25-only", emb, err)
 	}
 
 	var hooks struct {
