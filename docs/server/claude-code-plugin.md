@@ -27,13 +27,13 @@ daemon below is not.
 `server/protocol.go`) and `symbol`. The memory stores the path and a hash of the
 file's contents at that moment. A path outside the project root, or one that
 escapes it with `..`, is rejected. `recall_for_file {path, namespace?, k?}`
-returns everything linked to one file, newest first.
+returns up to `k` memories linked to one file (`k` defaults to 5), newest first.
 
 **Injection.** Two hooks read memories and add them to Claude's context:
 
 | Hook | When | What it adds |
 |---|---|---|
-| `session-start` | A session starts, resumes, clears or compacts (see below) | The project's most recently updated memories |
+| `session-start` | A session starts, resumes, forks, clears or compacts (see below) | The project's most recently updated memories |
 | `pre-tool-use` | Before `Read`, `Edit`, `Write` or `MultiEdit` | Memories linked to the file about to be touched |
 
 After a compaction or a clear the earlier injections are gone from Claude's
@@ -48,7 +48,11 @@ not as instructions.
 
 **Stale marking.** A linked memory is still shown when its file has changed, but
 it is marked `[stale]`; if the file no longer exists it is marked
-`[stale: file missing]`. The same marks appear in `recall` and `recall_for_file`
+`[stale: file missing]`. Both marks need a file that was readable when the
+memory was linked (that is when its hash is taken): a link to a file that did
+not exist yet is marked `[stale]` once the file appears, and is not marked while
+it stays missing. A linked file that has turned into a directory, become
+unreadable, or become a symlink leading out of the project is marked `[stale]`. The same marks appear in `recall` and `recall_for_file`
 results as `stale: true` and `stale: "file missing"`. Matching is exact on the
 normalised repo-relative path, so a renamed file leaves its old memories marked
 `[stale: file missing]` until they are re-saved.
@@ -67,6 +71,8 @@ given and with its symlinks resolved, and a file reached through a symlinked
 prefix of the root (a symlinked working directory, say) maps to the same
 repo-relative path. Symlinks inside the repository are not resolved: with
 `docs -> site/docs`, a memory about `docs/x.md` stays linked to `docs/x.md`.
+For the hash, symlinks that stay inside the project are followed; one that leads
+outside it (in any path component) is never read.
 
 ## Shared daemon
 
@@ -158,4 +164,7 @@ Plain `rostam-server mcp` is unchanged: it embeds the engine over
 automatically. To get the hooks without the plugin, register `rostam-server hook session-start` and
 `rostam-server hook pre-tool-use` as Claude Code hooks yourself; they read the
 hook JSON on stdin and accept `-connect`, `-token-file` and `-state-dir` before
-the event name.
+the event name. `-connect` must be an `IP:port`: the hook sends the token only
+after checking that the listener there belongs to the current user, and a
+hostname (even `localhost`) or an empty host cannot be checked, so the hook
+stays silent.

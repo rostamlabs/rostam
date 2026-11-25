@@ -15,7 +15,12 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   sessions share one memory through a local daemon on `127.0.0.1:7480`
   (`rostam-server memory-daemon [-stop]`). Not supported on Windows in this
   release; plain `rostam-server mcp` is unchanged and still allows one session
-  at a time. See [Claude Code plugin](server/claude-code-plugin.md).
+  at a time. Under `-autostart` or an explicit `-project-root`, a call that
+  omits `namespace` uses the project's namespace instead of `"default"`, so
+  memories saved earlier with no namespace are not recalled by default: pass
+  `namespace: "default"` (or `-namespace default`) to reach them, or see
+  [Migrating from an embedded rostam MCP entry](server/claude-code-plugin.md#migrating-from-an-embedded-rostam-mcp-entry).
+  See [Claude Code plugin](server/claude-code-plugin.md).
 
 ## v0.7.0 — 2026-09-27
 

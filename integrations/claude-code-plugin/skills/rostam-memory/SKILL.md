@@ -31,10 +31,12 @@ Call `remember` with one self-contained fact per call.
 
 - Before a nontrivial task, `recall` with the task's keywords instead of
   re-reading large files.
-- To see everything attached to one file, call `recall_for_file` with its `path`.
-  The automatic injection is capped at a few memories; this is the way to get
-  the rest.
+- To see more of what is attached to one file, call `recall_for_file` with its
+  `path`. It returns at most `k` memories, newest first, and `k` defaults to 5;
+  pass a larger `k` (say 50) when you need the rest. The automatic injection is
+  capped at a few memories.
 - A memory marked `[stale]` was linked to a file that has changed since. One
   marked `[stale: file missing]` points at a file that no longer exists. Treat
-  both as leads to verify, then re-`remember` the corrected fact (same `key`, or
-  `forget` the old one).
+  both as leads to verify. Then re-`remember` the corrected fact with the same
+  `path`, `symbol` and `key` (a re-save replaces the whole entry, so a link you
+  leave out is dropped); `forget` the old memory when it had no key.
