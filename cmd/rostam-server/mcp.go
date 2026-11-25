@@ -88,6 +88,10 @@ func runMcpCmd(args []string) {
 	fs.StringVar(&fl.tlsKey, "tls-key", "", "client private key PEM for mTLS (-connect; requires -tls-cert)")
 	fs.StringVar(&fl.tlsServer, "tls-server-name", "", "expected server certificate name (SNI + verification) for -connect")
 	fs.BoolVar(&fl.destructive, "enable-destructive", false, "register delete/delete_by_filter tools for arbitrary collections (off by default)")
+	autostart := fs.Bool("autostart", false,
+		"connect to the shared local memory daemon (127.0.0.1:7480, token from ~/.rostam/memory/token), starting it first if it is not running; mutually exclusive with -data and -connect")
+	projectRoot := fs.String("project-root", "",
+		"project root for code-linked memories (default: CLAUDE_PROJECT_DIR, else the working directory, resolved to its git top-level)")
 	listModels := fs.Bool("list-embed-models", false, "print the built-in local embedding models, then exit")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
@@ -113,6 +117,29 @@ func runMcpCmd(args []string) {
 			dataExplicit = true
 		}
 	})
+
+	if *autostart {
+		if err := checkAutostartConflicts(fl, dataExplicit); err != nil {
+			fatal(err.Error())
+		}
+		if !daemonSupported {
+			fatal("mcp: -autostart is not supported on Windows in this release; use -data (one embedded session) or -connect to a running rostam-server")
+		}
+		dir, err := defaultMemoryDir()
+		if err != nil {
+			fatal("mcp: resolving home directory for -autostart", "err", err)
+		}
+		if err := ensureDaemon(context.Background(), dir, memoryDefaultAddr, newDaemonSpawner(dir, memoryDefaultAddr)); err != nil {
+			fatal("mcp: " + err.Error())
+		}
+		tok, err := ensureToken(dir)
+		if err != nil {
+			fatal("mcp: reading daemon token", "err", err)
+		}
+		// From here on this is exactly `-connect 127.0.0.1:7480` with the token:
+		// the connect branch below skips claimDataDir.
+		fl.connect, fl.authToken = memoryDefaultAddr, tok
+	}
 
 	switch {
 	case fl.connect != "" && !dataExplicit:
@@ -171,6 +198,7 @@ func runMcpCmd(args []string) {
 		Embedder:    rt.embedder,
 		Destructive: fl.destructive,
 		Logger:      log,
+		ProjectRoot: defaultProjectRoot(*projectRoot, os.Getenv, os.Getwd),
 	})
 	if err != nil {
 		_ = rt.store.Close()

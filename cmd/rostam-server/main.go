@@ -92,6 +92,10 @@ func main() {
 		runMcpCmd(os.Args[2:])
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "memory-daemon" {
+		runMemoryDaemonCmd(os.Args[2:])
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "hook" {
 		runHookCmd(os.Args[2:])
 		return

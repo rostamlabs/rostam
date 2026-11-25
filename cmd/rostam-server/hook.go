@@ -62,10 +62,10 @@ func runHookCmd(args []string) {
 	if herr != nil || home == "" {
 		home = "" // defaults below are only usable when both flags are explicit
 	}
-	connect := fs.String("connect", "127.0.0.1:7480", "memory daemon address")
+	connect := fs.String("connect", memoryDefaultAddr, "memory daemon address")
 	defTok, defState := "", ""
 	if home != "" {
-		defTok = filepath.Join(home, ".rostam", "memory", "token")
+		defTok = filepath.Join(home, ".rostam", "memory", memoryTokenName)
 		defState = filepath.Join(home, ".rostam", "hook-state")
 	}
 	tokenFile := fs.String("token-file", defTok, "file holding the daemon bearer token")
