@@ -12,6 +12,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // Metadata fields that link a memory to a file. Reserved like nsField: stored
@@ -25,9 +26,10 @@ const (
 type fileState int
 
 const (
-	fileOK      fileState = iota // file read; hash is valid
-	fileMissing                  // file does not exist
-	fileNoRoot                   // no project root, or the file is unreadable (e.g. a directory)
+	fileOK         fileState = iota // file read; hash is valid
+	fileMissing                     // file does not exist
+	fileNoRoot                      // no project root: nothing can be checked
+	fileUnreadable                  // exists but is not a readable regular file inside the root
 )
 
 // NormalizeLinkPath is normalizeLinkPath for callers outside this package (the
@@ -106,34 +108,47 @@ var hashFileFn = fileHash
 
 // fileHash streams the file at root/rel through SHA-256. The hash is "" unless
 // the state is fileOK.
+//
+// Every access goes through an os.Root, so no symlink — in any path
+// component, not just the last — can reach outside the project; symlinks that
+// stay inside it are followed. Only regular files are hashed: the type is
+// checked before opening (a FIFO or device must not be opened at all), the
+// open is non-blocking (a file swapped for a FIFO in between cannot hang it),
+// and the opened descriptor is checked again before reading.
 func fileHash(root, rel string) (string, fileState) {
 	if root == "" {
 		return "", fileNoRoot
 	}
-	full := filepath.Join(root, filepath.FromSlash(rel))
-	// Lstat first: opening a FIFO or device would block, and a symlink could
-	// point outside the project. Only regular files are hashed.
-	fi, err := os.Lstat(full)
+	r, err := os.OpenRoot(root)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return "", fileMissing
-		}
 		return "", fileNoRoot
+	}
+	defer func() { _ = r.Close() }()
+	name := filepath.FromSlash(rel)
+	classify := func(err error) fileState {
+		if errors.Is(err, os.ErrNotExist) {
+			return fileMissing
+		}
+		return fileUnreadable
+	}
+	fi, err := r.Stat(name)
+	if err != nil {
+		return "", classify(err)
 	}
 	if !fi.Mode().IsRegular() {
-		return "", fileNoRoot
+		return "", fileUnreadable
 	}
-	f, err := os.Open(full)
+	f, err := r.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return "", fileMissing
-		}
-		return "", fileNoRoot
+		return "", classify(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
+	if ofi, err := f.Stat(); err != nil || !ofi.Mode().IsRegular() {
+		return "", fileUnreadable
+	}
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
-		return "", fileNoRoot
+		return "", fileUnreadable
 	}
 	return hex.EncodeToString(h.Sum(nil)), fileOK
 }
@@ -149,6 +164,12 @@ func staleState(p, stored, cur string, st fileState) any {
 	case fileMissing:
 		if stored != "" {
 			return "file missing"
+		}
+	case fileUnreadable:
+		// It was hashed when linked, and now it is a directory, a symlink out
+		// of the project, or unreadable: it is no longer the file remembered.
+		if stored != "" {
+			return true
 		}
 	case fileOK:
 		// No stored hash means the file did not exist at write time, so

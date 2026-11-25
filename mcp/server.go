@@ -109,7 +109,9 @@ func NewServer(ctx context.Context, cfg Config) (*Server, error) {
 	} else {
 		s.emb = semcache.NewStubEmbedder("stub", 64)
 	}
-	if !s.readOnly { // a read-only client may have no embedder at all
+	// A read-only client with no embedder never embeds, so it skips the
+	// identity check; one that was given an embedder is held to it.
+	if !s.readOnly || cfg.Embedder != nil {
 		if err := s.checkEmbedderIdentity(ctx); err != nil {
 			return nil, err
 		}

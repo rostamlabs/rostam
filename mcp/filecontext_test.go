@@ -5,6 +5,7 @@ package mcp
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/rostamlabs/rostam"
@@ -143,13 +144,29 @@ func TestReadOnlyIgnoresEmbedIdentity(t *testing.T) {
 	}
 }
 
+// A read-only server that WAS given an embedder still has to match the store.
+func TestReadOnlyWithEmbedderChecksIdentity(t *testing.T) {
+	st := newHeapStore(t)
+	w := newTestServer(t, Config{Store: st}) // bootstrapped with the stub embedder
+	seedMemory(t, w, "p", "a.go", "hello", 1)
+	if _, err := NewServer(context.Background(), Config{Store: st, ReadOnly: true, Embedder: fakeEmbedder{}}); !errors.Is(err, ErrEmbedderMismatch) {
+		t.Fatalf("read-only NewServer with a mismatched embedder: err = %v, want ErrEmbedderMismatch", err)
+	}
+}
+
 func TestReadOnlyRejectsWrites(t *testing.T) {
 	st := newHeapStore(t)
 	w := newTestServer(t, Config{Store: st})
 	seedMemory(t, w, "p", "", "x", 1)
 	c := startServer(t, Config{Store: st, ReadOnly: true})
 	c.initialize()
-	c.callTool("remember", map[string]any{"content": "nope"}, nil, true)
+	if msg := c.callTool("remember", map[string]any{"content": "nope", "namespace": "p"}, nil, true); !strings.Contains(msg, "read-only") {
+		t.Errorf("remember error = %q, want the read-only refusal", msg)
+	}
+	got, err := w.RecentMemories(context.Background(), "p", 10)
+	if err != nil || len(got) != 1 || got[0].Content != "x" {
+		t.Fatalf("after a refused remember the namespace holds %+v (%v); want only the seeded memory", got, err)
+	}
 }
 
 // failingScroll is a store whose VectorScroll always fails with err.

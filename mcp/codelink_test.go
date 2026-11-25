@@ -125,7 +125,10 @@ func TestRememberMissingFileStillSucceeds(t *testing.T) {
 
 func TestRememberRejectsEscapingPath(t *testing.T) {
 	c, _ := linkEnv(t)
-	c.callTool("remember", map[string]any{"content": "x", "namespace": "p", "path": "../x"}, nil, true)
+	msg := c.callTool("remember", map[string]any{"content": "x", "namespace": "p", "path": "../x"}, nil, true)
+	if !strings.Contains(msg, "outside the project root") {
+		t.Errorf("error %q does not name the escaping path", msg)
+	}
 }
 
 func TestRememberPathReservedKeysRejectedInMetadata(t *testing.T) {
@@ -141,7 +144,10 @@ func TestRememberPathReservedKeysRejectedInMetadata(t *testing.T) {
 func TestRememberRejectsEmptyOrPaddedPath(t *testing.T) {
 	c, _ := linkEnv(t)
 	for _, p := range []string{"", " a.go", "a.go ", "  "} {
-		c.callTool("remember", map[string]any{"content": "x", "namespace": "p", "path": p}, nil, true)
+		msg := c.callTool("remember", map[string]any{"content": "x", "namespace": "p", "path": p}, nil, true)
+		if !strings.Contains(msg, "non-empty") || !strings.Contains(msg, "whitespace") {
+			t.Errorf("path %q: error %q is not the padded-path rule", p, msg)
+		}
 	}
 }
 

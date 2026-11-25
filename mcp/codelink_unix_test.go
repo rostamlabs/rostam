@@ -22,8 +22,8 @@ func TestFileHashNonRegularDoesNotBlock(t *testing.T) {
 	go func() { _, st := fileHash(root, "pipe"); done <- st }()
 	select {
 	case st := <-done:
-		if st != fileNoRoot {
-			t.Fatalf("state = %v, want fileNoRoot", st)
+		if st != fileUnreadable {
+			t.Fatalf("state = %v, want fileUnreadable", st)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("fileHash blocked on a FIFO")
@@ -80,5 +80,68 @@ func TestNormalizeLinkPathSymlinks(t *testing.T) {
 				t.Errorf("root %s: NormalizeLinkPath(%q) = %q, want error", root, in, got)
 			}
 		}
+	}
+}
+
+// No symlink may carry hashing outside the project: not a symlinked file, and
+// not a symlinked ancestor directory (Lstat on the final component alone does
+// not catch the latter). Symlinks that stay inside the project are followed.
+func TestFileHashSymlinkConfinement(t *testing.T) {
+	outside := t.TempDir()
+	writeFile(t, outside, "secret.go", "package secret\n")
+	realRoot, _ := symlinkLayout(t)
+	for name, target := range map[string]string{
+		"out.go":  filepath.Join(outside, "secret.go"), // file symlink out of the root
+		"vendor":  outside,                             // dir symlink out of the root
+		"self.go": "a.go",                              // file symlink inside the root
+	} {
+		if err := os.Symlink(target, filepath.Join(realRoot, name)); err != nil {
+			t.Skipf("symlink: %v", err)
+		}
+	}
+	for _, rel := range []string{"out.go", "vendor/secret.go"} {
+		if h, st := fileHash(realRoot, rel); st != fileUnreadable || h != "" {
+			t.Errorf("fileHash(%q) = %q, %v; want \"\", fileUnreadable", rel, h, st)
+		}
+	}
+	want, st := fileHash(realRoot, "a.go")
+	if st != fileOK {
+		t.Fatalf("a.go: %v", st)
+	}
+	if h, st := fileHash(realRoot, "self.go"); st != fileOK || h != want {
+		t.Errorf("in-root file symlink = %q, %v; want a.go's hash", h, st)
+	}
+	if _, st := fileHash(realRoot, "docs/x.md"); st != fileOK {
+		t.Errorf("in-root dir symlink docs/x.md = %v, want fileOK", st)
+	}
+}
+
+// A linked file that was hashed and is now unreadable (here, replaced by a
+// directory) is stale; one that never had a hash stays unflagged.
+func TestStaleWhenFileBecomesUnreadable(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "a.go", "package a\n")
+	stored, st := fileHash(root, "a.go")
+	if st != fileOK {
+		t.Fatal(st)
+	}
+	if err := os.Remove(filepath.Join(root, "a.go")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "a.go"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cur, st := fileHash(root, "a.go")
+	if st != fileUnreadable {
+		t.Fatalf("directory at a.go: state %v, want fileUnreadable", st)
+	}
+	if got := staleState("a.go", stored, cur, st); got != true {
+		t.Errorf("hashed then unreadable: stale = %v, want true", got)
+	}
+	if got := staleState("a.go", "", cur, st); got != nil {
+		t.Errorf("never hashed: stale = %v, want nil", got)
+	}
+	if got := staleState("a.go", stored, "", fileNoRoot); got != nil {
+		t.Errorf("no project root: stale = %v, want nil", got)
 	}
 }
