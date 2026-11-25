@@ -82,7 +82,7 @@ func ensureToken(dir string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("creating token: %w", err)
 	}
-	defer func() { _ = os.Remove(tmp.Name()) }() // fails harmlessly once linked into place
+	defer func() { _ = os.Remove(tmp.Name()) }() //nolint:gosec // G703: CreateTemp name inside the data dir; fails harmlessly once linked
 	if _, err := tmp.WriteString(tok + "\n"); err != nil {
 		_ = tmp.Close()
 		return "", fmt.Errorf("writing token: %w", err)

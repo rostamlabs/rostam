@@ -129,7 +129,7 @@ func superviseDaemonWith(data string, mkChild func(token, cfgPath string) *exec.
 		_ = cmd.Wait()
 		return fmt.Errorf("writing %s: %w", pidPath, err)
 	}
-	defer func() { _ = os.Remove(pidPath) }()
+	defer func() { _ = os.Remove(pidPath) }() //nolint:gosec // G703: fixed name inside the data dir
 
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
