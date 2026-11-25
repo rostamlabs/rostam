@@ -37,6 +37,7 @@ type Config struct {
 	Embedder    semcache.Embedder // nil => BM25-only mode (stub vectors, text recall)
 	Destructive bool              // register delete/delete_by_filter for arbitrary collections
 	Logger      *slog.Logger      // stderr logger; nil => slog.Default()
+	ProjectRoot string            // absolute project root for path-linked memories; "" => paths stored but never hashed
 }
 
 type toolDef struct {
@@ -52,6 +53,7 @@ type Server struct {
 	emb         semcache.Embedder
 	hybrid      bool // real embedder configured: recall uses dense+BM25 fusion
 	destructive bool
+	projectRoot string
 	log         *slog.Logger
 	tools       []toolDef
 	initialized bool
@@ -77,7 +79,7 @@ func NewServer(ctx context.Context, cfg Config) (*Server, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	s := &Server{store: cfg.Store, destructive: cfg.Destructive, log: log}
+	s := &Server{store: cfg.Store, destructive: cfg.Destructive, projectRoot: cfg.ProjectRoot, log: log}
 	if cfg.Embedder != nil {
 		s.emb, s.hybrid = cfg.Embedder, true
 	} else {

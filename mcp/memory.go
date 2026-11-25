@@ -256,6 +256,14 @@ type memoryHit struct {
 	Created  int64          `json:"created,omitempty"`
 	Updated  int64          `json:"updated,omitempty"`
 	Metadata map[string]any `json:"metadata,omitempty"`
+
+	// Code link (set only for memories remembered with a path). Stale is true
+	// when the file changed since the memory was written, "file missing" when
+	// it is gone; fileHash is the stored hash, kept for markStale.
+	Path     string `json:"path,omitempty"`
+	Symbol   string `json:"symbol,omitempty"`
+	Stale    any    `json:"stale,omitempty"`
+	fileHash string
 }
 
 // registerMemoryTools registers remember, recall, forget, list_memories, and
@@ -271,6 +279,8 @@ func (s *Server) registerMemoryTools() {
 				"namespace": map[string]any{"type": "string", "description": `isolation namespace (default "default")`},
 				"metadata":  map[string]any{"type": "object", "description": "optional extra metadata to attach"},
 				"key":       map[string]any{"type": "string", "description": "optional stable key; re-remembering the same key REPLACES the prior content (one canonical entry). Use for live/in-flight state; omit for durable one-off facts."},
+				"path":      map[string]any{"type": "string", "description": "optional repo-relative file this fact is about; recall then flags the memory stale if the file changes"},
+				"symbol":    map[string]any{"type": "string", "description": "optional symbol within path (requires path)"},
 			},
 			"required": []any{"content"},
 		},
@@ -342,6 +352,8 @@ type rememberArgs struct {
 	Namespace string                     `json:"namespace"`
 	Metadata  map[string]json.RawMessage `json:"metadata"`
 	Key       string                     `json:"key"`
+	Path      string                     `json:"path"`
+	Symbol    string                     `json:"symbol"`
 }
 
 func (s *Server) handleRemember(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -356,10 +368,20 @@ func (s *Server) handleRemember(ctx context.Context, raw json.RawMessage) (any, 
 	if ns == "" {
 		ns = defaultNS
 	}
-	for _, reserved := range [...]string{nsField, createdField, keyField, updatedField, "$content"} {
+	for _, reserved := range [...]string{nsField, createdField, keyField, updatedField, pathField, symbolField, fileHashField, "$content"} {
 		if _, ok := args.Metadata[reserved]; ok {
 			return nil, fmt.Errorf("mcp: remember: metadata key %q is reserved", reserved)
 		}
+	}
+
+	var relPath string
+	if args.Path != "" {
+		var err error
+		if relPath, err = normalizeLinkPath(s.projectRoot, args.Path); err != nil {
+			return nil, fmt.Errorf("mcp: remember: %w", err)
+		}
+	} else if args.Symbol != "" {
+		return nil, fmt.Errorf("mcp: remember: symbol requires path")
 	}
 
 	if err := s.ensureMemory(ctx); err != nil {
@@ -376,6 +398,14 @@ func (s *Server) handleRemember(ctx context.Context, raw json.RawMessage) (any, 
 	now := time.Now().Unix()
 	md[nsField] = vector.NewString(ns)
 	md[updatedField] = vector.NewInt(now)
+	if relPath != "" {
+		hash, _ := fileHash(s.projectRoot, relPath) // "" when unreadable: link is still stored
+		md[pathField] = vector.NewString(relPath)
+		md[fileHashField] = vector.NewString(hash)
+		if args.Symbol != "" {
+			md[symbolField] = vector.NewString(args.Symbol)
+		}
+	}
 
 	// A keyed remember always lands on the same point (memoryKeyID ignores
 	// content), so a re-remember under the same key is an update to one
@@ -479,6 +509,7 @@ func (s *Server) recallBM25(ctx context.Context, query string, k int, f rostam.V
 	for i, d := range docs {
 		hits[i] = toMemoryHit(d.ID, d.Content, d.Score, d.Metadata)
 	}
+	s.markStale(hits)
 	return map[string]any{"hits": hits}, nil
 }
 
@@ -505,6 +536,7 @@ func (s *Server) recallHybrid(ctx context.Context, query string, k int, f rostam
 	for i, d := range docs {
 		hits[i] = toMemoryHitJSON(d.ID, d.Content, d.Score, d.Metadata)
 	}
+	s.markStale(hits)
 	return map[string]any{"hits": hits}, nil
 }
 
@@ -512,7 +544,7 @@ func (s *Server) recallHybrid(ctx context.Context, query string, k int, f rostam
 // owns for its own bookkeeping. Callers of remember/recall never see these
 // directly; toMemoryHit/toMemoryHitJSON strip them from returned metadata
 // after lifting key/created/updated into memoryHit's typed columns.
-var reservedMetadataFields = [...]string{nsField, createdField, keyField, updatedField}
+var reservedMetadataFields = [...]string{nsField, createdField, keyField, updatedField, pathField, symbolField, fileHashField}
 
 // stripReservedMetadata removes the memory subsystem's own bookkeeping
 // fields (namespace, key, creation/update time) before metadata is handed
@@ -556,6 +588,15 @@ func toMemoryHit(id uint64, content string, score float32, md rostam.VectorMetad
 	if v, ok := md[updatedField]; ok && v.Kind == vector.ValueInt {
 		hit.Updated = v.Int
 	}
+	if v, ok := md[pathField]; ok && v.Kind == vector.ValueString {
+		hit.Path = v.Str
+	}
+	if v, ok := md[symbolField]; ok && v.Kind == vector.ValueString {
+		hit.Symbol = v.Str
+	}
+	if v, ok := md[fileHashField]; ok && v.Kind == vector.ValueString {
+		hit.fileHash = v.Str
+	}
 	hit.Metadata = metadataToJSON(stripReservedMetadata(md))
 	return hit
 }
@@ -577,6 +618,9 @@ func toMemoryHitJSON(id uint64, content string, score float32, md map[string]any
 	if v, ok := md[updatedField].(int64); ok {
 		hit.Updated = v
 	}
+	hit.Path, _ = md[pathField].(string)
+	hit.Symbol, _ = md[symbolField].(string)
+	hit.fileHash, _ = md[fileHashField].(string)
 	for _, r := range reservedMetadataFields {
 		delete(md, r)
 	}
@@ -707,6 +751,7 @@ func (s *Server) handleListMemories(ctx context.Context, raw json.RawMessage) (a
 	for i, d := range docs {
 		memories[i] = toMemoryHit(d.ID, d.Content, d.Score, d.Metadata)
 	}
+	s.markStale(memories)
 	return map[string]any{"memories": memories, "next_cursor": cursor}, nil
 }
 
