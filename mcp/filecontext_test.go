@@ -163,7 +163,9 @@ func (f failingScroll) VectorScroll(context.Context, string, rostam.VectorFilter
 }
 
 func TestProbeMemoryMissingSpellings(t *testing.T) {
-	for _, msg := range []string{"unknown collection mcp_memory", "no collection \"mcp_memory\"", "rpc: No Collection mcp_memory"} {
+	for _, msg := range []string{"unknown collection mcp_memory", "no collection \"mcp_memory\"", "rpc: No Collection mcp_memory",
+		// verbatim from a real remote (memory_e2e_test.go)
+		`client: server error on op "vector_scroll": ops: unknown collection "mcp_memory"`} {
 		s := newTestServer(t, Config{Store: failingScroll{newHeapStore(t), errors.New(msg)}, ReadOnly: true})
 		if _, err := s.RecentMemories(context.Background(), "p", 5); !errors.Is(err, ErrNoMemory) {
 			t.Errorf("%q: err = %v, want ErrNoMemory", msg, err)
