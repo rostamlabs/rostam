@@ -3,6 +3,7 @@
 package mcp
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -165,5 +166,42 @@ func TestRecallHybridKeepsLink(t *testing.T) {
 func TestInstructionsMentionPath(t *testing.T) {
 	if !strings.Contains(instructions, "path") || !strings.Contains(instructions, "recall_for_file") {
 		t.Fatalf("instructions must teach the path argument and recall_for_file:\n%s", instructions)
+	}
+}
+
+func TestMarkStaleHashesEachPathOnce(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "a.go", "package a\n")
+	writeFile(t, root, "b.go", "package b\n")
+	s := newTestServer(t, Config{ProjectRoot: root})
+	for i := 0; i < 12; i++ {
+		p := "a.go"
+		if i%4 == 3 {
+			p = "b.go"
+		}
+		seedMemory(t, s, "p", p, "fact "+strings.Repeat("x", i), int64(100+i))
+	}
+	calls := map[string]int{}
+	orig := hashFileFn
+	hashFileFn = func(root, rel string) (string, fileState) {
+		calls[rel]++
+		return orig(root, rel)
+	}
+	t.Cleanup(func() { hashFileFn = orig })
+
+	hits, err := s.RecentMemories(context.Background(), "p", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 12 {
+		t.Fatalf("want 12 hits, got %d", len(hits))
+	}
+	if calls["a.go"] != 1 || calls["b.go"] != 1 {
+		t.Fatalf("each path must be hashed once per call, got %v", calls)
+	}
+	for _, h := range hits {
+		if h.Stale != true { // seeded with an empty stored hash: the file exists, so it changed
+			t.Fatalf("hit %q: stale = %v, want true", h.Content, h.Stale)
+		}
 	}
 }

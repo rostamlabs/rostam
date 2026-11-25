@@ -55,6 +55,9 @@ func normalizeLinkPath(root, p string) (string, error) {
 	return rel, nil
 }
 
+// hashFileFn is fileHash behind a seam so tests can count hashing calls.
+var hashFileFn = fileHash
+
 // fileHash streams the file at root/rel through SHA-256. The hash is "" unless
 // the state is fileOK.
 func fileHash(root, rel string) (string, fileState) {
@@ -89,11 +92,13 @@ func fileHash(root, rel string) (string, fileState) {
 	return hex.EncodeToString(h.Sum(nil)), fileOK
 }
 
-func (s *Server) staleState(p, stored string) any {
+// staleState compares a memory's stored hash against cur/st, the file's
+// current state: true (changed), "file missing", or nil (fresh, unlinked, or
+// not checkable).
+func staleState(p, stored, cur string, st fileState) any {
 	if p == "" {
 		return nil
 	}
-	cur, st := fileHash(s.projectRoot, p)
 	switch st {
 	case fileMissing:
 		if stored != "" {
@@ -109,9 +114,25 @@ func (s *Server) staleState(p, stored string) any {
 	return nil
 }
 
-// markStale fills Stale on every linked hit.
+// markStale fills Stale on every linked hit. Each distinct path is hashed once
+// per call: a page of hits is often many memories about the same file.
 func (s *Server) markStale(hits []memoryHit) {
+	type state struct {
+		hash string
+		st   fileState
+	}
+	seen := map[string]state{}
 	for i := range hits {
-		hits[i].Stale = s.staleState(hits[i].Path, hits[i].fileHash)
+		p := hits[i].Path
+		if p == "" {
+			hits[i].Stale = nil
+			continue
+		}
+		cur, ok := seen[p]
+		if !ok {
+			cur.hash, cur.st = hashFileFn(s.projectRoot, p)
+			seen[p] = cur
+		}
+		hits[i].Stale = staleState(p, hits[i].fileHash, cur.hash, cur.st)
 	}
 }
