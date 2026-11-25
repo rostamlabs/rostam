@@ -151,3 +151,30 @@ func TestReadOnlyRejectsWrites(t *testing.T) {
 	c.initialize()
 	c.callTool("remember", map[string]any{"content": "nope"}, nil, true)
 }
+
+// failingScroll is a store whose VectorScroll always fails with err.
+type failingScroll struct {
+	rostam.Store
+	err error
+}
+
+func (f failingScroll) VectorScroll(context.Context, string, rostam.VectorFilter, int, rostam.VectorScrollOpts) ([]rostam.VectorDocument, rostam.FanMeta, string, error) {
+	return nil, rostam.FanMeta{}, "", f.err
+}
+
+func TestProbeMemoryMissingSpellings(t *testing.T) {
+	for _, msg := range []string{"unknown collection mcp_memory", "no collection \"mcp_memory\"", "rpc: No Collection mcp_memory"} {
+		s := newTestServer(t, Config{Store: failingScroll{newHeapStore(t), errors.New(msg)}, ReadOnly: true})
+		if _, err := s.RecentMemories(context.Background(), "p", 5); !errors.Is(err, ErrNoMemory) {
+			t.Errorf("%q: err = %v, want ErrNoMemory", msg, err)
+		}
+	}
+}
+
+func TestProbeMemoryTransientErrorNotNoMemory(t *testing.T) {
+	s := newTestServer(t, Config{Store: failingScroll{newHeapStore(t), errors.New("connection reset by peer")}, ReadOnly: true})
+	_, err := s.RecentMemories(context.Background(), "p", 5)
+	if err == nil || errors.Is(err, ErrNoMemory) {
+		t.Fatalf("err = %v, want a non-ErrNoMemory error", err)
+	}
+}

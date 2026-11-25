@@ -1,0 +1,375 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+	"unicode/utf8"
+
+	rostam "github.com/rostamlabs/rostam"
+	"github.com/rostamlabs/rostam/mcp"
+	"github.com/rostamlabs/rostam/ops"
+)
+
+func hookHeapStore(t *testing.T) rostam.Store {
+	t.Helper()
+	reg := ops.NewRegistry()
+	if err := ops.RegisterBuiltins(reg); err != nil {
+		t.Fatal(err)
+	}
+	st, err := rostam.NewDirect(rostam.DirectConfig{Ops: reg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	return st
+}
+
+// hookRemember stores one memory through a real (writable) MCP server.
+func hookRemember(t *testing.T, st rostam.Store, root string, args map[string]any) {
+	t.Helper()
+	srv, err := mcp.NewServer(context.Background(), mcp.Config{Store: st, ProjectRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	params, _ := json.Marshal(map[string]any{"name": "remember", "arguments": args})
+	req := `{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}` + "\n" +
+		`{"jsonrpc":"2.0","method":"notifications/initialized"}` + "\n" +
+		fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":%s}`+"\n", params)
+	var out bytes.Buffer
+	if err := srv.Serve(strings.NewReader(req), &out); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), `"isError":true`) || strings.Contains(out.String(), `"error"`) {
+		t.Fatalf("remember failed: %s", out.String())
+	}
+}
+
+type hookEnv struct {
+	st    rostam.Store
+	root  string
+	state string
+}
+
+func newHookEnv(t *testing.T) hookEnv {
+	t.Helper()
+	root := t.TempDir()
+	if r, err := filepath.EvalSymlinks(root); err == nil {
+		root = r
+	}
+	run(t, root, "git", "init", "-q")
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return hookEnv{st: hookHeapStore(t), root: root, state: t.TempDir()}
+}
+
+func run(t *testing.T, dir string, name string, args ...string) {
+	t.Helper()
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("%s %v: %v\n%s", name, args, err, out)
+	}
+}
+
+func (e hookEnv) ns() string { return filepath.Base(e.root) }
+
+func (e hookEnv) deps(event string) hookDeps {
+	return hookDeps{
+		event:    event,
+		stateDir: e.state,
+		open:     func(context.Context) (rostam.Store, error) { return e.st, nil },
+		keepOpen: true,
+	}
+}
+
+func (e hookEnv) payload(session, tool, file string) string {
+	b, _ := json.Marshal(map[string]any{
+		"session_id": session, "cwd": e.root, "hook_event_name": "PreToolUse",
+		"tool_name": tool, "tool_input": map[string]any{"file_path": file},
+	})
+	return string(b)
+}
+
+func runHookStr(t *testing.T, d hookDeps, in string) string {
+	t.Helper()
+	var out bytes.Buffer
+	runHook(context.Background(), strings.NewReader(in), &out, d)
+	return out.String()
+}
+
+type hookOut struct {
+	HookSpecificOutput struct {
+		HookEventName     string `json:"hookEventName"`
+		AdditionalContext string `json:"additionalContext"`
+	} `json:"hookSpecificOutput"`
+}
+
+func parseHookOut(t *testing.T, s string) hookOut {
+	t.Helper()
+	var o hookOut
+	if err := json.Unmarshal([]byte(s), &o); err != nil {
+		t.Fatalf("output is not JSON: %v\n%q", err, s)
+	}
+	return o
+}
+
+func TestHookPreToolUseInjectsLinkedMemory(t *testing.T) {
+	e := newHookEnv(t)
+	hookRemember(t, e.st, e.root, map[string]any{"content": "a.go is fragile", "namespace": e.ns(), "path": "a.go", "symbol": "Foo"})
+	hookRemember(t, e.st, e.root, map[string]any{"content": "unrelated", "namespace": e.ns(), "path": "b.go"})
+
+	got := runHookStr(t, e.deps("pre-tool-use"), e.payload("s1", "Edit", filepath.Join(e.root, "a.go")))
+	o := parseHookOut(t, got)
+	if o.HookSpecificOutput.HookEventName != "PreToolUse" {
+		t.Fatalf("event = %q", o.HookSpecificOutput.HookEventName)
+	}
+	ctx := o.HookSpecificOutput.AdditionalContext
+	if !strings.HasPrefix(ctx, "Rostam memory (recalled, may be stale") || !strings.Contains(ctx, "a.go#Foo: a.go is fragile") || strings.Contains(ctx, "unrelated") {
+		t.Fatalf("context = %q", ctx)
+	}
+}
+
+func TestHookSessionStartRecent(t *testing.T) {
+	e := newHookEnv(t)
+	hookRemember(t, e.st, e.root, map[string]any{"content": "project fact", "namespace": e.ns()})
+	in := `{"session_id":"s","cwd":` + jsonStr(e.root) + `,"hook_event_name":"SessionStart"}`
+	o := parseHookOut(t, runHookStr(t, e.deps("session-start"), in))
+	if o.HookSpecificOutput.HookEventName != "SessionStart" || !strings.Contains(o.HookSpecificOutput.AdditionalContext, "project fact") {
+		t.Fatalf("got %+v", o)
+	}
+}
+
+func jsonStr(s string) string { b, _ := json.Marshal(s); return string(b) }
+
+func TestHookStaleMarked(t *testing.T) {
+	e := newHookEnv(t)
+	hookRemember(t, e.st, e.root, map[string]any{"content": "a.go is fragile", "namespace": e.ns(), "path": "a.go"})
+	if err := os.WriteFile(filepath.Join(e.root, "a.go"), []byte("package a // edited\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := runHookStr(t, e.deps("pre-tool-use"), e.payload("s1", "Read", "a.go"))
+	if ctx := parseHookOut(t, got).HookSpecificOutput.AdditionalContext; !strings.Contains(ctx, "- [stale] a.go: a.go is fragile") {
+		t.Fatalf("context = %q", ctx)
+	}
+}
+
+func TestHookDedupeWithinSession(t *testing.T) {
+	e := newHookEnv(t)
+	hookRemember(t, e.st, e.root, map[string]any{"content": "once only", "namespace": e.ns(), "path": "a.go"})
+	d := e.deps("pre-tool-use")
+	if runHookStr(t, d, e.payload("s1", "Edit", "a.go")) == "" {
+		t.Fatal("first call injected nothing")
+	}
+	if got := runHookStr(t, d, e.payload("s1", "Edit", "a.go")); got != "" {
+		t.Fatalf("second call same session = %q, want empty", got)
+	}
+	if runHookStr(t, d, e.payload("s2", "Edit", "a.go")) == "" {
+		t.Fatal("different session was deduped")
+	}
+	entries, _ := os.ReadDir(e.state)
+	for _, en := range entries {
+		fi, _ := en.Info()
+		if fi.Mode().Perm() != 0o600 {
+			t.Errorf("%s mode = %v, want 0600", en.Name(), fi.Mode().Perm())
+		}
+	}
+}
+
+func TestHookNoSessionIDNoDedupe(t *testing.T) {
+	e := newHookEnv(t)
+	hookRemember(t, e.st, e.root, map[string]any{"content": "again", "namespace": e.ns(), "path": "a.go"})
+	d := e.deps("pre-tool-use")
+	for i := 0; i < 2; i++ {
+		if runHookStr(t, d, e.payload("", "Edit", "a.go")) == "" {
+			t.Fatalf("call %d injected nothing", i)
+		}
+	}
+	if entries, _ := os.ReadDir(e.state); len(entries) != 0 {
+		t.Fatalf("state written without a session id: %v", entries)
+	}
+}
+
+func TestHookGarbageStdinSilent(t *testing.T) {
+	e := newHookEnv(t)
+	for _, in := range []string{"", "not json", "{", `{"cwd": 5}`, `{"cwd":""}`} {
+		if got := runHookStr(t, e.deps("pre-tool-use"), in); got != "" {
+			t.Errorf("%q -> %q", in, got)
+		}
+	}
+}
+
+func TestHookDaemonDownSilent(t *testing.T) {
+	e := newHookEnv(t)
+	d := e.deps("pre-tool-use")
+	d.open = func(context.Context) (rostam.Store, error) { return nil, errors.New("connection refused") }
+	if got := runHookStr(t, d, e.payload("s", "Edit", "a.go")); got != "" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestHookNoMemoryCollectionSilent(t *testing.T) {
+	e := newHookEnv(t) // fresh store: no collection
+	if got := runHookStr(t, e.deps("pre-tool-use"), e.payload("s", "Edit", "a.go")); got != "" {
+		t.Fatalf("got %q", got)
+	}
+	// The read-only hook must not have created it.
+	if _, _, _, err := e.st.VectorScroll(context.Background(), "mcp_memory", rostam.VectorFilter{}, 1, rostam.VectorScrollOpts{}); err == nil {
+		t.Fatal("hook created the memory collection")
+	}
+}
+
+func TestHookIgnoresPathOutsideRoot(t *testing.T) {
+	e := newHookEnv(t)
+	hookRemember(t, e.st, e.root, map[string]any{"content": "x", "namespace": e.ns(), "path": "a.go"})
+	for _, f := range []string{"../a.go", "/etc/passwd", filepath.Join(e.root, "..", "a.go"), ""} {
+		if got := runHookStr(t, e.deps("pre-tool-use"), e.payload("s", "Edit", f)); got != "" {
+			t.Errorf("%q -> %q", f, got)
+		}
+	}
+	// Other tools are ignored.
+	if got := runHookStr(t, e.deps("pre-tool-use"), e.payload("s", "Bash", "a.go")); got != "" {
+		t.Errorf("Bash -> %q", got)
+	}
+}
+
+func TestRenderInjectionBudget(t *testing.T) {
+	var hits []mcp.MemoryHit
+	for i := 0; i < 6; i++ {
+		hits = append(hits, mcp.MemoryHit{ID: uint64(i + 1), Content: fmt.Sprintf("memory-%d", i)})
+	}
+	got := renderInjection(hits, 1500, 5)
+	if n := strings.Count(got, "\n- "); n != 5 {
+		t.Fatalf("rendered %d memories, want 5:\n%s", n, got)
+	}
+	if !strings.Contains(got, "(more: call recall_for_file)") {
+		t.Fatalf("no more-pointer when cut by maxHits:\n%s", got)
+	}
+
+	big := []mcp.MemoryHit{{ID: 1, Path: "a.go", Content: strings.Repeat("é世", 1500)}, {ID: 2, Content: "second"}}
+	got = renderInjection(big, 1500, 5)
+	if len(got) > 1500 {
+		t.Fatalf("len = %d > 1500", len(got))
+	}
+	if !utf8.ValidString(got) {
+		t.Fatal("invalid UTF-8 after truncation")
+	}
+	if !strings.HasSuffix(got, "(more: call recall_for_file)") {
+		t.Fatalf("missing more pointer: %q", got[len(got)-60:])
+	}
+	if renderInjection(nil, 1500, 5) != "" {
+		t.Fatal("empty hits must render empty")
+	}
+}
+
+func TestRenderInjectionJSONEscaping(t *testing.T) {
+	content := "line1\nline2 \"quoted\" \"}} {\"hookSpecificOutput\":1} \\ end"
+	hits := []mcp.MemoryHit{{ID: 1, Path: "a.go", Content: content}}
+	text := renderInjection(hits, 1500, 5)
+	var buf bytes.Buffer
+	if err := writeHookOutput(&buf, "PreToolUse", text); err != nil {
+		t.Fatal(err)
+	}
+	var o hookOut
+	if err := json.Unmarshal(buf.Bytes(), &o); err != nil {
+		t.Fatalf("not valid JSON: %v\n%s", err, buf.String())
+	}
+	if o.HookSpecificOutput.AdditionalContext != text {
+		t.Fatal("additionalContext did not round-trip")
+	}
+	if strings.Count(text, "\n") != 1 { // header newline only: memory is one line
+		t.Fatalf("memory spans lines: %q", text)
+	}
+	if !strings.Contains(text, `"quoted" "}} {"hookSpecificOutput":1}`) {
+		t.Fatalf("content altered: %q", text)
+	}
+}
+
+func TestResolveProjectWorktree(t *testing.T) {
+	main := filepath.Join(t.TempDir(), "mainrepo")
+	if err := os.MkdirAll(main, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if r, err := filepath.EvalSymlinks(main); err == nil {
+		main = r
+	}
+	run(t, main, "git", "init", "-q")
+	run(t, main, "git", "commit", "-q", "--allow-empty", "-m", "init")
+	wt := filepath.Join(t.TempDir(), "other-name")
+	run(t, main, "git", "worktree", "add", "-q", wt)
+	if r, err := filepath.EvalSymlinks(wt); err == nil {
+		wt = r
+	}
+	sub := filepath.Join(wt, "sub")
+	_ = os.MkdirAll(sub, 0o755)
+
+	for _, cwd := range []string{main, wt, sub} {
+		root, ns := resolveProject(cwd)
+		if ns != "mainrepo" {
+			t.Errorf("cwd %s: namespace = %q, want mainrepo", cwd, ns)
+		}
+		wantRoot := main
+		if cwd != main {
+			wantRoot = wt
+		}
+		if root != wantRoot {
+			t.Errorf("cwd %s: root = %q, want %q", cwd, root, wantRoot)
+		}
+	}
+
+	plain := t.TempDir() // not a git repo
+	if root, ns := resolveProject(plain); root != plain || ns != filepath.Base(plain) {
+		t.Errorf("non-git: %q %q", root, ns)
+	}
+}
+
+type blockingStore struct {
+	rostam.Store
+	release chan struct{}
+}
+
+func (b blockingStore) VectorScroll(context.Context, string, rostam.VectorFilter, int, rostam.VectorScrollOpts) ([]rostam.VectorDocument, rostam.FanMeta, string, error) {
+	<-b.release
+	return nil, rostam.FanMeta{}, "", errors.New("released")
+}
+
+func TestHookTimeout(t *testing.T) {
+	e := newHookEnv(t)
+	bs := blockingStore{Store: e.st, release: make(chan struct{})}
+	t.Cleanup(func() { close(bs.release) })
+	d := e.deps("pre-tool-use")
+	d.open = func(context.Context) (rostam.Store, error) { return bs, nil }
+
+	start := time.Now()
+	got := runHookStr(t, d, e.payload("s", "Edit", "a.go"))
+	if el := time.Since(start); el > 1500*time.Millisecond {
+		t.Fatalf("took %v, want about 800ms", el)
+	}
+	if got != "" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestHookPanicRecovered(t *testing.T) {
+	e := newHookEnv(t)
+	d := e.deps("pre-tool-use")
+	d.open = func(context.Context) (rostam.Store, error) { panic("boom") }
+	if got := runHookStr(t, d, e.payload("s", "Edit", "a.go")); got != "" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+var _ io.Reader = (*bytes.Buffer)(nil)

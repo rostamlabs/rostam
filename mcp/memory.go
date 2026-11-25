@@ -117,11 +117,20 @@ func (s *Server) probeMemory(ctx context.Context) error {
 	switch {
 	case err == nil:
 		return nil
-	case strings.Contains(err.Error(), "unknown collection"):
+	case collectionMissing(err):
 		return ErrNoMemory
 	default:
 		return fmt.Errorf("mcp: probing memory collection: %w", err)
 	}
+}
+
+// collectionMissing reports whether err is the server saying the collection
+// does not exist. It mirrors the client package's unexported
+// isCollectionNotFound (both spellings, case-insensitive); no importable form
+// exists, and any other error (a timeout, a reset) must NOT read as "missing".
+func collectionMissing(err error) bool {
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "no collection") || strings.Contains(s, "unknown collection")
 }
 
 // bootstrapMemory is one bootstrap attempt. The caller holds s.memMu.
