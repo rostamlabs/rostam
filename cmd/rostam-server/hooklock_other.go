@@ -11,3 +11,6 @@ import "context"
 func lockSession(context.Context, string, string) (func(), bool) {
 	return func() {}, true
 }
+
+// removeLockIfFree is a no-op: without flock no lock files are created.
+func removeLockIfFree(string) {}

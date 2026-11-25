@@ -453,18 +453,28 @@ func TestPruneHookState(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	touch("old.json", ancient)
-	touch("old.json.lock", ancient)
-	touch("live.json", now)
-	touch("live.json.lock", ancient) // lock mtime never moves; its session is live
-	touch("orphan.json.lock", ancient)
+	name := func(session string) string { return filepath.Base(stateFile(dir, session)) }
+	oldS, liveS, orphanS := name("old"), name("live"), name("orphan")
+	touch(oldS, ancient)
+	touch(liveS, now)
 	touch(".tmp-123", ancient)
+	// Files this hook never creates survive even when old and json-named.
+	touch("unrelated.json", ancient)
+	touch("unrelated.json.lock", ancient)
+	touch(".tmp-notours", ancient)
 	touch("unrelated.txt", ancient)
+	want := map[string]bool{
+		oldS: false, ".tmp-123": false, liveS: true,
+		"unrelated.json": true, "unrelated.json.lock": true, ".tmp-notours": true, "unrelated.txt": true,
+	}
+	if flockSupported {
+		touch(oldS+".lock", ancient)
+		touch(liveS+".lock", ancient) // lock mtime never moves; its session is live
+		touch(orphanS+".lock", ancient)
+		want[oldS+".lock"], want[liveS+".lock"], want[orphanS+".lock"] = false, true, false
+	}
 	pruneHookState(dir, hookStateMaxAge, now)
-	for name, want := range map[string]bool{
-		"old.json": false, "old.json.lock": false, "orphan.json.lock": false, ".tmp-123": false,
-		"live.json": true, "live.json.lock": true, "unrelated.txt": true,
-	} {
+	for name, want := range want {
 		_, err := os.Stat(filepath.Join(dir, name))
 		if got := err == nil; got != want {
 			t.Errorf("%s present = %v, want %v", name, got, want)

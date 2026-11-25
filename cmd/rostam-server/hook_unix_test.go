@@ -93,3 +93,62 @@ func TestHookLockWaitBoundedByContext(t *testing.T) {
 		t.Fatal("lock wait not bounded by ctx")
 	}
 }
+
+const flockSupported = true
+
+// Pruning never removes a lock file somebody holds.
+func TestPruneKeepsHeldLock(t *testing.T) {
+	dir := t.TempDir()
+	release, ok := lockSession(context.Background(), dir, "held")
+	if !ok {
+		t.Fatal("lock not acquired")
+	}
+	defer release()
+	lock := stateFile(dir, "held") + ".lock"
+	ancient := time.Now().Add(-2 * hookStateMaxAge)
+	if err := os.Chtimes(lock, ancient, ancient); err != nil {
+		t.Fatal(err)
+	}
+	pruneHookState(dir, hookStateMaxAge, time.Now())
+	if _, err := os.Stat(lock); err != nil {
+		t.Fatalf("held lock file was removed: %v", err)
+	}
+}
+
+// A hook waiting on a lock file that is unlinked under it must not end up
+// "holding" the dead file: it relocks the file now at the path, so it still
+// excludes a newcomer.
+func TestLockSessionRelocksAfterUnlink(t *testing.T) {
+	dir := t.TempDir()
+	release, ok := lockSession(context.Background(), dir, "s")
+	if !ok {
+		t.Fatal("first lock not acquired")
+	}
+	got := make(chan func(), 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		r, ok := lockSession(ctx, dir, "s")
+		if !ok {
+			got <- nil
+			return
+		}
+		got <- r
+	}()
+	time.Sleep(50 * time.Millisecond) // the waiter is now polling the old inode
+	if err := os.Remove(stateFile(dir, "s") + ".lock"); err != nil {
+		t.Fatal(err)
+	}
+	release()
+	r := <-got
+	if r == nil {
+		t.Fatal("waiter never got the lock")
+	}
+	defer r()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if r2, ok := lockSession(ctx, dir, "s"); ok {
+		r2()
+		t.Fatal("a newcomer took the lock while the waiter holds it: the waiter held an unlinked file")
+	}
+}

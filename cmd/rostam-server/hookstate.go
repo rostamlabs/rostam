@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -78,36 +79,45 @@ func saveInjected(dir, sessionID string, ids map[uint64]bool) {
 // at worst sees its memories injected once more.
 const hookStateMaxAge = 30 * 24 * time.Hour
 
-// pruneHookState removes session state and lock files under dir not modified
-// within maxAge of now. Best effort and silent, like everything in the hook.
-// A lock file's mtime never moves (it is only opened), so it goes only when
-// its session's state file is gone or stale too: a long-lived session that
-// is still injecting keeps the lock its concurrent hooks share.
+// Names this hook creates in its state directory, and only these are ever
+// pruned, so a -state-dir shared with anything else loses nothing else:
+// stateFile's 32 hex digits + ".json", its ".lock", and CreateTemp's ".tmp-N".
+var (
+	hookStateName = regexp.MustCompile(`^[0-9a-f]{32}\.json$`)
+	hookLockName  = regexp.MustCompile(`^[0-9a-f]{32}\.json\.lock$`)
+	hookTempName  = regexp.MustCompile(`^\.tmp-[0-9]+$`)
+)
+
+// pruneHookState removes this hook's files under dir not modified within
+// maxAge of now. Best effort and silent, like everything in the hook. A lock
+// file's mtime never moves (it is only opened), so it goes only when its
+// session's state file is gone or stale too, and then only while nobody holds
+// it (removeLockIfFree).
 func pruneHookState(dir string, maxAge time.Duration, now time.Time) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
 	old := func(name string) bool {
-		fi, err := os.Stat(filepath.Join(dir, name))
-		return err == nil && now.Sub(fi.ModTime()) > maxAge
+		fi, err := os.Lstat(filepath.Join(dir, name))
+		return err == nil && fi.Mode().IsRegular() && now.Sub(fi.ModTime()) > maxAge
 	}
 	for _, e := range entries {
 		name := e.Name()
 		switch {
-		case e.IsDir():
-			continue
-		case strings.HasSuffix(name, ".json.lock"):
+		case !e.Type().IsRegular():
+		case hookLockName.MatchString(name):
 			state := strings.TrimSuffix(name, ".lock")
-			if _, err := os.Stat(filepath.Join(dir, state)); err == nil && !old(state) {
+			if _, err := os.Lstat(filepath.Join(dir, state)); err == nil && !old(state) {
 				continue
 			}
-		case strings.HasSuffix(name, ".json"), strings.HasPrefix(name, ".tmp-"):
-		default:
-			continue
-		}
-		if old(name) {
-			_ = os.Remove(filepath.Join(dir, name))
+			if old(name) {
+				removeLockIfFree(filepath.Join(dir, name))
+			}
+		case hookStateName.MatchString(name), hookTempName.MatchString(name):
+			if old(name) {
+				_ = os.Remove(filepath.Join(dir, name))
+			}
 		}
 	}
 }
