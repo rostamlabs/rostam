@@ -161,3 +161,9 @@ func TestRecallHybridKeepsLink(t *testing.T) {
 		}
 	}
 }
+
+func TestInstructionsMentionPath(t *testing.T) {
+	if !strings.Contains(instructions, "path") || !strings.Contains(instructions, "recall_for_file") {
+		t.Fatalf("instructions must teach the path argument and recall_for_file:\n%s", instructions)
+	}
+}

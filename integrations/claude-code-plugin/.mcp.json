@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "rostam": {
+      "command": "rostam-server",
+      "args": ["mcp", "-autostart"]
+    }
+  }
+}

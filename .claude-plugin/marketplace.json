@@ -1,0 +1,13 @@
+{
+  "name": "rostam",
+  "owner": { "name": "Rostam Labs" },
+  "description": "Rostam: persistent agent memory that follows your code.",
+  "plugins": [
+    {
+      "name": "rostam-memory",
+      "source": "./integrations/claude-code-plugin",
+      "description": "Code-linked agent memory: memories attached to files are shown automatically when Claude reads or edits those files, shared across concurrent sessions through a local daemon.",
+      "category": "memory"
+    }
+  ]
+}

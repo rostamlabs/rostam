@@ -5,6 +5,18 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **Code-linked memory and a Claude Code plugin.** `remember` takes an optional
+  `path` (and `symbol`) that links a memory to a file, and `recall_for_file`
+  lists what is linked to one. A linked memory whose file has since changed is
+  marked `stale`, or `"file missing"` when the file is gone. The new
+  `rostam-memory` plugin shows linked memories automatically when Claude reads
+  or edits the file (at most 5 memories and 1,500 characters per injection, each
+  once per session), and `rostam-server mcp -autostart` lets several Claude Code
+  sessions share one memory through a local daemon on `127.0.0.1:7480`
+  (`rostam-server memory-daemon [-stop]`). Not supported on Windows in this
+  release; plain `rostam-server mcp` is unchanged and still allows one session
+  at a time. See [Claude Code plugin](server/claude-code-plugin.md).
+
 ## v0.7.0 — 2026-09-27
 
 - **`go install …/cmd/rostam-server@v0.7.0` and `go get github.com/rostamlabs/rostam`

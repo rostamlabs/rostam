@@ -29,7 +29,8 @@ const instructions = `Rostam is persistent, namespaced memory for carrying facts
 - Prefer recall over re-reading a large file to answer "what did we already establish about X".
 - Never store secrets or credentials.
 - Use list_namespaces and list_memories to orient when unsure what's stored.
-- For live/in-flight state (a PR's status, what you're mid-task on), pass a stable "key" to remember (e.g. "pr-status:<branch>") so each update REPLACES the prior entry instead of piling up stale snapshots; recall and list show each memory's key and its updated time. Omit key for durable one-off facts.`
+- For live/in-flight state (a PR's status, what you're mid-task on), pass a stable "key" to remember (e.g. "pr-status:<branch>") so each update REPLACES the prior entry instead of piling up stale snapshots; recall and list show each memory's key and its updated time. Omit key for durable one-off facts.
+- When a fact is about a specific file, pass path (repo-relative, e.g. "server/protocol.go") to remember, and symbol when it narrows the fact. Linked memories are shown automatically when that file is next touched; recall_for_file {path} lists everything linked to a file. A memory marked stale was linked to a file that has since changed or disappeared: verify it before relying on it.`
 
 // Config configures a Server.
 type Config struct {
