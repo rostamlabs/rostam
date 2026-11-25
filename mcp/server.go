@@ -39,7 +39,12 @@ type Config struct {
 	Destructive bool              // register delete/delete_by_filter for arbitrary collections
 	Logger      *slog.Logger      // stderr logger; nil => slog.Default()
 	ProjectRoot string            // absolute project root for path-linked memories; "" => paths stored but never hashed
-	ReadOnly    bool              // read an existing memory store only: never create the collection, skip the embedder-identity check, reject writes
+	// ReadOnly guards the MEMORY tools only: the memory collection is never
+	// created, the embedder-identity check is skipped, and remember/forget are
+	// rejected. The generic db tools (upsert, create_collection, ...) stay
+	// registered and writable; the only ReadOnly caller is the hook, which never
+	// serves tools to a client.
+	ReadOnly bool
 }
 
 type toolDef struct {

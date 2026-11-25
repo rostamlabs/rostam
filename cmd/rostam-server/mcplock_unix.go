@@ -60,6 +60,18 @@ func lockDataDirFile(dir string) (*os.File, error) {
 	return f, nil
 }
 
+// flockErr classifies a flock(2) failure.
+//
+// Only the nonblocking-contention errno means what errDataDirBusy claims:
+// somebody else holds the lock. flock can also fail with ENOSYS or ENOTSUP (a
+// filesystem with no flock support — some network mounts), EBADF, EINTR, or an
+// I/O error, and reporting any of those as "another rostam-server mcp process
+// is using this data directory" sends the reader hunting for a process that
+// does not exist. Everything but contention comes back as the ordinary I/O
+// failure it is, naming the lock file.
+//
+// EWOULDBLOCK and EAGAIN are the same value on Linux and are checked
+// separately because they are not on every unix.
 func flockErr(path string, err error) error {
 	if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
 		return fmt.Errorf("%w: %w", errDataDirBusy, err)

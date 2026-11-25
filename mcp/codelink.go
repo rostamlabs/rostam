@@ -12,9 +12,6 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
-
-	"github.com/rostamlabs/rostam"
-	"github.com/rostamlabs/rostam/vector"
 )
 
 // Metadata fields that link a memory to a file. Reserved like nsField: stored
@@ -90,19 +87,6 @@ func fileHash(root, rel string) (string, fileState) {
 		return "", fileNoRoot
 	}
 	return hex.EncodeToString(h.Sum(nil)), fileOK
-}
-
-// staleFor reports whether a linked memory's file has changed since it was
-// written: true, "file missing", or nil (fresh, unlinked, or not checkable).
-func (s *Server) staleFor(md rostam.VectorMetadata) any {
-	var p, stored string
-	if v, ok := md[pathField]; ok && v.Kind == vector.ValueString {
-		p = v.Str
-	}
-	if v, ok := md[fileHashField]; ok && v.Kind == vector.ValueString {
-		stored = v.Str
-	}
-	return s.staleState(p, stored)
 }
 
 func (s *Server) staleState(p, stored string) any {
