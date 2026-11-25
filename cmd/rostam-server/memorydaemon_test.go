@@ -368,24 +368,44 @@ func TestProjectRootDefaults(t *testing.T) {
 		}
 		return ""
 	}
-	if got := defaultProjectRoot("", env, noCwd); got != repo {
+	if got, ns := defaultProjectRoot("", env, noCwd); got != repo || ns != filepath.Base(repo) {
 		t.Errorf("env default = %q, want %q", got, repo)
 	}
 	// No env: cwd, also resolved to the top-level.
 	cwd := func() (string, error) { return sub, nil }
-	if got := defaultProjectRoot("", func(string) string { return "" }, cwd); got != repo {
+	if got, _ := defaultProjectRoot("", func(string) string { return "" }, cwd); got != repo {
 		t.Errorf("cwd default = %q, want %q", got, repo)
 	}
 	// Outside any repo: the directory itself.
 	plain := t.TempDir()
 	plainReal, _ := filepath.EvalSymlinks(plain)
-	if got := defaultProjectRoot("", func(string) string { return "" },
+	if got, _ := defaultProjectRoot("", func(string) string { return "" },
 		func() (string, error) { return plain, nil }); got != plain && got != plainReal {
 		t.Errorf("non-repo default = %q, want %q", got, plain)
 	}
 	// An explicit flag is used as given (made absolute), not re-resolved.
-	if got := defaultProjectRoot(sub, env, noCwd); got != sub {
+	if got, ns := defaultProjectRoot(sub, env, noCwd); got != sub || ns != filepath.Base(repo) {
 		t.Errorf("explicit = %q, want %q", got, sub)
+	}
+}
+
+func TestMcpDefaultNamespaceRule(t *testing.T) {
+	for _, c := range []struct {
+		name                         string
+		flagNS                       string
+		nsGiven, autostart, rootFlag bool
+		want                         string
+	}{
+		{"plain embedded keeps default", "", false, false, false, ""},
+		{"autostart uses project", "", false, true, false, "proj"},
+		{"explicit project root uses project", "", false, false, true, "proj"},
+		{"flag wins", "other", true, true, true, "other"},
+		{"flag wins embedded", "other", true, false, false, "other"},
+		{"explicit empty flag means default", "", true, true, false, ""},
+	} {
+		if got := mcpDefaultNamespace("proj", c.flagNS, c.nsGiven, c.autostart, c.rootFlag); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
 	}
 }
 

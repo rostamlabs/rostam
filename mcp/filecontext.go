@@ -84,7 +84,7 @@ func (s *Server) registerFileContextTools() {
 			"type": "object",
 			"properties": map[string]any{
 				"path":      map[string]any{"type": "string", "description": "repo-relative (or absolute, inside the project) file path"},
-				"namespace": map[string]any{"type": "string", "description": `namespace to search (default "default")`},
+				"namespace": map[string]any{"type": "string", "description": s.nsDesc("namespace to search")},
 				"k":         map[string]any{"type": "integer", "description": "max memories to return (default 5)"},
 			},
 			"required": []any{"path"},
@@ -106,10 +106,7 @@ func (s *Server) handleRecallForFile(ctx context.Context, raw json.RawMessage) (
 	if err != nil {
 		return nil, fmt.Errorf("mcp: recall_for_file: %w", err)
 	}
-	ns := args.Namespace
-	if ns == "" {
-		ns = defaultNS
-	}
+	ns := s.namespaceOr(args.Namespace)
 	k := args.K
 	if k <= 0 {
 		k = defaultFileK

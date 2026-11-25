@@ -302,12 +302,12 @@ type memoryHit struct {
 func (s *Server) registerMemoryTools() {
 	s.register(toolDef{
 		Name:        "remember",
-		Description: `Store a fact in persistent memory for later recall. Store ONE self-contained, durable fact per call (a decision, gotcha, command, or finding), phrased so it stands alone when recalled later — not transient chatter, and never secrets. Pass namespace = the project directory name so facts stay project-scoped. Pass a stable key for live/in-flight state (e.g. a PR's status) so re-remembering the same key REPLACES the prior entry instead of piling up snapshots; omit key for durable one-off facts.`,
+		Description: `Store a fact in persistent memory for later recall. Store ONE self-contained, durable fact per call (a decision, gotcha, command, or finding), phrased so it stands alone when recalled later — not transient chatter, and never secrets. Omit namespace to use this server's default (the project's, when it was started for one); when passing one, use the project's main checkout directory name, not a worktree's. Pass a stable key for live/in-flight state (e.g. a PR's status) so re-remembering the same key REPLACES the prior entry instead of piling up snapshots; omit key for durable one-off facts.`,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"content":   map[string]any{"type": "string", "description": "the fact to store"},
-				"namespace": map[string]any{"type": "string", "description": `isolation namespace (default "default")`},
+				"namespace": map[string]any{"type": "string", "description": s.nsDesc("isolation namespace")},
 				"metadata":  map[string]any{"type": "object", "description": "optional extra metadata to attach"},
 				"key":       map[string]any{"type": "string", "description": "optional stable key; re-remembering the same key REPLACES the prior content (one canonical entry). Use for live/in-flight state; omit for durable one-off facts."},
 				"path":      map[string]any{"type": "string", "description": "optional repo-relative file this fact is about; recall then flags the memory stale if the file changes"},
@@ -319,12 +319,12 @@ func (s *Server) registerMemoryTools() {
 	})
 	s.register(toolDef{
 		Name:        "recall",
-		Description: `Search stored memories by relevance to a query, scoped to a namespace. Call this at the START of a task, before re-reading large files or re-exploring a codebase — it's cheaper than rediscovering what you already know. Pass namespace = the project directory name.`,
+		Description: `Search stored memories by relevance to a query, scoped to a namespace. Call this at the START of a task, before re-reading large files or re-exploring a codebase — it's cheaper than rediscovering what you already know. Omit namespace to search this server's default namespace.`,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"query":     map[string]any{"type": "string", "description": "search text"},
-				"namespace": map[string]any{"type": "string", "description": `restrict the search to this namespace (default "default")`},
+				"namespace": map[string]any{"type": "string", "description": s.nsDesc("restrict the search to this namespace")},
 				"k":         map[string]any{"type": "integer", "description": "max hits to return (default 5)"},
 				"filter":    map[string]any{"type": "object", "description": "optional metadata filter, ANDed with the namespace"},
 			},
@@ -343,7 +343,7 @@ func (s *Server) registerMemoryTools() {
 					"items":       map[string]any{"type": "integer"},
 					"description": "ids of the memories to delete",
 				},
-				"namespace": map[string]any{"type": "string", "description": `namespace the keys below belong to (default "default")`},
+				"namespace": map[string]any{"type": "string", "description": s.nsDesc("namespace the keys below belong to")},
 				"keys": map[string]any{
 					"type":        "array",
 					"items":       map[string]any{"type": "string"},
@@ -359,7 +359,7 @@ func (s *Server) registerMemoryTools() {
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"namespace": map[string]any{"type": "string", "description": `namespace to list (default "default")`},
+				"namespace": map[string]any{"type": "string", "description": s.nsDesc("namespace to list")},
 				"limit":     map[string]any{"type": "integer", "description": "max memories per page (default 50, max 500)"},
 				"cursor":    map[string]any{"type": "string", "description": "resume-after cursor from a previous call's next_cursor"},
 			},
@@ -399,10 +399,7 @@ func (s *Server) handleRemember(ctx context.Context, raw json.RawMessage) (any, 
 	if strings.TrimSpace(args.Content) == "" {
 		return nil, fmt.Errorf("mcp: remember: content is required")
 	}
-	ns := args.Namespace
-	if ns == "" {
-		ns = defaultNS
-	}
+	ns := s.namespaceOr(args.Namespace)
 	for _, reserved := range [...]string{nsField, createdField, keyField, updatedField, pathField, symbolField, fileHashField, "$content"} {
 		if _, ok := args.Metadata[reserved]; ok {
 			return nil, fmt.Errorf("mcp: remember: metadata key %q is reserved", reserved)
@@ -504,10 +501,7 @@ func (s *Server) handleRecall(ctx context.Context, raw json.RawMessage) (any, er
 	if strings.TrimSpace(args.Query) == "" {
 		return nil, fmt.Errorf("mcp: recall: query is required")
 	}
-	ns := args.Namespace
-	if ns == "" {
-		ns = defaultNS
-	}
+	ns := s.namespaceOr(args.Namespace)
 	// <= 0, not == 0: a client can send "k": -1, and a negative k reaching the
 	// search call is the same nonsense as a zero one. Matches list_memories.
 	k := args.K
@@ -699,10 +693,7 @@ func (s *Server) handleForget(ctx context.Context, raw json.RawMessage) (any, er
 
 	ids := args.IDs
 	if len(args.Keys) > 0 {
-		ns := args.Namespace
-		if ns == "" {
-			ns = defaultNS
-		}
+		ns := s.namespaceOr(args.Namespace)
 		ids = make([]uint64, 0, len(args.IDs)+len(args.Keys))
 		ids = append(ids, args.IDs...)
 		for _, key := range args.Keys {
@@ -767,10 +758,7 @@ func (s *Server) handleListMemories(ctx context.Context, raw json.RawMessage) (a
 	if err := json.Unmarshal(raw, &args); err != nil {
 		return nil, fmt.Errorf("mcp: bad list_memories args: %w", err)
 	}
-	ns := args.Namespace
-	if ns == "" {
-		ns = defaultNS
-	}
+	ns := s.namespaceOr(args.Namespace)
 	limit := args.Limit
 	switch {
 	case limit <= 0:

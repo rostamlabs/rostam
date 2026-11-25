@@ -265,26 +265,45 @@ func checkAutostartConflicts(visited map[string]bool) error {
 	return nil
 }
 
-// defaultProjectRoot picks the MCP project root. An explicit flag is used as
-// given (made absolute); otherwise CLAUDE_PROJECT_DIR, else the working
-// directory, resolved to the enclosing git top-level.
-func defaultProjectRoot(flagVal string, getenv func(string) string, getwd func() (string, error)) string {
+// defaultProjectRoot picks the MCP project root and its namespace. An explicit
+// flag is used as given (made absolute); otherwise CLAUDE_PROJECT_DIR, else the
+// working directory, resolved to the enclosing git top-level. The namespace is
+// resolveProject's: the MAIN checkout's directory name, so a linked worktree
+// shares its repository's namespace, exactly as the hook computes it.
+func defaultProjectRoot(flagVal string, getenv func(string) string, getwd func() (string, error)) (root, namespace string) {
 	if flagVal != "" {
-		if abs, err := filepath.Abs(flagVal); err == nil {
-			return abs
+		abs, err := filepath.Abs(flagVal)
+		if err != nil {
+			abs = flagVal
 		}
-		return flagVal
+		_, namespace = resolveProject(abs)
+		return abs, namespace
 	}
 	dir := getenv("CLAUDE_PROJECT_DIR")
 	if dir == "" {
 		wd, err := getwd()
 		if err != nil {
-			return ""
+			return "", ""
 		}
 		dir = wd
 	}
-	root, _ := resolveProject(dir)
-	return root
+	return resolveProject(dir)
+}
+
+// mcpDefaultNamespace is the namespace `mcp` uses when a tool call omits one
+// ("" = the historical "default"). An explicit -namespace always wins. Without
+// it, the resolved project namespace is used only when the session was started
+// FOR a project: -autostart (the Claude Code plugin) or an explicit
+// -project-root. A plain embedded `mcp` keeps "default", so existing setups
+// that never passed a namespace still see their memories.
+func mcpDefaultNamespace(resolved, flagNS string, nsGiven, autostart, rootGiven bool) string {
+	switch {
+	case nsGiven:
+		return flagNS
+	case autostart || rootGiven:
+		return resolved
+	}
+	return ""
 }
 
 // isDaemonArgs reports whether a process command line is `<exe> memory-daemon ...`

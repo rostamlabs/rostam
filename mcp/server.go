@@ -24,13 +24,21 @@ const protocolVersion = "2025-06-18"
 // convey that. Keep it short, imperative, and client-agnostic.
 const instructions = `Rostam is persistent, namespaced memory for carrying facts across sessions so you don't re-derive what you already know. Use it well:
 - At the start of a nontrivial task, call recall with the task's keywords BEFORE re-reading large files or re-exploring a codebase — recall is cheaper than rediscovery.
-- Namespace per project: pass namespace = the project/repo directory name (not "default") so facts stay scoped and don't collide across projects.
 - When you learn a durable fact (a decision, a gotcha, a build/test command, an investigation result), call remember — one self-contained fact per call, phrased so it still makes sense when recalled later.
 - Prefer recall over re-reading a large file to answer "what did we already establish about X".
 - Never store secrets or credentials.
 - Use list_namespaces and list_memories to orient when unsure what's stored.
 - For live/in-flight state (a PR's status, what you're mid-task on), pass a stable "key" to remember (e.g. "pr-status:<branch>") so each update REPLACES the prior entry instead of piling up stale snapshots; recall and list show each memory's key and its updated time. Omit key for durable one-off facts.
 - When a fact is about a specific file, pass path (repo-relative, e.g. "server/protocol.go") to remember, and symbol when it narrows the fact. Linked memories are shown automatically when that file is next touched; recall_for_file {path} lists everything linked to a file. A memory marked stale was linked to a file that has since changed or disappeared: verify it before relying on it.`
+
+// instructionsFor is instructions plus the namespace rule for a server whose
+// omitted-namespace default is defNS ("" = "default").
+func instructionsFor(defNS string) string {
+	if defNS != "" && defNS != defaultNS {
+		return instructions + fmt.Sprintf("\n- Namespace: this server is scoped to the project namespace %q. Omit namespace to use it; when passing one explicitly for this project, pass exactly %q (the main checkout's directory name, also when working in a git worktree, never the worktree's own name).", defNS, defNS)
+	}
+	return instructions + "\n- Namespace per project: pass namespace = the project's main checkout directory name (in a git worktree, the main repository's directory name, not the worktree's), not \"default\", so facts stay scoped and don't collide across projects."
+}
 
 // Config configures a Server.
 type Config struct {
@@ -39,6 +47,10 @@ type Config struct {
 	Destructive bool              // register delete/delete_by_filter for arbitrary collections
 	Logger      *slog.Logger      // stderr logger; nil => slog.Default()
 	ProjectRoot string            // absolute project root for path-linked memories; "" => paths stored but never hashed
+	// DefaultNamespace is the namespace the memory tools use when a call omits
+	// one; "" means "default". Set it to the project's namespace (the main
+	// checkout's directory name) so memories land where the hook looks.
+	DefaultNamespace string
 	// ReadOnly guards the MEMORY tools only: the memory collection is never
 	// created, the embedder-identity check is skipped, and remember/forget are
 	// rejected. The generic db tools (upsert, create_collection, ...) stay
@@ -61,6 +73,7 @@ type Server struct {
 	hybrid      bool // real embedder configured: recall uses dense+BM25 fusion
 	destructive bool
 	projectRoot string
+	defNS       string // namespace for calls that omit one
 	readOnly    bool
 	log         *slog.Logger
 	tools       []toolDef
@@ -87,7 +100,10 @@ func NewServer(ctx context.Context, cfg Config) (*Server, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	s := &Server{store: cfg.Store, destructive: cfg.Destructive, projectRoot: cfg.ProjectRoot, readOnly: cfg.ReadOnly, log: log}
+	s := &Server{store: cfg.Store, destructive: cfg.Destructive, projectRoot: cfg.ProjectRoot, readOnly: cfg.ReadOnly, log: log, defNS: cfg.DefaultNamespace}
+	if s.defNS == "" {
+		s.defNS = defaultNS
+	}
 	if cfg.Embedder != nil {
 		s.emb, s.hybrid = cfg.Embedder, true
 	} else {
@@ -107,6 +123,19 @@ func NewServer(ctx context.Context, cfg Config) (*Server, error) {
 }
 
 func (s *Server) register(t toolDef) { s.tools = append(s.tools, t) }
+
+// namespaceOr returns ns, or the server's default namespace when ns is "".
+func (s *Server) namespaceOr(ns string) string {
+	if ns == "" {
+		return s.defNS
+	}
+	return ns
+}
+
+// nsDesc is a namespace argument's schema description, naming the default.
+func (s *Server) nsDesc(what string) string {
+	return fmt.Sprintf("%s (default %q)", what, s.defNS)
+}
 
 func textResult(v any) map[string]any {
 	b, err := json.Marshal(v)
@@ -198,7 +227,7 @@ func (s *Server) dispatch(ctx context.Context, c *conn, req *request) error {
 			"serverInfo": map[string]any{"name": "rostam", "version": buildinfo.Version()},
 			// Teaches the agent WHEN to use the memory tools; clients inject
 			// this into the model's context.
-			"instructions": instructions,
+			"instructions": instructionsFor(s.defNS),
 		})
 	case "ping":
 		return c.reply(req.ID, map[string]any{})

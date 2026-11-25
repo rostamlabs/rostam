@@ -71,6 +71,7 @@ type mcpRuntime struct {
 type mcpExtraFlags struct {
 	autostart   *bool
 	projectRoot *string
+	namespace   *string
 	listModels  *bool
 }
 
@@ -96,6 +97,8 @@ func defineMcpFlags(fs *flag.FlagSet, fl *mcpFlags) mcpExtraFlags {
 		"connect to the shared local memory daemon (127.0.0.1:7480, token from ~/.rostam/memory/token), starting it first if it is not running; mutually exclusive with -data and -connect")
 	x.projectRoot = fs.String("project-root", "",
 		"project root for code-linked memories (default: CLAUDE_PROJECT_DIR, else the working directory, resolved to its git top-level)")
+	x.namespace = fs.String("namespace", "",
+		`namespace the memory tools use when a call omits one (default: the project's namespace, the main checkout's directory name, under -autostart or -project-root; otherwise "default")`)
 	x.listModels = fs.Bool("list-embed-models", false, "print the built-in local embedding models, then exit")
 	return x
 }
@@ -216,12 +219,15 @@ func runMcpCmd(args []string) {
 	// stdout is reserved for the MCP wire (JSON-RPC frames to the client), so
 	// every log line goes to stderr via a plain text handler.
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	visited := visitedFlags(fs)
+	root, resolvedNS := defaultProjectRoot(*projectRoot, os.Getenv, os.Getwd)
 	srv, err := mcp.NewServer(context.Background(), mcp.Config{
-		Store:       rt.store,
-		Embedder:    rt.embedder,
-		Destructive: fl.destructive,
-		Logger:      log,
-		ProjectRoot: defaultProjectRoot(*projectRoot, os.Getenv, os.Getwd),
+		Store:            rt.store,
+		Embedder:         rt.embedder,
+		Destructive:      fl.destructive,
+		Logger:           log,
+		ProjectRoot:      root,
+		DefaultNamespace: mcpDefaultNamespace(resolvedNS, *x.namespace, visited["namespace"], *autostart, *projectRoot != ""),
 	})
 	if err != nil {
 		_ = rt.store.Close()

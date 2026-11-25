@@ -559,3 +559,74 @@ func TestHookSessionStartPointerIsNotFileScoped(t *testing.T) {
 		t.Fatalf("session-start context = %q", ctx)
 	}
 }
+
+// hookRememberCfg is hookRemember with a caller-built config (default
+// namespace, project root) instead of an explicit namespace argument.
+func hookRememberCfg(t *testing.T, cfg mcp.Config, args map[string]any) {
+	t.Helper()
+	srv, err := mcp.NewServer(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	params, _ := json.Marshal(map[string]any{"name": "remember", "arguments": args})
+	req := `{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}` + "\n" +
+		fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":%s}`+"\n", params)
+	var out bytes.Buffer
+	if err := srv.Serve(strings.NewReader(req), &out); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), `"isError":true`) || strings.Contains(out.String(), `"error"`) {
+		t.Fatalf("remember failed: %s", out.String())
+	}
+}
+
+// TestWorktreeMemoryReachesHook: a memory remembered with no namespace by an
+// `mcp -autostart` session started in one checkout of a repo is injected by
+// the hook for the same file in another checkout (main <-> linked worktree).
+func TestWorktreeMemoryReachesHook(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	main := filepath.Join(t.TempDir(), "mainrepo")
+	if err := os.MkdirAll(main, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if r, err := filepath.EvalSymlinks(main); err == nil {
+		main = r
+	}
+	run(t, main, "git", "init", "-q")
+	if err := os.WriteFile(filepath.Join(main, "a.go"), []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, main, "git", "add", "a.go")
+	run(t, main, "git", "commit", "-q", "-m", "init")
+	wt := filepath.Join(t.TempDir(), "wt-name")
+	run(t, main, "git", "worktree", "add", "-q", wt)
+	if r, err := filepath.EvalSymlinks(wt); err == nil {
+		wt = r
+	}
+	noEnv := func(string) string { return "" }
+
+	for _, c := range []struct{ name, writeIn, hookIn string }{
+		{"worktree to main", wt, main},
+		{"main to worktree", main, wt},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			st := hookHeapStore(t)
+			// The MCP side exactly as runMcpCmd resolves it under -autostart.
+			root, resolved := defaultProjectRoot("", noEnv, func() (string, error) { return c.writeIn, nil })
+			ns := mcpDefaultNamespace(resolved, "", false, true, false)
+			if ns != "mainrepo" {
+				t.Fatalf("resolved namespace %q, want mainrepo", ns)
+			}
+			hookRememberCfg(t, mcp.Config{Store: st, ProjectRoot: root, DefaultNamespace: ns},
+				map[string]any{"content": "a.go needs the lock held", "path": "a.go"})
+
+			e := hookEnv{st: st, root: c.hookIn, state: t.TempDir()}
+			out := runHookStr(t, e.deps("pre-tool-use"), e.payload("s1", "Read", filepath.Join(c.hookIn, "a.go")))
+			if out == "" || !strings.Contains(parseHookOut(t, out).HookSpecificOutput.AdditionalContext, "a.go needs the lock held") {
+				t.Fatalf("hook in %s did not inject the memory written in %s: %q", c.hookIn, c.writeIn, out)
+			}
+		})
+	}
+}
