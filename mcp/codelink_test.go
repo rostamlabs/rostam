@@ -136,3 +136,28 @@ func TestRememberPathReservedKeysRejectedInMetadata(t *testing.T) {
 		}
 	}
 }
+
+func TestRememberRejectsEmptyOrPaddedPath(t *testing.T) {
+	c, _ := linkEnv(t)
+	for _, p := range []string{"", " a.go", "a.go ", "  "} {
+		c.callTool("remember", map[string]any{"content": "x", "namespace": "p", "path": p}, nil, true)
+	}
+}
+
+func TestRecallHybridKeepsLink(t *testing.T) {
+	root := t.TempDir()
+	c := startServer(t, Config{Store: newHeapStore(t), Embedder: fakeEmbedder{}, ProjectRoot: root})
+	c.initialize()
+	writeFile(t, root, "a.go", "package a")
+	c.callTool("remember", map[string]any{"content": "a: widget is fragile", "namespace": "p", "path": "a.go", "symbol": "Widget"}, nil, false)
+	writeFile(t, root, "a.go", "package a // edited")
+	h := recallLinked(t, c)
+	if h.Path != "a.go" || h.Symbol != "Widget" || h.Stale != true {
+		t.Fatalf("hybrid hit = %+v", h)
+	}
+	for _, k := range []string{"__path", "__symbol", "__file_hash"} {
+		if _, ok := h.Metadata[k]; ok {
+			t.Errorf("metadata leaked %s", k)
+		}
+	}
+}

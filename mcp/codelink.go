@@ -64,7 +64,20 @@ func fileHash(root, rel string) (string, fileState) {
 	if root == "" {
 		return "", fileNoRoot
 	}
-	f, err := os.Open(filepath.Join(root, filepath.FromSlash(rel)))
+	full := filepath.Join(root, filepath.FromSlash(rel))
+	// Lstat first: opening a FIFO or device would block, and a symlink could
+	// point outside the project. Only regular files are hashed.
+	fi, err := os.Lstat(full)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", fileMissing
+		}
+		return "", fileNoRoot
+	}
+	if !fi.Mode().IsRegular() {
+		return "", fileNoRoot
+	}
+	f, err := os.Open(full)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return "", fileMissing

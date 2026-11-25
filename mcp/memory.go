@@ -95,11 +95,33 @@ func (s *Server) ensureMemory(ctx context.Context) error {
 	if s.memReady {
 		return nil
 	}
+	if s.readOnly {
+		if err := s.probeMemory(ctx); err != nil {
+			return err
+		}
+		s.memReady = true
+		return nil
+	}
 	if err := s.bootstrapMemory(ctx); err != nil {
 		return err
 	}
 	s.memReady = true
 	return nil
+}
+
+// probeMemory is ensureMemory's read-only form: it only checks that the memory
+// collection exists, by scrolling one document. ErrNoMemory is returned (and
+// not latched) when it does not.
+func (s *Server) probeMemory(ctx context.Context) error {
+	_, _, _, err := s.store.VectorScroll(ctx, memCollection, rostam.VectorFilter{}, 1, rostam.VectorScrollOpts{})
+	switch {
+	case err == nil:
+		return nil
+	case strings.Contains(err.Error(), "unknown collection"):
+		return ErrNoMemory
+	default:
+		return fmt.Errorf("mcp: probing memory collection: %w", err)
+	}
 }
 
 // bootstrapMemory is one bootstrap attempt. The caller holds s.memMu.
@@ -335,6 +357,7 @@ func (s *Server) registerMemoryTools() {
 		},
 		Handler: s.handleListMemories,
 	})
+	s.registerFileContextTools()
 	s.register(toolDef{
 		Name:        "list_namespaces",
 		Description: "List all known memory namespaces.",
@@ -352,11 +375,14 @@ type rememberArgs struct {
 	Namespace string                     `json:"namespace"`
 	Metadata  map[string]json.RawMessage `json:"metadata"`
 	Key       string                     `json:"key"`
-	Path      string                     `json:"path"`
+	Path      *string                    `json:"path"` // pointer: absent and "" differ
 	Symbol    string                     `json:"symbol"`
 }
 
 func (s *Server) handleRemember(ctx context.Context, raw json.RawMessage) (any, error) {
+	if s.readOnly {
+		return nil, errReadOnly
+	}
 	var args rememberArgs
 	if err := json.Unmarshal(raw, &args); err != nil {
 		return nil, fmt.Errorf("mcp: bad remember args: %w", err)
@@ -375,9 +401,12 @@ func (s *Server) handleRemember(ctx context.Context, raw json.RawMessage) (any, 
 	}
 
 	var relPath string
-	if args.Path != "" {
+	if args.Path != nil {
+		if *args.Path == "" || *args.Path != strings.TrimSpace(*args.Path) {
+			return nil, fmt.Errorf("mcp: remember: path must be non-empty with no leading or trailing whitespace")
+		}
 		var err error
-		if relPath, err = normalizeLinkPath(s.projectRoot, args.Path); err != nil {
+		if relPath, err = normalizeLinkPath(s.projectRoot, *args.Path); err != nil {
 			return nil, fmt.Errorf("mcp: remember: %w", err)
 		}
 	} else if args.Symbol != "" {
@@ -648,6 +677,9 @@ type forgetArgs struct {
 // by the memories carrying it (see handleListNamespaces), so deleting the last
 // one is all that "removing a namespace" means.
 func (s *Server) handleForget(ctx context.Context, raw json.RawMessage) (any, error) {
+	if s.readOnly {
+		return nil, errReadOnly
+	}
 	var args forgetArgs
 	if err := json.Unmarshal(raw, &args); err != nil {
 		return nil, fmt.Errorf("mcp: bad forget args: %w", err)

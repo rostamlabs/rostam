@@ -38,6 +38,7 @@ type Config struct {
 	Destructive bool              // register delete/delete_by_filter for arbitrary collections
 	Logger      *slog.Logger      // stderr logger; nil => slog.Default()
 	ProjectRoot string            // absolute project root for path-linked memories; "" => paths stored but never hashed
+	ReadOnly    bool              // read an existing memory store only: never create the collection, skip the embedder-identity check, reject writes
 }
 
 type toolDef struct {
@@ -54,6 +55,7 @@ type Server struct {
 	hybrid      bool // real embedder configured: recall uses dense+BM25 fusion
 	destructive bool
 	projectRoot string
+	readOnly    bool
 	log         *slog.Logger
 	tools       []toolDef
 	initialized bool
@@ -79,14 +81,16 @@ func NewServer(ctx context.Context, cfg Config) (*Server, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	s := &Server{store: cfg.Store, destructive: cfg.Destructive, projectRoot: cfg.ProjectRoot, log: log}
+	s := &Server{store: cfg.Store, destructive: cfg.Destructive, projectRoot: cfg.ProjectRoot, readOnly: cfg.ReadOnly, log: log}
 	if cfg.Embedder != nil {
 		s.emb, s.hybrid = cfg.Embedder, true
 	} else {
 		s.emb = semcache.NewStubEmbedder("stub", 64)
 	}
-	if err := s.checkEmbedderIdentity(ctx); err != nil {
-		return nil, err
+	if !s.readOnly { // a read-only client may have no embedder at all
+		if err := s.checkEmbedderIdentity(ctx); err != nil {
+			return nil, err
+		}
 	}
 	s.registerMemoryTools()
 	s.registerDBTools()
