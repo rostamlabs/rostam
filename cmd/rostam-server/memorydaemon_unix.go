@@ -217,7 +217,7 @@ func stopDaemon(data string, wait time.Duration) error {
 		if perr != nil || pid <= 1 {
 			continue
 		}
-		if (i == 0 && processIsDaemon(pid)) || (i == 1 && processIsDaemonServer(pid, data)) {
+		if (i == 0 && processIsDaemon(pid, data)) || (i == 1 && processIsDaemonServer(pid, data)) {
 			target = pid
 			break
 		}
@@ -257,14 +257,13 @@ func isDaemonServerArgs(args []string, exeBase, data string) bool {
 	return hasPair("-data", data) && hasPair("-config", filepath.Join(data, daemonConfigName))
 }
 
+// processArgs returns pid's argv: /proc where it exists (Linux), else the
+// platform's own source (platformProcArgs).
 func processArgs(pid int) []string {
 	if b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cmdline"); err == nil {
 		return strings.Split(strings.TrimRight(string(b), "\x00"), "\x00")
 	}
-	if out, err := exec.Command("ps", "-o", "args=", "-p", strconv.Itoa(pid)).Output(); err == nil {
-		return strings.Fields(string(out))
-	}
-	return nil
+	return platformProcArgs(pid)
 }
 
 // processIsDaemonServer reports whether pid is the server a supervisor started
@@ -278,8 +277,8 @@ func processIsDaemonServer(pid int, data string) bool {
 }
 
 // processIsDaemon reports whether pid is a live `<this binary> memory-daemon`
-// process.
-func processIsDaemon(pid int) bool {
+// process for data.
+func processIsDaemon(pid int, data string) bool {
 	if pid <= 1 {
 		return false
 	}
@@ -287,6 +286,6 @@ func processIsDaemon(pid int) bool {
 	if err != nil {
 		return false
 	}
-	args := processArgs(pid)
-	return isDaemonArgs(args, filepath.Base(exe))
+	defData, _ := defaultMemoryDir()
+	return isDaemonArgs(processArgs(pid), filepath.Base(exe), data, defData)
 }

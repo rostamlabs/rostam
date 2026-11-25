@@ -17,10 +17,10 @@ import (
 )
 
 func TestProcessIsDaemonRejectsUnrelatedPids(t *testing.T) {
-	if processIsDaemon(os.Getpid()) {
+	if processIsDaemon(os.Getpid(), "/x") {
 		t.Fatal("the test process is not a memory daemon")
 	}
-	if processIsDaemon(0) || processIsDaemon(-1) || processIsDaemon(1<<30) {
+	if processIsDaemon(0, "/x") || processIsDaemon(-1, "/x") || processIsDaemon(1<<30, "/x") {
 		t.Fatal("invalid/nonexistent pids must not verify")
 	}
 }
@@ -48,8 +48,11 @@ func TestStopRefusesUnverifiedPid(t *testing.T) {
 		t.Fatalf("stopDaemon = %v, want a refusal", err)
 	}
 	time.Sleep(50 * time.Millisecond)
-	if err := syscall.Kill(victim.Process.Pid, 0); err != nil {
-		t.Fatalf("victim is gone (signalled?): %v", err)
+	// The victim is our unreaped child: once signalled it would be a zombie,
+	// which kill(pid, 0) still reports alive. A non-blocking reap tells.
+	var ws syscall.WaitStatus
+	if n, _ := syscall.Wait4(victim.Process.Pid, &ws, syscall.WNOHANG, nil); n == victim.Process.Pid {
+		t.Fatalf("victim was signalled and exited: %v", ws)
 	}
 }
 
@@ -155,7 +158,8 @@ func TestIsDaemonServerArgs(t *testing.T) {
 	if isDaemonServerArgs(good, "other", d) || isDaemonServerArgs(good, "rostam-server", "/else") {
 		t.Error("mismatched exe/data accepted")
 	}
-	if isDaemonServerArgs([]string{"/bin/rostam-server", "-data", d}, "rostam-server", d) {
+	// Long enough to pass the length guard, so the missing -config decides.
+	if isDaemonServerArgs([]string{"/bin/rostam-server", "-tcp", "127.0.0.1:7480", "-data", d, "-shards", "8"}, "rostam-server", d) {
 		t.Error("argv without -config accepted")
 	}
 }

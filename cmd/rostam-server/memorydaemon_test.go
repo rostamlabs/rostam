@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -413,20 +415,50 @@ func TestMcpDefaultNamespaceRule(t *testing.T) {
 }
 
 func TestIsDaemonArgs(t *testing.T) {
+	const def = "/h/.rostam/memory"
 	cases := []struct {
 		args []string
+		data string
 		want bool
 	}{
-		{[]string{"/usr/bin/rostam-server", "memory-daemon", "-data", "/x"}, true},
-		{[]string{"rostam-server", "memory-daemon"}, true},
-		{[]string{"/usr/bin/rostam-server", "mcp"}, false},
-		{[]string{"/usr/bin/vim", "memory-daemon"}, false},
-		{[]string{"rostam-server"}, false},
-		{nil, false},
+		{[]string{"/usr/bin/rostam-server", "memory-daemon", "-data", "/x"}, "/x", true},
+		{[]string{"/usr/bin/rostam-server", "memory-daemon", "-data=/x/", "-addr", "127.0.0.1:7480"}, "/x", true},
+		{[]string{"/usr/bin/rostam-server", "memory-daemon", "--data", "/x"}, "/x", true},
+		{[]string{"rostam-server", "memory-daemon"}, def, true},                           // no -data: the default dir
+		{[]string{"rostam-server", "memory-daemon"}, "/x", false},                         // ...which is not /x
+		{[]string{"/usr/bin/rostam-server", "memory-daemon", "-data", "/y"}, "/x", false}, // another dir's daemon
+		{[]string{"/usr/bin/rostam-server", "memory-daemon", "-data"}, "/x", false},
+		{[]string{"/usr/bin/rostam-server", "mcp"}, "/x", false},
+		{[]string{"/usr/bin/vim", "memory-daemon"}, def, false},
+		{[]string{"rostam-server"}, def, false},
+		{nil, def, false},
 	}
 	for _, tc := range cases {
-		if got := isDaemonArgs(tc.args, "rostam-server"); got != tc.want {
-			t.Errorf("isDaemonArgs(%v) = %v, want %v", tc.args, got, tc.want)
+		if got := isDaemonArgs(tc.args, "rostam-server", tc.data, def); got != tc.want {
+			t.Errorf("isDaemonArgs(%v, data %s) = %v, want %v", tc.args, tc.data, got, tc.want)
+		}
+	}
+}
+
+func TestParseProcArgs2(t *testing.T) {
+	enc := func(argc int32, exe string, pad int, argv ...string) []byte {
+		b := binary.NativeEndian.AppendUint32(nil, uint32(argc))
+		b = append(b, exe...)
+		b = append(b, make([]byte, 1+pad)...)
+		for _, a := range argv {
+			b = append(append(b, a...), 0)
+		}
+		return append(b, "PATH=/bin\x00"...) // environment follows argv
+	}
+	got := parseProcArgs2(enc(4, "/Apps/My Tools/rostam-server", 3,
+		"/Apps/My Tools/rostam-server", "memory-daemon", "-data", "/Users/a b/.rostam/memory"))
+	want := []string{"/Apps/My Tools/rostam-server", "memory-daemon", "-data", "/Users/a b/.rostam/memory"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("parseProcArgs2 = %q, want %q", got, want)
+	}
+	for _, bad := range [][]byte{nil, {1, 0}, enc(0, "x", 0), enc(3, "x", 0, "only-one")[:12]} {
+		if got := parseProcArgs2(bad); got != nil {
+			t.Errorf("parseProcArgs2(%q) = %q, want nil", bad, got)
 		}
 	}
 }

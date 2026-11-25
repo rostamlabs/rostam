@@ -3,8 +3,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -329,9 +331,60 @@ func mcpDefaultNamespace(resolved, flagNS string, nsGiven, autostart, rootGiven 
 }
 
 // isDaemonArgs reports whether a process command line is `<exe> memory-daemon ...`
-// for our executable name.
-func isDaemonArgs(args []string, exeBase string) bool {
-	return len(args) >= 2 && filepath.Base(args[0]) == exeBase && args[1] == "memory-daemon"
+// for our executable name serving data: its -data flag names data, or it has
+// none and data is defData (the flag's default). A recycled pid that is some
+// OTHER data dir's daemon is therefore not ours.
+func isDaemonArgs(args []string, exeBase, data, defData string) bool {
+	if len(args) < 2 || filepath.Base(args[0]) != exeBase || args[1] != "memory-daemon" {
+		return false
+	}
+	got, found := defData, false
+	for i := 2; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "-data" || a == "--data":
+			if i+1 < len(args) {
+				got, found = args[i+1], true
+			}
+		case strings.HasPrefix(a, "-data="), strings.HasPrefix(a, "--data="):
+			_, got, _ = strings.Cut(a, "=")
+			found = true
+		}
+	}
+	if !found && defData == "" {
+		return false
+	}
+	return got != "" && filepath.Clean(got) == filepath.Clean(data)
+}
+
+// parseProcArgs2 decodes a macOS KERN_PROCARGS2 buffer: a native-endian int32
+// argc, the executable path, NUL padding, then argc NUL-terminated argv
+// strings. Unlike `ps -o args=` it keeps argv boundaries, so a path with a
+// space in it still matches. nil when the buffer is malformed.
+func parseProcArgs2(buf []byte) []string {
+	if len(buf) < 4 {
+		return nil
+	}
+	argc := int(int32(binary.NativeEndian.Uint32(buf[:4]))) //nolint:gosec // G115: kernel-reported count, bounded below
+	rest := buf[4:]
+	i := bytes.IndexByte(rest, 0) // end of the executable path
+	if argc <= 0 || i < 0 {
+		return nil
+	}
+	rest = rest[i:]
+	for len(rest) > 0 && rest[0] == 0 {
+		rest = rest[1:]
+	}
+	args := make([]string, 0, argc)
+	for len(args) < argc {
+		j := bytes.IndexByte(rest, 0)
+		if j < 0 {
+			return nil
+		}
+		args = append(args, string(rest[:j]))
+		rest = rest[j+1:]
+	}
+	return args
 }
 
 // mcpInitErr adds -autostart's remedies to an embedder-identity mismatch: the
