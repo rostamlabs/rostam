@@ -111,4 +111,8 @@ func TestPluginFilesValid(t *testing.T) {
 	if err != nil || len(skill) == 0 {
 		t.Fatalf("skill missing: %v", err)
 	}
+	// The skill must steer the agent off worktree-named namespaces.
+	if !strings.Contains(string(skill), "namespace") || !strings.Contains(string(skill), "worktree") {
+		t.Fatal("SKILL.md must say to omit namespace and never use a worktree's name")
+	}
 }
