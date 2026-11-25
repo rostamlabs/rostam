@@ -104,9 +104,11 @@ the kernel socket table (`/proc/net/tcp`) before the token goes anywhere:
 before each dial, that the listener on `127.0.0.1:7480` belongs to the current
 user, and after it, that the socket at the other end of that very connection
 does, before the first request is sent. If either belongs to another user, or
-cannot be found or read, nothing is sent: the hook stays silent, and the MCP
-server fails with "port 7480 is owned by another user (uid N)" (or a "cannot
-verify" error) instead of starting a daemon. Off Linux there is no socket
+cannot be found or read, the token is not sent. The hook then stays silent.
+`mcp -autostart` fails with "port 7480 is owned by another user (uid N)"
+without trying to start a daemon; when the owner merely cannot be verified it
+treats the daemon as not running, may try to start one (which cannot bind a
+port that is in use), and fails with a "did not become ready" error. Off Linux there is no socket
 table to read (macOS, the BSDs), so the check does not run and the token is
 sent unverified: do not run the daemon on a shared machine there.
 
