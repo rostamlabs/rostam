@@ -365,6 +365,113 @@ func TestHookTimeout(t *testing.T) {
 	}
 }
 
+// slowStore delays every VectorScroll, so the hook's work outlives its budget.
+type slowStore struct {
+	rostam.Store
+	delay time.Duration
+}
+
+func (s slowStore) VectorScroll(ctx context.Context, c string, f rostam.VectorFilter, n int, o rostam.VectorScrollOpts) ([]rostam.VectorDocument, rostam.FanMeta, string, error) {
+	time.Sleep(s.delay)
+	return s.Store.VectorScroll(ctx, c, f, n, o)
+}
+
+// Work that finishes after the budget was abandoned must not record its
+// memories as injected (they were never shown), and must free the lock.
+func TestHookTimeoutRecordsNothing(t *testing.T) {
+	e := newHookEnv(t)
+	hookRemember(t, e.st, e.root, map[string]any{"content": "late fact", "namespace": e.ns(), "path": "a.go"})
+	d := e.deps("pre-tool-use")
+	d.budget = 100 * time.Millisecond
+	d.open = func(context.Context) (rostam.Store, error) {
+		return slowStore{Store: e.st, delay: 300 * time.Millisecond}, nil
+	}
+	if got := runHookStr(t, d, e.payload("s", "Edit", "a.go")); got != "" {
+		t.Fatalf("timed-out hook wrote %q", got)
+	}
+	time.Sleep(time.Second) // let the abandoned work run to completion
+	if seen := loadInjected(e.state, "s"); len(seen) != 0 {
+		t.Fatalf("abandoned work recorded %v as injected", seen)
+	}
+	if got := runHookStr(t, e.deps("pre-tool-use"), e.payload("s", "Edit", "a.go")); !strings.Contains(got, "late fact") {
+		t.Fatalf("next hook in the session = %q, want the memory injected", got)
+	}
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("stdout closed") }
+
+// A failed write means nothing was shown, so nothing is recorded.
+func TestHookOutputFailureRecordsNothing(t *testing.T) {
+	e := newHookEnv(t)
+	hookRemember(t, e.st, e.root, map[string]any{"content": "unseen fact", "namespace": e.ns(), "path": "a.go"})
+	runHook(context.Background(), strings.NewReader(e.payload("s", "Edit", "a.go")), failingWriter{}, e.deps("pre-tool-use"))
+	if seen := loadInjected(e.state, "s"); len(seen) != 0 {
+		t.Fatalf("failed write recorded %v as injected", seen)
+	}
+	if got := runHookStr(t, e.deps("pre-tool-use"), e.payload("s", "Edit", "a.go")); !strings.Contains(got, "unseen fact") {
+		t.Fatalf("after a failed write = %q, want the memory injected", got)
+	}
+}
+
+// More memories than the fetch cap: already-injected ones must not crowd the
+// rest out, so repeated hooks in one session eventually show every memory.
+func TestHookSeenDoNotUseUpFetchCap(t *testing.T) {
+	e := newHookEnv(t)
+	const total = hookMaxHits*4 + 3
+	for i := 0; i < total; i++ {
+		hookRemember(t, e.st, e.root, map[string]any{"content": fmt.Sprintf("fact-%02d", i), "namespace": e.ns(), "path": "a.go"})
+	}
+	shown := map[string]bool{}
+	for round := 0; round < total; round++ {
+		out := runHookStr(t, e.deps("pre-tool-use"), e.payload("s", "Read", "a.go"))
+		if out == "" {
+			break
+		}
+		for i := 0; i < total; i++ {
+			if f := fmt.Sprintf("fact-%02d", i); strings.Contains(hookCtx(t, out), f) {
+				shown[f] = true
+			}
+		}
+	}
+	if len(shown) != total {
+		t.Fatalf("session saw %d of %d memories", len(shown), total)
+	}
+}
+
+func TestPruneHookState(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	ancient := now.Add(-2 * hookStateMaxAge)
+	touch := func(name string, mt time.Time) {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(p, mt, mt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	touch("old.json", ancient)
+	touch("old.json.lock", ancient)
+	touch("live.json", now)
+	touch("live.json.lock", ancient) // lock mtime never moves; its session is live
+	touch("orphan.json.lock", ancient)
+	touch(".tmp-123", ancient)
+	touch("unrelated.txt", ancient)
+	pruneHookState(dir, hookStateMaxAge, now)
+	for name, want := range map[string]bool{
+		"old.json": false, "old.json.lock": false, "orphan.json.lock": false, ".tmp-123": false,
+		"live.json": true, "live.json.lock": true, "unrelated.txt": true,
+	} {
+		_, err := os.Stat(filepath.Join(dir, name))
+		if got := err == nil; got != want {
+			t.Errorf("%s present = %v, want %v", name, got, want)
+		}
+	}
+}
+
 func TestHookPanicRecovered(t *testing.T) {
 	e := newHookEnv(t)
 	d := e.deps("pre-tool-use")
@@ -435,24 +542,6 @@ func TestHookConcurrentAtMostOnce(t *testing.T) {
 		if c != 1 {
 			t.Errorf("fact-%d rendered %d times, want 1", i, c)
 		}
-	}
-}
-
-func TestHookLockWaitBoundedByContext(t *testing.T) {
-	dir := t.TempDir()
-	release, ok := lockSession(context.Background(), dir, "s")
-	if !ok {
-		t.Skip("no advisory lock on this platform")
-	}
-	defer release()
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
-	defer cancel()
-	start := time.Now()
-	if _, ok := lockSession(ctx, dir, "s"); ok {
-		t.Fatal("second lock acquired while held")
-	}
-	if time.Since(start) > time.Second {
-		t.Fatal("lock wait not bounded by ctx")
 	}
 }
 

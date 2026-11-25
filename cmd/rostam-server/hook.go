@@ -35,7 +35,7 @@ const (
 type hookPayload struct {
 	SessionID     string `json:"session_id"`
 	CWD           string `json:"cwd"`
-	Source        string `json:"source"` // SessionStart only: startup|resume|clear|compact
+	Source        string `json:"source"` // SessionStart only: startup|resume|clear|compact|fork
 	HookEventName string `json:"hook_event_name"`
 	ToolName      string `json:"tool_name"`
 	ToolInput     struct {
@@ -121,7 +121,10 @@ func runHook(ctx context.Context, in io.Reader, out io.Writer, d hookDeps) {
 	ctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
-	type result struct{ eventName, text string }
+	type result struct {
+		eventName, text string
+		commit          func(emitted bool)
+	}
 	done := make(chan result, 1)
 	go func() {
 		defer func() {
@@ -129,27 +132,40 @@ func runHook(ctx context.Context, in io.Reader, out io.Writer, d hookDeps) {
 				done <- result{}
 			}
 		}()
-		name, text := hookWork(ctx, in, d)
-		done <- result{name, text}
+		name, text, commit := hookWork(ctx, in, d)
+		done <- result{name, text, commit}
 	}()
 
 	select {
 	case r := <-done:
-		if r.text != "" {
-			_ = writeHookOutput(out, r.eventName, r.text)
+		emitted := r.text != "" && writeHookOutput(out, r.eventName, r.text) == nil
+		if r.commit != nil {
+			r.commit(emitted)
 		}
 	case <-ctx.Done():
+		// The work may still finish (staleness hashing is not cancellable). It
+		// must not record as injected what was never written, and it must let
+		// go of the session lock.
+		go func() {
+			if r := <-done; r.commit != nil {
+				r.commit(false)
+			}
+		}()
 	}
 }
 
-func hookWork(ctx context.Context, in io.Reader, d hookDeps) (eventName, text string) {
+// hookWork computes what to inject. When text is non-empty, commit is
+// non-nil and the caller MUST call it exactly once: with true after the text
+// was written (the shown memories are then recorded as injected), with false
+// otherwise. It also releases the session lock held since rendering.
+func hookWork(ctx context.Context, in io.Reader, d hookDeps) (eventName, text string, commit func(emitted bool)) {
 	raw, err := io.ReadAll(io.LimitReader(in, hookMaxStdin))
 	if err != nil {
-		return "", ""
+		return "", "", nil
 	}
 	var p hookPayload
 	if json.Unmarshal(raw, &p) != nil || p.CWD == "" {
-		return "", ""
+		return "", "", nil
 	}
 
 	// compact and clear drop earlier injections from the model's context, so
@@ -159,11 +175,20 @@ func hookWork(ctx context.Context, in io.Reader, d hookDeps) (eventName, text st
 		p.SessionID != "" && d.stateDir != "" {
 		release, ok := lockSession(ctx, d.stateDir, p.SessionID)
 		if !ok {
-			return "", ""
+			return "", "", nil
 		}
 		resetInjected(d.stateDir, p.SessionID)
 		release()
 	}
+	if d.event == "session-start" && p.Source == "startup" && d.stateDir != "" {
+		pruneHookState(d.stateDir, hookStateMaxAge, time.Now())
+	}
+
+	// A snapshot of what this session has already seen, taken without the
+	// lock, so seen memories do not use up the fetch cap. It is only a hint:
+	// the set is re-read under the lock below before anything is rendered.
+	hint := loadInjected(d.stateDir, p.SessionID)
+	skip := func(id uint64) bool { return hint[id] }
 
 	root, ns := resolveProjectCtx(ctx, p.CWD)
 	pointer := hookMorePointer
@@ -172,49 +197,60 @@ func hookWork(ctx context.Context, in io.Reader, d hookDeps) (eventName, text st
 	case "session-start":
 		eventName = "SessionStart"
 		pointer = hookRecallPtr
-		fetch = func(s *mcp.Server) ([]mcp.MemoryHit, error) { return s.RecentMemories(ctx, ns, hookMaxHits*4) }
+		fetch = func(s *mcp.Server) ([]mcp.MemoryHit, error) {
+			return s.RecentMemoriesExcept(ctx, ns, hookMaxHits*4, skip)
+		}
 	case "pre-tool-use":
 		eventName = "PreToolUse"
 		switch p.ToolName {
 		case "Read", "Edit", "Write", "MultiEdit":
 		default:
-			return "", ""
+			return "", "", nil
 		}
 		rel, ok := relInRoot(root, p.CWD, p.ToolInput.FilePath)
 		if !ok {
-			return "", ""
+			return "", "", nil
 		}
-		fetch = func(s *mcp.Server) ([]mcp.MemoryHit, error) { return s.FileMemories(ctx, ns, rel, hookMaxHits*4) }
+		fetch = func(s *mcp.Server) ([]mcp.MemoryHit, error) {
+			return s.FileMemoriesExcept(ctx, ns, rel, hookMaxHits*4, skip)
+		}
 	default:
-		return "", ""
+		return "", "", nil
 	}
 
 	store, err := d.open(ctx)
 	if err != nil || store == nil {
-		return "", ""
+		return "", "", nil
 	}
 	if !d.keepOpen {
 		defer func() { _ = store.Close() }()
 	}
 	srv, err := mcp.NewServer(ctx, mcp.Config{Store: store, ReadOnly: true, ProjectRoot: root})
 	if err != nil {
-		return "", ""
+		return "", "", nil
 	}
 	hits, err := fetch(srv)
 	if err != nil || len(hits) == 0 {
-		return "", ""
+		return "", "", nil
 	}
 
+	release := func() {}
 	if p.SessionID != "" && d.stateDir != "" {
 		// Serialise read-seen -> render -> save across concurrent hooks of the
 		// same session; the wait is bounded by the hook budget, and on timeout
-		// nothing is injected.
-		release, ok := lockSession(ctx, d.stateDir, p.SessionID)
+		// nothing is injected. The lock is held until commit.
+		r, ok := lockSession(ctx, d.stateDir, p.SessionID)
 		if !ok {
-			return "", ""
+			return "", "", nil
 		}
-		defer release()
+		release = r
 	}
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			release()
+		}
+	}()
 	seen := loadInjected(d.stateDir, p.SessionID)
 	fresh := hits[:0:0]
 	for _, h := range hits {
@@ -224,13 +260,20 @@ func hookWork(ctx context.Context, in io.Reader, d hookDeps) (eventName, text st
 	}
 	text, n := renderInjectionN(fresh, hookMaxChars, hookMaxHits, pointer)
 	if n == 0 {
-		return "", ""
+		return "", "", nil
 	}
-	for _, h := range fresh[:n] {
-		seen[h.ID] = true
+	shown := fresh[:n]
+	handedOff = true
+	return eventName, text, func(emitted bool) {
+		defer release()
+		if !emitted {
+			return
+		}
+		for _, h := range shown {
+			seen[h.ID] = true
+		}
+		saveInjected(d.stateDir, p.SessionID, seen)
 	}
-	saveInjected(d.stateDir, p.SessionID, seen)
-	return eventName, text
 }
 
 // relInRoot turns a tool's file_path into a slash-separated path relative to

@@ -28,23 +28,36 @@ const defaultFileK = 5
 // FileMemories returns the memories in namespace ns linked to exactly the
 // repo-relative path rel, newest first, at most k.
 func (s *Server) FileMemories(ctx context.Context, ns, rel string, k int) ([]MemoryHit, error) {
+	return s.FileMemoriesExcept(ctx, ns, rel, k, nil)
+}
+
+// FileMemoriesExcept is FileMemories leaving out every memory whose id skip
+// reports true, BEFORE the k cap: memories a caller has already seen do not
+// use up the k it asked for. A nil skip leaves nothing out.
+func (s *Server) FileMemoriesExcept(ctx context.Context, ns, rel string, k int, skip func(id uint64) bool) ([]MemoryHit, error) {
 	f := rostam.VectorFilter{Op: vector.FilterAnd, And: []rostam.VectorFilter{
 		{Op: vector.FilterEq, Field: nsField, Value: vector.NewString(ns)},
 		{Op: vector.FilterEq, Field: pathField, Value: vector.NewString(rel)},
 	}}
-	return s.newestMemories(ctx, f, k)
+	return s.newestMemories(ctx, f, k, skip)
 }
 
 // RecentMemories returns the newest k memories in namespace ns.
 func (s *Server) RecentMemories(ctx context.Context, ns string, k int) ([]MemoryHit, error) {
-	f := rostam.VectorFilter{Op: vector.FilterEq, Field: nsField, Value: vector.NewString(ns)}
-	return s.newestMemories(ctx, f, k)
+	return s.RecentMemoriesExcept(ctx, ns, k, nil)
 }
 
-// newestMemories scrolls every match of f (memory sets are small), sorts by
-// Updated descending (id ascending breaks ties so output is stable), keeps k,
-// and marks staleness on the survivors only.
-func (s *Server) newestMemories(ctx context.Context, f rostam.VectorFilter, k int) ([]MemoryHit, error) {
+// RecentMemoriesExcept is RecentMemories with skip applied before the k cap;
+// see FileMemoriesExcept.
+func (s *Server) RecentMemoriesExcept(ctx context.Context, ns string, k int, skip func(id uint64) bool) ([]MemoryHit, error) {
+	f := rostam.VectorFilter{Op: vector.FilterEq, Field: nsField, Value: vector.NewString(ns)}
+	return s.newestMemories(ctx, f, k, skip)
+}
+
+// newestMemories scrolls every match of f (memory sets are small), drops the
+// ids skip reports, sorts by Updated descending (id ascending breaks ties so
+// output is stable), keeps k, and marks staleness on the survivors only.
+func (s *Server) newestMemories(ctx context.Context, f rostam.VectorFilter, k int, skip func(uint64) bool) ([]MemoryHit, error) {
 	if err := s.ensureMemory(ctx); err != nil {
 		return nil, err
 	}
@@ -56,6 +69,9 @@ func (s *Server) newestMemories(ctx context.Context, f rostam.VectorFilter, k in
 			return nil, fmt.Errorf("mcp: listing memories: %w", err)
 		}
 		for _, d := range docs {
+			if skip != nil && skip(d.ID) {
+				continue
+			}
 			hits = append(hits, toMemoryHit(d.ID, d.Content, d.Score, d.Metadata))
 		}
 		if next == "" || next == cursor {

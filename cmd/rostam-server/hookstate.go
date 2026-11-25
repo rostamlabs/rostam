@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 )
 
 // Hooks are separate processes, so "already injected in this session" lives in
@@ -67,6 +69,46 @@ func saveInjected(dir, sessionID string, ids map[uint64]bool) {
 	cerr := tmp.Close()
 	if werr != nil || cerr != nil || os.Rename(tmp.Name(), stateFile(dir, sessionID)) != nil {
 		_ = os.Remove(tmp.Name())
+	}
+}
+
+// hookStateMaxAge is how long an untouched session's state files are kept.
+// Claude Code gives no "session ended" signal, so finished sessions' files
+// would otherwise pile up forever; a session idle this long that comes back
+// at worst sees its memories injected once more.
+const hookStateMaxAge = 30 * 24 * time.Hour
+
+// pruneHookState removes session state and lock files under dir not modified
+// within maxAge of now. Best effort and silent, like everything in the hook.
+// A lock file's mtime never moves (it is only opened), so it goes only when
+// its session's state file is gone or stale too: a long-lived session that
+// is still injecting keeps the lock its concurrent hooks share.
+func pruneHookState(dir string, maxAge time.Duration, now time.Time) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	old := func(name string) bool {
+		fi, err := os.Stat(filepath.Join(dir, name))
+		return err == nil && now.Sub(fi.ModTime()) > maxAge
+	}
+	for _, e := range entries {
+		name := e.Name()
+		switch {
+		case e.IsDir():
+			continue
+		case strings.HasSuffix(name, ".json.lock"):
+			state := strings.TrimSuffix(name, ".lock")
+			if _, err := os.Stat(filepath.Join(dir, state)); err == nil && !old(state) {
+				continue
+			}
+		case strings.HasSuffix(name, ".json"), strings.HasPrefix(name, ".tmp-"):
+		default:
+			continue
+		}
+		if old(name) {
+			_ = os.Remove(filepath.Join(dir, name))
+		}
 	}
 }
 

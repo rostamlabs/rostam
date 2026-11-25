@@ -74,7 +74,7 @@ func TestPluginFilesValid(t *testing.T) {
 	}
 	readJSON(t, filepath.Join(pluginDir, "hooks", "hooks.json"), &hooks)
 	want := map[string]struct{ matcher, command string }{
-		"SessionStart": {"startup|resume|clear|compact", "rostam-server hook session-start"},
+		"SessionStart": {"startup|resume|clear|compact|fork", "rostam-server hook session-start"},
 		"PreToolUse":   {"Read|Edit|Write|MultiEdit", "rostam-server hook pre-tool-use"},
 	}
 	for event, w := range want {

@@ -5,9 +5,11 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/rostamlabs/rostam/mcp"
 )
@@ -70,5 +72,24 @@ func TestRelInRootMatchesMCPNormalisation(t *testing.T) {
 				t.Errorf("root %s: MCP side maps %s to %q, %v; hook side %q", root, abs, m, err, got)
 			}
 		}
+	}
+}
+
+func TestHookLockWaitBoundedByContext(t *testing.T) {
+	dir := t.TempDir()
+	// unix only: the !unix lockSession is a no-op that always succeeds.
+	release, ok := lockSession(context.Background(), dir, "s")
+	if !ok {
+		t.Fatal("first lock not acquired")
+	}
+	defer release()
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, ok := lockSession(ctx, dir, "s"); ok {
+		t.Fatal("second lock acquired while held")
+	}
+	if time.Since(start) > time.Second {
+		t.Fatal("lock wait not bounded by ctx")
 	}
 }

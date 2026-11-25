@@ -65,6 +65,29 @@ func TestFileMemoriesExactPathOnly(t *testing.T) {
 	}
 }
 
+// Skipped ids are dropped before the k cap, so the cap still yields k unseen
+// memories when the newest ones were already seen.
+func TestMemoriesExceptSkipsBeforeCap(t *testing.T) {
+	s := newTestServer(t, Config{})
+	seedMemory(t, s, "p", "a.go", "old", 1)
+	seedMemory(t, s, "p", "a.go", "newest", 30)
+	seedMemory(t, s, "p", "a.go", "mid", 20)
+	all, err := s.FileMemories(context.Background(), "p", "a.go", 0)
+	if err != nil || len(all) != 3 {
+		t.Fatalf("all = %+v, %v", all, err)
+	}
+	seen := map[uint64]bool{all[0].ID: true, all[1].ID: true} // newest, mid
+	skip := func(id uint64) bool { return seen[id] }
+	got, err := s.FileMemoriesExcept(context.Background(), "p", "a.go", 2, skip)
+	if err != nil || len(got) != 1 || got[0].Content != "old" {
+		t.Fatalf("FileMemoriesExcept = %+v, %v; want just the unseen \"old\"", got, err)
+	}
+	got, err = s.RecentMemoriesExcept(context.Background(), "p", 1, skip)
+	if err != nil || len(got) != 1 || got[0].Content != "old" {
+		t.Fatalf("RecentMemoriesExcept = %+v, %v; want just the unseen \"old\"", got, err)
+	}
+}
+
 func TestFileMemoriesNewestFirstAndK(t *testing.T) {
 	s := newTestServer(t, Config{})
 	seedMemory(t, s, "p", "a.go", "old", 1)
