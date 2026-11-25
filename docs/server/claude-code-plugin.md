@@ -99,13 +99,16 @@ store is BM25-only. A store remembers the embedder it was created with, so they
 must stay the same for the life of `~/.rostam/memory`.
 
 **One user per host.** The daemon's port is fixed, so this release supports one
-user per machine. Before sending its token, a session (and the hook) checks on
-Linux, via `/proc/net/tcp`, that the process listening on `127.0.0.1:7480`
-belongs to the current user. If another user owns the port, the hook stays
-silent and the MCP server fails with "port 7480 is owned by another user (uid
-N)" instead of starting a daemon. The check is best effort: where `/proc` is
-unavailable (macOS) or the socket cannot be found, the connection proceeds as
-before.
+user per machine. On Linux, the clients (the MCP session and the hook) check
+the kernel socket table (`/proc/net/tcp`) before the token goes anywhere:
+before each dial, that the listener on `127.0.0.1:7480` belongs to the current
+user, and after it, that the socket at the other end of that very connection
+does, before the first request is sent. If either belongs to another user, or
+cannot be found or read, nothing is sent: the hook stays silent, and the MCP
+server fails with "port 7480 is owned by another user (uid N)" (or a "cannot
+verify" error) instead of starting a daemon. Off Linux there is no socket
+table to read (macOS, the BSDs), so the check does not run and the token is
+sent unverified: do not run the daemon on a shared machine there.
 
 ## Failure behaviour
 
@@ -164,7 +167,7 @@ Plain `rostam-server mcp` is unchanged: it embeds the engine over
 automatically. To get the hooks without the plugin, register `rostam-server hook session-start` and
 `rostam-server hook pre-tool-use` as Claude Code hooks yourself; they read the
 hook JSON on stdin and accept `-connect`, `-token-file` and `-state-dir` before
-the event name. `-connect` must be an `IP:port`: the hook sends the token only
-after checking that the listener there belongs to the current user, and a
-hostname (even `localhost`) or an empty host cannot be checked, so the hook
-stays silent.
+the event name. On Linux the hook sends the token only after the owner check
+above, which needs `-connect` to be an `IP:port`: a hostname (even
+`localhost`) or an empty host cannot be checked, so the hook stays silent.
+Elsewhere the check does not run and the connection proceeds unverified.

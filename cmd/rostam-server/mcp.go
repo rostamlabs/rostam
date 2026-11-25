@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -54,6 +55,9 @@ type storeFlags struct {
 	// rostam.ClientConfig.BeforeConnect). Not a flag: set by -autostart and
 	// the hook so the daemon token only ever goes to this user's listener.
 	beforeConnect func(ctx context.Context, addr string) error
+	// verifyConn vets each established connection's peer before anything is
+	// sent on it (see rostam.ClientConfig.VerifyConn).
+	verifyConn func(ctx context.Context, local, remote net.Addr) error
 }
 
 // mcpFlags holds the parsed `mcp` subcommand flags. It is passed to mcpSetup
@@ -179,9 +183,11 @@ func runMcpCmd(args []string) {
 		// the connect branch below skips claimDataDir.
 		fl.connect, fl.authToken = memoryDefaultAddr, tok
 		// This session lives as long as Claude Code does and redials whenever
-		// the daemon restarts: every dial re-checks who owns the port, so the
-		// token never goes to another user who took 7480 in between.
-		fl.beforeConnect = ownerCheckBeforeConnect
+		// the daemon restarts, so every new connection is vetted before the
+		// token goes over it: on Linux, the listener's owner before the dial
+		// and the accepting socket's owner after it. Elsewhere (no /proc
+		// socket table) both checks are skipped; see listenerOwnerCheck.
+		fl.beforeConnect, fl.verifyConn = ownerCheckBeforeConnect, ownerCheckVerifyConn
 	}
 
 	switch {
@@ -455,6 +461,7 @@ func connectStore(fl storeFlags, reg *ops.Registry, lookupEnv func(string) (stri
 		AuthToken:     token,
 		TLSConfig:     tlsCfg,
 		BeforeConnect: fl.beforeConnect,
+		VerifyConn:    fl.verifyConn,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("rostam-server: connect to %q: %w", fl.connect, err)

@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -166,6 +167,131 @@ func TestConnectStoreRunsOwnerCheckBeforeDial(t *testing.T) {
 	case <-accepted:
 		t.Fatal("a connection reached the listener despite the owner check")
 	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// A socket table that exists but cannot be read must not fail open.
+func TestOwnerChecksFailClosedOnUnreadableTable(t *testing.T) {
+	denied := func(string) ([]byte, error) { return nil, os.ErrPermission }
+	if err := listenerOwnerErr("127.0.0.1:7480", denied, 1000); err == nil {
+		t.Error("listenerOwnerErr with /proc/net/tcp unreadable = nil, want an error")
+	}
+	l := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 50000}
+	r := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 7480}
+	if err := connOwnerErr(l, r, denied, 1000); err == nil {
+		t.Error("connOwnerErr with /proc/net/tcp unreadable = nil, want an error")
+	}
+	missing := func(string) ([]byte, error) { return nil, os.ErrNotExist }
+	if err := connOwnerErr(l, r, missing, 1000); err != nil {
+		t.Errorf("connOwnerErr with no socket table = %v, want nil (best effort)", err)
+	}
+}
+
+func TestConnOwner(t *testing.T) {
+	const me, other = 1000, 1001
+	l := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 50000}
+	r := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 7480}
+	// procConn is one socket line with explicit local/remote endpoints.
+	procConn := func(lip string, lport int, rip string, rport int, state string, uid int) string {
+		v6 := strings.Contains(lip, ":")
+		return fmt.Sprintf("   0: %s:%04X %s:%04X %s 00000000:00000000 00:00000000 00000000 %5d        0 4242 1 0000000000000000 100 0 0 10 0\n",
+			procHex(net.ParseIP(lip), v6), lport, procHex(net.ParseIP(rip), v6), rport, state, uid)
+	}
+	for _, c := range []struct {
+		name      string
+		tcp, tcp6 string
+		wantUID   int
+	}{
+		{"server end ours", procHeader + procConn("127.0.0.1", 7480, "127.0.0.1", 50000, "01", me) + procConn("127.0.0.1", 50000, "127.0.0.1", 7480, "01", me), "", 0},
+		{"server end other user", procHeader + procConn("127.0.0.1", 7480, "127.0.0.1", 50000, "01", other) + procConn("127.0.0.1", 50000, "127.0.0.1", 7480, "01", me), "", other},
+		{"our own end does not count", procHeader + procConn("127.0.0.1", 50000, "127.0.0.1", 7480, "01", me), "", unverified},
+		{"listener alone does not count", procHeader + procLine(0, "127.0.0.1", 7480, "0A", me), "", unverified},
+		{"v4-mapped server end other user", procHeader, procHeader + procConn("::ffff:127.0.0.1", 7480, "::ffff:127.0.0.1", 50000, "01", other), other},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			files := map[string]string{"/proc/net/tcp": c.tcp, "/proc/net/tcp6": c.tcp6}
+			read := func(p string) ([]byte, error) {
+				if s, ok := files[p]; ok && s != "" {
+					return []byte(s), nil
+				}
+				return nil, os.ErrNotExist
+			}
+			err := connOwnerErr(l, r, read, me)
+			var pe *portOwnerError
+			switch {
+			case c.wantUID == unverified:
+				if err == nil || errors.As(err, &pe) {
+					t.Fatalf("err = %v, want a cannot-verify error", err)
+				}
+			case c.wantUID == 0 && err != nil:
+				t.Fatalf("err = %v, want nil", err)
+			case c.wantUID != 0 && (!errors.As(err, &pe) || pe.uid != c.wantUID):
+				t.Fatalf("err = %v, want a portOwnerError for uid %d", err, c.wantUID)
+			}
+		})
+	}
+}
+
+// VerifyConn runs on the established connection before any request: when it
+// refuses, not one byte (so no token) reaches the listener.
+func TestConnectStoreVerifiesPeerBeforeSending(t *testing.T) {
+	orig := connOwnerCheck
+	t.Cleanup(func() { connOwnerCheck = orig })
+	var checked net.Addr
+	connOwnerCheck = func(_, remote net.Addr) error {
+		checked = remote
+		return &portOwnerError{port: "7480", uid: 7}
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	got := make(chan int, 16)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = c.Close() }()
+				n, _ := io.Copy(io.Discard, c)
+				got <- int(n)
+			}()
+		}
+	}()
+	reg := ops.NewRegistry()
+	if err := ops.RegisterBuiltins(reg); err != nil {
+		t.Fatal(err)
+	}
+	st, err := connectStore(storeFlags{connect: ln.Addr().String(), authToken: "secret", verifyConn: ownerCheckVerifyConn}, reg,
+		func(string) (string, bool) { return "", false })
+	if err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_, err = st.Get(ctx, []byte("k"))
+		_ = st.Close()
+	}
+	var pe *portOwnerError
+	if !errors.As(err, &pe) {
+		t.Fatalf("err = %v, want the owner error from VerifyConn", err)
+	}
+	if checked == nil || checked.String() != ln.Addr().String() {
+		t.Fatalf("peer check saw %v, want %s", checked, ln.Addr())
+	}
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case n := <-got:
+			if n != 0 {
+				t.Fatalf("the listener received %d bytes despite the refused peer", n)
+			}
+		case <-deadline:
+			return
+		case <-time.After(300 * time.Millisecond):
+			return
+		}
 	}
 }
 

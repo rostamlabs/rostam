@@ -4,10 +4,18 @@
 
 package main
 
-import "os"
+import (
+	"net"
+	"os"
+)
 
 // checkListenerOwner reads /proc/net/tcp{,6}, which exists on Linux only;
-// elsewhere both reads fail and the check passes (best effort).
+// elsewhere both reads fail with ErrNotExist and the check passes unchecked.
 func checkListenerOwner(addr string) error {
 	return listenerOwnerErr(addr, os.ReadFile, os.Getuid())
+}
+
+// checkConnOwner: as checkListenerOwner, for an established connection.
+func checkConnOwner(local, remote net.Addr) error {
+	return connOwnerErr(local, remote, os.ReadFile, os.Getuid())
 }

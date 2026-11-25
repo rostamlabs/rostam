@@ -50,6 +50,13 @@ type Conn struct {
 // Addr returns the server address this conn is dialed to.
 func (c *Conn) Addr() string { return c.addr }
 
+// LocalAddr and RemoteAddr are the connection's TCP endpoints, for an
+// AfterConnect hook that vets the peer before any request is sent.
+func (c *Conn) LocalAddr() net.Addr { return c.tcp.LocalAddr() }
+
+// RemoteAddr: see LocalAddr.
+func (c *Conn) RemoteAddr() net.Addr { return c.tcp.RemoteAddr() }
+
 // dial opens a new TCP connection to addr with the given dial timeout and
 // stamps lifetime metadata. Hooks (BeforeConnect/AfterConnect) are invoked
 // by the pool around this call.
