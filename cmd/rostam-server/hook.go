@@ -194,7 +194,7 @@ func hookWork(ctx context.Context, in io.Reader, d hookDeps) (eventName, text st
 		return "", ""
 	}
 	if !d.keepOpen {
-		defer store.Close()
+		defer func() { _ = store.Close() }()
 	}
 	srv, err := mcp.NewServer(ctx, mcp.Config{Store: store, ReadOnly: true, ProjectRoot: root})
 	if err != nil {
@@ -274,7 +274,7 @@ func resolveProjectCtx(ctx context.Context, cwd string) (root, namespace string)
 }
 
 func gitOut(ctx context.Context, dir string, args ...string) (string, bool) {
-	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...) //nolint:gosec // G204: fixed "git" binary, argv only, no shell
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	if cmd.Run() != nil {

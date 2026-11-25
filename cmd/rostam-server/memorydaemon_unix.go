@@ -61,7 +61,7 @@ func superviseDaemon(data, addr string) error {
 		return fmt.Errorf("locating own executable: %w", err)
 	}
 	return superviseDaemonWith(data, func(token, cfgPath string) *exec.Cmd {
-		cmd := exec.Command(exe,
+		cmd := exec.Command(exe, //nolint:gosec // G204: exe is os.Executable(), argv only, no shell
 			"-tcp", addr,
 			"-http", "", // the flag default is :8080 on every interface
 			"-data", data,
@@ -81,7 +81,7 @@ func superviseDaemon(data, addr string) error {
 // process that actually has the store open) lives, even if this supervisor is
 // killed.
 func superviseDaemonWith(data string, mkChild func(token, cfgPath string) *exec.Cmd) error {
-	if err := os.MkdirAll(data, 0o700); err != nil {
+	if err := os.MkdirAll(data, 0o700); err != nil { //nolint:gosec // G703: data is the user's own -data flag or the home default
 		return fmt.Errorf("creating -data directory %s: %w", data, err)
 	}
 	// The regular server takes no lock on -data, so the supervisor takes the
@@ -94,7 +94,7 @@ func superviseDaemonWith(data string, mkChild func(token, cfgPath string) *exec.
 	case err != nil:
 		return err
 	}
-	defer lockFile.Close()
+	defer func() { _ = lockFile.Close() }()
 
 	token, err := ensureToken(data)
 	if err != nil {
@@ -105,7 +105,7 @@ func superviseDaemonWith(data string, mkChild func(token, cfgPath string) *exec.
 	// only cache-budget knob. Rewritten on every start.
 	cfgPath := filepath.Join(data, daemonConfigName)
 	cfg := `{"cache":{"max_memory":"` + daemonCacheBudget + `"}}` + "\n"
-	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil { //nolint:gosec // G703: fixed name inside the data dir
 		return fmt.Errorf("writing %s: %w", cfgPath, err)
 	}
 
@@ -124,12 +124,12 @@ func superviseDaemonWith(data string, mkChild func(token, cfgPath string) *exec.
 	// the supervisor was killed and the server orphaned).
 	pidPath := filepath.Join(data, daemonPidName)
 	pids := strconv.Itoa(os.Getpid()) + "\n" + strconv.Itoa(cmd.Process.Pid) + "\n"
-	if err := os.WriteFile(pidPath, []byte(pids), 0o600); err != nil {
+	if err := os.WriteFile(pidPath, []byte(pids), 0o600); err != nil { //nolint:gosec // G703: fixed name inside the data dir
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		return fmt.Errorf("writing %s: %w", pidPath, err)
 	}
-	defer os.Remove(pidPath)
+	defer func() { _ = os.Remove(pidPath) }()
 
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
@@ -175,10 +175,10 @@ func newDaemonSpawner(data, addr string) func() error {
 		if err != nil {
 			return err
 		}
-		defer logf.Close()
+		defer func() { _ = logf.Close() }() // the child holds its own copy of the fd
 		_ = logf.Chmod(0o600)
-		cmd := exec.Command(exe, "memory-daemon", "-data", data, "-addr", addr)
-		cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, logf, logf // nil stdin = /dev/null
+		cmd := exec.Command(exe, "memory-daemon", "-data", data, "-addr", addr) //nolint:gosec // G204: exe is os.Executable(), argv only, no shell
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, logf, logf                     // nil stdin = /dev/null
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 		if err := cmd.Start(); err != nil {
 			return err

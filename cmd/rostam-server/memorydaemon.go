@@ -60,7 +60,7 @@ func defaultMemoryDir() (string, error) {
 // name exists), so concurrent first runs all end up reading the single winner's
 // token and no reader ever sees a partial file.
 func ensureToken(dir string) (string, error) {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil { //nolint:gosec // G703: dir is the daemon data dir (home default or the user's own -data flag)
 		return "", fmt.Errorf("creating %s: %w", dir, err)
 	}
 	path := filepath.Join(dir, memoryTokenName)
@@ -80,7 +80,7 @@ func ensureToken(dir string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("creating token: %w", err)
 	}
-	defer os.Remove(tmp.Name())
+	defer func() { _ = os.Remove(tmp.Name()) }() // fails harmlessly once linked into place
 	if _, err := tmp.WriteString(tok + "\n"); err != nil {
 		_ = tmp.Close()
 		return "", fmt.Errorf("writing token: %w", err)
@@ -99,9 +99,13 @@ func ensureToken(dir string) (string, error) {
 }
 
 // readToken reads a token file, tightening a loose mode: a token that other
-// local users can read is no token.
+// local users can read is no token, so one whose mode cannot be checked or
+// tightened is refused rather than used.
+//
+// path is <data dir>/token, where the data dir is the home default or the
+// user's own -data flag; the G703 findings below are that trusted path.
 func readToken(path string) (string, error) {
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(path) //nolint:gosec // G703: fixed name inside the daemon data dir
 	if err != nil {
 		return "", err
 	}
@@ -109,8 +113,14 @@ func readToken(path string) (string, error) {
 	if tok == "" {
 		return "", fmt.Errorf("token file %s is empty; delete it to generate a new one", path)
 	}
-	if fi, err := os.Stat(path); err == nil && fi.Mode().Perm()&0o077 != 0 {
-		_ = os.Chmod(path, 0o600)
+	fi, err := os.Stat(path) //nolint:gosec // G703: as above
+	if err != nil {
+		return "", fmt.Errorf("checking token file %s: %w", path, err)
+	}
+	if fi.Mode().Perm()&0o077 != 0 {
+		if err := os.Chmod(path, 0o600); err != nil { //nolint:gosec // G703: as above
+			return "", fmt.Errorf("token file %s is readable by other users and its mode cannot be tightened to 0600: %w", path, err)
+		}
 	}
 	return tok, nil
 }
@@ -167,7 +177,7 @@ func probeDaemon(ctx context.Context, addr, token string) error {
 	if err != nil {
 		return err
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 	if _, err := store.Get(ctx, []byte("__rostam_probe__")); err != nil && !errors.Is(err, rostam.ErrNotFound) {
 		if errors.Is(err, client.ErrUnauthorized) {
 			return errTokenRejected
@@ -214,7 +224,7 @@ func ensureDaemonWith(ctx context.Context, data, addr string, spawn func() error
 	for {
 		unlock, lerr := claimDataDir(lockDir)
 		if lerr == nil {
-			defer unlock()
+			defer func() { _ = unlock() }()
 			// Another session may have finished spawning while we waited.
 			if ok, err := up(); ok || err != nil {
 				return err

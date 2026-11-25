@@ -28,13 +28,12 @@ import (
 // HOME (so ~/.rostam is never the developer's), BM25-only embedding, and none
 // of the ambient ROSTAM_* / CLAUDE_* configuration.
 type e2eEnv struct {
-	t      *testing.T
-	bin    string
-	home   string
-	repo   string // temp git checkout used as the project
-	ns     string // memory namespace == basename of repo
-	data   string // <home>/.rostam/memory
-	mcpEnv []string
+	t    *testing.T
+	bin  string
+	home string
+	repo string // temp git checkout used as the project
+	ns   string // memory namespace == basename of repo
+	data string // <home>/.rostam/memory
 }
 
 func (e *e2eEnv) environ(extra ...string) []string {

@@ -49,7 +49,7 @@ func lockDataDir(dir string) (func() error, error) {
 // file description, which the child then shares.
 func lockDataDirFile(dir string) (*os.File, error) {
 	path := filepath.Join(dir, dataDirLockName)
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600) //nolint:gosec // G703: fixed lock-file name inside the caller's data dir
 	if err != nil {
 		return nil, fmt.Errorf("opening lock file %s: %w", path, err)
 	}
