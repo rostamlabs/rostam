@@ -105,7 +105,7 @@ func hookOpen(connect, tokenFile string) func(context.Context) (rostam.Store, er
 			return nil, err
 		}
 		// The token goes in by value, never argv or the environment.
-		return connectStore(storeFlags{connect: connect, authToken: strings.TrimSpace(string(tok))}, reg,
+		return connectStore(storeFlags{connect: connect, authToken: strings.TrimSpace(string(tok)), beforeConnect: ownerCheckBeforeConnect}, reg,
 			func(string) (string, bool) { return "", false })
 	}
 }

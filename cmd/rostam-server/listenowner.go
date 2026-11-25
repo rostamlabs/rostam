@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -26,9 +27,16 @@ func (e *portOwnerError) Error() string {
 
 // listenerOwnerCheck verifies, before any token is sent to addr, that the
 // process listening there runs as this user. It is a seam for tests; the real
-// check is platform-specific (checkListenerOwner) and best effort: when the
-// owner cannot be determined it returns nil and the caller proceeds as before.
+// check is platform-specific (checkListenerOwner). Where the kernel's socket
+// table can be read (Linux) it fails closed; where it cannot be read at all
+// (other unixes) it returns nil and the caller proceeds as before.
 var listenerOwnerCheck = checkListenerOwner
+
+// ownerCheckBeforeConnect is listenerOwnerCheck as a client BeforeConnect
+// hook, so the check runs before every dial, not only the first.
+func ownerCheckBeforeConnect(_ context.Context, addr string) error {
+	return listenerOwnerCheck(addr)
+}
 
 // procListener is one LISTEN socket from /proc/net/tcp or /proc/net/tcp6.
 type procListener struct {
@@ -81,22 +89,34 @@ func parseProcNetTCP(text []byte, port int) []procListener {
 // listenerOwnerErr is the decision behind checkListenerOwner: read is
 // os.ReadFile, myUID os.Getuid(). It returns a *portOwnerError when the socket
 // that would accept a connection to addr is owned by another uid, and nil when
-// it is ours or cannot be found (best effort).
+// it is ours. It fails closed: an address that is not IP:port (a hostname
+// could resolve anywhere, an empty host means every interface) and a readable
+// socket table with no listener for addr are errors, since the owner of what
+// we would connect to cannot be shown to be us. Only when neither table can be
+// read at all (no /proc) does it return nil.
 func listenerOwnerErr(addr string, read func(string) ([]byte, error), myUID int) error {
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
-		return nil
+		return fmt.Errorf("cannot verify the owner of %q: %w", addr, err)
 	}
 	target := net.ParseIP(host)
+	if target == nil {
+		return fmt.Errorf("cannot verify the owner of %s: host %q is not an IP address", addr, host)
+	}
 	port, err := strconv.Atoi(portStr)
-	if target == nil || err != nil {
-		return nil
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("cannot verify the owner of %s: bad port %q", addr, portStr)
 	}
 	var all []procListener
+	readable := false
 	for _, f := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
 		if b, err := read(f); err == nil {
+			readable = true
 			all = append(all, parseProcNetTCP(b, port)...)
 		}
+	}
+	if !readable {
+		return nil // no socket table on this platform: best effort
 	}
 	// A socket bound to the exact address takes the connection over a
 	// wildcard one, so wildcards only decide when there is no exact match.
@@ -112,6 +132,12 @@ func listenerOwnerErr(addr string, read func(string) ([]byte, error), myUID int)
 	candidates := exact
 	if len(candidates) == 0 {
 		candidates = wild
+	}
+	if len(candidates) == 0 {
+		// Nothing listens there right now, so nothing can be verified; a
+		// listener that appears after this check is exactly what must not get
+		// the token.
+		return fmt.Errorf("cannot verify the owner of %s: no listening socket found", addr)
 	}
 	for _, l := range candidates {
 		if l.uid != myUID {

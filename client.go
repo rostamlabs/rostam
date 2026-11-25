@@ -49,6 +49,11 @@ type ClientConfig struct {
 	// RootCAs to verify the server, and (for mTLS) a client cert/key — the cert CN
 	// then becomes the principal when no AuthToken is set. nil ⇒ plaintext default.
 	TLSConfig *tls.Config
+
+	// BeforeConnect, when non-nil, runs before every new connection to a
+	// server (including lazy redials after a reconnect); a non-nil error
+	// aborts that dial. Use it to vet an address before a credential is sent.
+	BeforeConnect func(ctx context.Context, addr string) error
 }
 
 // NewClient constructs a networked Rostam client and returns a Store
@@ -86,6 +91,7 @@ func NewClient(cfg ClientConfig) (Store, error) {
 		TopologyRefreshInterval: cfg.TopologyRefreshInterval,
 		AuthToken:               cfg.AuthToken,
 		TLSConfig:               cfg.TLSConfig,
+		BeforeConnect:           cfg.BeforeConnect,
 	}
 	c, err := client.New(cc)
 	if err != nil {

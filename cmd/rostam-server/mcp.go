@@ -49,6 +49,11 @@ var errDataDirBusy = errors.New("data directory is held by another process")
 type storeFlags struct {
 	data, connect, authToken          string
 	tlsCA, tlsCert, tlsKey, tlsServer string
+
+	// beforeConnect, when set, vets the address before every dial (see
+	// rostam.ClientConfig.BeforeConnect). Not a flag: set by -autostart and
+	// the hook so the daemon token only ever goes to this user's listener.
+	beforeConnect func(ctx context.Context, addr string) error
 }
 
 // mcpFlags holds the parsed `mcp` subcommand flags. It is passed to mcpSetup
@@ -165,6 +170,10 @@ func runMcpCmd(args []string) {
 		// From here on this is exactly `-connect 127.0.0.1:7480` with the token:
 		// the connect branch below skips claimDataDir.
 		fl.connect, fl.authToken = memoryDefaultAddr, tok
+		// This session lives as long as Claude Code does and redials whenever
+		// the daemon restarts: every dial re-checks who owns the port, so the
+		// token never goes to another user who took 7480 in between.
+		fl.beforeConnect = ownerCheckBeforeConnect
 	}
 
 	switch {
@@ -418,10 +427,11 @@ func connectStore(fl storeFlags, reg *ops.Registry, lookupEnv func(string) (stri
 	}
 
 	store, err := rostam.NewClient(rostam.ClientConfig{
-		Servers:   []string{fl.connect},
-		Ops:       reg,
-		AuthToken: token,
-		TLSConfig: tlsCfg,
+		Servers:       []string{fl.connect},
+		Ops:           reg,
+		AuthToken:     token,
+		TLSConfig:     tlsCfg,
+		BeforeConnect: fl.beforeConnect,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("rostam-server: connect to %q: %w", fl.connect, err)
