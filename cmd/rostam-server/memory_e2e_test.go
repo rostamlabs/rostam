@@ -28,12 +28,22 @@ import (
 // HOME (so ~/.rostam is never the developer's), BM25-only embedding, and none
 // of the ambient ROSTAM_* / CLAUDE_* configuration.
 type e2eEnv struct {
-	t    *testing.T
+	t    *testing.T // the test failures are reported against (see in)
+	root *testing.T // TestMemoryE2E itself: owns cleanups that outlive a subtest
 	bin  string
 	home string
 	repo string // temp git checkout used as the project
 	ns   string // memory namespace == basename of repo
 	data string // <home>/.rostam/memory
+}
+
+// in returns a copy of e that reports failures against the subtest t, while
+// processes it starts are still cleaned up when the whole test ends (later
+// subtests use sessions an earlier one started).
+func (e *e2eEnv) in(t *testing.T) *e2eEnv {
+	c := *e
+	c.t = t
+	return &c
 }
 
 func (e *e2eEnv) environ(extra ...string) []string {
@@ -159,7 +169,7 @@ func (e *e2eEnv) startMcpAutostartIn(dir string) *mcpProc {
 	}
 	p := &mcpProc{t: e.t, cmd: cmd, in: in, out: bufio.NewScanner(out), logs: logs}
 	p.out.Buffer(make([]byte, 64<<10), 16<<20)
-	e.t.Cleanup(func() {
+	e.root.Cleanup(func() {
 		_ = in.Close()
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
@@ -289,7 +299,7 @@ func TestMemoryE2E(t *testing.T) {
 	if err := os.MkdirAll(repo, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	e := &e2eEnv{t: t, bin: bin, home: home, repo: repo, ns: "widgets", data: filepath.Join(home, ".rostam", "memory")}
+	e := &e2eEnv{t: t, root: t, bin: bin, home: home, repo: repo, ns: "widgets", data: filepath.Join(home, ".rostam", "memory")}
 	if out, err := exec.Command("git", "-C", repo, "init", "-q").CombinedOutput(); err != nil {
 		t.Fatalf("git init: %v\n%s", err, out)
 	}
@@ -323,7 +333,25 @@ func TestMemoryE2E(t *testing.T) {
 		}
 	})
 
+	t.Run("0_bad_embedder_config_spawns_no_daemon", func(t *testing.T) {
+		e := e.in(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, bin, "mcp", "-autostart", "-project-root", repo)
+		// ENDPOINT without MODEL is a configuration error.
+		cmd.Env = e.environ("ROSTAM_EMBED_ENDPOINT=http://127.0.0.1:1/v1/embeddings")
+		out, err := cmd.CombinedOutput()
+		if err == nil || !strings.Contains(string(out), "ROSTAM_EMBED_MODEL") {
+			t.Fatalf("mcp -autostart with a bad embedder config: err %v, output:\n%s", err, out)
+		}
+		time.Sleep(300 * time.Millisecond) // a spawned daemon would be binding by now
+		if sup, srv := e.daemons(); len(sup)+len(srv) != 0 || e.daemonUp() {
+			t.Fatalf("a daemon was spawned before the embedder config was rejected: %v %v", sup, srv)
+		}
+	})
+
 	t.Run("a_no_daemon_and_missing_collection", func(t *testing.T) {
+		e := e.in(t)
 		out, code, _ := e.hook("pre-tool-use", e.preToolUse("s-a1"))
 		e.wantSilent("hook with no daemon", out, code)
 		out, code, _ = e.hook("session-start", e.sessionStart("s-a1", "startup"))
@@ -373,6 +401,7 @@ func TestMemoryE2E(t *testing.T) {
 
 	var alpha, beta *mcpProc
 	t.Run("b_two_sessions_share_memory", func(t *testing.T) {
+		e := e.in(t)
 		alpha, beta = e.startMcpAutostart(), e.startMcpAutostart()
 		alpha.initialize()
 		beta.initialize()
@@ -389,6 +418,7 @@ func TestMemoryE2E(t *testing.T) {
 	})
 
 	t.Run("b2_worktree_memory_without_namespace_reaches_main_checkout", func(t *testing.T) {
+		e := e.in(t)
 		wt := filepath.Join(t.TempDir(), "widgets-feature")
 		run(t, repo, "git", "worktree", "add", "-q", wt)
 		p := e.startMcpAutostartIn(wt)
@@ -403,6 +433,7 @@ func TestMemoryE2E(t *testing.T) {
 	})
 
 	t.Run("c_pre_tool_use_injects_and_dedupes", func(t *testing.T) {
+		e := e.in(t)
 		out, code, _ := e.hook("pre-tool-use", e.preToolUse("s-c1"))
 		ctx := e.wantInjected("first pre-tool-use", out, code, "PreToolUse", "alpha rule", "beta rule")
 		if strings.Contains(ctx, "[stale") {
@@ -415,6 +446,7 @@ func TestMemoryE2E(t *testing.T) {
 	})
 
 	t.Run("d_stale_after_edit_and_delete", func(t *testing.T) {
+		e := e.in(t)
 		if err := os.WriteFile(mainGo, []byte("package main\n\nfunc main() { println(1) }\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -428,6 +460,7 @@ func TestMemoryE2E(t *testing.T) {
 	})
 
 	t.Run("e_session_start_compact_resets_resume_does_not", func(t *testing.T) {
+		e := e.in(t)
 		out, code, _ := e.hook("session-start", e.sessionStart("s-e", "startup"))
 		e.wantInjected("startup", out, code, "SessionStart", "rule")
 		out, code, _ = e.hook("session-start", e.sessionStart("s-e", "startup"))
@@ -439,6 +472,7 @@ func TestMemoryE2E(t *testing.T) {
 	})
 
 	t.Run("f_daemon_killed_hook_is_silent_and_fast", func(t *testing.T) {
+		e := e.in(t)
 		// Sessions hold open connections to the daemon; close them first so
 		// the stop is a clean one.
 		if alpha == nil || beta == nil {
@@ -458,6 +492,7 @@ func TestMemoryE2E(t *testing.T) {
 	})
 
 	t.Run("g_autostart_race_spawns_one_daemon", func(t *testing.T) {
+		e := e.in(t)
 		if sup, srv := e.daemons(); len(sup)+len(srv) != 0 {
 			t.Fatalf("daemon processes still alive before the race: %v %v", sup, srv)
 		}

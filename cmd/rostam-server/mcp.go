@@ -99,7 +99,7 @@ func defineMcpFlags(fs *flag.FlagSet, fl *mcpFlags) mcpExtraFlags {
 	fs.StringVar(&fl.tlsServer, "tls-server-name", "", "expected server certificate name (SNI + verification) for -connect")
 	fs.BoolVar(&fl.destructive, "enable-destructive", false, "register delete/delete_by_filter tools for arbitrary collections (off by default)")
 	x.autostart = fs.Bool("autostart", false,
-		"connect to the shared local memory daemon (127.0.0.1:7480, token from ~/.rostam/memory/token), starting it first if it is not running; mutually exclusive with -data and -connect")
+		"connect to the shared local memory daemon (127.0.0.1:7480, token from ~/.rostam/memory/token), starting it first if it is not running; cannot be combined with -data, -connect, -auth-token or the -tls-* flags")
 	x.projectRoot = fs.String("project-root", "",
 		"project root for code-linked memories (default: CLAUDE_PROJECT_DIR, else the working directory, resolved to its git top-level)")
 	x.namespace = fs.String("namespace", "",
@@ -149,6 +149,7 @@ func runMcpCmd(args []string) {
 		}
 	})
 
+	var autoEmbedder *semcache.Embedder // built early by -autostart; reused below
 	if *autostart {
 		if err := checkAutostartConflicts(visitedFlags(fs)); err != nil {
 			fatal(err.Error())
@@ -160,6 +161,13 @@ func runMcpCmd(args []string) {
 		if err != nil {
 			fatal("mcp: resolving home directory for -autostart", "err", err)
 		}
+		// Validate the embedder config BEFORE spawning: a typo'd ROSTAM_EMBED_*
+		// must not leave a detached daemon behind on its way to failing.
+		emb, err := embedderFromEnv(os.LookupEnv)
+		if err != nil {
+			fatal("mcp: setup failed", "err", err)
+		}
+		autoEmbedder = &emb
 		if err := ensureDaemon(context.Background(), dir, memoryDefaultAddr, newDaemonSpawner(dir, memoryDefaultAddr)); err != nil {
 			fatal("mcp: " + err.Error())
 		}
@@ -216,7 +224,13 @@ func runMcpCmd(args []string) {
 		}
 	}
 
-	rt, err := mcpSetup(fl, os.LookupEnv)
+	var rt mcpRuntime
+	var err error
+	if autoEmbedder != nil {
+		rt, err = mcpSetupWith(fl, *autoEmbedder, os.LookupEnv)
+	} else {
+		rt, err = mcpSetup(fl, os.LookupEnv)
+	}
 	if err != nil {
 		_ = unlock()
 		fatal("mcp: setup failed", "err", err)
@@ -323,7 +337,16 @@ func mcpSetup(fl mcpFlags, lookupEnv func(string) (string, bool)) (mcpRuntime, e
 	if err != nil {
 		return mcpRuntime{}, err
 	}
+	return mcpSetupWith(fl, embedder, lookupEnv)
+}
 
+// mcpSetupWith is mcpSetup with the embedder already built (-autostart builds
+// it before spawning the daemon, so a bad embedder config never spawns one).
+func mcpSetupWith(fl mcpFlags, embedder semcache.Embedder, lookupEnv func(string) (string, bool)) (mcpRuntime, error) {
+	if fl.data != "" && fl.connect != "" {
+		return mcpRuntime{}, errors.New("mcp: use -data or -connect, not both")
+	}
+	var err error
 	reg := ops.NewRegistry()
 	if err := ops.RegisterBuiltins(reg); err != nil {
 		return mcpRuntime{}, fmt.Errorf("mcp: register ops: %w", err)
