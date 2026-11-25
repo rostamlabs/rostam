@@ -225,8 +225,8 @@ func hookWork(ctx context.Context, in io.Reader, d hookDeps) (eventName, text st
 
 // relInRoot turns a tool's file_path into a slash-separated path relative to
 // root, or reports false when it is empty or outside root. Relative inputs are
-// taken relative to cwd; symlinks in the directory part are resolved so a
-// symlinked checkout still matches git's real root.
+// taken relative to cwd; the rest is mcp.NormalizeLinkPath, the same rule the
+// MCP server applies when a memory is written, so both sides agree.
 func relInRoot(root, cwd, file string) (string, bool) {
 	if file == "" {
 		return "", false
@@ -234,15 +234,8 @@ func relInRoot(root, cwd, file string) (string, bool) {
 	if !filepath.IsAbs(file) {
 		file = filepath.Join(cwd, file)
 	}
-	file = filepath.Clean(file)
-	if dir, err := filepath.EvalSymlinks(filepath.Dir(file)); err == nil {
-		file = filepath.Join(dir, filepath.Base(file))
-	}
-	rel, err := filepath.Rel(root, file)
-	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", false
-	}
-	return filepath.ToSlash(rel), true
+	rel, err := mcp.NormalizeLinkPath(root, file)
+	return rel, err == nil
 }
 
 // resolveProject returns the project root (git toplevel, else cwd) and the

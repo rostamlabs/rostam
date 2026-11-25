@@ -30,10 +30,20 @@ const (
 	fileNoRoot                   // no project root, or the file is unreadable (e.g. a directory)
 )
 
+// NormalizeLinkPath is normalizeLinkPath for callers outside this package (the
+// hook), so both sides map a file to the same repo-relative path.
+func NormalizeLinkPath(root, p string) (string, error) { return normalizeLinkPath(root, p) }
+
 // normalizeLinkPath returns p as a clean repo-relative slash path. An absolute
 // p must lie inside root. Empty paths, "." and anything that escapes root
-// (via ".." or an absolute path elsewhere) are rejected. Symlinks are not
-// resolved.
+// (via ".." or an absolute path elsewhere) are rejected.
+//
+// Symlinks are handled so that every way of naming the same checkout gives the
+// same answer: the root is accepted both as given and with its symlinks
+// resolved, and an absolute p reached through a symlinked prefix of the root
+// (a symlinked cwd, say) is matched by resolving p's ancestors until one IS the
+// root. Symlinks inside the repo are never resolved: a symlinked dir
+// docs -> site/docs keeps the path as written, docs/x.md.
 func normalizeLinkPath(root, p string) (string, error) {
 	if strings.TrimSpace(p) == "" {
 		return "", errors.New("path is empty")
@@ -42,8 +52,8 @@ func normalizeLinkPath(root, p string) (string, error) {
 		if root == "" {
 			return "", fmt.Errorf("absolute path %q needs a project root", p)
 		}
-		rel, err := filepath.Rel(root, p)
-		if err != nil {
+		rel, ok := relUnderRoot(root, filepath.Clean(p))
+		if !ok {
 			return "", fmt.Errorf("path %q is outside the project root", p)
 		}
 		p = rel
@@ -53,6 +63,42 @@ func normalizeLinkPath(root, p string) (string, error) {
 		return "", fmt.Errorf("path %q is outside the project root", p)
 	}
 	return rel, nil
+}
+
+// relUnderRoot maps the clean absolute path p to a path relative to root, or
+// reports false when p is not inside it. See normalizeLinkPath.
+func relUnderRoot(root, p string) (string, bool) {
+	roots := []string{filepath.Clean(root)}
+	realRoot := roots[0]
+	if r, err := filepath.EvalSymlinks(root); err == nil && r != realRoot {
+		realRoot = r
+		roots = append(roots, r)
+	}
+	for _, r := range roots {
+		if rel, ok := lexicalRel(r, p); ok {
+			return rel, true
+		}
+	}
+	// p names the checkout through a symlinked prefix: find the deepest
+	// existing ancestor that resolves to the root and keep the rest lexical, so
+	// in-repo symlinks and not-yet-created files are left as written.
+	for a := filepath.Dir(p); ; a = filepath.Dir(a) {
+		if r, err := filepath.EvalSymlinks(a); err == nil && r == realRoot {
+			return lexicalRel(a, p)
+		}
+		if filepath.Dir(a) == a {
+			return "", false
+		}
+	}
+}
+
+// lexicalRel is filepath.Rel(base, p) restricted to paths strictly inside base.
+func lexicalRel(base, p string) (string, bool) {
+	rel, err := filepath.Rel(base, p)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", false
+	}
+	return rel, true
 }
 
 // hashFileFn is fileHash behind a seam so tests can count hashing calls.
