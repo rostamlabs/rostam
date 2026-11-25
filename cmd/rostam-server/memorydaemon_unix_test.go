@@ -88,10 +88,11 @@ func TestHelperChild(t *testing.T) {
 
 func pidAlive(pid int) bool { return syscall.Kill(pid, 0) == nil }
 
-// The data-dir lock must stay held by the server process when its supervisor
-// dies, and -stop must still stop that orphan.
-func TestDaemonLockSurvivesSupervisorKill(t *testing.T) {
-	data := filepath.Join(t.TempDir(), "memory")
+// startHelperSupervisor runs TestHelperSupervisor (a real supervisor over a
+// fake server) on data, waits for its pid file, and returns the supervisor and
+// the server's pid. Both are killed when the test ends.
+func startHelperSupervisor(t *testing.T, data string) (*exec.Cmd, int) {
+	t.Helper()
 	exe, _ := os.Executable()
 	sup := exec.Command(exe, "-test.run=^TestHelperSupervisor$")
 	sup.Env = append(os.Environ(), "ROSTAM_TEST_SUPERVISOR_DATA="+data)
@@ -106,20 +107,25 @@ func TestDaemonLockSurvivesSupervisorKill(t *testing.T) {
 			_ = syscall.Kill(childPid, syscall.SIGKILL)
 		}
 	})
-
-	pidPath := filepath.Join(data, daemonPidName)
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		raw, _ := os.ReadFile(pidPath)
+		raw, _ := os.ReadFile(filepath.Join(data, daemonPidName))
 		if f := strings.Fields(string(raw)); len(f) == 2 {
 			childPid, _ = strconv.Atoi(f[1])
-			break
+			return sup, childPid
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("supervisor never wrote its pid file")
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// The data-dir lock must stay held by the server process when its supervisor
+// dies, and -stop must still stop that orphan.
+func TestDaemonLockSurvivesSupervisorKill(t *testing.T) {
+	data := filepath.Join(t.TempDir(), "memory")
+	sup, childPid := startHelperSupervisor(t, data)
 	if _, err := lockDataDir(data); !errors.Is(err, errDataDirBusy) {
 		t.Fatalf("lock while running: %v, want busy", err)
 	}
@@ -168,32 +174,7 @@ func TestIsDaemonServerArgs(t *testing.T) {
 func TestStopDaemonRelativeData(t *testing.T) {
 	parent := t.TempDir()
 	data := filepath.Join(parent, "memory")
-	exe, _ := os.Executable()
-	sup := exec.Command(exe, "-test.run=^TestHelperSupervisor$")
-	sup.Env = append(os.Environ(), "ROSTAM_TEST_SUPERVISOR_DATA="+data)
-	if err := sup.Start(); err != nil {
-		t.Fatal(err)
-	}
-	var childPid int
-	t.Cleanup(func() {
-		_ = sup.Process.Kill()
-		_ = sup.Wait()
-		if childPid > 1 {
-			_ = syscall.Kill(childPid, syscall.SIGKILL)
-		}
-	})
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		raw, _ := os.ReadFile(filepath.Join(data, daemonPidName))
-		if f := strings.Fields(string(raw)); len(f) == 2 {
-			childPid, _ = strconv.Atoi(f[1])
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("supervisor never wrote its pid file")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	startHelperSupervisor(t, data)
 	t.Chdir(parent)
 	if err := stopDaemon("memory", 10*time.Second); err != nil {
 		t.Fatalf("stopDaemon with a relative -data: %v", err)

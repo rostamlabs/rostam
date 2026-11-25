@@ -8,6 +8,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -124,6 +125,10 @@ func TestLockSessionRelocksAfterUnlink(t *testing.T) {
 	if !ok {
 		t.Fatal("first lock not acquired")
 	}
+	waiting := make(chan struct{})
+	var once sync.Once // the final newcomer check contends too
+	lockContendedHook = func() { once.Do(func() { close(waiting) }) }
+	t.Cleanup(func() { lockContendedHook = nil })
 	got := make(chan func(), 1)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -135,7 +140,11 @@ func TestLockSessionRelocksAfterUnlink(t *testing.T) {
 		}
 		got <- r
 	}()
-	time.Sleep(50 * time.Millisecond) // the waiter is now polling the old inode
+	select { // the waiter has failed a flock on the old inode and is polling it
+	case <-waiting:
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiter never reached the held lock")
+	}
 	if err := os.Remove(stateFile(dir, "s") + ".lock"); err != nil {
 		t.Fatal(err)
 	}

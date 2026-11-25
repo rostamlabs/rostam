@@ -43,17 +43,24 @@ func lockSession(ctx context.Context, dir, sessionID string) (func(), bool) {
 	}
 }
 
+// lockContendedHook, when set (tests only), is called the first time a
+// flockWait finds its file locked by someone else.
+var lockContendedHook func()
+
 // flockWait takes an exclusive flock on f, waiting out contention until ctx
 // ends. Only contention is worth waiting out; any other failure (ENOLCK,
 // ENOTSUP on a filesystem without flock) will not clear within the budget.
 func flockWait(ctx context.Context, f *os.File) bool {
-	for {
+	for first := true; ; first = false {
 		err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
 		if err == nil {
 			return true
 		}
 		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
 			return false
+		}
+		if first && lockContendedHook != nil {
+			lockContendedHook()
 		}
 		select {
 		case <-ctx.Done():
