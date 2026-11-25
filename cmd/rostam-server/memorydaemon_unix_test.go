@@ -163,3 +163,39 @@ func TestIsDaemonServerArgs(t *testing.T) {
 		t.Error("argv without -config accepted")
 	}
 }
+
+// -stop given a relative -data stops the daemon started with the absolute one.
+func TestStopDaemonRelativeData(t *testing.T) {
+	parent := t.TempDir()
+	data := filepath.Join(parent, "memory")
+	exe, _ := os.Executable()
+	sup := exec.Command(exe, "-test.run=^TestHelperSupervisor$")
+	sup.Env = append(os.Environ(), "ROSTAM_TEST_SUPERVISOR_DATA="+data)
+	if err := sup.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var childPid int
+	t.Cleanup(func() {
+		_ = sup.Process.Kill()
+		_ = sup.Wait()
+		if childPid > 1 {
+			_ = syscall.Kill(childPid, syscall.SIGKILL)
+		}
+	})
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		raw, _ := os.ReadFile(filepath.Join(data, daemonPidName))
+		if f := strings.Fields(string(raw)); len(f) == 2 {
+			childPid, _ = strconv.Atoi(f[1])
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("supervisor never wrote its pid file")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Chdir(parent)
+	if err := stopDaemon("memory", 10*time.Second); err != nil {
+		t.Fatalf("stopDaemon with a relative -data: %v", err)
+	}
+}

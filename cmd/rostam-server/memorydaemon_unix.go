@@ -40,6 +40,12 @@ func runMemoryDaemonCmd(args []string) {
 	if *data == "" {
 		fatal("memory-daemon: no -data directory and no home directory to default to")
 	}
+	// Absolute from here on: the server is started with it, and -stop matches
+	// it against running daemons' argv, so "-data ./mem" and "-data /abs/mem"
+	// must name the same daemon.
+	if abs, err := filepath.Abs(*data); err == nil {
+		*data = abs
+	}
 	if err := validateLoopbackAddr(*addr); err != nil {
 		fatal("memory-daemon: " + err.Error())
 	}
@@ -194,6 +200,9 @@ func newDaemonSpawner(data, addr string) func() error {
 // the data-dir lock must be held (a stale pid file whose number was recycled
 // is therefore never signalled).
 func stopDaemon(data string, wait time.Duration) error {
+	if abs, err := filepath.Abs(data); err == nil {
+		data = abs // argv of a daemon we started holds the absolute path
+	}
 	pidPath := filepath.Join(data, daemonPidName)
 	raw, err := os.ReadFile(pidPath)
 	if errors.Is(err, os.ErrNotExist) {
