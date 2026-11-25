@@ -83,21 +83,31 @@ func runHookCmd(args []string) {
 	deps := hookDeps{
 		event:    fs.Arg(0),
 		stateDir: *stateDir,
-		open: func(context.Context) (rostam.Store, error) {
-			tok, err := os.ReadFile(*tokenFile)
-			if err != nil {
-				return nil, err
-			}
-			reg := ops.NewRegistry()
-			if err := ops.RegisterBuiltins(reg); err != nil {
-				return nil, err
-			}
-			// The token goes in by value, never argv or the environment.
-			return connectStore(storeFlags{connect: *connect, authToken: strings.TrimSpace(string(tok))}, reg,
-				func(string) (string, bool) { return "", false })
-		},
+		open:     hookOpen(*connect, *tokenFile),
 	}
 	runHook(context.Background(), os.Stdin, os.Stdout, deps)
+}
+
+// hookOpen returns the hook's store opener: it connects to the daemon at
+// connect with the token from tokenFile, after checking that the listener
+// belongs to this user (the token is never sent to another user's process).
+func hookOpen(connect, tokenFile string) func(context.Context) (rostam.Store, error) {
+	return func(context.Context) (rostam.Store, error) {
+		if err := listenerOwnerCheck(connect); err != nil {
+			return nil, err
+		}
+		tok, err := os.ReadFile(tokenFile)
+		if err != nil {
+			return nil, err
+		}
+		reg := ops.NewRegistry()
+		if err := ops.RegisterBuiltins(reg); err != nil {
+			return nil, err
+		}
+		// The token goes in by value, never argv or the environment.
+		return connectStore(storeFlags{connect: connect, authToken: strings.TrimSpace(string(tok))}, reg,
+			func(string) (string, bool) { return "", false })
+	}
 }
 
 // runHook reads one hook payload from in and, only when there is something to

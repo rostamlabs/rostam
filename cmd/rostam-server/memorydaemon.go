@@ -154,6 +154,10 @@ func probeDaemon(ctx context.Context, addr, token string) error {
 		return err
 	}
 	_ = c.Close()
+	// Never hand the token to another user's process squatting on the port.
+	if err := listenerOwnerCheck(addr); err != nil {
+		return err
+	}
 	reg := ops.NewRegistry()
 	if err := ops.RegisterBuiltins(reg); err != nil {
 		return err
@@ -189,6 +193,10 @@ func ensureDaemonWith(ctx context.Context, data, addr string, spawn func() error
 	// but refuses our token, so spawning another daemon cannot help).
 	up := func() (bool, error) {
 		perr := probe(ctx, addr, token)
+		var owner *portOwnerError
+		if errors.As(perr, &owner) {
+			return false, owner // spawning cannot help: our daemon could never bind the port
+		}
 		if errors.Is(perr, errTokenRejected) {
 			return false, fmt.Errorf("a server on %s rejected the token in %s; run \"rostam-server memory-daemon -stop\" and retry",
 				addr, filepath.Join(data, memoryTokenName))
