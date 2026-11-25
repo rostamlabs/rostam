@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//go:build unix
+//go:build linux
 
 package main
 
@@ -132,8 +132,19 @@ func (e *e2eEnv) wantInjected(what, out string, code int, event string, want ...
 // startMcpAutostart launches `mcp -autostart -project-root <repo>`.
 func (e *e2eEnv) startMcpAutostart() *mcpProc {
 	e.t.Helper()
-	cmd := exec.Command(e.bin, "mcp", "-autostart", "-project-root", e.repo)
-	cmd.Env = e.environ("CLAUDE_PROJECT_DIR=" + e.repo)
+	return e.startMcpAutostartIn(e.repo)
+}
+
+// startMcpAutostartIn launches `mcp -autostart` as Claude Code would for a
+// session opened in dir: no -project-root, CLAUDE_PROJECT_DIR=dir.
+func (e *e2eEnv) startMcpAutostartIn(dir string) *mcpProc {
+	e.t.Helper()
+	args := []string{"mcp", "-autostart"}
+	if dir == e.repo {
+		args = append(args, "-project-root", e.repo)
+	}
+	cmd := exec.Command(e.bin, args...)
+	cmd.Env = e.environ("CLAUDE_PROJECT_DIR=" + dir)
 	in, err := cmd.StdinPipe()
 	if err != nil {
 		e.t.Fatal(err)
@@ -287,6 +298,9 @@ func TestMemoryE2E(t *testing.T) {
 	if err := os.WriteFile(mainGo, []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// A commit, so a linked worktree can be added for the namespace case.
+	run(t, repo, "git", "add", "main.go")
+	run(t, repo, "git", "commit", "-q", "-m", "init")
 
 	// Cleanup order (LIFO): this runs after every subtest and after the
 	// per-session cleanups. It stops the daemon cleanly, then kills anything
@@ -375,6 +389,20 @@ func TestMemoryE2E(t *testing.T) {
 		}
 	})
 
+	t.Run("b2_worktree_memory_without_namespace_reaches_main_checkout", func(t *testing.T) {
+		wt := filepath.Join(t.TempDir(), "widgets-feature")
+		run(t, repo, "git", "worktree", "add", "-q", wt)
+		p := e.startMcpAutostartIn(wt)
+		p.initialize()
+		// No namespace: the session resolves the main checkout's ("widgets").
+		if got := p.callTool("remember", map[string]any{"content": "worktree rule: widgets flush on close", "path": "main.go"}); !strings.Contains(got, `"namespace":"widgets"`) {
+			t.Fatalf("worktree session remembered into the wrong namespace: %s", got)
+		}
+		_ = p.in.Close() // drop its daemon connection before f stops the daemon
+		out, code, _ := e.hook("pre-tool-use", e.preToolUse("s-b2"))
+		e.wantInjected("main-checkout hook after a worktree remember", out, code, "PreToolUse", "worktree rule")
+	})
+
 	t.Run("c_pre_tool_use_injects_and_dedupes", func(t *testing.T) {
 		out, code, _ := e.hook("pre-tool-use", e.preToolUse("s-c1"))
 		ctx := e.wantInjected("first pre-tool-use", out, code, "PreToolUse", "alpha rule", "beta rule")
@@ -414,6 +442,9 @@ func TestMemoryE2E(t *testing.T) {
 	t.Run("f_daemon_killed_hook_is_silent_and_fast", func(t *testing.T) {
 		// Sessions hold open connections to the daemon; close them first so
 		// the stop is a clean one.
+		if alpha == nil || beta == nil {
+			t.Skip("sessions from b did not start")
+		}
 		_ = alpha.in.Close()
 		_ = beta.in.Close()
 		if err := e.stopDaemon(); err != nil {
