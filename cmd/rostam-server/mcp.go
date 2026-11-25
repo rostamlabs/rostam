@@ -67,13 +67,17 @@ type mcpRuntime struct {
 	embedder semcache.Embedder // nil in BM25-only mode
 }
 
-// runMcpCmd implements `rostam-server mcp`: an MCP stdio server exposing
-// memory + generic DB tools over a rostam.Store. Like runKeysCmd, it owns its
-// own FlagSet and process exit. stdout is the MCP JSON-RPC wire, so every
-// diagnostic here goes to stderr — never fmt.Print* to stdout.
-func runMcpCmd(args []string) {
-	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
-	var fl mcpFlags
+// mcpExtraFlags are the `mcp` flags that live outside mcpFlags.
+type mcpExtraFlags struct {
+	autostart   *bool
+	projectRoot *string
+	listModels  *bool
+}
+
+// defineMcpFlags registers every `mcp` flag on fs. Split from runMcpCmd so the
+// real flag set can be parsed in tests.
+func defineMcpFlags(fs *flag.FlagSet, fl *mcpFlags) mcpExtraFlags {
+	var x mcpExtraFlags
 	fs.StringVar(&fl.data, "data", mcpDataAuto,
 		`data directory for embedded mode: "auto" (default) resolves to `+
 			`~/.rostam/memory (created if missing); "" runs heap/ephemeral `+
@@ -88,11 +92,30 @@ func runMcpCmd(args []string) {
 	fs.StringVar(&fl.tlsKey, "tls-key", "", "client private key PEM for mTLS (-connect; requires -tls-cert)")
 	fs.StringVar(&fl.tlsServer, "tls-server-name", "", "expected server certificate name (SNI + verification) for -connect")
 	fs.BoolVar(&fl.destructive, "enable-destructive", false, "register delete/delete_by_filter tools for arbitrary collections (off by default)")
-	autostart := fs.Bool("autostart", false,
+	x.autostart = fs.Bool("autostart", false,
 		"connect to the shared local memory daemon (127.0.0.1:7480, token from ~/.rostam/memory/token), starting it first if it is not running; mutually exclusive with -data and -connect")
-	projectRoot := fs.String("project-root", "",
+	x.projectRoot = fs.String("project-root", "",
 		"project root for code-linked memories (default: CLAUDE_PROJECT_DIR, else the working directory, resolved to its git top-level)")
-	listModels := fs.Bool("list-embed-models", false, "print the built-in local embedding models, then exit")
+	x.listModels = fs.Bool("list-embed-models", false, "print the built-in local embedding models, then exit")
+	return x
+}
+
+// visitedFlags is the set of flag names given explicitly on the command line.
+func visitedFlags(fs *flag.FlagSet) map[string]bool {
+	v := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { v[f.Name] = true })
+	return v
+}
+
+// runMcpCmd implements `rostam-server mcp`: an MCP stdio server exposing
+// memory + generic DB tools over a rostam.Store. Like runKeysCmd, it owns its
+// own FlagSet and process exit. stdout is the MCP JSON-RPC wire, so every
+// diagnostic here goes to stderr — never fmt.Print* to stdout.
+func runMcpCmd(args []string) {
+	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
+	var fl mcpFlags
+	x := defineMcpFlags(fs, &fl)
+	autostart, projectRoot, listModels := x.autostart, x.projectRoot, x.listModels
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
 	}
@@ -119,7 +142,7 @@ func runMcpCmd(args []string) {
 	})
 
 	if *autostart {
-		if err := checkAutostartConflicts(fl, dataExplicit); err != nil {
+		if err := checkAutostartConflicts(visitedFlags(fs)); err != nil {
 			fatal(err.Error())
 		}
 		if !daemonSupported {

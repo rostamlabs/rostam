@@ -5,6 +5,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -56,5 +57,105 @@ func TestStopWithNoDaemonIsClean(t *testing.T) {
 	data := t.TempDir()
 	if err := stopDaemon(data, time.Second); err == nil || !strings.Contains(err.Error(), "not running") {
 		t.Fatalf("got %v, want not-running error", err)
+	}
+}
+
+// Helper-process entry points (re-exec of the test binary).
+func TestHelperSupervisor(t *testing.T) {
+	data := os.Getenv("ROSTAM_TEST_SUPERVISOR_DATA")
+	if data == "" {
+		t.Skip("helper process only")
+	}
+	exe, _ := os.Executable()
+	err := superviseDaemonWith(data, func(token, cfgPath string) *exec.Cmd {
+		// A fake server whose argv looks like the real one.
+		cmd := exec.Command(exe, "-test.run=^TestHelperChild$", "--", "-data", data, "-config", cfgPath)
+		cmd.Env = append(os.Environ(), "ROSTAM_TEST_CHILD=1")
+		return cmd
+	})
+	t.Fatalf("supervisor returned: %v", err)
+}
+
+func TestHelperChild(t *testing.T) {
+	if os.Getenv("ROSTAM_TEST_CHILD") == "" {
+		t.Skip("helper process only")
+	}
+	time.Sleep(time.Minute)
+}
+
+func pidAlive(pid int) bool { return syscall.Kill(pid, 0) == nil }
+
+// The data-dir lock must stay held by the server process when its supervisor
+// dies, and -stop must still stop that orphan.
+func TestDaemonLockSurvivesSupervisorKill(t *testing.T) {
+	data := filepath.Join(t.TempDir(), "memory")
+	exe, _ := os.Executable()
+	sup := exec.Command(exe, "-test.run=^TestHelperSupervisor$")
+	sup.Env = append(os.Environ(), "ROSTAM_TEST_SUPERVISOR_DATA="+data)
+	if err := sup.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var childPid int
+	t.Cleanup(func() {
+		_ = sup.Process.Kill()
+		_ = sup.Wait()
+		if childPid > 1 {
+			_ = syscall.Kill(childPid, syscall.SIGKILL)
+		}
+	})
+
+	pidPath := filepath.Join(data, daemonPidName)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		raw, _ := os.ReadFile(pidPath)
+		if f := strings.Fields(string(raw)); len(f) == 2 {
+			childPid, _ = strconv.Atoi(f[1])
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("supervisor never wrote its pid file")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := lockDataDir(data); !errors.Is(err, errDataDirBusy) {
+		t.Fatalf("lock while running: %v, want busy", err)
+	}
+
+	// Kill the supervisor only.
+	if err := sup.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = sup.Wait()
+	if !pidAlive(childPid) {
+		t.Fatal("child died with its supervisor; test premise broken")
+	}
+	if _, err := lockDataDir(data); !errors.Is(err, errDataDirBusy) {
+		t.Fatalf("lock after supervisor death: %v, want still busy (held by the child)", err)
+	}
+	if err := superviseDaemonWith(data, nil); !errors.Is(err, errDataDirBusy) {
+		t.Fatalf("second supervisor: %v, want refusal on the busy lock", err)
+	}
+
+	if err := stopDaemon(data, 10*time.Second); err != nil {
+		t.Fatalf("stopDaemon against the orphan: %v", err)
+	}
+	if unlock, err := lockDataDir(data); err != nil {
+		t.Fatalf("lock after stop: %v", err)
+	} else {
+		_ = unlock()
+	}
+}
+
+func TestIsDaemonServerArgs(t *testing.T) {
+	d := "/h/.rostam/memory"
+	good := []string{"/bin/rostam-server", "-tcp", "127.0.0.1:7480", "-http", "", "-data", d, "-shards", "8", "-config", d + "/daemon-config.json"}
+	if !isDaemonServerArgs(good, "rostam-server", d) {
+		t.Error("real server argv rejected")
+	}
+	if isDaemonServerArgs(good, "other", d) || isDaemonServerArgs(good, "rostam-server", "/else") {
+		t.Error("mismatched exe/data accepted")
+	}
+	if isDaemonServerArgs([]string{"/bin/rostam-server", "-data", d}, "rostam-server", d) {
+		t.Error("argv without -config accepted")
 	}
 }

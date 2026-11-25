@@ -56,46 +56,62 @@ func runMemoryDaemonCmd(args []string) {
 }
 
 func superviseDaemon(data, addr string) error {
-	// The regular server takes no lock on -data, so the supervisor holds the
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("locating own executable: %w", err)
+	}
+	return superviseDaemonWith(data, func(token, cfgPath string) *exec.Cmd {
+		cmd := exec.Command(exe,
+			"-tcp", addr,
+			"-http", "", // the flag default is :8080 on every interface
+			"-data", data,
+			"-shards", strconv.Itoa(daemonShards),
+			"-config", cfgPath)
+		// The token travels in the environment, never argv. Inherited ROSTAM_*
+		// variables are dropped: every server flag reads one, and the user's
+		// shell must not reconfigure (or re-expose) the daemon.
+		cmd.Env = daemonEnv(os.Environ(), token)
+		return cmd
+	})
+}
+
+// superviseDaemonWith runs the child built by mkChild under the data-dir lock.
+// The locked file is passed to the child as an extra fd: flock belongs to the
+// open file description, so the lock stays held for as long as the child (the
+// process that actually has the store open) lives, even if this supervisor is
+// killed.
+func superviseDaemonWith(data string, mkChild func(token, cfgPath string) *exec.Cmd) error {
+	if err := os.MkdirAll(data, 0o700); err != nil {
+		return fmt.Errorf("creating -data directory %s: %w", data, err)
+	}
+	// The regular server takes no lock on -data, so the supervisor takes the
 	// single-writer lock for it: one daemon per data dir, and an embedded
 	// `mcp -data` on the same directory is refused rather than corrupting it.
-	unlock, err := claimDataDir(data)
+	lockFile, err := lockDataDirFile(data)
 	switch {
 	case errors.Is(err, errDataDirBusy):
 		return fmt.Errorf("another process (a running memory daemon or an embedded mcp) already holds %s: %w", data, err)
 	case err != nil:
 		return err
 	}
-	defer func() { _ = unlock() }()
+	defer lockFile.Close()
 
 	token, err := ensureToken(data)
 	if err != nil {
 		return err
 	}
-	exe, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("locating own executable: %w", err)
-	}
 	// A personal memory store must not size itself like a server (the default
 	// budget is a fraction of host RAM, mmap-backed). -config is the server's
-	// only cache-budget knob.
+	// only cache-budget knob. Rewritten on every start.
 	cfgPath := filepath.Join(data, daemonConfigName)
 	cfg := `{"cache":{"max_memory":"` + daemonCacheBudget + `"}}` + "\n"
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
 		return fmt.Errorf("writing %s: %w", cfgPath, err)
 	}
 
-	cmd := exec.Command(exe,
-		"-tcp", addr,
-		"-http", "", // the flag default is :8080 on every interface
-		"-data", data,
-		"-shards", strconv.Itoa(daemonShards),
-		"-config", cfgPath)
-	// The token travels in the environment, never argv. Inherited ROSTAM_*
-	// variables are dropped: every server flag reads one, and the user's shell
-	// must not reconfigure (or re-expose) the daemon.
-	cmd.Env = daemonEnv(os.Environ(), token)
+	cmd := mkChild(token, cfgPath)
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+	cmd.ExtraFiles = append(cmd.ExtraFiles, lockFile) // child inherits the lock
 
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -104,8 +120,11 @@ func superviseDaemon(data, addr string) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("starting server: %w", err)
 	}
+	// Line 1: supervisor pid; line 2: server pid (what -stop falls back to if
+	// the supervisor was killed and the server orphaned).
 	pidPath := filepath.Join(data, daemonPidName)
-	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+	pids := strconv.Itoa(os.Getpid()) + "\n" + strconv.Itoa(cmd.Process.Pid) + "\n"
+	if err := os.WriteFile(pidPath, []byte(pids), 0o600); err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		return fmt.Errorf("writing %s: %w", pidPath, err)
@@ -189,13 +208,24 @@ func stopDaemon(data string, wait time.Duration) error {
 	} else if !errors.Is(lerr, errDataDirBusy) {
 		return lerr
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
-	if err != nil || pid <= 1 {
-		return fmt.Errorf("refusing to signal: %s does not hold a valid pid", pidPath)
+	// Only a pid verified as ours is signalled: the supervisor (it forwards
+	// SIGTERM to the server), else the server itself when the supervisor was
+	// killed and left it orphaned still holding the lock.
+	var target int
+	for i, field := range strings.Fields(string(raw)) {
+		pid, perr := strconv.Atoi(field)
+		if perr != nil || pid <= 1 {
+			continue
+		}
+		if (i == 0 && processIsDaemon(pid)) || (i == 1 && processIsDaemonServer(pid, data)) {
+			target = pid
+			break
+		}
 	}
-	if !processIsDaemon(pid) {
-		return fmt.Errorf("refusing to signal pid %d: it is not a rostam-server memory-daemon process", pid)
+	if target == 0 {
+		return fmt.Errorf("refusing to signal: the pids in %s are not a rostam-server memory daemon", pidPath)
 	}
+	pid := target
 	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
 		return fmt.Errorf("signalling pid %d: %w", pid, err)
 	}
@@ -210,6 +240,43 @@ func stopDaemon(data string, wait time.Duration) error {
 	return fmt.Errorf("pid %d did not exit within %s", pid, wait)
 }
 
+// isDaemonServerArgs reports whether args is the server the supervisor
+// launched for data: `<exe> ... -data <data> ... -config <data>/daemon-config.json`.
+func isDaemonServerArgs(args []string, exeBase, data string) bool {
+	if len(args) < 5 || filepath.Base(args[0]) != exeBase {
+		return false
+	}
+	hasPair := func(flag, val string) bool {
+		for i := 1; i+1 < len(args); i++ {
+			if args[i] == flag && args[i+1] == val {
+				return true
+			}
+		}
+		return false
+	}
+	return hasPair("-data", data) && hasPair("-config", filepath.Join(data, daemonConfigName))
+}
+
+func processArgs(pid int) []string {
+	if b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cmdline"); err == nil {
+		return strings.Split(strings.TrimRight(string(b), "\x00"), "\x00")
+	}
+	if out, err := exec.Command("ps", "-o", "args=", "-p", strconv.Itoa(pid)).Output(); err == nil {
+		return strings.Fields(string(out))
+	}
+	return nil
+}
+
+// processIsDaemonServer reports whether pid is the server a supervisor started
+// for data.
+func processIsDaemonServer(pid int, data string) bool {
+	exe, err := os.Executable()
+	if pid <= 1 || err != nil {
+		return false
+	}
+	return isDaemonServerArgs(processArgs(pid), filepath.Base(exe), data)
+}
+
 // processIsDaemon reports whether pid is a live `<this binary> memory-daemon`
 // process.
 func processIsDaemon(pid int) bool {
@@ -220,11 +287,6 @@ func processIsDaemon(pid int) bool {
 	if err != nil {
 		return false
 	}
-	var args []string
-	if b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cmdline"); err == nil {
-		args = strings.Split(strings.TrimRight(string(b), "\x00"), "\x00")
-	} else if out, err := exec.Command("ps", "-o", "args=", "-p", strconv.Itoa(pid)).Output(); err == nil {
-		args = strings.Fields(string(out))
-	}
+	args := processArgs(pid)
 	return isDaemonArgs(args, filepath.Base(exe))
 }

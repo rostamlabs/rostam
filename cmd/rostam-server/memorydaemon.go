@@ -16,6 +16,7 @@ import (
 	"time"
 
 	rostam "github.com/rostamlabs/rostam"
+	"github.com/rostamlabs/rostam/client"
 	"github.com/rostamlabs/rostam/ops"
 )
 
@@ -132,6 +133,10 @@ func validateLoopbackAddr(addr string) error {
 	return nil
 }
 
+// errTokenRejected means something is listening at the address but refused
+// our token: spawning another daemon cannot help.
+var errTokenRejected = errors.New("daemon rejected the token")
+
 // probeFunc reports nil when an authenticated daemon answers at addr.
 type probeFunc func(ctx context.Context, addr, token string) error
 
@@ -159,6 +164,9 @@ func probeDaemon(ctx context.Context, addr, token string) error {
 	}
 	defer store.Close()
 	if _, err := store.Get(ctx, []byte("__rostam_probe__")); err != nil && !errors.Is(err, rostam.ErrNotFound) {
+		if errors.Is(err, client.ErrUnauthorized) {
+			return errTokenRejected
+		}
 		return err
 	}
 	return nil
@@ -175,11 +183,21 @@ func ensureDaemonWith(ctx context.Context, data, addr string, spawn func() error
 	if err != nil {
 		return err
 	}
-	if probe(ctx, addr, token) == nil {
-		return nil
+	logPath := filepath.Join(data, daemonLogName)
+	// up reports a ready daemon; a non-nil error is final (something answers
+	// but refuses our token, so spawning another daemon cannot help).
+	up := func() (bool, error) {
+		perr := probe(ctx, addr, token)
+		if errors.Is(perr, errTokenRejected) {
+			return false, fmt.Errorf("a server on %s rejected the token in %s; run \"rostam-server memory-daemon -stop\" and retry",
+				addr, filepath.Join(data, memoryTokenName))
+		}
+		return perr == nil, nil
+	}
+	if ok, err := up(); ok || err != nil {
+		return err
 	}
 
-	logPath := filepath.Join(data, daemonLogName)
 	notReady := fmt.Errorf("memory daemon did not become ready on %s within %s; see %s", addr, wait, logPath)
 	deadline := time.Now().Add(wait)
 	lockDir := filepath.Join(filepath.Dir(data), spawnLockDirName)
@@ -189,15 +207,15 @@ func ensureDaemonWith(ctx context.Context, data, addr string, spawn func() error
 		if lerr == nil {
 			defer unlock()
 			// Another session may have finished spawning while we waited.
-			if probe(ctx, addr, token) == nil {
-				return nil
+			if ok, err := up(); ok || err != nil {
+				return err
 			}
 			if err := spawn(); err != nil {
 				return fmt.Errorf("starting memory daemon: %w (see %s)", err, logPath)
 			}
 			for time.Now().Before(deadline) {
-				if probe(ctx, addr, token) == nil {
-					return nil
+				if ok, err := up(); ok || err != nil {
+					return err
 				}
 				if err := sleepCtx(ctx, 50*time.Millisecond); err != nil {
 					return err
@@ -212,8 +230,8 @@ func ensureDaemonWith(ctx context.Context, data, addr string, spawn func() error
 		if err := sleepCtx(ctx, 25*time.Millisecond); err != nil {
 			return err
 		}
-		if probe(ctx, addr, token) == nil {
-			return nil
+		if ok, err := up(); ok || err != nil {
+			return err
 		}
 		if !time.Now().Before(deadline) {
 			return notReady
@@ -232,14 +250,17 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// checkAutostartConflicts rejects -autostart combined with a flag that selects
-// a different store.
-func checkAutostartConflicts(fl mcpFlags, dataExplicit bool) error {
-	switch {
-	case dataExplicit:
-		return errors.New("mcp: -autostart cannot be combined with -data (the daemon owns ~/.rostam/memory)")
-	case fl.connect != "":
-		return errors.New("mcp: -autostart cannot be combined with -connect (it connects to its own daemon)")
+// autostartConflictFlags select a different store or credentials; -autostart
+// always uses its own daemon and token.
+var autostartConflictFlags = []string{"data", "connect", "auth-token", "tls-ca", "tls-cert", "tls-key", "tls-server-name"}
+
+// checkAutostartConflicts rejects -autostart combined with any flag in
+// autostartConflictFlags. visited is the set of flags given explicitly.
+func checkAutostartConflicts(visited map[string]bool) error {
+	for _, name := range autostartConflictFlags {
+		if visited[name] {
+			return fmt.Errorf("mcp: -autostart cannot be combined with -%s (it connects to its own daemon with its own token)", name)
+		}
 	}
 	return nil
 }

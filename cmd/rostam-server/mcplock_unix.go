@@ -34,6 +34,20 @@ const dataDirLockName = ".mcp.lock"
 // protect against the same process opening the dir twice; that isn't a case
 // runMcpCmd can produce.
 func lockDataDir(dir string) (func() error, error) {
+	f, err := lockDataDirFile(dir)
+	if err != nil {
+		return nil, err
+	}
+	// Closing the file drops the flock. The lock file itself is left behind on
+	// purpose: unlinking it would let a second process create a fresh one and
+	// lock that instead, which is the same as having no lock at all.
+	return f.Close, nil
+}
+
+// lockDataDirFile is lockDataDir returning the locked file, so a caller can
+// hand it to a child process (exec.Cmd.ExtraFiles): flock belongs to the open
+// file description, which the child then shares.
+func lockDataDirFile(dir string) (*os.File, error) {
 	path := filepath.Join(dir, dataDirLockName)
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
@@ -43,24 +57,9 @@ func lockDataDir(dir string) (func() error, error) {
 		_ = f.Close()
 		return nil, flockErr(path, err)
 	}
-	// Closing the file drops the flock. The lock file itself is left behind on
-	// purpose: unlinking it would let a second process create a fresh one and
-	// lock that instead, which is the same as having no lock at all.
-	return f.Close, nil
+	return f, nil
 }
 
-// flockErr classifies a flock(2) failure.
-//
-// Only the nonblocking-contention errno means what errDataDirBusy claims:
-// somebody else holds the lock. flock can also fail with ENOSYS or ENOTSUP (a
-// filesystem with no flock support — some network mounts), EBADF, EINTR, or an
-// I/O error, and reporting any of those as "another rostam-server mcp process
-// is using this data directory" sends the reader hunting for a process that
-// does not exist. Everything but contention comes back as the ordinary I/O
-// failure it is, naming the lock file.
-//
-// EWOULDBLOCK and EAGAIN are the same value on Linux and are checked
-// separately because they are not on every unix.
 func flockErr(path string, err error) error {
 	if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
 		return fmt.Errorf("%w: %w", errDataDirBusy, err)

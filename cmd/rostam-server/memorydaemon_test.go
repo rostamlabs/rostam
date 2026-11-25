@@ -5,6 +5,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"flag"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -15,6 +17,10 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	rostam "github.com/rostamlabs/rostam"
+	"github.com/rostamlabs/rostam/authz"
+	"github.com/rostamlabs/rostam/ops"
 )
 
 func TestEnsureTokenCreatesAndReuses(t *testing.T) {
@@ -234,25 +240,94 @@ func TestEnsureDaemonFailureNamesLog(t *testing.T) {
 	}
 }
 
+// Exercises the real `mcp` flag set: -autostart combined with any flag that
+// selects another store or credentials is refused.
 func TestMcpAutostartFlagConflicts(t *testing.T) {
-	cases := []struct {
-		name         string
-		fl           mcpFlags
-		dataExplicit bool
-		wantErr      string
-	}{
-		{"plain", mcpFlags{}, false, ""},
-		{"data", mcpFlags{}, true, "-data"},
-		{"connect", mcpFlags{storeFlags: storeFlags{connect: "h:1"}}, false, "-connect"},
-	}
-	for _, tc := range cases {
-		err := checkAutostartConflicts(tc.fl, tc.dataExplicit)
-		switch {
-		case tc.wantErr == "" && err != nil:
-			t.Errorf("%s: unexpected %v", tc.name, err)
-		case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
-			t.Errorf("%s: err = %v, want mention of %s", tc.name, err, tc.wantErr)
+	parse := func(args ...string) error {
+		fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		var fl mcpFlags
+		defineMcpFlags(fs, &fl)
+		if err := fs.Parse(args); err != nil {
+			t.Fatalf("parse %v: %v", args, err)
 		}
+		return checkAutostartConflicts(visitedFlags(fs))
+	}
+	if err := parse("-autostart"); err != nil {
+		t.Errorf("plain -autostart: %v", err)
+	}
+	if err := parse("-autostart", "-project-root", "/x", "-enable-destructive"); err != nil {
+		t.Errorf("unrelated flags: %v", err)
+	}
+	for _, args := range [][]string{
+		{"-autostart", "-data", "/d"},
+		{"-autostart", "-data", ""},
+		{"-autostart", "-connect", "h:1"},
+		{"-autostart", "-auth-token", "t"},
+		{"-autostart", "-tls-ca", "ca.pem"},
+		{"-autostart", "-tls-cert", "c.pem"},
+		{"-autostart", "-tls-key", "k.pem"},
+		{"-autostart", "-tls-server-name", "n"},
+	} {
+		err := parse(args...)
+		if err == nil || !strings.Contains(err.Error(), args[1]) {
+			t.Errorf("%v: err = %v, want a refusal naming %s", args, err, args[1])
+		}
+	}
+}
+
+// A listener that is up but wants a different token (token file deleted and
+// regenerated while the daemon runs) must be reported as such, at once, with
+// no spawn attempt, not as a 5 s startup timeout.
+func TestEnsureDaemonRejectedTokenFailsFast(t *testing.T) {
+	data := filepath.Join(t.TempDir(), "memory")
+	tok, err := ensureToken(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, serverKey string
+		wantErr         bool
+	}{
+		{"wrong token", "some-other-key", true},
+		{"right token", tok, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			addr := ln.Addr().String()
+			_ = ln.Close()
+			reg := ops.NewRegistry()
+			if err := ops.RegisterBuiltins(reg); err != nil {
+				t.Fatal(err)
+			}
+			srv, err := rostam.NewServer(withAuth(rostam.ServerConfig{
+				TCPAddr:      addr,
+				DirectConfig: rostam.DirectConfig{Ops: reg},
+			}, staticKeyAuthenticator(tc.serverKey)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = srv.Close() })
+
+			var spawns atomic.Int32
+			start := time.Now()
+			err = ensureDaemon(context.Background(), data, addr, func() error { spawns.Add(1); return nil })
+			if el := time.Since(start); el > 3*time.Second {
+				t.Errorf("took %v, want well under the 5s startup wait", el)
+			}
+			if spawns.Load() != 0 {
+				t.Errorf("spawn called %d times; a listening server must never trigger a spawn", spawns.Load())
+			}
+			switch {
+			case tc.wantErr && (err == nil || !strings.Contains(err.Error(), "rejected the token") || !strings.Contains(err.Error(), filepath.Join(data, "token"))):
+				t.Errorf("err = %v, want the rejected-token error naming the token file", err)
+			case !tc.wantErr && err != nil:
+				t.Errorf("right token: %v", err)
+			}
+		})
 	}
 }
 
@@ -331,4 +406,9 @@ func TestIsDaemonArgs(t *testing.T) {
 			t.Errorf("isDaemonArgs(%v) = %v, want %v", tc.args, got, tc.want)
 		}
 	}
+}
+
+func withAuth(c rostam.ServerConfig, a authz.Authenticator) rostam.ServerConfig {
+	c.Authenticator = a
+	return c
 }
