@@ -742,11 +742,11 @@ func TestBootstrapToleratesConcurrentCreator(t *testing.T) {
 	}
 }
 
-// TestBootstrapReportsAbandonedCreator is the other side of that tolerance: a
-// collection that exists with no identity recorded means some other creator
-// died mid-bootstrap. Proceeding would run against a collection whose embedder
-// was never verified, so it must error instead of hanging or pretending.
-func TestBootstrapReportsAbandonedCreator(t *testing.T) {
+// TestBootstrapVerifiesWhenIdentityStaysMissing is the other side of that
+// tolerance: when the retries never see an identity, the session gives up
+// waiting and verifies its embedder against the collection instead of hanging.
+// An embedder that does not fit the collection is still refused.
+func TestBootstrapVerifiesWhenIdentityStaysMissing(t *testing.T) {
 	st := newHeapStore(t)
 	first, err := NewServer(context.Background(), Config{Store: st})
 	if err != nil {
@@ -761,12 +761,16 @@ func TestBootstrapReportsAbandonedCreator(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewServer (second): %v", err)
 	}
-	err = second.ensureMemory(context.Background())
-	if err == nil {
-		t.Fatal("a collection with no recorded identity must not be accepted silently")
+	if err := second.ensureMemory(context.Background()); err != nil {
+		t.Fatalf("a matching embedder must not be locked out: %v", err)
 	}
-	if !strings.Contains(err.Error(), "embedder identity") {
-		t.Fatalf("error should name the missing identity, got %v", err)
+
+	other, err := NewServer(context.Background(), Config{Store: hidden, Embedder: fakeEmbedder{}})
+	if err != nil {
+		t.Fatalf("NewServer (other): %v", err)
+	}
+	if err := other.ensureMemory(context.Background()); !errors.Is(err, ErrEmbedderMismatch) {
+		t.Fatalf("an embedder that does not fit the collection: err = %v, want ErrEmbedderMismatch", err)
 	}
 }
 
