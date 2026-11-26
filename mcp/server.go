@@ -35,7 +35,7 @@ const instructions = `Rostam is persistent, namespaced memory for carrying facts
 // omitted-namespace default is defNS ("" = "default").
 func instructionsFor(defNS string) string {
 	if defNS != "" && defNS != defaultNS {
-		return instructions + fmt.Sprintf("\n- Namespace: this server is scoped to the project namespace %q. Omit namespace to use it; when passing one explicitly for this project, pass exactly %q (the main checkout's directory name, also when working in a git worktree, never the worktree's own name).", defNS, defNS)
+		return instructions + fmt.Sprintf("\n- Namespace: this server is scoped to the project namespace %q. Omit namespace to use it. It is this machine's registered name for the project: normally the main checkout's directory name (the same from any git worktree, never the worktree's own name), with a short hash suffix when another project here already has that name, so never derive it yourself; when passing one explicitly for this project, pass exactly %q.", defNS, defNS)
 	}
 	return instructions + "\n- Namespace per project: pass namespace = the project's main checkout directory name (in a git worktree, the main repository's directory name, not the worktree's), not \"default\", so facts stay scoped and don't collide across projects."
 }

@@ -245,7 +245,11 @@ func runMcpCmd(args []string) {
 	// every log line goes to stderr via a plain text handler.
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	visited := visitedFlags(fs)
-	root, resolvedNS := defaultProjectRoot(*projectRoot, os.Getenv, os.Getwd)
+	root, nsDir := defaultProjectRoot(*projectRoot, os.Getenv, os.Getwd)
+	resolvedNS := ""
+	if !visited["namespace"] && (*autostart || *projectRoot != "") {
+		resolvedNS = mcpProjectNamespace(nsDir, func(msg string) { log.Warn(msg) })
+	}
 	srv, err := mcp.NewServer(context.Background(), mcp.Config{
 		Store:            rt.store,
 		Embedder:         rt.embedder,

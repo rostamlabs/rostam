@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"io"
 	"os"
@@ -209,7 +210,10 @@ func hookWork(ctx context.Context, in io.Reader, d hookDeps) (eventName, text st
 	hint := loadInjected(d.stateDir, p.SessionID)
 	skip := func(id uint64) bool { return hint[id] }
 
-	root, ns := hookProject(ctx, d, p.CWD)
+	root, ns, ok := hookProject(ctx, d, p.CWD)
+	if !ok {
+		return "", "", nil
+	}
 	pointer := hookMorePointer
 	var fetch func(*mcp.Server) ([]mcp.MemoryHit, error)
 	switch d.event {
@@ -295,20 +299,31 @@ func hookWork(ctx context.Context, in io.Reader, d hookDeps) (eventName, text st
 	}
 }
 
-// hookProject picks the project root and namespace: see hookDeps.
-func hookProject(ctx context.Context, d hookDeps, cwd string) (root, namespace string) {
-	if d.projectRoot != "" {
+// hookProject picks the project root and namespace: see hookDeps. ok is false
+// when the namespace registry stayed busy past the hook's budget: the hook
+// then injects nothing rather than guess a namespace mcp may not be using.
+// Any other registry problem yields the same hashed name mcp falls back to,
+// so the two still agree.
+func hookProject(ctx context.Context, d hookDeps, cwd string) (root, namespace string, ok bool) {
+	dir, explicit := cwd, ""
+	switch {
+	case d.projectRoot != "":
 		abs, err := filepath.Abs(d.projectRoot)
 		if err != nil {
 			abs = d.projectRoot
 		}
-		_, namespace = resolveProjectCtx(ctx, abs)
-		return abs, namespace
+		dir, explicit = abs, abs
+	case d.projectDir != "":
+		dir = d.projectDir
 	}
-	if d.projectDir != "" {
-		return resolveProjectCtx(ctx, d.projectDir)
+	root, namespace, err := resolveNamespace(ctx, dir)
+	if errors.Is(err, errRegistryBusy) {
+		return "", "", false
 	}
-	return resolveProjectCtx(ctx, cwd)
+	if explicit != "" {
+		root = explicit // an explicit root is used as given, as mcp does
+	}
+	return root, namespace, true
 }
 
 // relInRoot turns a tool's file_path into a slash-separated path relative to
@@ -326,28 +341,12 @@ func relInRoot(root, cwd, file string) (string, bool) {
 	return rel, err == nil
 }
 
-// resolveProject returns the project root (git toplevel, else cwd) and the
-// namespace (basename of the main checkout, so linked worktrees share one).
+// resolveProject is resolveNamespace with its own deadline, ignoring
+// warnings: the namespace it returns is the one to use either way.
 func resolveProject(cwd string) (root, namespace string) {
-	ctx, cancel := context.WithTimeout(context.Background(), hookBudget)
+	ctx, cancel := context.WithTimeout(context.Background(), mcpRegistryWait)
 	defer cancel()
-	return resolveProjectCtx(ctx, cwd)
-}
-
-func resolveProjectCtx(ctx context.Context, cwd string) (root, namespace string) {
-	root = cwd
-	if out, ok := gitOut(ctx, cwd, "rev-parse", "--show-toplevel"); ok {
-		root = out
-	}
-	namespace = filepath.Base(root)
-	if out, ok := gitOut(ctx, cwd, "rev-parse", "--git-common-dir"); ok {
-		if !filepath.IsAbs(out) {
-			out = filepath.Join(cwd, out)
-		}
-		if out = filepath.Clean(out); filepath.Base(out) == ".git" {
-			namespace = filepath.Base(filepath.Dir(out))
-		}
-	}
+	root, namespace, _ = resolveNamespace(ctx, cwd)
 	return root, namespace
 }
 

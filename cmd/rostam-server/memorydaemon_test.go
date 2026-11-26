@@ -373,8 +373,8 @@ func TestProjectRootDefaults(t *testing.T) {
 		}
 		return ""
 	}
-	if got, ns := defaultProjectRoot("", env, noCwd); got != repo || ns != filepath.Base(repo) {
-		t.Errorf("env default = %q, want %q", got, repo)
+	if got, nsDir := defaultProjectRoot("", env, noCwd); got != repo || nsDir != sub {
+		t.Errorf("env default = %q (namespace from %q), want %q (from %q)", got, nsDir, repo, sub)
 	}
 	// No env: cwd, also resolved to the top-level.
 	cwd := func() (string, error) { return sub, nil }
@@ -389,8 +389,12 @@ func TestProjectRootDefaults(t *testing.T) {
 		t.Errorf("non-repo default = %q, want %q", got, plain)
 	}
 	// An explicit flag is used as given (made absolute), not re-resolved.
-	if got, ns := defaultProjectRoot(sub, env, noCwd); got != sub || ns != filepath.Base(repo) {
-		t.Errorf("explicit = %q, want %q", got, sub)
+	if got, nsDir := defaultProjectRoot(sub, env, noCwd); got != sub || nsDir != sub {
+		t.Errorf("explicit = %q (namespace from %q), want %q", got, nsDir, sub)
+	}
+	// Either way the namespace is the repository's (registry-assigned) name.
+	if _, ns := resolveProject(sub); ns != filepath.Base(repo) {
+		t.Errorf("namespace from %s = %q, want %q", sub, ns, filepath.Base(repo))
 	}
 }
 

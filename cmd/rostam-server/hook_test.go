@@ -765,8 +765,8 @@ func TestWorktreeMemoryReachesHook(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			st := hookHeapStore(t)
 			// The MCP side exactly as runMcpCmd resolves it under -autostart.
-			root, resolved := defaultProjectRoot("", noEnv, func() (string, error) { return c.writeIn, nil })
-			ns := mcpDefaultNamespace(resolved, "", false, true, false)
+			root, nsDir := defaultProjectRoot("", noEnv, func() (string, error) { return c.writeIn, nil })
+			ns := mcpDefaultNamespace(mcpProjectNamespace(nsDir, func(m string) { t.Error(m) }), "", false, true, false)
 			if ns != "mainrepo" {
 				t.Fatalf("resolved namespace %q, want mainrepo", ns)
 			}

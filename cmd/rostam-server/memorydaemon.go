@@ -297,19 +297,18 @@ func checkAutostartConflicts(visited map[string]bool) error {
 	return nil
 }
 
-// defaultProjectRoot picks the MCP project root and its namespace. An explicit
-// flag is used as given (made absolute); otherwise CLAUDE_PROJECT_DIR, else the
-// working directory, resolved to the enclosing git top-level. The namespace is
-// resolveProject's: the MAIN checkout's directory name, so a linked worktree
-// shares its repository's namespace, exactly as the hook computes it.
-func defaultProjectRoot(flagVal string, getenv func(string) string, getwd func() (string, error)) (root, namespace string) {
+// defaultProjectRoot picks the MCP project root, and the directory its
+// namespace is resolved from (resolveNamespace, only when the namespace is
+// needed). An explicit flag is used as given (made absolute); otherwise
+// CLAUDE_PROJECT_DIR, else the working directory, resolved to the enclosing
+// git top-level, exactly as the hook does (hookProject).
+func defaultProjectRoot(flagVal string, getenv func(string) string, getwd func() (string, error)) (root, nsDir string) {
 	if flagVal != "" {
 		abs, err := filepath.Abs(flagVal)
 		if err != nil {
 			abs = flagVal
 		}
-		_, namespace = resolveProject(abs)
-		return abs, namespace
+		return abs, abs
 	}
 	dir := getenv("CLAUDE_PROJECT_DIR")
 	if dir == "" {
@@ -319,7 +318,26 @@ func defaultProjectRoot(flagVal string, getenv func(string) string, getwd func()
 		}
 		dir = wd
 	}
-	return resolveProject(dir)
+	ctx, cancel := context.WithTimeout(context.Background(), hookBudget)
+	defer cancel()
+	root, _ = identifyProject(ctx, dir)
+	return root, dir
+}
+
+// mcpProjectNamespace resolves the default namespace for an mcp session that
+// needs one, reporting registry trouble on warn (stderr).
+func mcpProjectNamespace(nsDir string, warn func(msg string)) string {
+	ctx, cancel := context.WithTimeout(context.Background(), mcpRegistryWait)
+	defer cancel()
+	_, ns, err := resolveNamespace(ctx, nsDir)
+	if err != nil {
+		if errors.Is(err, errRegistryBusy) {
+			warn(fmt.Sprintf("mcp: %v; using namespace %q for this session (the hooks inject nothing while the registry is busy, and may use the registered name later)", err, ns))
+		} else {
+			warn(fmt.Sprintf("mcp: %v; using namespace %q (the hooks fall back to the same name)", err, ns))
+		}
+	}
+	return ns
 }
 
 // mcpDefaultNamespace is the namespace `mcp` uses when a tool call omits one

@@ -79,6 +79,35 @@ func sameFileAsPath(f *os.File, path string) bool {
 	return err == nil && os.SameFile(fi, pi)
 }
 
+// errLockBusy: the lock was held by someone else until ctx ended.
+var errLockBusy = errors.New("lock is busy")
+
+// lockFileCtx takes an exclusive flock on path (created 0600), waiting out
+// contention until ctx ends (errLockBusy). Any other flock failure is
+// returned as is. The file is never unlinked.
+func lockFileCtx(ctx context.Context, path string) (func(), error) {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600) //nolint:gosec // G703: fixed name in the daemon data dir
+	if err != nil {
+		return nil, err
+	}
+	for {
+		err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			return func() { _ = f.Close() }, nil
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
+			_ = f.Close()
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			_ = f.Close()
+			return nil, errLockBusy
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}
+
 // removeLockIfFree unlinks a session lock file only while holding its flock,
 // so no hook is inside its critical section; a hook already waiting on the
 // unlinked file notices (lockSession's path check) and relocks the new one.
