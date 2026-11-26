@@ -398,6 +398,58 @@ func TestHookTimeoutRecordsNothing(t *testing.T) {
 	}
 }
 
+// A result that is ready only once the budget has expired is neither
+// printed nor recorded.
+func TestEmitHookResultAfterDeadline(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var out bytes.Buffer
+	committed, emitted := false, true
+	emitHookResult(ctx, &out, "PreToolUse", "late text", func(e bool) { committed, emitted = true, e })
+	if out.Len() != 0 || !committed || emitted {
+		t.Fatalf("after the deadline: wrote %q, committed %v emitted %v; want nothing written, commit(false)", out.String(), committed, emitted)
+	}
+	out.Reset()
+	emitHookResult(context.Background(), &out, "PreToolUse", "on time", func(e bool) { emitted = e })
+	if !strings.Contains(out.String(), "on time") || !emitted {
+		t.Fatalf("within the budget: wrote %q, emitted %v", out.String(), emitted)
+	}
+}
+
+// The hook resolves the project the way mcp does: CLAUDE_PROJECT_DIR wins over
+// the payload's cwd (which follows the session's cd), and an explicit
+// -project-root is used as given, so a memory stored under it is found.
+func TestHookProjectMatchesMcp(t *testing.T) {
+	e := newHookEnv(t)
+	hookRemember(t, e.st, e.root, map[string]any{"content": "root fact", "namespace": e.ns(), "path": "a.go"})
+	elsewhere := t.TempDir() // the session cd'd out of the project
+	b, _ := json.Marshal(map[string]any{"session_id": "s1", "cwd": elsewhere, "hook_event_name": "PreToolUse",
+		"tool_name": "Read", "tool_input": map[string]any{"file_path": filepath.Join(e.root, "a.go")}})
+	d := e.deps("pre-tool-use")
+	if got := runHookStr(t, d, string(b)); got != "" {
+		t.Fatalf("without CLAUDE_PROJECT_DIR the cwd decides, and it is outside the project: got %q", got)
+	}
+	d.projectDir = e.root
+	if got := runHookStr(t, d, string(b)); !strings.Contains(got, "root fact") {
+		t.Fatalf("CLAUDE_PROJECT_DIR set: got %q, want the memory", got)
+	}
+
+	// mcp -project-root <repo>/pkg stores pkg/b.go as "b.go".
+	pkg := filepath.Join(e.root, "pkg")
+	if err := os.MkdirAll(pkg, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pkg, "b.go"), []byte("package pkg\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hookRemember(t, e.st, pkg, map[string]any{"content": "pkg fact", "namespace": e.ns(), "path": "b.go"})
+	d = e.deps("pre-tool-use")
+	d.projectRoot = pkg
+	if got := runHookStr(t, d, e.payload("s2", "Read", filepath.Join(pkg, "b.go"))); !strings.Contains(got, "pkg fact") {
+		t.Fatalf("-project-root %s: got %q, want the memory stored under that root", pkg, got)
+	}
+}
+
 type failingWriter struct{}
 
 func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("stdout closed") }

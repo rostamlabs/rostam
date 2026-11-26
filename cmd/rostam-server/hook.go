@@ -51,6 +51,14 @@ type hookDeps struct {
 	open     func(ctx context.Context) (rostam.Store, error)
 	keepOpen bool          // tests share one store; do not close it
 	budget   time.Duration // 0 = hookBudget
+
+	// The project, resolved exactly as `mcp` resolves it (defaultProjectRoot)
+	// so both sides link files against the same root: projectRoot is an
+	// explicit -project-root, used as given; projectDir is CLAUDE_PROJECT_DIR,
+	// resolved to its git top-level. With neither, the payload's cwd is used.
+	// The cwd still anchors a relative tool file_path either way: it moves
+	// when the session changes directory, the project does not.
+	projectRoot, projectDir string
 }
 
 // runHookCmd implements `rostam-server hook <event>`. It never fails: every
@@ -72,6 +80,7 @@ func runHookCmd(args []string) {
 	}
 	tokenFile := fs.String("token-file", defTok, "file holding the daemon bearer token")
 	stateDir := fs.String("state-dir", defState, "per-session dedupe state directory")
+	projectRoot := fs.String("project-root", "", "project root, as given to `mcp -project-root` (default: CLAUDE_PROJECT_DIR, else the payload's cwd, resolved to its git top-level)")
 	if fs.Parse(args) != nil || fs.NArg() != 1 {
 		return
 	}
@@ -81,9 +90,11 @@ func runHookCmd(args []string) {
 		return
 	}
 	deps := hookDeps{
-		event:    fs.Arg(0),
-		stateDir: *stateDir,
-		open:     hookOpen(*connect, *tokenFile),
+		event:       fs.Arg(0),
+		stateDir:    *stateDir,
+		open:        hookOpen(*connect, *tokenFile),
+		projectRoot: *projectRoot,
+		projectDir:  os.Getenv("CLAUDE_PROJECT_DIR"),
 	}
 	runHook(context.Background(), os.Stdin, os.Stdout, deps)
 }
@@ -138,10 +149,7 @@ func runHook(ctx context.Context, in io.Reader, out io.Writer, d hookDeps) {
 
 	select {
 	case r := <-done:
-		emitted := r.text != "" && writeHookOutput(out, r.eventName, r.text) == nil
-		if r.commit != nil {
-			r.commit(emitted)
-		}
+		emitHookResult(ctx, out, r.eventName, r.text, r.commit)
 	case <-ctx.Done():
 		// The work may still finish (staleness hashing is not cancellable). It
 		// must not record as injected what was never written, and it must let
@@ -151,6 +159,17 @@ func runHook(ctx context.Context, in io.Reader, out io.Writer, d hookDeps) {
 				r.commit(false)
 			}
 		}()
+	}
+}
+
+// emitHookResult writes a finished result and commits it. select picks at
+// random when the result and the deadline are both ready, so a result that
+// arrives after the budget is dropped here (committed as not emitted) rather
+// than printed late.
+func emitHookResult(ctx context.Context, out io.Writer, eventName, text string, commit func(bool)) {
+	emitted := text != "" && ctx.Err() == nil && writeHookOutput(out, eventName, text) == nil
+	if commit != nil {
+		commit(emitted)
 	}
 }
 
@@ -190,7 +209,7 @@ func hookWork(ctx context.Context, in io.Reader, d hookDeps) (eventName, text st
 	hint := loadInjected(d.stateDir, p.SessionID)
 	skip := func(id uint64) bool { return hint[id] }
 
-	root, ns := resolveProjectCtx(ctx, p.CWD)
+	root, ns := hookProject(ctx, d, p.CWD)
 	pointer := hookMorePointer
 	var fetch func(*mcp.Server) ([]mcp.MemoryHit, error)
 	switch d.event {
@@ -274,6 +293,22 @@ func hookWork(ctx context.Context, in io.Reader, d hookDeps) (eventName, text st
 		}
 		saveInjected(d.stateDir, p.SessionID, seen)
 	}
+}
+
+// hookProject picks the project root and namespace: see hookDeps.
+func hookProject(ctx context.Context, d hookDeps, cwd string) (root, namespace string) {
+	if d.projectRoot != "" {
+		abs, err := filepath.Abs(d.projectRoot)
+		if err != nil {
+			abs = d.projectRoot
+		}
+		_, namespace = resolveProjectCtx(ctx, abs)
+		return abs, namespace
+	}
+	if d.projectDir != "" {
+		return resolveProjectCtx(ctx, d.projectDir)
+	}
+	return resolveProjectCtx(ctx, cwd)
 }
 
 // relInRoot turns a tool's file_path into a slash-separated path relative to

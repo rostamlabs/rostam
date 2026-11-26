@@ -173,8 +173,11 @@ Plain `rostam-server mcp` is unchanged: it embeds the engine over
 (`remember` with `path`, `recall_for_file`), but nothing is injected
 automatically. To get the hooks without the plugin, register `rostam-server hook session-start` and
 `rostam-server hook pre-tool-use` as Claude Code hooks yourself; they read the
-hook JSON on stdin and accept `-connect`, `-token-file` and `-state-dir` before
-the event name. On Linux the hook sends the token only after the owner check
+hook JSON on stdin and accept `-connect`, `-token-file`, `-state-dir` and
+`-project-root` before the event name. The hooks find the project the way
+`mcp` does: `-project-root` as given, else `CLAUDE_PROJECT_DIR`, else the
+session's working directory, resolved to its git top-level; if you pass
+`mcp -project-root`, pass the same value to the hooks so file links match. On Linux the hook sends the token only after the owner check
 above, which needs `-connect` to be an `IP:port`: a hostname (even
 `localhost`) or an empty host cannot be checked, so the hook stays silent.
 Elsewhere the check does not run and the connection proceeds unverified.
