@@ -5,6 +5,46 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **Agent memory survives a crash.** In `rostam-server mcp` with a data
+  directory and in the memory daemon, the memory collection now has a
+  write-ahead log: a `remember` or `forget` that was acknowledged is still there
+  after the process is killed, at the price of one disk sync per remembered or
+  forgotten memory. One exception: if a memory is being replaced (same `key`, or
+  identical content) and the process is killed before the call answers, the old
+  version can be gone without the new one stored. A killed process is what is
+  tested; power-loss safety rests on the disk sync and is not claimed as tested.
+  An existing store is converted in place at the first start; if that fails it
+  opens in its old form with a `not crash-safe` warning and the next start tries
+  again. The memory collection is now held in RAM. `mcp -autostart` replaces a
+  running daemon from an earlier build, without durable memory, by stopping it
+  cleanly and starting a new one. Over `mcp -connect`, start the server with
+  `-durable-collections mcp_memory`. `-data ""` stays non-durable.
+  See [What survives a crash](server/mcp.md#what-survives-a-crash).
+- **`-durable-collections` and `DirectConfig.DurableCollections`.** A
+  single-node server, or an embedded store, can name dense vector collections
+  that always run with a write-ahead log synced before every acknowledged write.
+  Empty by default; ignored with `-cluster`.
+  See [Running a server](server/running.md).
+- **Breaking: a damaged write-ahead log now stops the open.** This applies to
+  every collection with a write-ahead log (dense, multi-vector and named).
+  Before, replay stopped silently at the first bad record, and writes made after
+  it could not be replayed later. Now a half-written tail is cut off and saved as
+  `<file>.torn-<number>`, and the store opens. Damage followed by further
+  records, or a record that cannot be decoded, makes the store (and a server
+  using it) fail to start with the file and offset in the error. To recover,
+  stop the process, keep a copy of the file, and truncate it at that offset,
+  which loses the records after it.
+  See [A damaged log](server/mcp.md#a-damaged-log).
+- **A failed log write stops further writes.** After a write to a write-ahead
+  log fails (a full disk, for example), the collection refuses writes until the
+  process restarts.
+- **Memory no longer locks out when the embedder record is missing.** The first
+  memory tool call checks the configured embedder against the stored memories
+  and records it again.
+- **Over `mcp -connect`, a new memory store needs a server at v0.5.0 or later**,
+  as does rebuilding a missing embedder record. A v0.4.x server with
+  authorization on refuses it for non-admin keys. Existing stores that have the
+  record are unaffected.
 - **Code-linked memory and a Claude Code plugin.** `remember` takes an optional
   `path` (and `symbol`) that links a memory to a file, and `recall_for_file`
   lists what is linked to one. A linked memory whose file has since changed is
@@ -16,8 +56,8 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   (`rostam-server memory-daemon [-stop]`). Linux only in this release: macOS,
   the BSDs and Windows refuse at once, because the daemon's persistent store
   needs storage the engine provides only on Linux and Windows, and the daemon
-  itself is not ported to Windows yet. Plain `rostam-server mcp` is unchanged
-  and still allows one session at a time. Under `-autostart` or an explicit
+  itself is not ported to Windows yet. Plain `rostam-server mcp` still allows
+  one session at a time. Under `-autostart` or an explicit
   `-project-root`, a call that omits `namespace` uses the project's namespace
   instead of `"default"`, so memories saved earlier with no namespace are not
   recalled by default: pass `namespace: "default"` (or `-namespace default`)

@@ -150,6 +150,40 @@ variables through from the environment Claude Code is started in; unset, the
 store is BM25-only. A store remembers the embedder it was created with, so they
 must stay the same for the life of `~/.rostam/memory`.
 
+### Durability
+
+The daemon runs its server with `-durable-collections mcp_memory`, so a
+`remember` or `forget` that was acknowledged survives the daemon being killed,
+at the price of a disk sync per change. The rules, and the one exception
+(replacing a memory and being killed before the call answers), are the same as
+for plain `mcp`: see [What survives a crash](mcp.md#what-survives-a-crash).
+
+- **Existing stores** are [converted](mcp.md#upgrading-an-existing-store) when
+  the new daemon first starts. If that fails, the daemon still runs, and
+  `~/.rostam/memory/daemon.log` carries a `not crash-safe` warning. The
+  conversion happens before the daemon answers; if a session gives up with "did
+  not become ready" and the log shows no error, start another session.
+- **A failed log write** (a full disk, for example) makes memory refuse further
+  writes until the daemon restarts. Free the space, run
+  `rostam-server memory-daemon -stop`, and start a new session.
+- **A damaged log** keeps the daemon from starting. Sessions report that it did
+  not become ready, and `daemon.log` names the file
+  (`~/.rostam/memory/vectors/default/mcp_memory.wal`) and the offset. With no
+  daemon running, follow [A damaged log](mcp.md#a-damaged-log).
+
+### Replacing an older daemon
+
+A daemon left running by an earlier build does not keep memory durable. When
+`mcp -autostart` finds one, it stops it cleanly, the way `memory-daemon -stop`
+does, which saves its data, and then starts a new one. Sessions starting
+together replace it once. A daemon that already runs with durable memory is
+never replaced, and the hooks never stop or start a daemon. If the old daemon
+cannot be stopped safely (it cannot be identified, for example), the session
+does not force it: it prints a warning and uses it, without durable memory. Run
+`rostam-server memory-daemon -stop` and start a new session to replace it. An
+old daemon that takes more than 30 seconds to stop is killed by its own
+supervisor, as under `memory-daemon -stop`, and loses what it had not saved.
+
 **One user per host.** The daemon's port is fixed, so this release supports one
 user per machine. On Linux, the clients (the MCP session and the hook) check
 the kernel socket table (`/proc/net/tcp`) before the token goes anywhere:
@@ -174,10 +208,10 @@ never starts the daemon itself, so a session whose daemon is down simply gets no
 injection until the MCP server starts it.
 
 If the daemon crashes or is stopped while sessions are open, those sessions'
-memory tools return errors and their hooks go silent; they do not reconnect or
-restart the daemon on their own in this release. Restart the affected Claude
-Code sessions (the first one to start brings the daemon back). Automatic
-recovery is planned.
+memory tools return errors and their hooks go silent; they do not restart the
+daemon on their own in this release. Start a new Claude Code session to bring it
+back. The open sessions then reconnect on a later call (the first call after a
+restart may still fail). Automatic restart is planned.
 
 ## Troubleshooting
 
@@ -217,8 +251,9 @@ project's namespace.
 
 ## Without the plugin
 
-Plain `rostam-server mcp` is unchanged: it embeds the engine over
-`~/.rostam/memory` and supports one session at a time. Linking works there too
+Plain `rostam-server mcp` embeds the engine over `~/.rostam/memory` and
+supports one session at a time. Its memory is
+[durable](mcp.md#what-survives-a-crash) too. Linking works there too
 (`remember` with `path`, `recall_for_file`), but nothing is injected
 automatically. To get the hooks without the plugin, register `rostam-server hook session-start` and
 `rostam-server hook pre-tool-use` as Claude Code hooks yourself; they read the

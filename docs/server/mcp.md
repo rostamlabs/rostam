@@ -61,26 +61,95 @@ one is refused at startup with an error saying so. To give concurrent clients
 one shared memory, run a single `rostam-server` and point each client at it
 with [`-connect`](#remote-mode).
 
-### What "persists" means here
+### What survives a crash
 
-An embedded session stores memories in mmap-backed files under `-data` and
-writes the index sidecar that makes them readable again when the process shuts
-down cleanly — which is what happens when an MCP client closes the connection
-or exits, and also on `SIGINT`/`SIGTERM`: both are handled, so the server
-finishes the tool call in flight, flushes, releases the data-dir lock, and
-exits 0. Reopening the same directory then restores everything.
+The memory collection (`mcp_memory`) has a write-ahead log, in an embedded
+session with a data directory and in the
+[shared daemon](claude-code-plugin.md#durability). Every `remember` and
+`forget` is written to that log and synced to disk before the tool call answers,
+so a change that was acknowledged is still there after the process holding the
+store is killed (`SIGKILL`, an out-of-memory kill, a crash). The price is one
+disk sync per `remember` and one per forgotten memory. A killed process is what
+is tested. Safety against power loss rests on that sync and is not claimed as
+tested.
 
-The flush point is that clean shutdown, so a session killed outright (`SIGKILL`,
-a machine losing power) loses the memories added since the last one. If that
-matters, run a real `rostam-server` and use `-connect`: a server's own
-durability (Raft log and snapshots) does not depend on how the MCP process
-ends.
+One case is not covered. Replacing a memory (a `remember` with a `key` that
+already exists, or of content identical to an earlier one) removes the old
+version and then adds the new one. If the process is killed, or the log write
+fails, before that call has answered, the old version can be gone without the
+new one having been stored. Run the `remember` again.
+
+On a clean shutdown (the client closing the connection, `SIGINT` or `SIGTERM`)
+the log is folded into a snapshot and emptied. The same happens at startup when
+the log has grown past 16 MiB. The memory collection is held in RAM and loaded
+from the snapshot and the log at startup.
+
+If writing the log fails (a full disk, for example), the collection refuses
+further writes until the process holding the store is restarted. Free the space
+first, then restart the session, or for the shared daemon run
+`rostam-server memory-daemon -stop` and start a new session. A change that was
+reported as failed may or may not be there afterwards, so check before relying
+on it.
+
+Only `mcp_memory` gets this. Collections made with the generic tools keep their
+own mode: a `persistent` one is saved at a clean shutdown, and a forced stop can
+lose what changed since. With `-data ""` nothing is durable, by design. Over
+`-connect`, durability is the server's business: see
+[Remote mode](#remote-mode).
+
+### Upgrading an existing store
+
+A memory store written by an earlier release is converted to the log form the
+first time it is opened. There is nothing to run. The live memories are copied
+into a new snapshot and the old files are replaced only once that snapshot is
+complete. Memories already lost to an earlier forced stop cannot be recovered.
+
+If the conversion fails, the store still opens with the collection in its old
+form, a warning says it is `not crash-safe` and why, and the next start tries
+again. Until it succeeds, a forced stop can lose recent memories. Read that
+warning on stderr (the shared daemon writes it to
+`~/.rostam/memory/daemon.log`). If a conversion was interrupted and the new
+snapshot cannot be loaded, the store fails to open instead of falling back to
+the old files.
+
+### A damaged log
+
+At startup the log is checked as it is replayed.
+
+**A half-written tail**, bad bytes at the end of the file with no complete
+record after them, is what a stop in the middle of a write leaves. It is cut
+off, the removed bytes are saved next to the log as `<file>.torn-<number>`, a
+warning is logged, and the store opens. Nothing deletes those saved files.
+
+**Damage anywhere else** (a complete record follows the bad bytes, or a record
+passes its checksum but cannot be decoded) makes the store refuse to open. The
+file is left as it is, and the error names it and the position:
+
+```text
+vector: write-ahead log damaged: /home/you/.rostam/memory/vectors/default/mcp_memory.wal at offset 18342
+```
+
+To recover:
+
+1. Stop every process using the data directory.
+2. Keep a copy of the named file.
+3. Truncate the file at the named offset, in bytes:
+   `truncate -s 18342 /path/named/in/the/error.wal`.
+4. Start again.
+
+This keeps every record before the offset and loses the ones after it. One rare
+power-loss case is refused the same way although nothing acknowledged is
+missing: a later, unacknowledged record reached the disk and an earlier one did
+not.
+
+A log holding a record type this build does not know, as one written by a newer
+release may, also refuses to open. Run the newer release instead of truncating.
 
 ## Flags
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `-data` | `auto` | Embedded data directory. `auto` resolves to `~/.rostam/memory` (created if missing); `""` runs heap/ephemeral mode (nothing persists past the process); any other value is used as given. Mutually exclusive with `-connect`. |
+| `-data` | `auto` | Embedded data directory. `auto` resolves to `~/.rostam/memory` (created if missing); `""` runs heap/ephemeral mode (nothing persists past the process, and nothing is durable); any other value is used as given. Mutually exclusive with `-connect`. |
 | `-connect` | disabled | Remote mode: `host:port` of a running `rostam-server` to connect to over the binary TCP protocol, instead of embedding the engine. Mutually exclusive with `-data`. |
 | `-auth-token` | — | Bearer token for `-connect`. Prefer `ROSTAM_AUTH_TOKEN` — a flag-passed secret is visible to other local users via `/proc` and shell history. |
 | `-tls-ca` | — | CA bundle PEM to verify the remote server's certificate (`-connect`). |
@@ -143,11 +212,20 @@ config from above:
     every subsequent start. A mismatch — a different model, a different
     `ROSTAM_EMBED_DIM`, or adding/removing the embedder entirely — refuses to
     start rather than silently mixing embedding spaces or crashing deep
-    inside the vector index on a dimension mismatch. The error names all
-    three ways out: unset the embedder configuration to go back to the
-    original mode, point `-data` at a different directory, or wipe the
-    existing data directory to start over. There is no automatic re-embed
-    migration in this release.
+    inside the vector index on a dimension mismatch. The ways out: restore
+    the embedder configuration the store was created with, point `-data` at a
+    different directory, or move the existing data directory aside to start
+    over. There is no automatic re-embed migration in this release.
+
+    A store whose record is missing is not locked out. The first memory tool
+    call checks the configured embedder against the store and records it
+    again. The vector dimension must match. Then up to three stored memories
+    are embedded again, and at least half of them, and at least one, must
+    reproduce their stored vectors. An empty store offers only the dimension
+    to check. If the check fails, or the store has entries but none with
+    content to embed, the call fails with an embedder mismatch and nothing is
+    recorded or changed. The hooks never write the record. Over `-connect`
+    this needs a recent server: see [Remote mode](#remote-mode).
 
 ## Local embeddings
 
@@ -282,7 +360,7 @@ last `updated` 3 days ago" — without parsing `content`.
 
 | Tool | Args | Behavior |
 |---|---|---|
-| `create_collection` | `name` (required), `dim` (required), `metric` (`cosine`\|`l2`\|`dot`, default `cosine`), `full_text` (default `true`), `persistent` (default `true`) | Creates a vector collection. `persistent` collections are stored on disk and survive a restart; `persistent: false` makes an in-memory collection that is gone when the process exits. A persistent collection is SQ8-quantized (disk-backed vector storage requires a quantizer): candidates are re-ranked exactly against the full-precision vectors, so scores are unaffected and only recall moves, marginally. |
+| `create_collection` | `name` (required), `dim` (required), `metric` (`cosine`\|`l2`\|`dot`, default `cosine`), `full_text` (default `true`), `persistent` (default `true`) | Creates a vector collection. `persistent` collections are stored on disk and survive a clean restart (see [What survives a crash](#what-survives-a-crash)); `persistent: false` makes an in-memory collection that is gone when the process exits. A persistent collection is SQ8-quantized (disk-backed vector storage requires a quantizer): candidates are re-ranked exactly against the full-precision vectors, so scores are unaffected and only recall moves, marginally. |
 | `upsert` | `collection` (required), `id` (required), `vector` (optional array), `content` (optional), `metadata` (optional) | Inserts or updates a point. Provide `vector` explicitly, or omit it and provide `content` with an embedder configured to auto-embed. Returns `{id}`. |
 | `search` | `collection` (required), `mode` (`text`\|`dense`\|`hybrid`; default `text` with no embedder, `hybrid` with one), `query_text`, `vector`, `k` (default 10), `filter` | Text search, dense nearest-neighbor, or dense+BM25 hybrid fusion. In `dense`/`hybrid` mode, an omitted `vector` is derived by embedding `query_text` (requires an embedder). Returns `{hits: [{id, content, score, distance, metadata}]}`. |
 | `get` | `collection` (required), `ids` (required), `with_vector` (default `false`) | Fetches points by id. Returns `{points: [{id, content, metadata, vector?}], missing: [...]}`. |
@@ -353,3 +431,29 @@ follow the same conventions as the rest of the client tooling:
 
 See [Security](security.md) for how the target server's own auth and TLS are
 configured.
+
+### Durability over `-connect`
+
+The `mcp` process stores nothing itself in remote mode. For memory to survive
+the server being killed, start a single-node server with a data directory and
+list the memory collection in
+[`-durable-collections`](running.md):
+
+```sh
+rostam-server -tcp 127.0.0.1:7000 -data /var/lib/rostam -durable-collections mcp_memory
+```
+
+The flag also converts an `mcp_memory` collection that already exists on that
+server, at startup (see [Upgrading an existing store](#upgrading-an-existing-store)),
+and the notes on a [damaged log](#a-damaged-log) apply to the server. Without
+the flag, a new `mcp_memory` collection on a single-node server has no
+write-ahead log, and a forced stop can lose memories. Without `-data` nothing is kept across a
+restart. With `-cluster` the flag is ignored: Raft is the durability authority
+there.
+
+### Server version
+
+Creating a new memory store over `-connect`, and rebuilding a missing embedder
+record, need a server at **v0.5.0 or later**. A v0.4.x server with
+authorization on refuses it for any key without admin rights. An existing store
+that has its record is not affected.
