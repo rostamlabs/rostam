@@ -1,0 +1,9 @@
+{
+  "name": "rostam-memory",
+  "version": "0.1.0",
+  "description": "Code-linked agent memory for Claude Code: facts attached to files resurface when those files are read or edited, shared across concurrent sessions.",
+  "homepage": "https://github.com/rostamlabs/rostam",
+  "repository": "https://github.com/rostamlabs/rostam",
+  "license": "Apache-2.0",
+  "keywords": ["memory", "mcp", "agent-memory", "hooks"]
+}

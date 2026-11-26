@@ -34,8 +34,22 @@ const dataDirLockName = ".mcp.lock"
 // protect against the same process opening the dir twice; that isn't a case
 // runMcpCmd can produce.
 func lockDataDir(dir string) (func() error, error) {
+	f, err := lockDataDirFile(dir)
+	if err != nil {
+		return nil, err
+	}
+	// Closing the file drops the flock. The lock file itself is left behind on
+	// purpose: unlinking it would let a second process create a fresh one and
+	// lock that instead, which is the same as having no lock at all.
+	return f.Close, nil
+}
+
+// lockDataDirFile is lockDataDir returning the locked file, so a caller can
+// hand it to a child process (exec.Cmd.ExtraFiles): flock belongs to the open
+// file description, which the child then shares.
+func lockDataDirFile(dir string) (*os.File, error) {
 	path := filepath.Join(dir, dataDirLockName)
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600) //nolint:gosec // G703: fixed lock-file name inside the caller's data dir
 	if err != nil {
 		return nil, fmt.Errorf("opening lock file %s: %w", path, err)
 	}
@@ -43,10 +57,7 @@ func lockDataDir(dir string) (func() error, error) {
 		_ = f.Close()
 		return nil, flockErr(path, err)
 	}
-	// Closing the file drops the flock. The lock file itself is left behind on
-	// purpose: unlinking it would let a second process create a fresh one and
-	// lock that instead, which is the same as having no lock at all.
-	return f.Close, nil
+	return f, nil
 }
 
 // flockErr classifies a flock(2) failure.

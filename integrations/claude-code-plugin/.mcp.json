@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "rostam": {
+      "command": "rostam-server",
+      "args": ["mcp", "-autostart"],
+      "env": {
+        "ROSTAM_EMBED_LOCAL": "${ROSTAM_EMBED_LOCAL:-}",
+        "ROSTAM_EMBED_MODELS_DIR": "${ROSTAM_EMBED_MODELS_DIR:-}",
+        "ROSTAM_EMBED_ENDPOINT": "${ROSTAM_EMBED_ENDPOINT:-}",
+        "ROSTAM_EMBED_MODEL": "${ROSTAM_EMBED_MODEL:-}",
+        "ROSTAM_EMBED_DIM": "${ROSTAM_EMBED_DIM:-}",
+        "ROSTAM_EMBED_API_KEY": "${ROSTAM_EMBED_API_KEY:-}"
+      }
+    }
+  }
+}

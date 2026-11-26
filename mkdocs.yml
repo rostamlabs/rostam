@@ -114,6 +114,7 @@ nav:
       - Backups & cold tier: server/backups.md
       - Monitoring: server/monitoring.md
       - MCP server: server/mcp.md
+      - Claude Code plugin: server/claude-code-plugin.md
       - LLM caching proxy: server/llm-proxy.md
       - RAG CLI: server/rag.md
   - API reference:

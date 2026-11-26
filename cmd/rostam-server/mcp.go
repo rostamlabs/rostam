@@ -49,6 +49,14 @@ var errDataDirBusy = errors.New("data directory is held by another process")
 type storeFlags struct {
 	data, connect, authToken          string
 	tlsCA, tlsCert, tlsKey, tlsServer string
+
+	// beforeConnect, when set, vets the address before every dial (see
+	// rostam.ClientConfig.BeforeConnect). Not a flag: set by -autostart and
+	// the hook so the daemon token only ever goes to this user's listener.
+	beforeConnect func(ctx context.Context, addr string) error
+	// afterConnect vets each new connection before anything is sent on it
+	// (see rostam.ClientConfig.AfterConnect).
+	afterConnect func(ctx context.Context, addr string) error
 }
 
 // mcpFlags holds the parsed `mcp` subcommand flags. It is passed to mcpSetup
@@ -67,13 +75,18 @@ type mcpRuntime struct {
 	embedder semcache.Embedder // nil in BM25-only mode
 }
 
-// runMcpCmd implements `rostam-server mcp`: an MCP stdio server exposing
-// memory + generic DB tools over a rostam.Store. Like runKeysCmd, it owns its
-// own FlagSet and process exit. stdout is the MCP JSON-RPC wire, so every
-// diagnostic here goes to stderr — never fmt.Print* to stdout.
-func runMcpCmd(args []string) {
-	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
-	var fl mcpFlags
+// mcpExtraFlags are the `mcp` flags that live outside mcpFlags.
+type mcpExtraFlags struct {
+	autostart   *bool
+	projectRoot *string
+	namespace   *string
+	listModels  *bool
+}
+
+// defineMcpFlags registers every `mcp` flag on fs. Split from runMcpCmd so the
+// real flag set can be parsed in tests.
+func defineMcpFlags(fs *flag.FlagSet, fl *mcpFlags) mcpExtraFlags {
+	var x mcpExtraFlags
 	fs.StringVar(&fl.data, "data", mcpDataAuto,
 		`data directory for embedded mode: "auto" (default) resolves to `+
 			`~/.rostam/memory (created if missing); "" runs heap/ephemeral `+
@@ -88,7 +101,32 @@ func runMcpCmd(args []string) {
 	fs.StringVar(&fl.tlsKey, "tls-key", "", "client private key PEM for mTLS (-connect; requires -tls-cert)")
 	fs.StringVar(&fl.tlsServer, "tls-server-name", "", "expected server certificate name (SNI + verification) for -connect")
 	fs.BoolVar(&fl.destructive, "enable-destructive", false, "register delete/delete_by_filter tools for arbitrary collections (off by default)")
-	listModels := fs.Bool("list-embed-models", false, "print the built-in local embedding models, then exit")
+	x.autostart = fs.Bool("autostart", false,
+		"connect to the shared local memory daemon (127.0.0.1:7480, token from ~/.rostam/memory/token), starting it first if it is not running; cannot be combined with -data, -connect, -auth-token or the -tls-* flags")
+	x.projectRoot = fs.String("project-root", "",
+		"project root for code-linked memories (default: CLAUDE_PROJECT_DIR, else the working directory, resolved to its git top-level)")
+	x.namespace = fs.String("namespace", "",
+		`namespace the memory tools use when a call omits one (default: the project's namespace, the main checkout's directory name, under -autostart or -project-root; otherwise "default")`)
+	x.listModels = fs.Bool("list-embed-models", false, "print the built-in local embedding models, then exit")
+	return x
+}
+
+// visitedFlags is the set of flag names given explicitly on the command line.
+func visitedFlags(fs *flag.FlagSet) map[string]bool {
+	v := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { v[f.Name] = true })
+	return v
+}
+
+// runMcpCmd implements `rostam-server mcp`: an MCP stdio server exposing
+// memory + generic DB tools over a rostam.Store. Like runKeysCmd, it owns its
+// own FlagSet and process exit. stdout is the MCP JSON-RPC wire, so every
+// diagnostic here goes to stderr — never fmt.Print* to stdout.
+func runMcpCmd(args []string) {
+	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
+	var fl mcpFlags
+	x := defineMcpFlags(fs, &fl)
+	autostart, projectRoot, listModels := x.autostart, x.projectRoot, x.listModels
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
 	}
@@ -113,6 +151,43 @@ func runMcpCmd(args []string) {
 			dataExplicit = true
 		}
 	})
+
+	var autoEmbedder *semcache.Embedder // built early by -autostart; reused below
+	if *autostart {
+		if err := checkAutostartConflicts(visitedFlags(fs)); err != nil {
+			fatal(err.Error())
+		}
+		if !daemonSupported {
+			fatal("mcp: -autostart: " + errDaemonUnsupported.Error())
+		}
+		dir, err := defaultMemoryDir()
+		if err != nil {
+			fatal("mcp: resolving home directory for -autostart", "err", err)
+		}
+		// Validate the embedder config BEFORE spawning: a typo'd ROSTAM_EMBED_*
+		// must not leave a detached daemon behind on its way to failing.
+		emb, err := embedderFromEnv(os.LookupEnv)
+		if err != nil {
+			fatal("mcp: setup failed", "err", err)
+		}
+		autoEmbedder = &emb
+		if err := ensureDaemon(context.Background(), dir, memoryDefaultAddr, newDaemonSpawner(dir, memoryDefaultAddr)); err != nil {
+			fatal("mcp: " + err.Error())
+		}
+		tok, err := ensureToken(dir)
+		if err != nil {
+			fatal("mcp: reading daemon token", "err", err)
+		}
+		// From here on this is exactly `-connect 127.0.0.1:7480` with the token:
+		// the connect branch below skips claimDataDir.
+		fl.connect, fl.authToken = memoryDefaultAddr, tok
+		// This session lives as long as Claude Code does and redials whenever
+		// the daemon restarts, so every new connection is vetted before the
+		// token goes over it: on Linux, the listener's owner before the dial
+		// and the accepting socket's owner after it. Elsewhere (no /proc
+		// socket table) both checks are skipped; see listenerOwnerCheck.
+		fl.beforeConnect, fl.afterConnect = ownerCheckBeforeConnect, ownerCheckAfterConnect
+	}
 
 	switch {
 	case fl.connect != "" && !dataExplicit:
@@ -144,10 +219,7 @@ func runMcpCmd(args []string) {
 		unlock, lerr = claimDataDir(fl.data)
 		switch {
 		case errors.Is(lerr, errDataDirBusy):
-			fatal("mcp: another rostam-server mcp process is using this data directory; "+
-				"a data dir has one writer, so concurrent clients must share one server over -connect "+
-				"instead of each embedding their own",
-				"dir", fl.data, "err", lerr)
+			fatal(dataDirBusyMsg(fl.data), "dir", fl.data, "err", lerr)
 		case lerr != nil:
 			// Not a conflict — a path that cannot be created, a read-only
 			// filesystem, a full disk. Reporting it as "another process is
@@ -157,7 +229,13 @@ func runMcpCmd(args []string) {
 		}
 	}
 
-	rt, err := mcpSetup(fl, os.LookupEnv)
+	var rt mcpRuntime
+	var err error
+	if autoEmbedder != nil {
+		rt, err = mcpSetupWith(fl, *autoEmbedder, os.LookupEnv)
+	} else {
+		rt, err = mcpSetup(fl, os.LookupEnv)
+	}
 	if err != nil {
 		_ = unlock()
 		fatal("mcp: setup failed", "err", err)
@@ -166,16 +244,31 @@ func runMcpCmd(args []string) {
 	// stdout is reserved for the MCP wire (JSON-RPC frames to the client), so
 	// every log line goes to stderr via a plain text handler.
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	visited := visitedFlags(fs)
+	root, nsDir := defaultProjectRoot(*projectRoot, os.Getenv, os.Getwd)
+	resolvedNS := ""
+	if !visited["namespace"] && (*autostart || *projectRoot != "") {
+		ns, err := mcpProjectNamespace(nsDir, func(msg string) { log.Warn(msg) })
+		if err != nil {
+			_ = rt.store.Close()
+			_ = unlock()
+			fatal(err.Error())
+		}
+		resolvedNS = ns
+	}
 	srv, err := mcp.NewServer(context.Background(), mcp.Config{
-		Store:       rt.store,
-		Embedder:    rt.embedder,
-		Destructive: fl.destructive,
-		Logger:      log,
+		Store:            rt.store,
+		Embedder:         rt.embedder,
+		Destructive:      fl.destructive,
+		Logger:           log,
+		ProjectRoot:      root,
+		DefaultNamespace: mcpDefaultNamespace(resolvedNS, *x.namespace, visited["namespace"], *autostart, *projectRoot != ""),
 	})
 	if err != nil {
 		_ = rt.store.Close()
 		_ = unlock()
-		fatal("mcp: server init failed", "err", err)
+		memDir, _ := defaultMemoryDir()
+		fatal("mcp: server init failed", "err", mcpInitErr(err, *autostart, memDir))
 	}
 
 	// An MCP client that goes away closes stdin and Serve returns on its own.
@@ -259,7 +352,16 @@ func mcpSetup(fl mcpFlags, lookupEnv func(string) (string, bool)) (mcpRuntime, e
 	if err != nil {
 		return mcpRuntime{}, err
 	}
+	return mcpSetupWith(fl, embedder, lookupEnv)
+}
 
+// mcpSetupWith is mcpSetup with the embedder already built (-autostart builds
+// it before spawning the daemon, so a bad embedder config never spawns one).
+func mcpSetupWith(fl mcpFlags, embedder semcache.Embedder, lookupEnv func(string) (string, bool)) (mcpRuntime, error) {
+	if fl.data != "" && fl.connect != "" {
+		return mcpRuntime{}, errors.New("mcp: use -data or -connect, not both")
+	}
+	var err error
 	reg := ops.NewRegistry()
 	if err := ops.RegisterBuiltins(reg); err != nil {
 		return mcpRuntime{}, fmt.Errorf("mcp: register ops: %w", err)
@@ -363,10 +465,12 @@ func connectStore(fl storeFlags, reg *ops.Registry, lookupEnv func(string) (stri
 	}
 
 	store, err := rostam.NewClient(rostam.ClientConfig{
-		Servers:   []string{fl.connect},
-		Ops:       reg,
-		AuthToken: token,
-		TLSConfig: tlsCfg,
+		Servers:       []string{fl.connect},
+		Ops:           reg,
+		AuthToken:     token,
+		TLSConfig:     tlsCfg,
+		BeforeConnect: fl.beforeConnect,
+		AfterConnect:  fl.afterConnect,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("rostam-server: connect to %q: %w", fl.connect, err)

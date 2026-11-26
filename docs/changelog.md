@@ -5,6 +5,36 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **Code-linked memory and a Claude Code plugin.** `remember` takes an optional
+  `path` (and `symbol`) that links a memory to a file, and `recall_for_file`
+  lists what is linked to one. A linked memory whose file has since changed is
+  marked `stale`, or `"file missing"` when the file is gone. The new
+  `rostam-memory` plugin shows linked memories automatically when Claude reads
+  or edits the file (at most 5 memories and 1,500 characters per injection, each
+  once per session), and `rostam-server mcp -autostart` lets several Claude Code
+  sessions share one memory through a local daemon on `127.0.0.1:7480`
+  (`rostam-server memory-daemon [-stop]`). Linux only in this release: macOS,
+  the BSDs and Windows refuse at once, because the daemon's persistent store
+  needs storage the engine provides only on Linux and Windows, and the daemon
+  itself is not ported to Windows yet. Plain `rostam-server mcp` is unchanged
+  and still allows one session at a time. Under `-autostart` or an explicit
+  `-project-root`, a call that omits `namespace` uses the project's namespace
+  instead of `"default"`, so memories saved earlier with no namespace are not
+  recalled by default: pass `namespace: "default"` (or `-namespace default`)
+  to reach them, or see
+  [Migrating from an embedded rostam MCP entry](server/claude-code-plugin.md#migrating-from-an-embedded-rostam-mcp-entry).
+  Project namespaces come from a per-machine registry
+  (`~/.rostam/memory/namespaces.json`): the first project with a given
+  directory name keeps the plain name, and a different project with the same
+  name gets the name plus a short hash, so unrelated checkouts no longer share
+  memories. After upgrading, whichever same-named project opens first gets the
+  memories already saved under the plain name; leave `namespace` out rather
+  than passing the plain name from the other one. The separation is not
+  permanent: if the owning project is deleted, moved or unmounted, the next
+  same-named project with no assignment takes the plain name and its
+  memories.
+  See [Claude Code plugin](server/claude-code-plugin.md).
+
 ## v0.7.0 — 2026-09-27
 
 - **`go install …/cmd/rostam-server@v0.7.0` and `go get github.com/rostamlabs/rostam`

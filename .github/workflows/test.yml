@@ -40,6 +40,15 @@ jobs:
       - name: Build (default, cgo)
         run: go build ./...
 
+      - name: Build against the pinned client/sdk modules (GOWORK=off)
+        # The committed go.work points the root module at ./client and ./sdk,
+        # which hides root code that needs client/sdk API not yet in the
+        # versions go.mod pins. `go install .../cmd/rostam-server@version`
+        # resolves the pins, so this must build too.
+        env:
+          GOWORK: "off"
+        run: go build ./...
+
       - name: Build pure-Go packages without cgo
         run: CGO_ENABLED=0 go build ./vector/... ./objstore ./cache ./ops
 
@@ -330,6 +339,14 @@ jobs:
       # serial round-trip doesn't already give (they still run on the Linux lanes).
       - name: Test (vector mmap/persist round-trip, targeted)
         run: go test -count=1 -timeout 15m -run 'Mmap|Persist|Reopen|Grow|Reserve|Slab' -skip 'Concurrent|Latency|SIFT' ./vector/
+
+      # The namespace registry's Windows lock (cmd/rostam-server/
+      # nslock_windows.go: LockFileEx with a retry loop) is what keeps two
+      # first sessions of same-named projects from both taking the plain name;
+      # no other lane runs it. The registry tests are pure Go and need only the
+      # filesystem (and git, which the runner has).
+      - name: Test (namespace registry, targeted)
+        run: go test -count=1 -timeout 10m -run '^TestRegistry' ./cmd/rostam-server/
 
       # The filesystem backup store publishes a write-once snapshot with a hard
       # link (CreateHardLinkW here), whose refusal of an existing name is what

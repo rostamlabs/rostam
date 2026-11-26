@@ -25,8 +25,15 @@ const (
 	createdField  = "__created_unix" // metadata field: unix-seconds creation time
 	keyField      = "__key"          // metadata field: caller's stable key (keyed memories only)
 	updatedField  = "__updated_unix" // metadata field: unix-seconds last-write time
-	defaultNS     = "default"        // namespace used when the caller omits one
-	kvEmbedder    = "__mcp/embedder" // KV key: the embedIdentity this store was bootstrapped with
+	// updatedNsField: unix-nanoseconds last-write time, for newest-first order
+	// within one second. Additive: `updated` stays seconds. An older version
+	// could have stored a user field of this name, so it is read (and hidden)
+	// as ours only when it agrees with __updated_unix to the second; anything
+	// else stays user metadata. Memories written before it existed sort by
+	// seconds, as before.
+	updatedNsField = "__updated_ns"
+	defaultNS      = "default"        // namespace used when the caller omits one
+	kvEmbedder     = "__mcp/embedder" // KV key: the embedIdentity this store was bootstrapped with
 )
 
 // embedIdentity fingerprints the embedder a data dir's mcp_memory collection
@@ -49,6 +56,10 @@ const (
 	identityReadAttempts = 3
 	identityReadBackoff  = 50 * time.Millisecond
 )
+
+// ErrEmbedderMismatch is wrapped by NewServer's error when the store's memory
+// was created with a different embedder than this run's.
+var ErrEmbedderMismatch = errors.New("mcp: embedder mismatch")
 
 // checkEmbedderIdentity compares the configured embedder against the one
 // recorded in KV, if any. No record yet means the memory collection has
@@ -74,8 +85,8 @@ func (s *Server) matchStoredIdentity(raw []byte) error {
 	}
 	want := embedIdentity{Model: s.emb.Model(), Dim: s.emb.Dim(), Hybrid: s.hybrid}
 	if stored != want {
-		return fmt.Errorf("mcp: embedder mismatch: this data dir's memory was bootstrapped with model=%q dim=%d hybrid=%v, but this run is configured with model=%q dim=%d hybrid=%v; unset the embedder configuration to go back to the original mode, point -data at a different directory, or wipe the existing data dir to start over",
-			stored.Model, stored.Dim, stored.Hybrid, want.Model, want.Dim, want.Hybrid)
+		return fmt.Errorf("%w: this store's memory was bootstrapped with model=%q dim=%d hybrid=%v, but this run is configured with model=%q dim=%d hybrid=%v; set the same ROSTAM_EMBED_* environment the store was created with (none at all for model \"stub\"), or use a different store",
+			ErrEmbedderMismatch, stored.Model, stored.Dim, stored.Hybrid, want.Model, want.Dim, want.Hybrid)
 	}
 	return nil
 }
@@ -95,11 +106,42 @@ func (s *Server) ensureMemory(ctx context.Context) error {
 	if s.memReady {
 		return nil
 	}
+	if s.readOnly {
+		if err := s.probeMemory(ctx); err != nil {
+			return err
+		}
+		s.memReady = true
+		return nil
+	}
 	if err := s.bootstrapMemory(ctx); err != nil {
 		return err
 	}
 	s.memReady = true
 	return nil
+}
+
+// probeMemory is ensureMemory's read-only form: it only checks that the memory
+// collection exists, by scrolling one document. ErrNoMemory is returned (and
+// not latched) when it does not.
+func (s *Server) probeMemory(ctx context.Context) error {
+	_, _, _, err := s.store.VectorScroll(ctx, memCollection, rostam.VectorFilter{}, 1, rostam.VectorScrollOpts{})
+	switch {
+	case err == nil:
+		return nil
+	case collectionMissing(err):
+		return ErrNoMemory
+	default:
+		return fmt.Errorf("mcp: probing memory collection: %w", err)
+	}
+}
+
+// collectionMissing reports whether err is the server saying the collection
+// does not exist. It mirrors the client package's unexported
+// isCollectionNotFound (both spellings, case-insensitive); no importable form
+// exists, and any other error (a timeout, a reset) must NOT read as "missing".
+func collectionMissing(err error) bool {
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "no collection") || strings.Contains(s, "unknown collection")
 }
 
 // bootstrapMemory is one bootstrap attempt. The caller holds s.memMu.
@@ -256,6 +298,17 @@ type memoryHit struct {
 	Created  int64          `json:"created,omitempty"`
 	Updated  int64          `json:"updated,omitempty"`
 	Metadata map[string]any `json:"metadata,omitempty"`
+
+	// Code link (set only for memories remembered with a path). Stale is true
+	// when the file changed since the memory was written, "file missing" when
+	// it is gone; fileHash is the stored hash, kept for markStale.
+	Path     string `json:"path,omitempty"`
+	Symbol   string `json:"symbol,omitempty"`
+	Stale    any    `json:"stale,omitempty"`
+	fileHash string
+	// updatedNs is the nanosecond write time when stored (0 for older
+	// memories): ordering only, never on the wire.
+	updatedNs int64
 }
 
 // registerMemoryTools registers remember, recall, forget, list_memories, and
@@ -263,14 +316,16 @@ type memoryHit struct {
 func (s *Server) registerMemoryTools() {
 	s.register(toolDef{
 		Name:        "remember",
-		Description: `Store a fact in persistent memory for later recall. Store ONE self-contained, durable fact per call (a decision, gotcha, command, or finding), phrased so it stands alone when recalled later — not transient chatter, and never secrets. Pass namespace = the project directory name so facts stay project-scoped. Pass a stable key for live/in-flight state (e.g. a PR's status) so re-remembering the same key REPLACES the prior entry instead of piling up snapshots; omit key for durable one-off facts.`,
+		Description: `Store a fact in persistent memory for later recall. Store ONE self-contained, durable fact per call (a decision, gotcha, command, or finding), phrased so it stands alone when recalled later — not transient chatter, and never secrets. Omit namespace to use this server's default (the project's, when it was started for one); when passing one, use the project's main checkout directory name, not a worktree's. Pass a stable key for live/in-flight state (e.g. a PR's status) so re-remembering the same key REPLACES the prior entry instead of piling up snapshots; omit key for durable one-off facts.`,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"content":   map[string]any{"type": "string", "description": "the fact to store"},
-				"namespace": map[string]any{"type": "string", "description": `isolation namespace (default "default")`},
+				"namespace": map[string]any{"type": "string", "description": s.nsDesc("isolation namespace")},
 				"metadata":  map[string]any{"type": "object", "description": "optional extra metadata to attach"},
 				"key":       map[string]any{"type": "string", "description": "optional stable key; re-remembering the same key REPLACES the prior content (one canonical entry). Use for live/in-flight state; omit for durable one-off facts."},
+				"path":      map[string]any{"type": "string", "description": "optional repo-relative file this fact is about; recall then flags the memory stale if the file changes"},
+				"symbol":    map[string]any{"type": "string", "description": "optional symbol within path (requires path)"},
 			},
 			"required": []any{"content"},
 		},
@@ -278,12 +333,12 @@ func (s *Server) registerMemoryTools() {
 	})
 	s.register(toolDef{
 		Name:        "recall",
-		Description: `Search stored memories by relevance to a query, scoped to a namespace. Call this at the START of a task, before re-reading large files or re-exploring a codebase — it's cheaper than rediscovering what you already know. Pass namespace = the project directory name.`,
+		Description: `Search stored memories by relevance to a query, scoped to a namespace. Call this at the START of a task, before re-reading large files or re-exploring a codebase — it's cheaper than rediscovering what you already know. Omit namespace to search this server's default namespace.`,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"query":     map[string]any{"type": "string", "description": "search text"},
-				"namespace": map[string]any{"type": "string", "description": `restrict the search to this namespace (default "default")`},
+				"namespace": map[string]any{"type": "string", "description": s.nsDesc("restrict the search to this namespace")},
 				"k":         map[string]any{"type": "integer", "description": "max hits to return (default 5)"},
 				"filter":    map[string]any{"type": "object", "description": "optional metadata filter, ANDed with the namespace"},
 			},
@@ -302,7 +357,7 @@ func (s *Server) registerMemoryTools() {
 					"items":       map[string]any{"type": "integer"},
 					"description": "ids of the memories to delete",
 				},
-				"namespace": map[string]any{"type": "string", "description": `namespace the keys below belong to (default "default")`},
+				"namespace": map[string]any{"type": "string", "description": s.nsDesc("namespace the keys below belong to")},
 				"keys": map[string]any{
 					"type":        "array",
 					"items":       map[string]any{"type": "string"},
@@ -318,13 +373,14 @@ func (s *Server) registerMemoryTools() {
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"namespace": map[string]any{"type": "string", "description": `namespace to list (default "default")`},
+				"namespace": map[string]any{"type": "string", "description": s.nsDesc("namespace to list")},
 				"limit":     map[string]any{"type": "integer", "description": "max memories per page (default 50, max 500)"},
 				"cursor":    map[string]any{"type": "string", "description": "resume-after cursor from a previous call's next_cursor"},
 			},
 		},
 		Handler: s.handleListMemories,
 	})
+	s.registerFileContextTools()
 	s.register(toolDef{
 		Name:        "list_namespaces",
 		Description: "List all known memory namespaces.",
@@ -342,9 +398,14 @@ type rememberArgs struct {
 	Namespace string                     `json:"namespace"`
 	Metadata  map[string]json.RawMessage `json:"metadata"`
 	Key       string                     `json:"key"`
+	Path      *string                    `json:"path"` // pointer: absent and "" differ
+	Symbol    string                     `json:"symbol"`
 }
 
 func (s *Server) handleRemember(ctx context.Context, raw json.RawMessage) (any, error) {
+	if s.readOnly {
+		return nil, errReadOnly
+	}
 	var args rememberArgs
 	if err := json.Unmarshal(raw, &args); err != nil {
 		return nil, fmt.Errorf("mcp: bad remember args: %w", err)
@@ -352,14 +413,24 @@ func (s *Server) handleRemember(ctx context.Context, raw json.RawMessage) (any, 
 	if strings.TrimSpace(args.Content) == "" {
 		return nil, fmt.Errorf("mcp: remember: content is required")
 	}
-	ns := args.Namespace
-	if ns == "" {
-		ns = defaultNS
-	}
-	for _, reserved := range [...]string{nsField, createdField, keyField, updatedField, "$content"} {
+	ns := s.namespaceOr(args.Namespace)
+	for _, reserved := range [...]string{nsField, createdField, keyField, updatedField, updatedNsField, pathField, symbolField, fileHashField, linkField, "$content"} {
 		if _, ok := args.Metadata[reserved]; ok {
 			return nil, fmt.Errorf("mcp: remember: metadata key %q is reserved", reserved)
 		}
+	}
+
+	var relPath string
+	if args.Path != nil {
+		if *args.Path == "" || *args.Path != strings.TrimSpace(*args.Path) {
+			return nil, fmt.Errorf("mcp: remember: path must be non-empty with no leading or trailing whitespace")
+		}
+		var err error
+		if relPath, err = normalizeLinkPath(s.projectRoot, *args.Path); err != nil {
+			return nil, fmt.Errorf("mcp: remember: %w", err)
+		}
+	} else if args.Symbol != "" {
+		return nil, fmt.Errorf("mcp: remember: symbol requires path")
 	}
 
 	if err := s.ensureMemory(ctx); err != nil {
@@ -373,9 +444,20 @@ func (s *Server) handleRemember(ctx context.Context, raw json.RawMessage) (any, 
 	if md == nil {
 		md = make(rostam.VectorMetadata, 2)
 	}
-	now := time.Now().Unix()
+	wrote := time.Now()
+	now := wrote.Unix()
 	md[nsField] = vector.NewString(ns)
 	md[updatedField] = vector.NewInt(now)
+	md[updatedNsField] = vector.NewInt(wrote.UnixNano())
+	if relPath != "" {
+		hash, _ := fileHash(s.projectRoot, relPath) // "" when unreadable: link is still stored
+		md[pathField] = vector.NewString(relPath)
+		md[fileHashField] = vector.NewString(hash)
+		md[linkField] = linkMarker()
+		if args.Symbol != "" {
+			md[symbolField] = vector.NewString(args.Symbol)
+		}
+	}
 
 	// A keyed remember always lands on the same point (memoryKeyID ignores
 	// content), so a re-remember under the same key is an update to one
@@ -436,10 +518,7 @@ func (s *Server) handleRecall(ctx context.Context, raw json.RawMessage) (any, er
 	if strings.TrimSpace(args.Query) == "" {
 		return nil, fmt.Errorf("mcp: recall: query is required")
 	}
-	ns := args.Namespace
-	if ns == "" {
-		ns = defaultNS
-	}
+	ns := s.namespaceOr(args.Namespace)
 	// <= 0, not == 0: a client can send "k": -1, and a negative k reaching the
 	// search call is the same nonsense as a zero one. Matches list_memories.
 	k := args.K
@@ -479,6 +558,7 @@ func (s *Server) recallBM25(ctx context.Context, query string, k int, f rostam.V
 	for i, d := range docs {
 		hits[i] = toMemoryHit(d.ID, d.Content, d.Score, d.Metadata)
 	}
+	s.markStale(hits)
 	return map[string]any{"hits": hits}, nil
 }
 
@@ -505,6 +585,7 @@ func (s *Server) recallHybrid(ctx context.Context, query string, k int, f rostam
 	for i, d := range docs {
 		hits[i] = toMemoryHitJSON(d.ID, d.Content, d.Score, d.Metadata)
 	}
+	s.markStale(hits)
 	return map[string]any{"hits": hits}, nil
 }
 
@@ -515,15 +596,16 @@ func (s *Server) recallHybrid(ctx context.Context, query string, k int, f rostam
 var reservedMetadataFields = [...]string{nsField, createdField, keyField, updatedField}
 
 // stripReservedMetadata removes the memory subsystem's own bookkeeping
-// fields (namespace, key, creation/update time) before metadata is handed
-// back to a tool caller. $content is stripped separately by metadataToJSON.
-func stripReservedMetadata(md rostam.VectorMetadata) rostam.VectorMetadata {
+// fields (namespace, key, creation/update time, and the code-link fields when
+// link is set) before metadata is handed back to a tool caller. $content is
+// stripped separately by metadataToJSON.
+func stripReservedMetadata(md rostam.VectorMetadata, link bool) rostam.VectorMetadata {
 	if len(md) == 0 {
 		return md
 	}
 	out := make(rostam.VectorMetadata, len(md))
 	for k, v := range md {
-		if isReservedField(k) {
+		if isReservedField(k, link) {
 			continue
 		}
 		out[k] = v
@@ -531,10 +613,17 @@ func stripReservedMetadata(md rostam.VectorMetadata) rostam.VectorMetadata {
 	return out
 }
 
-func isReservedField(k string) bool {
+func isReservedField(k string, link bool) bool {
 	for _, r := range reservedMetadataFields {
 		if k == r {
 			return true
+		}
+	}
+	if link {
+		for _, r := range linkFields {
+			if k == r {
+				return true
+			}
 		}
 	}
 	return false
@@ -556,8 +645,51 @@ func toMemoryHit(id uint64, content string, score float32, md rostam.VectorMetad
 	if v, ok := md[updatedField]; ok && v.Kind == vector.ValueInt {
 		hit.Updated = v.Int
 	}
-	hit.Metadata = metadataToJSON(stripReservedMetadata(md))
+	mv, ok := md[linkField]
+	link := isLinkMarker(mv, ok)
+	if link {
+		if v, ok := md[pathField]; ok && v.Kind == vector.ValueString {
+			hit.Path = v.Str
+		}
+		if v, ok := md[symbolField]; ok && v.Kind == vector.ValueString {
+			hit.Symbol = v.Str
+		}
+		if v, ok := md[fileHashField]; ok && v.Kind == vector.ValueString {
+			hit.fileHash = v.Str
+		}
+	}
+	sm := stripReservedMetadata(md, link)
+	if v, ok := md[updatedNsField]; ok && v.Kind == vector.ValueInt && ownUpdatedNs(v.Int, hit.Updated) {
+		hit.updatedNs = v.Int
+		delete(sm, updatedNsField)
+	}
+	hit.Metadata = metadataToJSON(sm)
 	return hit
+}
+
+// ownUpdatedNs reports whether ns is the write time remember stored: it must
+// fall within the stored second. See updatedNsField.
+func ownUpdatedNs(ns, updated int64) bool {
+	return updated != 0 && ns >= updated*1e9 && ns < (updated+1)*1e9
+}
+
+// orderKey is a memory's one effective write time in nanoseconds: the stored
+// nanosecond time, else (older memories) the start of its stored second.
+func orderKey(h memoryHit) int64 {
+	if h.updatedNs != 0 {
+		return h.updatedNs
+	}
+	return h.Updated * 1e9
+}
+
+// newerThan orders memories newest first by orderKey, the id breaking ties:
+// a strict total order, so sorting is well-defined even when timestamped and
+// older memories share a second.
+func newerThan(a, b memoryHit) bool {
+	if ka, kb := orderKey(a), orderKey(b); ka != kb {
+		return ka > kb
+	}
+	return a.ID < b.ID
 }
 
 // toMemoryHitJSON is toMemoryHit's counterpart for recallHybrid, whose docs
@@ -576,6 +708,19 @@ func toMemoryHitJSON(id uint64, content string, score float32, md map[string]any
 	}
 	if v, ok := md[updatedField].(int64); ok {
 		hit.Updated = v
+	}
+	// metadataToJSON renders the geo marker as {"lat","lon"}.
+	if _, link := md[linkField].(map[string]float64); link {
+		hit.Path, _ = md[pathField].(string)
+		hit.Symbol, _ = md[symbolField].(string)
+		hit.fileHash, _ = md[fileHashField].(string)
+		for _, r := range linkFields {
+			delete(md, r)
+		}
+	}
+	if v, ok := md[updatedNsField].(int64); ok && ownUpdatedNs(v, hit.Updated) {
+		hit.updatedNs = v
+		delete(md, updatedNsField)
 	}
 	for _, r := range reservedMetadataFields {
 		delete(md, r)
@@ -604,6 +749,9 @@ type forgetArgs struct {
 // by the memories carrying it (see handleListNamespaces), so deleting the last
 // one is all that "removing a namespace" means.
 func (s *Server) handleForget(ctx context.Context, raw json.RawMessage) (any, error) {
+	if s.readOnly {
+		return nil, errReadOnly
+	}
 	var args forgetArgs
 	if err := json.Unmarshal(raw, &args); err != nil {
 		return nil, fmt.Errorf("mcp: bad forget args: %w", err)
@@ -614,10 +762,7 @@ func (s *Server) handleForget(ctx context.Context, raw json.RawMessage) (any, er
 
 	ids := args.IDs
 	if len(args.Keys) > 0 {
-		ns := args.Namespace
-		if ns == "" {
-			ns = defaultNS
-		}
+		ns := s.namespaceOr(args.Namespace)
 		ids = make([]uint64, 0, len(args.IDs)+len(args.Keys))
 		ids = append(ids, args.IDs...)
 		for _, key := range args.Keys {
@@ -682,10 +827,7 @@ func (s *Server) handleListMemories(ctx context.Context, raw json.RawMessage) (a
 	if err := json.Unmarshal(raw, &args); err != nil {
 		return nil, fmt.Errorf("mcp: bad list_memories args: %w", err)
 	}
-	ns := args.Namespace
-	if ns == "" {
-		ns = defaultNS
-	}
+	ns := s.namespaceOr(args.Namespace)
 	limit := args.Limit
 	switch {
 	case limit <= 0:
@@ -707,6 +849,7 @@ func (s *Server) handleListMemories(ctx context.Context, raw json.RawMessage) (a
 	for i, d := range docs {
 		memories[i] = toMemoryHit(d.ID, d.Content, d.Score, d.Metadata)
 	}
+	s.markStale(memories)
 	return map[string]any{"memories": memories, "next_cursor": cursor}, nil
 }
 
