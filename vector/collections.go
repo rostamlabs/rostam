@@ -57,6 +57,11 @@ type CollectionStore struct {
 	persistentCluster bool
 	gen               atomic.Uint64
 
+	// durable holds the canonical names of the dense collections that always run
+	// with the write-ahead log (see StoreOptions.DurableCollections). Set at open,
+	// read-only afterwards. Consulted only through isDurable.
+	durable map[string]struct{}
+
 	mu          sync.RWMutex
 	collections map[string]*Collection
 	// multi holds late-interaction (multi-vector) indexes by canonical name.
@@ -112,7 +117,7 @@ type CollectionStore struct {
 // Legacy top-level files from subsystem 1 (no tenant subdir) are picked up
 // and remapped to the "default" tenant on load.
 func OpenCollectionStore(dir string) (*CollectionStore, error) {
-	return OpenCollectionStorePersistent(dir, false)
+	return OpenCollectionStoreWith(dir, StoreOptions{})
 }
 
 // OpenCollectionStorePersistent is OpenCollectionStore with the per-node
@@ -121,7 +126,18 @@ func OpenCollectionStore(dir string) (*CollectionStore, error) {
 // per-collection sidecar: stale on-disk vector data files are wiped at open and
 // repopulated from the Raft snapshot/log. Used by shard.New in a replicated
 // deployment (shard.Config.PersistentVectors).
-func OpenCollectionStorePersistent(dir string, persistentCluster bool) (store *CollectionStore, retErr error) {
+func OpenCollectionStorePersistent(dir string, persistentCluster bool) (*CollectionStore, error) {
+	return OpenCollectionStoreWith(dir, StoreOptions{PersistentCluster: persistentCluster})
+}
+
+// OpenCollectionStoreWith is OpenCollectionStore with explicit options: the
+// persistent-cluster policy and the durable collections (see StoreOptions).
+func OpenCollectionStoreWith(dir string, opts StoreOptions) (store *CollectionStore, retErr error) {
+	persistentCluster := opts.PersistentCluster
+	durable, err := canonicalDurable(opts.DurableCollections)
+	if err != nil {
+		return nil, err
+	}
 	// No directory configured means heap mode. Give the store a private temp dir
 	// rather than letting every path resolve relative to the process's working
 	// directory: the on-disk layout below is an implementation detail of the
@@ -149,7 +165,7 @@ func OpenCollectionStorePersistent(dir string, persistentCluster bool) (store *C
 	if err := os.MkdirAll(vd, 0o750); err != nil {
 		return nil, fmt.Errorf("vector: mkdir %s: %w", vd, err)
 	}
-	s := &CollectionStore{dir: dir, ephemeralDir: ephemeral, persistentCluster: persistentCluster, collections: make(map[string]*Collection), multi: make(map[string]*MultiVectorIndex), named: make(map[string]*NamedCollection)}
+	s := &CollectionStore{dir: dir, ephemeralDir: ephemeral, persistentCluster: persistentCluster, durable: durable, collections: make(map[string]*Collection), multi: make(map[string]*MultiVectorIndex), named: make(map[string]*NamedCollection)}
 
 	// Cluster-persistent: the mmap files are a non-authoritative cache. Wipe any
 	// left by a prior process so Raft (FSM.Restore + log replay) is the single
@@ -266,6 +282,9 @@ func (s *CollectionStore) loadCollection(canonical, cfgPath, snapPath string) er
 			return fmt.Errorf("vector: wal open %s: %w", canonical, werr)
 		}
 		c.wal = w
+		if s.isDurable(canonical) {
+			s.checkpointLargeLog(canonical, walPath, c)
+		}
 		s.collections[canonical] = c
 		return nil
 	}
@@ -499,6 +518,7 @@ func (s *CollectionStore) CreateCollection(name string, cfg Config) error {
 	if err != nil {
 		return err
 	}
+	cfg = s.durableConfig(canonical, cfg)
 	defer s.lockName(canonical)()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -784,6 +804,7 @@ func (s *CollectionStore) RestoreCollectionWithConfig(name string, cfg Config, r
 		// anything is touched — this used to drop the existing collection first.
 		return fmt.Errorf("vector: restore %q: a named-vector config cannot be restored from a dense snapshot", canonical)
 	}
+	cfg = s.durableConfig(canonical, cfg)
 
 	// Nothing below may resolve canonical through Acquire or Get: the name lock is
 	// not reentrant, and resolving a cold collection promotes it, which takes this
@@ -880,9 +901,10 @@ func (s *CollectionStore) publishRestore(canonical string, cfg Config, c *Collec
 	s.catalogMu.RLock()
 	defer s.catalogMu.RUnlock()
 
-	cfgPath, _ := s.collectionPath(canonical)
+	cfgPath, snapPath := s.collectionPath(canonical)
 	_, _, _, walPath := s.persistPaths(canonical)
 	wal := cfg.WAL && !s.persistentCluster
+	durable := wal && s.isDurable(canonical)
 	fail := func(err error) error {
 		s.discardStaged(c)
 		// Mirrors CreateCollection: a marker left by a failed publish would
@@ -890,6 +912,9 @@ func (s *CollectionStore) publishRestore(canonical string, cfg Config, c *Collec
 		_ = os.Remove(cfgPath)
 		if wal {
 			_ = os.Remove(walPath)
+		}
+		if durable {
+			_ = os.Remove(snapPath)
 		}
 		return fmt.Errorf("vector: restore %q: the snapshot restored, but the existing collection had already been removed when publishing the restored one failed: %w", canonical, err)
 	}
@@ -908,6 +933,15 @@ func (s *CollectionStore) publishRestore(canonical string, cfg Config, c *Collec
 			return fail(err)
 		}
 		c.wal = w
+	}
+	// A durable collection's restored points are acknowledged when this returns,
+	// and the fresh log holds none of them: checkpoint them now. Written after the
+	// marker, so a stop before it leaves an empty collection, never a stale
+	// snapshot under no marker for a later create of the name to load.
+	if durable {
+		if err := s.writeSnapshotFile(c, snapPath); err != nil {
+			return fail(err)
+		}
 	}
 
 	s.mu.Lock()
