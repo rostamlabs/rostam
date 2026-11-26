@@ -145,3 +145,56 @@ func TestStaleWhenFileBecomesUnreadable(t *testing.T) {
 		t.Errorf("no project root: stale = %v, want nil", got)
 	}
 }
+
+// os.Root refuses absolute symlink targets; one that resolves inside the
+// project is still hashed (also through a symlinked ancestor), one that
+// resolves outside is not.
+func TestFileHashAbsoluteSymlinkInsideRoot(t *testing.T) {
+	realRoot, _ := symlinkLayout(t)
+	outside := t.TempDir()
+	writeFile(t, outside, "secret.go", "package secret\n")
+	for name, target := range map[string]string{
+		"alias.go":  filepath.Join(realRoot, "a.go"),     // absolute, inside
+		"sitealias": filepath.Join(realRoot, "site"),     // absolute dir, inside
+		"outabs.go": filepath.Join(outside, "secret.go"), // absolute, outside
+	} {
+		if err := os.Symlink(target, filepath.Join(realRoot, name)); err != nil {
+			t.Skipf("symlink: %v", err)
+		}
+	}
+	want, st := fileHash(realRoot, "a.go")
+	if st != fileOK {
+		t.Fatal(st)
+	}
+	if h, st := fileHash(realRoot, "alias.go"); st != fileOK || h != want {
+		t.Errorf("absolute in-root file symlink = %q, %v; want a.go's hash", h, st)
+	}
+	if _, st := fileHash(realRoot, "sitealias/docs/x.md"); st != fileOK {
+		t.Errorf("absolute in-root dir symlink = %v, want fileOK", st)
+	}
+	if h, st := fileHash(realRoot, "outabs.go"); st != fileUnreadable || h != "" {
+		t.Errorf("absolute out-of-root symlink = %q, %v; want \"\", fileUnreadable", h, st)
+	}
+}
+
+// A configured root that disappears does not read as "no root": its files are
+// missing, so a memory hashed earlier is flagged.
+func TestFileHashMissingRootIsMissing(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "repo")
+	writeFile(t, root, "a.go", "package a\n")
+	stored, st := fileHash(root, "a.go")
+	if st != fileOK {
+		t.Fatal(st)
+	}
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatal(err)
+	}
+	cur, st := fileHash(root, "a.go")
+	if st != fileMissing {
+		t.Fatalf("root removed: state %v, want fileMissing", st)
+	}
+	if got := staleState("a.go", stored, cur, st); got != "file missing" {
+		t.Fatalf("stale = %v, want \"file missing\"", got)
+	}
+}
