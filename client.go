@@ -7,7 +7,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"net"
 	"strings"
 	"sync"
 	"time"
@@ -56,12 +55,11 @@ type ClientConfig struct {
 	// aborts that dial.
 	BeforeConnect func(ctx context.Context, addr string) error
 
-	// VerifyConn, when non-nil, runs on every new connection right after it
-	// is established and before any request (and so any AuthToken) is sent
-	// over it; a non-nil error closes the connection and fails the dial. It
-	// sees the connection's TCP endpoints, so it can vet the actual peer
-	// with no check-then-dial window.
-	VerifyConn func(ctx context.Context, local, remote net.Addr) error
+	// AfterConnect, when non-nil, runs on every new connection to addr right
+	// after it is established and before any request (and so any AuthToken)
+	// is sent over it; a non-nil error closes the connection and fails the
+	// dial.
+	AfterConnect func(ctx context.Context, addr string) error
 }
 
 // NewClient constructs a networked Rostam client and returns a Store
@@ -101,10 +99,10 @@ func NewClient(cfg ClientConfig) (Store, error) {
 		TLSConfig:               cfg.TLSConfig,
 		BeforeConnect:           cfg.BeforeConnect,
 	}
-	if cfg.VerifyConn != nil {
-		verify := cfg.VerifyConn
+	if cfg.AfterConnect != nil {
+		after := cfg.AfterConnect
 		cc.AfterConnect = func(ctx context.Context, c *client.Conn) error {
-			return verify(ctx, c.LocalAddr(), c.RemoteAddr())
+			return after(ctx, c.Addr())
 		}
 	}
 	c, err := client.New(cc)

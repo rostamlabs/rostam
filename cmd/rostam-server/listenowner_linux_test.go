@@ -29,9 +29,8 @@ func TestListenerOwnerLiveProc(t *testing.T) {
 	}
 }
 
-// The post-dial check finds the server-side socket of the very connection,
-// both while it waits in the accept backlog and once accepted, and refuses it
-// for any other uid.
+// The post-dial check finds the server-side socket of our connection, both
+// while it waits in the accept backlog and once accepted.
 func TestConnOwnerLiveProc(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -44,12 +43,13 @@ func TestConnOwnerLiveProc(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = c.Close() })
 	check := func(stage string) {
-		if err := checkConnOwner(c.LocalAddr(), c.RemoteAddr()); err != nil {
+		if err := checkConnOwner(ln.Addr().String()); err != nil {
 			t.Fatalf("%s: own connection refused: %v", stage, err)
 		}
-		var pe *portOwnerError
-		if err := connOwnerErr(c.LocalAddr(), c.RemoteAddr(), os.ReadFile, os.Getuid()+1); !errors.As(err, &pe) || pe.uid != os.Getuid() {
-			t.Fatalf("%s: server end not found in /proc/net/tcp (err %v)", stage, err)
+		// Seen as another uid, our connection is not "ours", so nothing can
+		// be verified: an error, never a pass.
+		if err := connOwnerErr(ln.Addr().String(), os.ReadFile, os.Getuid()+1); err == nil {
+			t.Fatalf("%s: verified with the wrong uid", stage)
 		}
 	}
 	check("before accept")

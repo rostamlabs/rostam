@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -38,8 +39,8 @@ func (e *portOwnerError) Error() string {
 // meant for single-user hosts.
 var listenerOwnerCheck = checkListenerOwner
 
-// connOwnerCheck verifies an established connection's peer before anything is
-// sent on it (see connOwnerErr). Seam for tests, like listenerOwnerCheck.
+// connOwnerCheck verifies, after a dial and before anything is sent, who
+// accepted the connection (see connOwnerErr). Seam for tests.
 var connOwnerCheck = checkConnOwner
 
 // ownerCheckBeforeConnect is listenerOwnerCheck as a client BeforeConnect
@@ -48,11 +49,10 @@ func ownerCheckBeforeConnect(_ context.Context, addr string) error {
 	return listenerOwnerCheck(addr)
 }
 
-// ownerCheckVerifyConn is connOwnerCheck as a client VerifyConn hook: it runs
-// on the connection the token would travel over, after the dial and before
-// the first request, so there is no window between check and use.
-func ownerCheckVerifyConn(_ context.Context, local, remote net.Addr) error {
-	return connOwnerCheck(local, remote)
+// ownerCheckAfterConnect is connOwnerCheck as a client AfterConnect hook: it
+// runs after each dial and before the first request on that connection.
+func ownerCheckAfterConnect(_ context.Context, addr string) error {
+	return connOwnerCheck(addr)
 }
 
 // procListener is one LISTEN socket from /proc/net/tcp or /proc/net/tcp6.
@@ -130,10 +130,16 @@ func parseProcNetTCP(text []byte, port int) []procListener {
 	return out
 }
 
+// procTableRequired is whether this platform has a /proc socket table. On
+// Linux it must be readable: /proc unmounted or hidden (a sandbox) is an
+// error, not a reason to skip the check. Elsewhere (macOS, the BSDs) there is
+// none and the owner checks are skipped. A variable so tests can pick.
+var procTableRequired = runtime.GOOS == "linux"
+
 // readProcTables reads /proc/net/tcp and /proc/net/tcp6. ok is false only
-// when neither exists (no /proc socket table on this platform: the caller
-// falls back to best effort). Any other read failure is an error, so a
-// Linux host whose table cannot be read fails closed rather than open.
+// when neither exists on a platform without a /proc socket table (the caller
+// then skips the check). Any read failure other than "does not exist", and
+// both tables missing on Linux, are errors: Linux fails closed.
 func readProcTables(read func(string) ([]byte, error)) (texts [][]byte, ok bool, err error) {
 	for _, f := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
 		b, rerr := read(f)
@@ -144,6 +150,9 @@ func readProcTables(read func(string) ([]byte, error)) (texts [][]byte, ok bool,
 		default:
 			return nil, false, fmt.Errorf("cannot verify the listener's owner: reading %s: %w", f, rerr)
 		}
+	}
+	if len(texts) == 0 && procTableRequired {
+		return nil, false, errors.New("cannot verify the listener's owner: /proc/net/tcp and /proc/net/tcp6 are both missing (is /proc mounted?)")
 	}
 	return texts, len(texts) > 0, nil
 }
@@ -209,37 +218,64 @@ func listenerOwnerErr(addr string, read func(string) ([]byte, error), myUID int)
 	return nil
 }
 
-// connOwnerErr checks, for a connection that is already established but has
-// not carried a byte, who owns the OTHER end: the server-side socket, whose
-// local address is our remote and whose remote is our local, and which the
-// kernel creates with the listener's uid. Unlike listenerOwnerErr this has no
-// check-then-dial window: it is the very connection the token would go over.
-// Same fail-closed rules: only a platform with no socket table returns nil
-// unchecked.
-func connOwnerErr(local, remote net.Addr, read func(string) ([]byte, error), myUID int) error {
-	l, ok1 := local.(*net.TCPAddr)
-	r, ok2 := remote.(*net.TCPAddr)
-	if !ok1 || !ok2 {
-		return fmt.Errorf("cannot verify the peer of a %s connection", remote.Network())
+// connOwnerErr runs after a dial to addr and before the first request. The
+// pinned client module does not expose the new connection's own endpoints, so
+// it checks every connection this uid has ESTABLISHED to addr (the new one is
+// always among them): the server end of each (local = addr, remote = our
+// end), which the kernel creates with the listening socket's uid, must be
+// ours. One owned by another uid is a *portOwnerError; a server end that
+// cannot be found, or no connection to addr at all, cannot be verified and is
+// an error. This closes the window between listenerOwnerErr and the dial:
+// whoever accepted the connection is what is checked. It is conservative: a
+// connection of ANY of this user's processes to addr whose peer is foreign
+// refuses this one too, which is the right answer for a hijacked port.
+//
+// Same platform rules as listenerOwnerErr (see readProcTables).
+func connOwnerErr(addr string, read func(string) ([]byte, error), myUID int) error {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("cannot verify the owner of %q: %w", addr, err)
+	}
+	target := net.ParseIP(host)
+	port, perr := strconv.Atoi(portStr)
+	if target == nil || perr != nil {
+		return fmt.Errorf("cannot verify the owner of %s: not an IP:port", addr)
 	}
 	texts, ok, err := readProcTables(read)
 	if err != nil {
 		return err
 	}
 	if !ok {
-		return nil // no socket table on this platform: best effort
+		return nil // no socket table on this platform: unchecked
 	}
+	var all []procSocket
 	for _, b := range texts {
-		for _, s := range parseProcSockets(b) {
-			if s.state == tcpListenState || s.localPort != r.Port || s.remPort != l.Port ||
-				!s.localIP.Equal(r.IP) || !s.remIP.Equal(l.IP) {
+		all = append(all, parseProcSockets(b)...)
+	}
+	const established = "01"
+	ours := 0
+	for _, c := range all {
+		if c.state != established || c.uid != myUID || c.remPort != port || !c.remIP.Equal(target) {
+			continue
+		}
+		ours++
+		found := false
+		for _, s := range all {
+			if s.state == tcpListenState || s.localPort != port || s.remPort != c.localPort ||
+				!s.localIP.Equal(target) || !s.remIP.Equal(c.localIP) {
 				continue
 			}
+			found = true
 			if s.uid != myUID {
-				return &portOwnerError{port: strconv.Itoa(r.Port), uid: s.uid}
+				return &portOwnerError{port: portStr, uid: s.uid}
 			}
-			return nil
+		}
+		if !found {
+			return fmt.Errorf("cannot verify the owner of %s: the server end of a connection to it is not in the socket table", addr)
 		}
 	}
-	return fmt.Errorf("cannot verify the owner of %s: its end of the connection is not in the socket table", remote)
+	if ours == 0 {
+		return fmt.Errorf("cannot verify the owner of %s: no established connection to it found", addr)
+	}
+	return nil
 }

@@ -174,7 +174,7 @@ func probeDaemon(ctx context.Context, addr, token string) error {
 	if err := ops.RegisterBuiltins(reg); err != nil {
 		return err
 	}
-	store, err := connectStore(storeFlags{connect: addr, authToken: token, beforeConnect: ownerCheckBeforeConnect, verifyConn: ownerCheckVerifyConn}, reg,
+	store, err := connectStore(storeFlags{connect: addr, authToken: token, beforeConnect: ownerCheckBeforeConnect, afterConnect: ownerCheckAfterConnect}, reg,
 		func(string) (string, bool) { return "", false })
 	if err != nil {
 		return err

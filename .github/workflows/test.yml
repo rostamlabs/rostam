@@ -40,6 +40,15 @@ jobs:
       - name: Build (default, cgo)
         run: go build ./...
 
+      - name: Build against the pinned client/sdk modules (GOWORK=off)
+        # The committed go.work points the root module at ./client and ./sdk,
+        # which hides root code that needs client/sdk API not yet in the
+        # versions go.mod pins. `go install .../cmd/rostam-server@version`
+        # resolves the pins, so this must build too.
+        env:
+          GOWORK: "off"
+        run: go build ./...
+
       - name: Build pure-Go packages without cgo
         run: CGO_ENABLED=0 go build ./vector/... ./objstore ./cache ./ops
 

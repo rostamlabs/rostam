@@ -102,9 +102,11 @@ must stay the same for the life of `~/.rostam/memory`.
 user per machine. On Linux, the clients (the MCP session and the hook) check
 the kernel socket table (`/proc/net/tcp`) before the token goes anywhere:
 before each dial, that the listener on `127.0.0.1:7480` belongs to the current
-user, and after it, that the socket at the other end of that very connection
-does, before the first request is sent. If either belongs to another user, or
-cannot be found or read, the token is not sent. The hook then stays silent.
+user, and after it, before the first request is sent, that every connection
+this user has open to that port was accepted by a socket of the current user
+(the new one is always among them). If either belongs to another user, or
+cannot be found or read (including `/proc` missing or hidden on Linux), the
+token is not sent. The hook then stays silent.
 `mcp -autostart` fails with "port 7480 is owned by another user (uid N)"
 without trying to start a daemon; when the owner merely cannot be verified it
 treats the daemon as not running, may try to start one (which cannot bind a
