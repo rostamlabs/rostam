@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -487,6 +488,165 @@ func TestRepairIdentityOtherFailures(t *testing.T) {
 				t.Fatalf("ensureMemory = %v, want %v", err, tc.want)
 			}
 			requireNoIdentity(t, st)
+		})
+	}
+}
+
+var backends = []struct {
+	name  string
+	store func(*testing.T) rostam.Store
+}{{"embedded", newHeapStore}, {"remote", newRemoteStore}}
+
+// A record that appears after a server started is compared like one that was
+// there at startup.
+func TestIdentityAppearingAfterStartupIsCompared(t *testing.T) {
+	for _, b := range backends {
+		t.Run(b.name, func(t *testing.T) {
+			st := b.store(t)
+			storeWithoutIdentity(t, st, nil, "fact one")
+			wrong := startServer(t, Config{Store: st, Embedder: newSaltedEmbedder()})
+			wrong.initialize()
+			right := newTestServer(t, Config{Store: st}) // started with no record too
+			if err := newTestServer(t, Config{Store: st}).ensureMemory(context.Background()); err != nil {
+				t.Fatalf("repairing session: %v", err)
+			}
+
+			if msg := wrong.callTool("remember", map[string]any{"content": "incompatible fact"}, nil, true); !strings.Contains(msg, ErrEmbedderMismatch.Error()) {
+				t.Fatalf("remember = %q, want an embedder mismatch", msg)
+			}
+			if n := countMemories(t, st); n != 1 {
+				t.Fatalf("memories = %d, want only the original", n)
+			}
+			if err := right.ensureMemory(context.Background()); err != nil {
+				t.Fatalf("matching session: %v", err)
+			}
+			requireIdentity(t, st, stubIdentity)
+		})
+	}
+}
+
+// rivalStore runs rival while a session is between looking for the identity
+// record and writing it: right after it creates the collection, or while it
+// verifies an existing one.
+type rivalStore struct {
+	rostam.Store
+	rival func()
+}
+
+func (s rivalStore) CreateCollection(ctx context.Context, name string, cfg rostam.VectorConfig) error {
+	err := s.Store.CreateCollection(ctx, name, cfg)
+	if err == nil {
+		s.rival()
+	}
+	return err
+}
+
+func (s rivalStore) VectorScroll(ctx context.Context, collection string, f rostam.VectorFilter, limit int, opts rostam.VectorScrollOpts) ([]rostam.VectorDocument, rostam.FanMeta, string, error) {
+	s.rival()
+	return s.Store.VectorScroll(ctx, collection, f, limit, opts)
+}
+
+// A record written by someone else in the meantime is never overwritten: it is
+// read back and compared.
+func TestIdentityWrittenConcurrentlyIsKept(t *testing.T) {
+	paths := []struct {
+		name    string
+		prepare func(*testing.T, rostam.Store)
+	}{
+		{"creator", func(*testing.T, rostam.Store) {}},
+		{"repair", func(t *testing.T, st rostam.Store) { storeWithoutIdentity(t, st, nil, "fact one") }},
+	}
+	rivals := []struct {
+		name  string
+		id    embedIdentity
+		match bool
+	}{
+		{"different", embedIdentity{Model: "rival", Dim: 64, Hybrid: true}, false},
+		{"identical", stubIdentity, true},
+	}
+	for _, b := range backends {
+		for _, p := range paths {
+			for _, r := range rivals {
+				t.Run(b.name+"/"+p.name+"/"+r.name, func(t *testing.T) {
+					st := b.store(t)
+					p.prepare(t, st)
+					rec, err := json.Marshal(r.id)
+					if err != nil {
+						t.Fatal(err)
+					}
+					wrote := 0
+					racing := rivalStore{st, func() {
+						wrote++
+						if err := st.Put(context.Background(), []byte(kvEmbedder), rec, 0); err != nil {
+							t.Fatalf("rival Put: %v", err)
+						}
+					}}
+
+					s := newTestServer(t, Config{Store: racing})
+					err = s.ensureMemory(context.Background())
+					if wrote != 1 {
+						t.Fatalf("rival wrote %d times, want 1", wrote)
+					}
+					if r.match && err != nil {
+						t.Fatalf("ensureMemory: %v", err)
+					}
+					if !r.match && !errors.Is(err, ErrEmbedderMismatch) {
+						t.Fatalf("ensureMemory = %v, want ErrEmbedderMismatch", err)
+					}
+					if s.memReady != r.match {
+						t.Fatalf("memReady = %v, want %v", s.memReady, r.match)
+					}
+					requireIdentity(t, st, r.id)
+				})
+			}
+		}
+	}
+}
+
+// meetingStore holds each session's verification until all of them are in it.
+type meetingStore struct {
+	rostam.Store
+	meet *sync.WaitGroup
+}
+
+func (s meetingStore) VectorScroll(ctx context.Context, collection string, f rostam.VectorFilter, limit int, opts rostam.VectorScrollOpts) ([]rostam.VectorDocument, rostam.FanMeta, string, error) {
+	s.meet.Done()
+	s.meet.Wait()
+	return s.Store.VectorScroll(ctx, collection, f, limit, opts)
+}
+
+// Two embedders that both pass the check (an empty collection offers only its
+// dimension) cannot both be recorded.
+func TestIdentityOnlyOneConcurrentRepairerWins(t *testing.T) {
+	for _, b := range backends {
+		t.Run(b.name, func(t *testing.T) {
+			st := b.store(t)
+			createMemoryCollection(t, st, 64)
+			meet := &sync.WaitGroup{}
+			meet.Add(2)
+			sessions := []*Server{
+				newTestServer(t, Config{Store: meetingStore{st, meet}}),
+				newTestServer(t, Config{Store: meetingStore{st, meet}, Embedder: newSaltedEmbedder()}),
+			}
+			errs := make([]error, len(sessions))
+			var done sync.WaitGroup
+			for i, s := range sessions {
+				done.Add(1)
+				go func() {
+					defer done.Done()
+					errs[i] = s.ensureMemory(context.Background())
+				}()
+			}
+			done.Wait()
+
+			winner, loser := 0, 1
+			if errs[0] != nil {
+				winner, loser = 1, 0
+			}
+			if errs[winner] != nil || !errors.Is(errs[loser], ErrEmbedderMismatch) {
+				t.Fatalf("errors = %v, want one success and one ErrEmbedderMismatch", errs)
+			}
+			requireIdentity(t, st, sessions[winner].identity())
 		})
 	}
 }

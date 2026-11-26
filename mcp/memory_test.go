@@ -692,7 +692,7 @@ func TestEnsureMemoryRetriesEndToEnd(t *testing.T) {
 	}
 }
 
-// hiddenIdentityStore answers the first hideFirst reads of the embedder
+// hiddenIdentityStore answers the first `remaining` reads of the embedder
 // identity key as "not found" while the underlying store already holds it.
 // That is exactly the window two concurrent bootstrappers race in: both see no
 // identity, both decide to create, and the loser's CreateCollection comes back
@@ -700,11 +700,10 @@ func TestEnsureMemoryRetriesEndToEnd(t *testing.T) {
 type hiddenIdentityStore struct {
 	rostam.Store
 	remaining atomic.Int64
-	forever   bool
 }
 
 func (h *hiddenIdentityStore) Get(ctx context.Context, key []byte) ([]byte, error) {
-	if string(key) == kvEmbedder && (h.forever || h.remaining.Add(-1) >= 0) {
+	if string(key) == kvEmbedder && h.remaining.Add(-1) >= 0 {
 		return nil, rostam.ErrNotFound
 	}
 	return h.Store.Get(ctx, key)
@@ -743,7 +742,7 @@ func TestBootstrapToleratesConcurrentCreator(t *testing.T) {
 }
 
 // TestBootstrapVerifiesWhenIdentityStaysMissing is the other side of that
-// tolerance: when the retries never see an identity, the session gives up
+// tolerance: when none of the retries sees an identity, the session gives up
 // waiting and verifies its embedder against the collection instead of hanging.
 // An embedder that does not fit the collection is still refused.
 func TestBootstrapVerifiesWhenIdentityStaysMissing(t *testing.T) {
@@ -756,7 +755,10 @@ func TestBootstrapVerifiesWhenIdentityStaysMissing(t *testing.T) {
 		t.Fatalf("first ensureMemory: %v", err)
 	}
 
-	hidden := &hiddenIdentityStore{Store: st, forever: true}
+	// Hidden from the startup check, the bootstrap check and every retry.
+	const blind = 2 + identityReadAttempts
+	hidden := &hiddenIdentityStore{Store: st}
+	hidden.remaining.Store(blind)
 	second, err := NewServer(context.Background(), Config{Store: hidden})
 	if err != nil {
 		t.Fatalf("NewServer (second): %v", err)
@@ -765,6 +767,7 @@ func TestBootstrapVerifiesWhenIdentityStaysMissing(t *testing.T) {
 		t.Fatalf("a matching embedder must not be locked out: %v", err)
 	}
 
+	hidden.remaining.Store(blind)
 	other, err := NewServer(context.Background(), Config{Store: hidden, Embedder: fakeEmbedder{}})
 	if err != nil {
 		t.Fatalf("NewServer (other): %v", err)
