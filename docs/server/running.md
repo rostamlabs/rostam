@@ -98,7 +98,8 @@ configured, the server refuses to start on a non-loopback bind unless you pass
 → [Security](security.md#tls)
 
 **Storage** — `-data`, `-shards`, `-config` (carries the cache `max_memory`
-stanza), `-ttl-sweep-interval`, `-disable-cold-compaction`. The
+stanza), `-durable-collections` (see below), `-ttl-sweep-interval`,
+`-disable-cold-compaction`. The
 `-disable-cold-compaction` flag is an escape hatch, not a tuning knob: a
 persistent shard rewrites its pages file live-only at open, and that rewrite is
 the only thing that reclaims the bytes left behind by overwritten and expired
@@ -114,6 +115,30 @@ shards, cold compaction at the next restart). Lower it below the default if a
 write-heavy replicated node is climbing toward the cache cap between sweeps;
 raise it to cut background CPU on a cluster with many shards and slow-churning
 TTLs.
+
+`-durable-collections` takes a comma-separated list of dense vector collections
+that must not lose an acknowledged write. Empty (the default) changes nothing,
+and collections that are not listed behave as before.
+
+- A listed collection created or restored while the flag is set runs with a
+  [write-ahead log](../vector/persistence.md), synced to disk before each write
+  is acknowledged, whatever the request asked for. That costs a disk sync on the
+  write path.
+- A listed collection that already exists as `Persistent` is upgraded to the log
+  at startup. If the upgrade fails, the server still starts, the collection keeps
+  its old form, a warning says it is not crash-safe, and the next start tries
+  again.
+- A listed collection that already has a log is synced the same way from startup
+  on, even if it was created with `WALNoSync`.
+- A listed collection that already exists with neither `Persistent` nor a log
+  keeps its mode.
+- The logs are folded into a snapshot and emptied on a clean shutdown, and at
+  startup when a log has grown past 16 MiB.
+- Bare names belong to the default tenant; use `tenant/collection` otherwise. An
+  invalid name stops the server from starting.
+- Single node only, and it needs `-data` to keep anything across a restart. With
+  `-cluster` the flag is ignored with a warning: Raft is the durability authority
+  there.
 
 The cache eviction knobs (`-relocating-eviction`, `-relocate-reserve-interval`,
 `-in-place-same-size-update`, `-in-place-seqlock-reads`, `-sieve-visited-bit`)

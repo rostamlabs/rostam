@@ -58,6 +58,17 @@ type DirectConfig struct {
 	// row. What it bounds is MEMORY. See ops/kvindex/reconcile.go.
 	KVIndexReconcileIntervalMs int
 
+	// DurableCollections names the dense vector collections that always run with
+	// a write-ahead log, synced to disk before every acknowledged write,
+	// whatever their create or restore request asked for. Bare names belong to
+	// the default tenant. An existing Persistent collection named here is
+	// upgraded when the store opens; if the upgrade fails the store still opens,
+	// the collection keeps its old form and a warning is logged. Close
+	// snapshots these collections and empties their logs. Needs DataDir: a heap
+	// store keeps nothing across a restart. Empty changes nothing. See
+	// vector.StoreOptions.DurableCollections.
+	DurableCollections []string
+
 	// Authenticator, when non-nil, gates every request on all transports. It is
 	// the unified RBAC authorizer (authz.Authenticator): it receives an
 	// authz.AuthRequest{Token, Op, Args} (token from the protocol-v2 frame /
@@ -132,7 +143,9 @@ func NewDirect(cfg DirectConfig) (Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("rostam: cache.New: %w", err)
 	}
-	vectorStore, err := vector.OpenCollectionStore(cfg.DataDir)
+	vectorStore, err := vector.OpenCollectionStoreWith(cfg.DataDir, vector.StoreOptions{
+		DurableCollections: cfg.DurableCollections,
+	})
 	if err != nil {
 		_ = c.Close()
 		return nil, fmt.Errorf("rostam: open vector store: %w", err)
@@ -495,6 +508,12 @@ func (d *directStore) Close() error {
 		// untouched: FlushPersistent skips them, so this costs a map scan for
 		// stores that never asked for persistence.
 		if err := d.vectors.FlushPersistent(); err != nil {
+			errs = append(errs, err)
+		}
+		// The durable collections lose nothing without this: their logs already
+		// hold every acknowledged write. Checkpointing here keeps the logs short,
+		// so the next open has little to replay.
+		if err := d.vectors.CheckpointDurable(); err != nil {
 			errs = append(errs, err)
 		}
 		if err := d.vectors.Close(); err != nil {

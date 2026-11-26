@@ -126,6 +126,7 @@ func main() {
 	epollLoops := flag.Int("epoll-loops", 0, "epoll event-loop count (0 = GOMAXPROCS); ignored under -epoll=false or TLS")
 	configFile := flag.String("config", "", "path to a JSON config file. Currently carries the cache stanza: {\"cache\":{\"max_memory\":\"8GiB\"}} bounds TOTAL cache memory for this node (default: a fraction of host RAM). Sized knobs live here rather than as flags because they belong together and this command line is already large")
 	data := flag.String("data", "", "data directory (empty = in-memory, no persistence)")
+	durableCollections := flag.String("durable-collections", "", "comma-separated dense vector collections that always run with a write-ahead log, synced to disk before every acknowledged write (single-node only; ignored with -cluster, where Raft is the durability authority). It applies whatever a create or restore request asks for, and an existing persistent collection named here is upgraded at startup. Bare names belong to the default tenant. Needs -data to keep anything across a restart. Empty (default) changes nothing")
 	shards := flag.Int("shards", 0, "shards (cache shards in single-node mode; Raft shards in -cluster mode; 0 = default). TUNING (-cluster): each Raft shard runs its own goroutine set, and the replicated-write path is scheduler-bound, so over-sharding (many groups per core) burns CPU on goroutine churn. Rule of thumb: set Raft shards ≈ this node's core count (GOMAXPROCS), not far above it. Also set GOMAXPROCS to the cores this node actually owns — when co-locating multiple nodes on one box, GOMAXPROCS ≈ cores/nodes measurably cuts scheduler churn")
 	apiKey := flag.String("api-key", "", "if set, require this bearer token on every request (granted *:* superuser scope). PREFER the ROSTAM_API_KEY env var: a flag-passed secret is visible to other local users via /proc and lands in shell history")
 	keysFile := flag.String("keys-file", "", "path to a KeyRegistry JSON file enabling granular per-collection RBAC scopes (takes precedence over -api-key)")
@@ -471,7 +472,14 @@ func main() {
 		fatal("-tls-ca / -tls-require-client-cert set but -tls-cert/-tls-key missing; refusing to start plaintext with TLS flags present")
 	}
 
+	durable := splitCollections(*durableCollections)
+
 	if *cluster {
+		// Warned about rather than fatal: a cluster has no per-node durable list,
+		// its writes are made durable by replication.
+		if durable != nil {
+			slog.Warn("-durable-collections is ignored in -cluster mode, where Raft is the durability authority", "collections", durable)
+		}
 		// Fail loud (matching the TLS/allowlist validations below): a cluster with an
 		// authenticator configured (-keys-file or -api-key) but no -internal-token
 		// would have every inter-node forwarded op carry no token and be denied
@@ -580,9 +588,10 @@ func main() {
 		}
 		cacheCfg.NumShardsPerNode = *shards
 		cfg.DirectConfig = rostam.DirectConfig{
-			DataDir: *data,
-			Ops:     reg,
-			Cache:   cacheCfg,
+			DataDir:            *data,
+			Ops:                reg,
+			Cache:              cacheCfg,
+			DurableCollections: durable,
 			// Preserve the authenticator chosen above: it is promoted from the embedded
 			// DirectConfig, so replacing the struct wholesale would otherwise zero it and
 			// run single-node UNAUTHENTICATED. (RHS reads the value set in the precedence
@@ -986,6 +995,19 @@ func resolveSecret(flagName, envName, flagVal string) string {
 		slog.Warn("secret passed on the command line is visible to other local users via /proc and shell history; prefer the environment variable", "flag", flagName, "env", envName)
 	}
 	return flagVal
+}
+
+// splitCollections parses the -durable-collections list: names separated by
+// commas, surrounding whitespace trimmed, empty entries dropped. A list with no
+// name in it returns nil. Name validity is checked by the store when it opens.
+func splitCollections(s string) []string {
+	var out []string
+	for _, name := range strings.Split(s, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 // parseCNAllowlist parses the -node-cn-allowlist CSV into a set of trusted peer
