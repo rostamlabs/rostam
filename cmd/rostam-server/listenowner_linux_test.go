@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"testing"
-	"time"
 )
 
 // Against the real kernel table: our own listener is found and passes, and the
@@ -80,6 +79,7 @@ func TestConnOwnerLiveHalfClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = sc.Close() })
 	if err := sc.(*net.TCPConn).CloseWrite(); err != nil {
 		t.Fatal(err)
 	}
@@ -90,8 +90,7 @@ func TestConnOwnerLiveHalfClosed(t *testing.T) {
 	if err := checkConnOwner(ln.Addr().String()); err != nil {
 		t.Fatalf("half-closed own connection refused: %v", err)
 	}
-	_ = sc.Close()
-	time.Sleep(50 * time.Millisecond)
+	_ = sc.Close() // orphans the server end synchronously
 	if err := checkConnOwner(ln.Addr().String()); err != nil {
 		t.Fatalf("connection whose server end is closed refused: %v", err)
 	}

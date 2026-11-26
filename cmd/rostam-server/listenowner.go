@@ -119,9 +119,13 @@ func parseProcSockets(text []byte) []procSocket {
 		if !ok1 || !ok2 || err != nil || uid < 0 {
 			continue
 		}
-		var inode uint64
+		// An inode that is missing or does not parse is NOT 0: 0 means "no
+		// process holds it" and would skip the uid check (serverEndClosed).
+		inode := uint64(1)
 		if len(f) > 9 {
-			inode, _ = strconv.ParseUint(f[9], 10, 64)
+			if v, perr := strconv.ParseUint(f[9], 10, 64); perr == nil {
+				inode = v
+			}
 		}
 		out = append(out, procSocket{localIP: lip, remIP: rip, localPort: lport, remPort: rport,
 			state: f[3], v6: len(lip) == net.IPv6len, uid: uid, inode: inode})

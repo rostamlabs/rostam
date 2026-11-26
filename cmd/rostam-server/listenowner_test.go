@@ -249,6 +249,11 @@ func TestConnOwner(t *testing.T) {
 			procConnInode("127.0.0.1", 7480, "127.0.0.1", 50001, "05", 0, 0), "", 0},
 		{"half-closed, server end gone", procHeader + client(50000, me) + server(50000, "01", me) +
 			procConn("127.0.0.1", 50001, "127.0.0.1", 7480, "08", me), "", 0},
+		// A row whose inode is missing or garbled must not read as "closed".
+		{"half-closed, foreign server end with an unparsable inode", procHeader + procConn("127.0.0.1", 50001, "127.0.0.1", 7480, "08", me) +
+			strings.Replace(procConnInode("127.0.0.1", 7480, "127.0.0.1", 50001, "05", other, 0), "        0 0 1 ", "        0 x 1 ", 1), "", other},
+		{"half-closed, foreign server end with no inode field", procHeader + procConn("127.0.0.1", 50001, "127.0.0.1", 7480, "08", me) +
+			strings.Join(strings.Fields(procConnInode("127.0.0.1", 7480, "127.0.0.1", 50001, "05", other, 0))[:9], " ") + "\n", "", other},
 		{"backlog server end (inode 0) other user is still checked", procHeader + client(50000, me) +
 			procConnInode("127.0.0.1", 7480, "127.0.0.1", 50000, "01", other, 0), "", other},
 		{"v4-mapped server end other user", procHeader + client(50000, me), procHeader + procConn("::ffff:127.0.0.1", 7480, "::ffff:127.0.0.1", 50000, "01", other), other},
