@@ -23,6 +23,13 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   recalled by default: pass `namespace: "default"` (or `-namespace default`)
   to reach them, or see
   [Migrating from an embedded rostam MCP entry](server/claude-code-plugin.md#migrating-from-an-embedded-rostam-mcp-entry).
+  Project namespaces come from a per-machine registry
+  (`~/.rostam/memory/namespaces.json`): the first project with a given
+  directory name keeps the plain name, and a different project with the same
+  name gets the name plus a short hash, so unrelated checkouts no longer share
+  memories. After upgrading, whichever same-named project opens first gets the
+  memories already saved under the plain name; leave `namespace` out rather
+  than passing the plain name from the other one.
   See [Claude Code plugin](server/claude-code-plugin.md).
 
 ## v0.7.0 — 2026-09-27

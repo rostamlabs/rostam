@@ -19,10 +19,12 @@ Call `remember` with one self-contained fact per call.
   the fact. Linked facts come back on their own the next time that file is
   touched.
 - If the fact is about the project as a whole, leave `path` out.
-- Leave `namespace` out: the server already uses this project's namespace (the
-  main checkout's directory name, also from a git worktree), and only memories in
-  it are shown automatically. If you do pass one, pass exactly that name, never a
-  worktree's directory name.
+- Leave `namespace` out: the server already uses this project's namespace, and
+  only memories in it are shown automatically. It is normally the main
+  checkout's directory name (also from a git worktree), but a project whose
+  directory name another project on this machine already uses gets that name
+  plus a short hash, so do not derive it yourself. If you do pass one, pass
+  exactly the name the server states, never a worktree's directory name.
 - For in-flight state that changes, pass a stable `key` so each update replaces
   the last one.
 - Never store secrets or credentials.

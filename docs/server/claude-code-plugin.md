@@ -60,14 +60,46 @@ results as `stale: true` and `stale: "file missing"`. Matching is exact on the
 normalised repo-relative path, so a renamed file leaves its old memories marked
 `[stale: file missing]` until they are re-saved.
 
-**Namespace.** Memories are scoped to the project's namespace: the directory
-name of its main checkout. A linked git worktree uses the name of its main
-checkout too, so worktrees share the project's memories. The hooks and the MCP
-server compute it the same way, and under `-autostart` the memory tools use it
-whenever a call leaves `namespace` out, so the agent should simply omit it (the
-server's instructions name the resolved namespace). A namespace passed
-explicitly must be that main-checkout name, not a worktree's; anything else is
-stored but never injected. `mcp -namespace <name>` overrides the default.
+**Namespace.** Memories are scoped to the project's namespace. Each project is
+identified by its canonical main-repository path (symlinks resolved; a linked
+git worktree resolves to its main repository; a repository with a separate git
+directory is identified by that directory, so its worktrees stay together and
+two such repositories never merge; outside git, the project directory), and a
+per-machine registry, `~/.rostam/memory/namespaces.json`, assigns each identity
+a namespace:
+
+- the first project seen with a given directory name gets that plain name, so
+  memories saved before the registry existed keep working;
+- a different project with the same directory name gets the name plus a short
+  hash, for example `api-1a2b3c4d`, so two unrelated checkouts called `api` no
+  longer share or overwrite each other's memories;
+- an assignment never changes once made;
+- a project with no assignment takes over the plain name only when the
+  recorded owner's directory no longer exists.
+
+The hooks and the MCP server use the same function and the same registry, and
+under `-autostart` the memory tools use the result whenever a call leaves
+`namespace` out, so the agent should simply omit it (the server's instructions
+name the resolved namespace). Explicit `namespace` arguments and
+`mcp -namespace <name>` are used as given.
+
+Limits:
+
+- After upgrading, whichever same-named project opens first gets the plain
+  name, and with it every memory saved under that name before. If that was the
+  wrong project, move the registry entry by hand (or the memories with
+  `namespace` arguments).
+- Passing `namespace: "<basename>"` explicitly from the second project still
+  writes into the first project's memory. Leave `namespace` out.
+- Deleting, moving or unmounting the owning project lets the next same-named
+  project that has no assignment yet take the plain name (and its memories).
+  The former owner, if it comes back, gets a hashed name.
+- The registry is per machine: the same project can have a different name on
+  another machine.
+- If the registry is unreadable or corrupt, or its lock fails, the project's
+  hashed name is used and the file is left untouched; `mcp` says so on stderr
+  and the hooks use the same name. If the registry is only busy past the
+  hook's 800 ms budget, that hook injects nothing.
 
 Paths are matched the same way on both sides: the project root is accepted as
 given and with its symlinks resolved, and a file reached through a symlinked
