@@ -72,7 +72,9 @@ a namespace:
   memories saved before the registry existed keep working;
 - a different project with the same directory name gets the name plus a short
   hash, for example `api-1a2b3c4d`, so two unrelated checkouts called `api` no
-  longer share or overwrite each other's memories;
+  longer share or overwrite each other's memories (the registry checks the
+  hashed name against every assignment and lengthens it if another project
+  already holds it);
 - an assignment never changes once made;
 - a project with no assignment takes over the plain name only when the
   recorded owner's directory no longer exists.
@@ -98,8 +100,15 @@ Limits:
   another machine.
 - If the registry is unreadable or corrupt, or its lock fails, the project's
   hashed name is used and the file is left untouched; `mcp` says so on stderr
-  and the hooks use the same name. If the registry is only busy past the
-  hook's 800 ms budget, that hook injects nothing.
+  and the hooks use the same name. That fallback name is not checked against
+  other projects (the registry could not be read), so in this state two
+  projects could in principle share a name (a 32-bit hash collision). Fix or
+  move aside the file to restore the checked assignments.
+- If the registry stays locked, or git does not answer, past the caller's
+  deadline, no name is decided and none is registered: that hook injects
+  nothing (800 ms budget), and `mcp` refuses to start after 30 s with an error
+  telling you to retry or pass `-namespace`, rather than running the session
+  under a name the hooks would not use.
 
 Paths are matched the same way on both sides: the project root is accepted as
 given and with its symlinks resolved, and a file reached through a symlinked

@@ -29,7 +29,10 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   name gets the name plus a short hash, so unrelated checkouts no longer share
   memories. After upgrading, whichever same-named project opens first gets the
   memories already saved under the plain name; leave `namespace` out rather
-  than passing the plain name from the other one.
+  than passing the plain name from the other one. The separation is not
+  permanent: if the owning project is deleted, moved or unmounted, the next
+  same-named project with no assignment takes the plain name and its
+  memories.
   See [Claude Code plugin](server/claude-code-plugin.md).
 
 ## v0.7.0 — 2026-09-27
