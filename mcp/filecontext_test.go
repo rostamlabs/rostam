@@ -32,9 +32,72 @@ func seedMemory(t *testing.T, s *Server, ns, path, content string, updated int64
 	if path != "" {
 		md[pathField] = vector.NewString(path)
 		md[fileHashField] = vector.NewString("")
+		md[linkField] = linkMarker()
 	}
 	if err := s.store.VectorUpsert(ctx, memCollection, memoryID(ns, content), vecs[0], content, rostam.VectorInsertOpts{Metadata: md}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A memory written before code links existed may hold __path, __symbol or
+// __file_hash as the user's own metadata. With no link marker it is not a
+// link: the fields stay visible, nothing is flagged stale, and it is never
+// returned as linked to that file.
+func TestLegacyLinkNamedMetadataStaysUserData(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "a.go", "package a\n")
+	s := newTestServer(t, Config{ProjectRoot: root})
+	ctx := context.Background()
+	if err := s.ensureMemory(ctx); err != nil {
+		t.Fatal(err)
+	}
+	vecs, err := s.emb.Embed(ctx, []string{"legacy fact"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	md := rostam.VectorMetadata{
+		nsField:       vector.NewString("p"),
+		createdField:  vector.NewInt(1),
+		updatedField:  vector.NewInt(1),
+		pathField:     vector.NewString("a.go"),
+		symbolField:   vector.NewString("Mine"),
+		fileHashField: vector.NewString("not-a-hash"),
+	}
+	if err := s.store.VectorUpsert(ctx, memCollection, memoryID("p", "legacy fact"), vecs[0], "legacy fact", rostam.VectorInsertOpts{Metadata: md}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.FileMemories(ctx, "p", "a.go", 5)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("FileMemories = %+v, %v; a legacy __path is not a link", got, err)
+	}
+	all, err := s.RecentMemories(ctx, "p", 5)
+	if err != nil || len(all) != 1 {
+		t.Fatalf("RecentMemories = %+v, %v", all, err)
+	}
+	h := all[0]
+	if h.Path != "" || h.Symbol != "" || h.Stale != nil {
+		t.Fatalf("legacy memory read as a link: path %q symbol %q stale %v", h.Path, h.Symbol, h.Stale)
+	}
+	if h.Metadata[pathField] != "a.go" || h.Metadata[symbolField] != "Mine" || h.Metadata[fileHashField] != "not-a-hash" {
+		t.Fatalf("legacy user metadata hidden: %v", h.Metadata)
+	}
+	// The same through recall, BM25 and the JSON (hybrid) conversion.
+	c := startServer(t, Config{Store: s.store, ProjectRoot: root})
+	c.initialize()
+	var out struct {
+		Hits []memoryHit `json:"hits"`
+	}
+	c.callTool("recall", map[string]any{"query": "legacy fact", "namespace": "p"}, &out, false)
+	if len(out.Hits) != 1 || out.Hits[0].Path != "" || out.Hits[0].Metadata[pathField] != "a.go" {
+		t.Fatalf("recall = %+v", out.Hits)
+	}
+	hj := toMemoryHitJSON(1, "x", 0, metadataToJSON(md))
+	if hj.Path != "" || hj.Metadata[pathField] != "a.go" {
+		t.Fatalf("toMemoryHitJSON read a legacy __path as a link: %+v", hj)
+	}
+	md[linkField] = linkMarker()
+	if hj := toMemoryHitJSON(1, "x", 0, metadataToJSON(md)); hj.Path != "a.go" || hj.Metadata[pathField] != nil || hj.Metadata[linkField] != nil {
+		t.Fatalf("toMemoryHitJSON with the marker: %+v", hj)
 	}
 }
 

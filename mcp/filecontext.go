@@ -39,7 +39,10 @@ func (s *Server) FileMemoriesExcept(ctx context.Context, ns, rel string, k int, 
 		{Op: vector.FilterEq, Field: nsField, Value: vector.NewString(ns)},
 		{Op: vector.FilterEq, Field: pathField, Value: vector.NewString(rel)},
 	}}
-	return s.newestMemories(ctx, f, k, skip)
+	// A legacy memory whose USER metadata happens to hold __path is not a
+	// link (no marker, so toMemoryHit leaves Path empty): drop it.
+	notLink := func(h *MemoryHit) bool { return h.Path == "" }
+	return s.newestMemories(ctx, f, k, skip, notLink)
 }
 
 // RecentMemories returns the newest k memories in namespace ns.
@@ -51,13 +54,13 @@ func (s *Server) RecentMemories(ctx context.Context, ns string, k int) ([]Memory
 // see FileMemoriesExcept.
 func (s *Server) RecentMemoriesExcept(ctx context.Context, ns string, k int, skip func(id uint64) bool) ([]MemoryHit, error) {
 	f := rostam.VectorFilter{Op: vector.FilterEq, Field: nsField, Value: vector.NewString(ns)}
-	return s.newestMemories(ctx, f, k, skip)
+	return s.newestMemories(ctx, f, k, skip, nil)
 }
 
 // newestMemories scrolls every match of f (memory sets are small), drops the
 // ids skip reports, sorts by Updated descending (id ascending breaks ties so
 // output is stable), keeps k, and marks staleness on the survivors only.
-func (s *Server) newestMemories(ctx context.Context, f rostam.VectorFilter, k int, skip func(uint64) bool) ([]MemoryHit, error) {
+func (s *Server) newestMemories(ctx context.Context, f rostam.VectorFilter, k int, skip func(uint64) bool, drop func(*MemoryHit) bool) ([]MemoryHit, error) {
 	if err := s.ensureMemory(ctx); err != nil {
 		return nil, err
 	}
@@ -72,7 +75,11 @@ func (s *Server) newestMemories(ctx context.Context, f rostam.VectorFilter, k in
 			if skip != nil && skip(d.ID) {
 				continue
 			}
-			hits = append(hits, toMemoryHit(d.ID, d.Content, d.Score, d.Metadata))
+			h := toMemoryHit(d.ID, d.Content, d.Score, d.Metadata)
+			if drop != nil && drop(&h) {
+				continue
+			}
+			hits = append(hits, h)
 		}
 		if next == "" || next == cursor {
 			break

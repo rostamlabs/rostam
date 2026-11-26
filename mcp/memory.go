@@ -404,7 +404,7 @@ func (s *Server) handleRemember(ctx context.Context, raw json.RawMessage) (any, 
 		return nil, fmt.Errorf("mcp: remember: content is required")
 	}
 	ns := s.namespaceOr(args.Namespace)
-	for _, reserved := range [...]string{nsField, createdField, keyField, updatedField, pathField, symbolField, fileHashField, "$content"} {
+	for _, reserved := range [...]string{nsField, createdField, keyField, updatedField, pathField, symbolField, fileHashField, linkField, "$content"} {
 		if _, ok := args.Metadata[reserved]; ok {
 			return nil, fmt.Errorf("mcp: remember: metadata key %q is reserved", reserved)
 		}
@@ -441,6 +441,7 @@ func (s *Server) handleRemember(ctx context.Context, raw json.RawMessage) (any, 
 		hash, _ := fileHash(s.projectRoot, relPath) // "" when unreadable: link is still stored
 		md[pathField] = vector.NewString(relPath)
 		md[fileHashField] = vector.NewString(hash)
+		md[linkField] = linkMarker()
 		if args.Symbol != "" {
 			md[symbolField] = vector.NewString(args.Symbol)
 		}
@@ -580,18 +581,19 @@ func (s *Server) recallHybrid(ctx context.Context, query string, k int, f rostam
 // owns for its own bookkeeping. Callers of remember/recall never see these
 // directly; toMemoryHit/toMemoryHitJSON strip them from returned metadata
 // after lifting key/created/updated into memoryHit's typed columns.
-var reservedMetadataFields = [...]string{nsField, createdField, keyField, updatedField, pathField, symbolField, fileHashField}
+var reservedMetadataFields = [...]string{nsField, createdField, keyField, updatedField}
 
 // stripReservedMetadata removes the memory subsystem's own bookkeeping
-// fields (namespace, key, creation/update time) before metadata is handed
-// back to a tool caller. $content is stripped separately by metadataToJSON.
-func stripReservedMetadata(md rostam.VectorMetadata) rostam.VectorMetadata {
+// fields (namespace, key, creation/update time, and the code-link fields when
+// link is set) before metadata is handed back to a tool caller. $content is
+// stripped separately by metadataToJSON.
+func stripReservedMetadata(md rostam.VectorMetadata, link bool) rostam.VectorMetadata {
 	if len(md) == 0 {
 		return md
 	}
 	out := make(rostam.VectorMetadata, len(md))
 	for k, v := range md {
-		if isReservedField(k) {
+		if isReservedField(k, link) {
 			continue
 		}
 		out[k] = v
@@ -599,10 +601,17 @@ func stripReservedMetadata(md rostam.VectorMetadata) rostam.VectorMetadata {
 	return out
 }
 
-func isReservedField(k string) bool {
+func isReservedField(k string, link bool) bool {
 	for _, r := range reservedMetadataFields {
 		if k == r {
 			return true
+		}
+	}
+	if link {
+		for _, r := range linkFields {
+			if k == r {
+				return true
+			}
 		}
 	}
 	return false
@@ -624,16 +633,20 @@ func toMemoryHit(id uint64, content string, score float32, md rostam.VectorMetad
 	if v, ok := md[updatedField]; ok && v.Kind == vector.ValueInt {
 		hit.Updated = v.Int
 	}
-	if v, ok := md[pathField]; ok && v.Kind == vector.ValueString {
-		hit.Path = v.Str
+	mv, ok := md[linkField]
+	link := isLinkMarker(mv, ok)
+	if link {
+		if v, ok := md[pathField]; ok && v.Kind == vector.ValueString {
+			hit.Path = v.Str
+		}
+		if v, ok := md[symbolField]; ok && v.Kind == vector.ValueString {
+			hit.Symbol = v.Str
+		}
+		if v, ok := md[fileHashField]; ok && v.Kind == vector.ValueString {
+			hit.fileHash = v.Str
+		}
 	}
-	if v, ok := md[symbolField]; ok && v.Kind == vector.ValueString {
-		hit.Symbol = v.Str
-	}
-	if v, ok := md[fileHashField]; ok && v.Kind == vector.ValueString {
-		hit.fileHash = v.Str
-	}
-	hit.Metadata = metadataToJSON(stripReservedMetadata(md))
+	hit.Metadata = metadataToJSON(stripReservedMetadata(md, link))
 	return hit
 }
 
@@ -654,9 +667,15 @@ func toMemoryHitJSON(id uint64, content string, score float32, md map[string]any
 	if v, ok := md[updatedField].(int64); ok {
 		hit.Updated = v
 	}
-	hit.Path, _ = md[pathField].(string)
-	hit.Symbol, _ = md[symbolField].(string)
-	hit.fileHash, _ = md[fileHashField].(string)
+	// metadataToJSON renders the geo marker as {"lat","lon"}.
+	if _, link := md[linkField].(map[string]float64); link {
+		hit.Path, _ = md[pathField].(string)
+		hit.Symbol, _ = md[symbolField].(string)
+		hit.fileHash, _ = md[fileHashField].(string)
+		for _, r := range linkFields {
+			delete(md, r)
+		}
+	}
 	for _, r := range reservedMetadataFields {
 		delete(md, r)
 	}

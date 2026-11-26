@@ -81,7 +81,7 @@ func TestRememberWithPathStoresHash(t *testing.T) {
 	if h.Stale != nil {
 		t.Fatalf("stale = %v, want none", h.Stale)
 	}
-	for _, k := range []string{"__path", "__symbol", "__file_hash"} {
+	for _, k := range []string{"__path", "__symbol", "__file_hash", "__link"} {
 		if _, ok := h.Metadata[k]; ok {
 			t.Errorf("metadata leaks %s", k)
 		}
@@ -133,7 +133,7 @@ func TestRememberRejectsEscapingPath(t *testing.T) {
 
 func TestRememberPathReservedKeysRejectedInMetadata(t *testing.T) {
 	c, _ := linkEnv(t)
-	for _, k := range []string{"__path", "__symbol", "__file_hash"} {
+	for _, k := range []string{"__path", "__symbol", "__file_hash", "__link"} {
 		msg := c.callTool("remember", map[string]any{"content": "x", "namespace": "p", "metadata": map[string]any{k: "v"}}, nil, true)
 		if !strings.Contains(msg, "reserved") {
 			t.Errorf("%s: error %q", k, msg)
@@ -162,7 +162,7 @@ func TestRecallHybridKeepsLink(t *testing.T) {
 	if h.Path != "a.go" || h.Symbol != "Widget" || h.Stale != true {
 		t.Fatalf("hybrid hit = %+v", h)
 	}
-	for _, k := range []string{"__path", "__symbol", "__file_hash"} {
+	for _, k := range []string{"__path", "__symbol", "__file_hash", "__link"} {
 		if _, ok := h.Metadata[k]; ok {
 			t.Errorf("metadata leaked %s", k)
 		}

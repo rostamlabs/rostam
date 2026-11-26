@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"github.com/rostamlabs/rostam/vector"
 )
 
 // Metadata fields that link a memory to a file. Reserved like nsField: stored
@@ -21,7 +23,23 @@ const (
 	pathField     = "__path"      // repo-relative, slash-separated file path
 	symbolField   = "__symbol"    // optional symbol within the file
 	fileHashField = "__file_hash" // hex SHA-256 of the file at write time ("" if unreadable)
+	linkField     = "__link"      // marker: the three fields above are a code link
 )
+
+// The three link field names were ordinary user metadata keys before code
+// links existed, so a memory written by an older version may carry them as
+// the user's own data. Only a memory that also carries linkField as a geo
+// point is a code link: a geo value is the one kind remember's JSON metadata
+// can never produce (objects are rejected), now or in any earlier version,
+// so no legacy field can be mistaken for the marker. Without it, the fields
+// stay visible user metadata and the memory is not linked to any file.
+func linkMarker() vector.Value { return vector.NewGeo(0, 0) }
+
+func isLinkMarker(v vector.Value, ok bool) bool { return ok && v.Kind == vector.ValueGeo }
+
+// linkFields are the fields owned by a code link (stripped only from a
+// memory that is one).
+var linkFields = [...]string{pathField, symbolField, fileHashField, linkField}
 
 type fileState int
 
