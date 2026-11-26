@@ -110,7 +110,10 @@ complete. Memories already lost to an earlier forced stop cannot be recovered.
 
 If the conversion fails, the store still opens with the collection in its old
 form, a warning says it is `not crash-safe` and why, and the next start tries
-again. Until it succeeds, a forced stop can lose recent memories. The warning
+again. Until it succeeds, a forced stop can lose recent memories. A log
+found beside the old form is not replayed and not deleted: it is renamed to
+`<file>.stale-<number>` and a warning names it. While a large store converts,
+`mcp -autostart` keeps waiting for the daemon it started. The warning
 goes to stderr. A shared daemon that `mcp -autostart` started has it in
 `~/.rostam/memory/daemon.log`; a `memory-daemon` you started yourself writes it
 to its own stderr. If a conversion was interrupted and the new snapshot cannot
@@ -123,7 +126,10 @@ At startup the log is checked as it is replayed.
 **A half-written tail**, bad bytes at the end of the file with no complete
 record after them, is what a stop in the middle of a write leaves. It is cut
 off, the removed bytes are saved next to the log as `<file>.torn-<number>`, a
-warning is logged, and the store opens. Nothing deletes those saved files.
+warning is logged, and the store opens. If the bytes cannot be saved (a full
+disk, for example), the store does not open; free space and start again.
+Nothing deletes the saved files, and one can hold the content of a memory you
+later forgot, so remove them yourself once you no longer need them.
 
 **Damage anywhere else** (a complete record follows the bad bytes, or a record
 passes its checksum but cannot be decoded) makes the store refuse to open. The

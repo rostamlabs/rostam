@@ -12,7 +12,9 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   forgotten memory. Replacing a memory (same `key`, or identical content) is one
   log record, so a kill before the call answers leaves the old version or the
   new one, never neither. After an unclean stop, the previous release shows the
-  older version of memories replaced since the last checkpoint. A killed
+  older version of memories replaced since the last checkpoint. An older
+  release also appends after a half-written log tail without cutting it, and
+  this release then refuses that log as damaged. A killed
   process is what is tested; power-loss safety rests on the disk sync and is
   not claimed as tested.
   An existing store is converted in place at the first start; if that fails it
@@ -44,9 +46,11 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   as a newer release may write, still fails the start as before; that error has
   no offset and truncating is not the remedy: run the newer release.
   See [A damaged log](server/mcp.md#a-damaged-log).
-- **A failed log write stops further writes.** After a write to a write-ahead
-  log fails (a full disk, for example), the collection refuses writes until the
-  process restarts.
+- **A failed log write stops further writes.** After a write or a disk sync of
+  a write-ahead log fails (a full disk, for example), the collection refuses
+  every write, before applying it, until the process restarts. A snapshot
+  that exists but cannot be read now fails the open instead of loading the
+  collection empty.
 - **Memory no longer locks out when the embedder record is missing.** The first
   memory tool call checks the configured embedder against the stored memories
   and records it again.
