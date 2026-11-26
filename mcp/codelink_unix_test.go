@@ -198,3 +198,18 @@ func TestFileHashMissingRootIsMissing(t *testing.T) {
 		t.Fatalf("stale = %v, want \"file missing\"", got)
 	}
 }
+
+// An absolute in-repo symlink whose target is gone reads as missing, not
+// unreadable, so its memory is marked "file missing".
+func TestFileHashDanglingAbsoluteSymlinkIsMissing(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "gone.go"), filepath.Join(root, "alias.go")); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	if h, st := fileHash(root, "alias.go"); st != fileMissing || h != "" {
+		t.Fatalf("dangling absolute symlink = %q, %v; want \"\", fileMissing", h, st)
+	}
+}

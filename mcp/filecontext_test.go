@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -184,6 +185,38 @@ func TestMemoriesSubSecondOrder(t *testing.T) {
 	hj := toMemoryHitJSON(1, "x", 0, map[string]any{updatedField: int64(100), updatedNsField: int64(5)})
 	if hj.updatedNs != 0 || hj.Metadata[updatedNsField] != int64(5) {
 		t.Fatalf("a mismatching %s was taken as ours: %+v", updatedNsField, hj)
+	}
+}
+
+// One effective key for timestamped and older memories: a strict total order
+// (the old two-level comparison formed a cycle across a shared second).
+func TestNewerThanIsTotalOrder(t *testing.T) {
+	const s = int64(1_700_000_000)
+	hits := []memoryHit{
+		{ID: 3, Updated: s, updatedNs: s*1e9 + 900},
+		{ID: 1, Updated: s, updatedNs: s*1e9 + 100},
+		{ID: 2, Updated: s}, // written before nanosecond times existed
+	}
+	for _, a := range hits {
+		for _, b := range hits {
+			if newerThan(a, b) && newerThan(b, a) {
+				t.Fatalf("newerThan(%d,%d) and newerThan(%d,%d) both true", a.ID, b.ID, b.ID, a.ID)
+			}
+		}
+	}
+	// transitivity over every ordered triple
+	for _, a := range hits {
+		for _, b := range hits {
+			for _, c := range hits {
+				if newerThan(a, b) && newerThan(b, c) && !newerThan(a, c) {
+					t.Fatalf("not transitive: %d > %d > %d but not %d > %d", a.ID, b.ID, c.ID, a.ID, c.ID)
+				}
+			}
+		}
+	}
+	sort.Slice(hits, func(i, j int) bool { return newerThan(hits[i], hits[j]) })
+	if hits[0].ID != 3 || hits[1].ID != 1 || hits[2].ID != 2 {
+		t.Fatalf("order = %d,%d,%d; want 3,1,2", hits[0].ID, hits[1].ID, hits[2].ID)
 	}
 }
 

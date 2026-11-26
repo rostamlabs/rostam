@@ -13,13 +13,15 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   or edits the file (at most 5 memories and 1,500 characters per injection, each
   once per session), and `rostam-server mcp -autostart` lets several Claude Code
   sessions share one memory through a local daemon on `127.0.0.1:7480`
-  (`rostam-server memory-daemon [-stop]`). Linux only in this release (macOS,
-  the BSDs and Windows refuse at once; the daemon's persistent store needs
-  storage the engine provides only on Linux and Windows); plain `rostam-server mcp` is unchanged and still allows one session
-  at a time. Under `-autostart` or an explicit `-project-root`, a call that
-  omits `namespace` uses the project's namespace instead of `"default"`, so
-  memories saved earlier with no namespace are not recalled by default: pass
-  `namespace: "default"` (or `-namespace default`) to reach them, or see
+  (`rostam-server memory-daemon [-stop]`). Linux only in this release: macOS,
+  the BSDs and Windows refuse at once, because the daemon's persistent store
+  needs storage the engine provides only on Linux and Windows, and the daemon
+  itself is not ported to Windows yet. Plain `rostam-server mcp` is unchanged
+  and still allows one session at a time. Under `-autostart` or an explicit
+  `-project-root`, a call that omits `namespace` uses the project's namespace
+  instead of `"default"`, so memories saved earlier with no namespace are not
+  recalled by default: pass `namespace: "default"` (or `-namespace default`)
+  to reach them, or see
   [Migrating from an embedded rostam MCP entry](server/claude-code-plugin.md#migrating-from-an-embedded-rostam-mcp-entry).
   See [Claude Code plugin](server/claude-code-plugin.md).
 

@@ -151,6 +151,9 @@ func fileHash(root, rel string) (string, fileState) {
 	}
 	realRoot, rerr := filepath.EvalSymlinks(root)
 	real, ferr := filepath.EvalSymlinks(filepath.Join(root, name))
+	if errors.Is(ferr, os.ErrNotExist) {
+		return "", fileMissing // e.g. an absolute in-repo symlink whose target is gone
+	}
 	if rerr != nil || ferr != nil {
 		return h, st
 	}

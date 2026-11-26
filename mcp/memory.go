@@ -673,14 +673,21 @@ func ownUpdatedNs(ns, updated int64) bool {
 	return updated != 0 && ns >= updated*1e9 && ns < (updated+1)*1e9
 }
 
-// newerThan orders memories newest first: nanoseconds when both have them,
-// else seconds; the id breaks remaining ties so output is stable.
-func newerThan(a, b memoryHit) bool {
-	if a.updatedNs != 0 && b.updatedNs != 0 && a.updatedNs != b.updatedNs {
-		return a.updatedNs > b.updatedNs
+// orderKey is a memory's one effective write time in nanoseconds: the stored
+// nanosecond time, else (older memories) the start of its stored second.
+func orderKey(h memoryHit) int64 {
+	if h.updatedNs != 0 {
+		return h.updatedNs
 	}
-	if a.Updated != b.Updated {
-		return a.Updated > b.Updated
+	return h.Updated * 1e9
+}
+
+// newerThan orders memories newest first by orderKey, the id breaking ties:
+// a strict total order, so sorting is well-defined even when timestamped and
+// older memories share a second.
+func newerThan(a, b memoryHit) bool {
+	if ka, kb := orderKey(a), orderKey(b); ka != kb {
+		return ka > kb
 	}
 	return a.ID < b.ID
 }
