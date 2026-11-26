@@ -340,6 +340,19 @@ jobs:
       - name: Test (vector mmap/persist round-trip, targeted)
         run: go test -count=1 -timeout 15m -run 'Mmap|Persist|Reopen|Grow|Reserve|Slab' -skip 'Concurrent|Latency|SIFT' ./vector/
 
+      # The vector write-ahead log is opened O_APPEND, and on Windows an append
+      # handle cannot change the file's size (Go keeps only FILE_APPEND_DATA), so
+      # a checkpoint's truncate and the cut-back after a failed write go through a
+      # handle of their own. A regression there poisons every durable collection
+      # on its first clean stop, which no Linux lane can see. Run the log's whole
+      # lifecycle: durable collections, checkpoints, the log itself, the upgrade
+      # of older stores and atomic replace, in ./vector/ and through the library.
+      - name: Test (vector write-ahead log + durable memory, targeted)
+        run: go test -count=1 -timeout 20m -run 'Durable|Checkpoint|WAL|Upgrade|Replace' ./vector/
+
+      - name: Test (library durable collections, targeted)
+        run: go test -count=1 -timeout 10m -run 'TestDirectDurable|TestDirectCloseCheckpointsDurable' .
+
       # The namespace registry's Windows lock (cmd/rostam-server/
       # nslock_windows.go: LockFileEx with a retry loop) is what keeps two
       # first sessions of same-named projects from both taking the plain name;

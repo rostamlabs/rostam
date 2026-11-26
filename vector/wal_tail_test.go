@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -446,7 +447,7 @@ func TestWALFailedWriteNeverAcksBehindPartialFrame(t *testing.T) {
 		{"mid header", 3, false},
 		{"header only", 8, false},
 		{"mid payload", 12, false},
-		{"mid payload, cut fails", 12, true},
+		{"mid payload, append handle closed", 12, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -528,4 +529,139 @@ func TestWALFailedWriteNeverAcksBehindPartialFrame(t *testing.T) {
 			}
 		})
 	}
+}
+
+// failAfterReader reads from r until n bytes have been returned, then fails.
+type failAfterReader struct {
+	r   io.Reader
+	n   int
+	err error
+}
+
+func (f *failAfterReader) Read(p []byte) (int, error) {
+	if f.n <= 0 {
+		return 0, f.err
+	}
+	if len(p) > f.n {
+		p = p[:f.n]
+	}
+	n, err := f.r.Read(p)
+	f.n -= n
+	return n, err
+}
+
+// TestReplayHeaderReadErrorIsNotATornTail: a read that fails while a whole
+// header's worth of bytes is still in the file is an I/O error, not a short
+// header. Replay returns it and the log is left exactly as it was.
+func TestReplayHeaderReadErrorIsNotATornTail(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "x.wal")
+	rec := []byte("record")
+	var buf bytes.Buffer
+	var hdr [8]byte
+	binary.BigEndian.PutUint32(hdr[0:4], uint32(len(rec)))
+	binary.BigEndian.PutUint32(hdr[4:8], crc32.ChecksumIEEE(rec))
+	buf.Write(hdr[:])
+	buf.Write(rec)
+	good := buf.Len()
+	buf.Write(bytes.Repeat([]byte{0xAB}, 12)) // 12 bytes no frame parses from
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	errIO := errors.New("injected read failure")
+	prev := replayReader
+	replayReader = func(f *os.File) io.Reader { return &failAfterReader{r: f, n: good, err: errIO} }
+	t.Cleanup(func() { replayReader = prev })
+
+	err := replayFramed(path, func([]byte) error { return nil })
+	if !errors.Is(err, errIO) {
+		t.Fatalf("replay with a failing header read = %v, want the read error", err)
+	}
+	got, rerr := os.ReadFile(path)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if !bytes.Equal(got, buf.Bytes()) {
+		t.Fatalf("the log was changed: %d bytes, want %d", len(got), buf.Len())
+	}
+	if m, _ := filepath.Glob(path + ".torn-*"); len(m) != 0 {
+		t.Fatalf("a torn file was written: %v", m)
+	}
+}
+
+// TestWALTruncateAndCutBackWorkThroughTheAppendHandle pins the two places the
+// log is shortened: a checkpoint's truncate and the cut-back after a failed
+// write. The log's handle is O_APPEND, which on Windows cannot change the
+// file's size, so both go through a handle of their own (truncateFile); this
+// runs on the Windows lane, where the append handle alone fails.
+func TestWALTruncateAndCutBackWorkThroughTheAppendHandle(t *testing.T) {
+	recA := []byte{byte(walDelete), 0, 0, 0, 0, 0, 0, 0, 1}
+	recB := []byte{byte(walDelete), 0, 0, 0, 0, 0, 0, 0, 2}
+	replayAll := func(t *testing.T, path string) [][]byte {
+		t.Helper()
+		var got [][]byte
+		if err := replayFramed(path, func(rec []byte) error {
+			got = append(got, append([]byte(nil), rec...))
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+
+	t.Run("checkpoint truncate", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "x.wal")
+		w, err := openWAL(path, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = w.close() }()
+		for i := 0; i < 3; i++ {
+			if err := w.appendFramed(recA); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.truncate(); err != nil {
+				t.Fatalf("truncate %d: %v", i, err)
+			}
+			if w.poisoned.Load() {
+				t.Fatal("a successful truncate poisoned the log")
+			}
+			if st, err := os.Stat(path); err != nil || st.Size() != 0 {
+				t.Fatalf("log after truncate: %v, %v; want 0 bytes", st, err)
+			}
+		}
+		if err := w.appendFramed(recB); err != nil {
+			t.Fatalf("append after truncate: %v", err)
+		}
+		if err := w.close(); err != nil {
+			t.Fatal(err)
+		}
+		if got := replayAll(t, path); len(got) != 1 || !bytes.Equal(got[0], recB) {
+			t.Fatalf("replayed %v, want only record B", got)
+		}
+	})
+
+	t.Run("cut back after a failed write", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "x.wal")
+		w, err := openWAL(path, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = w.close() }()
+		if err := w.appendFramed(recA); err != nil {
+			t.Fatal(err)
+		}
+		st, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		good := st.Size()
+		w.writeHook = shortWriteHook(5)
+		if _, err := w.appendFramedStaged(recB); err == nil {
+			t.Fatal("a failed write was accepted")
+		}
+		if st, err := os.Stat(path); err != nil || st.Size() != good {
+			t.Fatalf("log after a failed write: %v, %v; want it cut back to %d bytes", st, err, good)
+		}
+	})
 }

@@ -120,8 +120,9 @@ type wal struct {
 	syncedSeq uint64 // highest writeSeq covered by a completed Sync (or truncate)
 	syncing   bool   // a leader is currently running f.Sync()
 
-	// poisoned is a TERMINAL latch tripped on the FIRST f.Sync() failure (in
-	// commitWait or truncate). It exists because of fsyncgate: on a failed
+	// poisoned is a TERMINAL latch tripped on the FIRST failed write (see
+	// writeFrameLocked) or f.Sync() failure (in commitWait or truncate). For the
+	// fsync it exists because of fsyncgate: on a failed
 	// fsync, the kernel may DISCARD the sync's dirty pages, and a SUBSEQUENT
 	// f.Sync() on the same file can then return SUCCESS having synced nothing
 	// (the post-4.13 Linux behavior; the PostgreSQL PANIC-on-fsync-failure
@@ -152,12 +153,14 @@ type wal struct {
 	writeHook func(f *os.File, p []byte) (int, error)
 }
 
-// ErrWALPoisoned is returned by every append/commit-wait entry point once the
-// WAL has been poisoned by a prior f.Sync() failure (fsyncgate — see the
-// poisoned field). The WAL accepts no further writes or acks until it is
-// reopened; the caller must surface this so a delete/insert is reported failed
-// rather than falsely acked on bytes that may never have reached disk.
-var ErrWALPoisoned = errors.New("vector: wal poisoned by a prior fsync failure")
+// ErrWALPoisoned is returned by every write to a log-backed collection, and by
+// every checkpoint of one, once its log has been poisoned by a failed write
+// (a full disk, an I/O error) or a failed fsync (fsyncgate — see the poisoned
+// field). The log accepts no further writes or acks until the process is
+// restarted and the store reopened; the caller must surface this so a
+// delete/insert is reported failed rather than falsely acked on bytes that may
+// never have reached disk.
+var ErrWALPoisoned = errors.New("vector: write-ahead log refuses writes after a failed write or sync; restart the process to recover")
 
 // openWAL opens (creating if absent) the WAL at path for appending. Replay the
 // existing contents with replayWAL BEFORE calling this if recovering. The
@@ -374,7 +377,7 @@ func (w *wal) appendDeleteStaged(id uint64) (uint64, error) {
 // call it from production code; use the staged pair.
 func (w *wal) appendFramed(payload []byte) error {
 	if w.poisoned.Load() {
-		return ErrWALPoisoned // fast fail-closed: a prior fsync failure poisoned the log.
+		return ErrWALPoisoned // fast fail-closed: a prior failed write or fsync poisoned the log.
 	}
 	// WRITE phase: under mu, append the framed record and assign this writer's
 	// commit sequence (the post-write writeSeq). mu is released BEFORE the fsync so
@@ -443,8 +446,33 @@ func (w *wal) writeFrameLocked(payload []byte) error {
 	w.poisoned.Store(true)
 	if n > 0 {
 		if st, serr := w.f.Stat(); serr == nil && st.Size() >= int64(n) {
-			_ = w.f.Truncate(st.Size() - int64(n))
+			_ = truncateFile(w.f.Name(), st.Size()-int64(n), false)
 		}
+	}
+	return err
+}
+
+// truncateFile sets the size of the file at path through a handle of its own,
+// opened write-only, and fsyncs that handle when sync is set.
+//
+// The log's own handle cannot do it on Windows: it is opened O_APPEND, and Go's
+// Windows open drops FILE_WRITE_DATA from an append handle (syscall.Open keeps
+// only FILE_APPEND_DATA), so SetFileInformationByHandle(FileEndOfFileInfo) on it
+// fails with access denied. A plain O_WRONLY handle has GENERIC_WRITE. Writes
+// through the append handle still land at the new end of file. On Linux
+// ftruncate and fsync act on the inode, so the second handle changes nothing
+// about durability; the callers still fsync the log's own handle afterwards.
+func truncateFile(path string, size int64, sync bool) error {
+	f, err := os.OpenFile(path, os.O_WRONLY, 0) //nolint:gosec // the log's own path
+	if err != nil {
+		return err
+	}
+	err = f.Truncate(size)
+	if err == nil && sync {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
 	}
 	return err
 }
@@ -470,7 +498,7 @@ func (w *wal) write(p []byte) (int, error) {
 // batches them.
 func (w *wal) appendFramedStaged(payload []byte) (uint64, error) {
 	if w.poisoned.Load() {
-		return 0, ErrWALPoisoned // fast fail-closed: a prior fsync failure poisoned the log.
+		return 0, ErrWALPoisoned // fast fail-closed: a prior failed write or fsync poisoned the log.
 	}
 	w.mu.Lock()
 	// AUTHORITATIVE fail-closed check, under w.mu: a sync leader can poison the WAL
@@ -524,9 +552,9 @@ func (w *wal) commitWaitStaged(seq uint64) error {
 // holding NEITHER mu NOR syncMu so writes overlap the in-flight fsync.
 func (w *wal) commitWait(seq uint64) error {
 	if seq == 0 {
-		// A no-op write (nothing staged) touches no durability, so it stays a
-		// success even on a poisoned WAL — this fast path MUST precede the poison
-		// gate so a no-op delete of an absent id is not turned into ErrWALPoisoned.
+		// A no-op write (nothing staged) touches no durability, so the wait itself
+		// succeeds even on a poisoned WAL. (A mutator of a poisoned log never gets
+		// here: it is refused before it applies, by refuseWrite.)
 		return nil
 	}
 	w.syncMu.Lock()
@@ -613,7 +641,9 @@ func (w *wal) truncate() error {
 	if w.poisoned.Load() {
 		return ErrWALPoisoned
 	}
-	if err := w.f.Truncate(0); err != nil {
+	// Through a second handle: the append handle cannot truncate on Windows (see
+	// truncateFile).
+	if err := truncateFile(w.f.Name(), 0, true); err != nil {
 		w.poisoned.Store(true)
 		return err
 	}
@@ -673,6 +703,23 @@ func (w *wal) refuseCheckpoint() error {
 	return nil
 }
 
+// refuseWrite returns ErrWALPoisoned when w is poisoned, nil otherwise (and for
+// a nil w: a collection without a log).
+//
+// EVERY MUTATOR OF A LOG-BACKED COLLECTION CALLS IT FIRST, under the lock that
+// orders its apply and its append (opMu), BEFORE it applies anything. Applying
+// first and failing the append afterwards would leave a refused write visible
+// in memory until a restart (a delete that errored, then a retry that reports
+// the point missing). A no-op write is refused too: the log is dead, and
+// answering a retried delete with "not there" would hide that.
+//
+// A group-commit fsync that fails after the check (it runs outside opMu) can
+// still poison the log between the check and this writer's append; that writer
+// applies, its append fails, and it is refused. Its write was never
+// acknowledged, and no checkpoint is taken from that state (refuseCheckpoint),
+// so a reopen holds the log's state.
+func (w *wal) refuseWrite() error { return w.refuseCheckpoint() }
+
 // close closes the underlying file. Idempotent.
 func (w *wal) close() error {
 	w.mu.Lock()
@@ -731,11 +778,14 @@ func replayFramed(path string, apply func(rec []byte) error) error {
 		return err
 	}
 	size := st.Size()
-	br := bufio.NewReaderSize(f, 1<<16)
+	br := bufio.NewReaderSize(replayReader(f), 1<<16)
 	var end int64 // offset of the first byte not yet consumed by a good record
 	for end < size {
 		var hdr [8]byte
 		if _, err := io.ReadFull(br, hdr[:]); err != nil {
+			if size-end >= 8 {
+				return err // the header fits the stat'd size, so this is a read failure
+			}
 			break // short header
 		}
 		plen := binary.BigEndian.Uint32(hdr[0:4])
@@ -770,6 +820,10 @@ func replayFramed(path string, apply func(rec []byte) error) error {
 	}
 	return cutTornTail(f, path, end, size)
 }
+
+// replayReader wraps the file replayFramed reads records from. Tests replace
+// it to make a read fail; production reads the file directly.
+var replayReader = func(f *os.File) io.Reader { return f }
 
 // ErrLogDamaged is returned when a write-ahead log cannot be replayed and the
 // damage is not a half-written tail: a complete record follows the bad bytes,
@@ -856,18 +910,7 @@ func cutTornTail(f *os.File, path string, end, size int64) error {
 	if err := syncDir(filepath.Dir(path)); err != nil {
 		return fmt.Errorf("vector: save torn log tail %s: %w", tornPath, err)
 	}
-	wf, err := os.OpenFile(path, os.O_WRONLY, 0) //nolint:gosec // caller-supplied path
-	if err != nil {
-		return fmt.Errorf("vector: cut torn log tail %s: %w", path, err)
-	}
-	terr := wf.Truncate(end)
-	if terr == nil {
-		terr = wf.Sync()
-	}
-	if cerr := wf.Close(); terr == nil {
-		terr = cerr
-	}
-	if terr != nil {
+	if terr := truncateFile(path, end, true); terr != nil {
 		return fmt.Errorf("vector: cut torn log tail %s: %w", path, terr)
 	}
 	slog.Warn("vector: cut a half-written write-ahead log tail",
