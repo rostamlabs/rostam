@@ -414,6 +414,17 @@ func TestMcpDefaultNamespaceRule(t *testing.T) {
 	}
 }
 
+// The daemon needs a persistent (mmap-backed) store: Linux only among the
+// platforms it is built for. Everywhere else it is refused up front.
+func TestDaemonSupportedOnLinuxOnly(t *testing.T) {
+	if daemonSupported != (runtime.GOOS == "linux") {
+		t.Fatalf("daemonSupported = %v on %s", daemonSupported, runtime.GOOS)
+	}
+	if !strings.Contains(errDaemonUnsupported.Error(), "Linux only") {
+		t.Fatalf("error %q does not say where it is supported", errDaemonUnsupported)
+	}
+}
+
 func TestIsDaemonArgs(t *testing.T) {
 	const def = "/h/.rostam/memory"
 	cases := []struct {

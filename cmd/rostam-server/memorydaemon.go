@@ -44,6 +44,14 @@ const (
 	daemonShards      = 8
 )
 
+// errDaemonUnsupported is the daemon's answer everywhere but Linux. The
+// daemon's store is persistent, which needs the engine's file-backed (mmap)
+// cache: that exists on Linux and Windows only, and the daemon itself
+// (flock, setsid, signals) is not ported to Windows yet. On macOS and the BSDs
+// the server would reject its own -data directory and -autostart would time
+// out, so it is refused up front instead.
+var errDaemonUnsupported = errors.New("the shared memory daemon (memory-daemon, mcp -autostart) is supported on Linux only in this release; use `mcp` with -data for a single embedded session (Linux, Windows) or -connect to a running rostam-server")
+
 // defaultMemoryDir is ~/.rostam/memory, the daemon's data directory.
 func defaultMemoryDir() (string, error) {
 	home, err := os.UserHomeDir()

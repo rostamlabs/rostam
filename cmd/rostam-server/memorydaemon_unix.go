@@ -12,13 +12,16 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
 
-const daemonSupported = true
+// daemonSupported: see errDaemonUnsupported (persistence is Linux-only among
+// the unixes).
+const daemonSupported = runtime.GOOS == "linux"
 
 const daemonStopWait = 30 * time.Second
 
@@ -29,6 +32,9 @@ const daemonStopWait = 30 * time.Second
 // sidecars) before the process exits. Diagnostics go to stderr, which a
 // spawned daemon has pointed at <data>/daemon.log.
 func runMemoryDaemonCmd(args []string) {
+	if !daemonSupported {
+		fatal("memory-daemon: " + errDaemonUnsupported.Error())
+	}
 	fs := flag.NewFlagSet("memory-daemon", flag.ExitOnError)
 	defData, _ := defaultMemoryDir()
 	data := fs.String("data", defData, "daemon data directory (default ~/.rostam/memory)")
@@ -170,6 +176,9 @@ func daemonEnv(env []string, token string) []string {
 // <data>/daemon.log mode 0600) that outlives this process.
 func newDaemonSpawner(data, addr string) func() error {
 	return func() error {
+		if !daemonSupported {
+			return errDaemonUnsupported
+		}
 		exe, err := os.Executable()
 		if err != nil {
 			return err

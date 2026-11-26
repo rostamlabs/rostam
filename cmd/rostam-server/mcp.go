@@ -158,7 +158,7 @@ func runMcpCmd(args []string) {
 			fatal(err.Error())
 		}
 		if !daemonSupported {
-			fatal("mcp: -autostart is not supported on Windows in this release; use -data (one embedded session) or -connect to a running rostam-server")
+			fatal("mcp: -autostart: " + errDaemonUnsupported.Error())
 		}
 		dir, err := defaultMemoryDir()
 		if err != nil {

@@ -18,8 +18,11 @@ bundle a binary. Then, in Claude Code:
 /plugin install rostam-memory@rostam
 ```
 
-The plugin is not supported on Windows in this release, because the shared
-daemon below is not.
+The plugin runs on Linux only in this release, because the shared daemon below
+does. The daemon's store is persistent, and the engine's persistent
+(file-mapped) storage exists on Linux and Windows only; the daemon itself is
+not ported to Windows yet. On macOS and the BSDs `mcp -autostart` and
+`memory-daemon` fail at once with an error saying so.
 
 ## What it does
 
@@ -110,9 +113,9 @@ token is not sent. The hook then stays silent.
 `mcp -autostart` fails with "port 7480 is owned by another user (uid N)"
 without trying to start a daemon; when the owner merely cannot be verified it
 treats the daemon as not running, may try to start one (which cannot bind a
-port that is in use), and fails with a "did not become ready" error. Off Linux there is no socket
-table to read (macOS, the BSDs), so the check does not run and the token is
-sent unverified: do not run the daemon on a shared machine there.
+port that is in use), and fails with a "did not become ready" error. The hook's own check
+needs the same socket table: pointed with `-connect` at a server on a platform
+without one, it sends the token unverified.
 
 ## Failure behaviour
 
