@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -118,7 +119,7 @@ func storeWithoutIdentity(t *testing.T, st rostam.Store, emb semcache.Embedder, 
 
 func countMemories(t *testing.T, st rostam.Store) int {
 	t.Helper()
-	docs, _, _, err := st.VectorScroll(context.Background(), memCollection, rostam.VectorFilter{}, 100, rostam.VectorScrollOpts{})
+	docs, _, _, err := st.VectorScroll(context.Background(), memCollection, rostam.VectorFilter{}, 1000, rostam.VectorScrollOpts{})
 	if err != nil {
 		t.Fatalf("VectorScroll: %v", err)
 	}
@@ -217,31 +218,152 @@ func TestRepairIdentityOtherEmbedderSameDim(t *testing.T) {
 	}
 }
 
-// One matching memory is not enough: every sampled one has to match.
-func TestRepairIdentityOneSampleMismatches(t *testing.T) {
-	st := newHeapStore(t)
+// putPoint writes a point into the memory collection: content "" leaves it
+// without content, and wrong stores a vector this run's stub embedder cannot
+// reproduce.
+func putPoint(t *testing.T, st rostam.Store, id uint64, content string, wrong bool) {
+	t.Helper()
 	ctx := context.Background()
-	w := newTestServer(t, Config{Store: st})
-	seedMemory(t, w, "default", "", "fact one", 1)
-	seedMemory(t, w, "default", "", "fact two", 2)
-	other, err := newSaltedEmbedder().Embed(ctx, []string{"fact three"})
+	var emb semcache.Embedder = semcache.NewStubEmbedder("stub", 64)
+	if wrong {
+		emb = newSaltedEmbedder()
+	}
+	vecs, err := emb.Embed(ctx, []string{content})
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The largest id, so it is the last one sampled.
-	if err := st.VectorUpsert(ctx, memCollection, math.MaxUint64, other[0], "fact three", rostam.VectorInsertOpts{}); err != nil {
+	if err := st.VectorUpsert(ctx, memCollection, id, vecs[0], content, rostam.VectorInsertOpts{}); err != nil {
 		t.Fatal(err)
 	}
-	removeIdentity(t, st)
+}
 
-	s := newTestServer(t, Config{Store: st})
-	if err := s.ensureMemory(ctx); !errors.Is(err, ErrEmbedderMismatch) {
+// At least half of the sampled memories, and at least one, must match.
+func TestRepairIdentityMajority(t *testing.T) {
+	const ok, bad = false, true
+	for _, tc := range []struct {
+		name  string
+		wrong []bool // one memory each, in id order
+		match bool
+	}{
+		{"1 of 1", []bool{ok}, true},
+		{"0 of 1", []bool{bad}, false},
+		{"1 of 2", []bool{bad, ok}, true},
+		{"0 of 2", []bool{bad, bad}, false},
+		{"2 of 3, first wrong", []bool{bad, ok, ok}, true},
+		{"2 of 3, last wrong", []bool{ok, ok, bad}, true},
+		{"1 of 3", []bool{ok, bad, bad}, false},
+		{"0 of 3", []bool{bad, bad, bad}, false},
+		{"only three are sampled", []bool{ok, ok, ok, bad, bad, bad, bad}, true},
+		{"matches past the sample do not count", []bool{bad, bad, bad, ok, ok, ok, ok}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newHeapStore(t)
+			createMemoryCollection(t, st, 64)
+			for i, wrong := range tc.wrong {
+				putPoint(t, st, uint64(i+1), fmt.Sprintf("fact %d", i+1), wrong)
+			}
+
+			err := newTestServer(t, Config{Store: st}).ensureMemory(context.Background())
+			if n := countMemories(t, st); n != len(tc.wrong) {
+				t.Fatalf("memories after repair = %d, want %d", n, len(tc.wrong))
+			}
+			if tc.match {
+				if err != nil {
+					t.Fatalf("ensureMemory: %v", err)
+				}
+				requireIdentity(t, st, stubIdentity)
+				return
+			}
+			if !errors.Is(err, ErrEmbedderMismatch) || !strings.Contains(err.Error(), "ROSTAM_EMBED_") {
+				t.Fatalf("ensureMemory = %v, want ErrEmbedderMismatch naming the environment", err)
+			}
+			requireNoIdentity(t, st)
+		})
+	}
+}
+
+// Points without content are neither matches nor misses, and the sample is
+// looked for past a first page full of them.
+func TestRepairIdentitySkipsContentlessPoints(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		store       func(*testing.T) rostam.Store
+		contentless int
+	}{
+		{"a few", newHeapStore, 5},
+		{"more than a page", newHeapStore, identityScanPage + 20},
+		{"remote, more than a page", newRemoteStore, identityScanPage + 20},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := tc.store(t)
+			createMemoryCollection(t, st, 64)
+			// Their vectors are ones the embedder cannot reproduce, so sampling
+			// them would count as misses.
+			for i := range tc.contentless {
+				putPoint(t, st, uint64(i+1), "", true)
+			}
+			// One wrong of three still passes.
+			next := uint64(tc.contentless + 1)
+			putPoint(t, st, next, "fact one", true)
+			putPoint(t, st, next+1, "fact two", false)
+			putPoint(t, st, next+2, "fact three", false)
+
+			if err := newTestServer(t, Config{Store: st}).ensureMemory(context.Background()); err != nil {
+				t.Fatalf("ensureMemory: %v", err)
+			}
+			requireIdentity(t, st, stubIdentity)
+		})
+	}
+}
+
+// requireUnverifiable checks the refusal for a collection offering nothing to
+// re-embed: changing the embedder environment would not help, so it must not
+// advise that.
+func requireUnverifiable(t *testing.T, err error) {
+	t.Helper()
+	if !errors.Is(err, ErrEmbedderMismatch) {
 		t.Fatalf("ensureMemory = %v, want ErrEmbedderMismatch", err)
 	}
-	requireNoIdentity(t, st)
-	if n := countMemories(t, st); n != 3 {
-		t.Fatalf("memories after a refused repair = %d, want 3", n)
+	if msg := err.Error(); !strings.Contains(msg, "cannot verify") || !strings.Contains(msg, "content") || strings.Contains(msg, "ROSTAM_EMBED_") {
+		t.Fatalf("the error must say there is no content to verify against, without environment advice: %v", err)
 	}
+}
+
+func TestRepairIdentityOnlyContentlessPoints(t *testing.T) {
+	st := newHeapStore(t)
+	createMemoryCollection(t, st, 64)
+	for id := range uint64(4) {
+		putPoint(t, st, id+1, "", false)
+	}
+
+	requireUnverifiable(t, newTestServer(t, Config{Store: st}).ensureMemory(context.Background()))
+	requireNoIdentity(t, st)
+	if n := countMemories(t, st); n != 4 {
+		t.Fatalf("points after a refused repair = %d, want 4", n)
+	}
+}
+
+// endlessContentlessStore scrolls full pages of contentless points forever.
+type endlessContentlessStore struct {
+	rostam.Store
+	pages int
+}
+
+func (s *endlessContentlessStore) VectorScroll(_ context.Context, _ string, _ rostam.VectorFilter, limit int, _ rostam.VectorScrollOpts) ([]rostam.VectorDocument, rostam.FanMeta, string, error) {
+	s.pages++
+	return make([]rostam.VectorDocument, limit), rostam.FanMeta{}, "", nil
+}
+
+func TestRepairIdentitySampleSearchIsBounded(t *testing.T) {
+	st := newHeapStore(t)
+	createMemoryCollection(t, st, 64)
+	endless := &endlessContentlessStore{Store: st}
+
+	requireUnverifiable(t, newTestServer(t, Config{Store: endless}).ensureMemory(context.Background()))
+	if endless.pages != identityScanPages {
+		t.Fatalf("pages scrolled = %d, want %d", endless.pages, identityScanPages)
+	}
+	requireNoIdentity(t, st)
 }
 
 func TestRepairIdentityCosineThreshold(t *testing.T) {

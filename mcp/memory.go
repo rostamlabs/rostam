@@ -15,6 +15,7 @@ import (
 	"github.com/cespare/xxhash/v2"
 
 	"github.com/rostamlabs/rostam"
+	"github.com/rostamlabs/rostam/ops"
 	"github.com/rostamlabs/rostam/vector"
 )
 
@@ -61,15 +62,19 @@ const (
 )
 
 // identitySampleSize is how many stored memories repairIdentity re-embeds, and
-// identityMinCosine how close each new vector must be to the stored one.
+// identityMinCosine how close each new vector must be to the stored one to
+// count as a match. The sample is sought in at most identityScanPages pages of
+// identityScanPage points.
 const (
 	identitySampleSize = 3
 	identityMinCosine  = 0.999
+	identityScanPage   = 100
+	identityScanPages  = 10
 )
 
 // ErrEmbedderMismatch is wrapped by the error NewServer or a memory tool
 // returns when the store's memory was created with a different embedder than
-// this run's.
+// this run's, or this run's cannot be verified against it.
 var ErrEmbedderMismatch = errors.New("mcp: embedder mismatch")
 
 // embedderAdvice ends every mismatch error: what to do about it.
@@ -246,10 +251,12 @@ func (s *Server) awaitStoredIdentity(ctx context.Context) error {
 
 // repairIdentity records this run's embedder for a memory collection that has
 // no identity record, after verifying it against what the collection holds: the
-// dimension must match, and re-embedding up to identitySampleSize memories must
-// reproduce their stored vectors. An empty collection offers only its dimension
-// to check. A failed check wraps ErrEmbedderMismatch and records nothing; no
-// memory is ever changed.
+// dimension must match, and re-embedding a sample of memories must reproduce
+// the stored vectors of at least half of them (and at least one), so that one
+// bad stored vector does not refuse the right embedder. An empty collection
+// offers only its dimension to check; a non-empty one with no content to
+// re-embed is refused. A refusal wraps ErrEmbedderMismatch and records
+// nothing; no memory is ever changed.
 func (s *Server) repairIdentity(ctx context.Context) error {
 	probe := make([]float32, s.emb.Dim())
 	if len(probe) > 0 {
@@ -264,32 +271,82 @@ func (s *Server) repairIdentity(ctx context.Context) error {
 		}
 		return err
 	}
-	docs, _, _, err := s.store.VectorScroll(ctx, memCollection, rostam.VectorFilter{}, identitySampleSize, rostam.VectorScrollOpts{})
+	sample, empty, err := s.identitySample(ctx)
 	if err != nil {
 		return err
 	}
-	for _, d := range docs {
-		found, stored, _, _, _, err := s.store.VectorGet(ctx, memCollection, d.ID, true, false)
+	if empty {
+		return s.storeIdentity(ctx)
+	}
+	if len(sample) == 0 {
+		return fmt.Errorf("%w: cannot verify this run's embedder: the %q collection is not empty, but no point with content to re-embed was found in it",
+			ErrEmbedderMismatch, memCollection)
+	}
+	matched := 0
+	for _, d := range sample {
+		ok, err := s.reproduces(ctx, d)
 		if err != nil {
 			return err
 		}
-		if !found {
-			return fmt.Errorf("mcp: memory %d disappeared while the embedder was being verified against it", d.ID)
-		}
-		vecs, err := s.emb.Embed(ctx, []string{d.Content})
-		if err != nil {
-			return err
-		}
-		vec, err := firstEmbedding(vecs)
-		if err != nil {
-			return err
-		}
-		if cos := cosine(stored, vec); !(cos >= identityMinCosine) { // negated so NaN is refused too
-			return fmt.Errorf("%w: model=%q does not reproduce the stored vector of memory %d (cosine %.4f, need %v); %s",
-				ErrEmbedderMismatch, s.emb.Model(), d.ID, cos, identityMinCosine, embedderAdvice)
+		if ok {
+			matched++
 		}
 	}
+	if matched == 0 || 2*matched < len(sample) {
+		return fmt.Errorf("%w: model=%q reproduces the stored vector of only %d of %d sampled memories; %s",
+			ErrEmbedderMismatch, s.emb.Model(), matched, len(sample), embedderAdvice)
+	}
 	return s.storeIdentity(ctx)
+}
+
+// identitySample returns up to identitySampleSize points of the memory
+// collection that have content, skipping those without, and whether the
+// collection holds no point at all. The next page's cursor is built from the
+// last id: a server reached over -connect may return a page without one.
+func (s *Server) identitySample(ctx context.Context) (sample []rostam.VectorDocument, empty bool, err error) {
+	empty = true
+	var cursor string
+	for range identityScanPages {
+		docs, _, _, err := s.store.VectorScroll(ctx, memCollection, rostam.VectorFilter{}, identityScanPage, rostam.VectorScrollOpts{Cursor: cursor})
+		if err != nil {
+			return nil, false, err
+		}
+		for _, d := range docs {
+			empty = false
+			if d.Content == "" {
+				continue
+			}
+			sample = append(sample, d)
+			if len(sample) == identitySampleSize {
+				return sample, empty, nil
+			}
+		}
+		if len(docs) < identityScanPage {
+			break
+		}
+		cursor = ops.EncodeScrollCursor(docs[len(docs)-1].ID)
+	}
+	return sample, empty, nil
+}
+
+// reproduces reports whether embedding d's content yields its stored vector.
+func (s *Server) reproduces(ctx context.Context, d rostam.VectorDocument) (bool, error) {
+	found, stored, _, _, _, err := s.store.VectorGet(ctx, memCollection, d.ID, true, false)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, fmt.Errorf("mcp: memory %d disappeared while the embedder was being verified against it", d.ID)
+	}
+	vecs, err := s.emb.Embed(ctx, []string{d.Content})
+	if err != nil {
+		return false, err
+	}
+	vec, err := firstEmbedding(vecs)
+	if err != nil {
+		return false, err
+	}
+	return cosine(stored, vec) >= identityMinCosine, nil // false for NaN
 }
 
 // cosine is the cosine similarity of a and b; 0 when their lengths differ or
