@@ -179,9 +179,9 @@ func (w *wal) appendNamedSetPayloadStaged(id uint64, meta Metadata, keyExpires m
 // NamedCollection via the shared replayFramed core. The per-record apply switches
 // on the named tag and re-calls the idempotent mutator with VERBATIM absolute
 // per-key deadlines (restorePayload, not SetPayload — replay must not recompute
-// now+ttl). It stops at the first malformed/unknown record (returning false),
-// which is the same torn-tail/durability boundary the framed core enforces for a
-// truncated final record. A missing file replays nothing.
+// now+ttl). A malformed record fails the replay with ErrLogDamaged and an
+// unknown tag with errUnknownWALRecord; a torn tail is cut by the framed core
+// (see replayFramed). A missing file replays nothing.
 func replayNamedWAL(path string, nc *NamedCollection) error {
 	return replayFramed(path, func(rec []byte) error {
 		return replayNamedRecord(rec, nc)

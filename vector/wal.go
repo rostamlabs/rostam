@@ -7,9 +7,12 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
+	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,8 +28,9 @@ import (
 // WAL tail. Flush rotates the WAL (truncates it) once the checkpoint subsumes it.
 //
 // Records are length+CRC framed so a torn final record from a crash mid-append
-// is detected and ignored on replay — the last fsync'd record is the durability
-// boundary. The log is logical (it stores the Insert/Delete operation, not graph
+// is detected on replay and cut off before the log is appended to again — the
+// last fsync'd record is the durability boundary. Damage anywhere else refuses
+// the open (ErrLogDamaged; see replayFramed). The log is logical (it stores the Insert/Delete operation, not graph
 // edges); replay re-applies via the normal index paths, yielding a valid index
 // containing every committed vector.
 
@@ -618,24 +622,34 @@ func (w *wal) close() error {
 
 // errUnknownWALRecord is returned by replayFramed when an INTACT (CRC-valid)
 // record carries a record tag this binary does not recognize. Unlike a torn tail
-// (which is the legitimate durability boundary and stops replay silently), a
+// (which is the legitimate durability boundary and is cut off), a
 // CRC-valid frame is a committed record: an unknown tag means the WAL was written
 // by a NEWER binary (a downgrade) or is corrupt. Failing loud here prevents
 // silently truncating replay and discarding the committed records that follow.
 var errUnknownWALRecord = errors.New("vector: WAL contains an unrecognized record tag (newer binary or corruption); refusing to truncate replay")
 
 // replayFramed is the family-AGNOSTIC replay core: it reads path and invokes
-// apply(recordPayload) for each intact framed record, in order. It stops
-// (without error) at EOF, a torn header, a garbage/torn length, or a CRC mismatch
-// (torn/corrupt tail) — the legitimate durability boundary. apply receives the
-// opaque record-payload bytes; a per-family decoder (dense's replayRecord, or
+// apply(recordPayload) for each intact framed record, in order. apply receives
+// the opaque record-payload bytes; a per-family decoder (dense's replayRecord, or
 // named/MV elsewhere) interprets them and returns an error to halt replay:
-//   - errStopReplay (or any apply-returned error wrapping it): a malformed body of
-//     a KNOWN tag, i.e. a torn record — replay stops WITHOUT surfacing an error
-//     (the historical quiet-stop boundary).
+//   - errStopReplay (or any apply-returned error wrapping it): a CRC-valid frame
+//     whose body cannot be decoded. The frame was written whole, so this is
+//     damage, never a torn tail: replay fails with ErrLogDamaged.
 //   - errUnknownWALRecord: a CRC-valid frame with an UNRECOGNIZED tag — replay
 //     fails loud (the error propagates) so a downgraded/corrupt WAL is not
 //     silently truncated, dropping committed records.
+//
+// When the frames stop parsing before the end of the file (a short header or
+// body, a zero or oversized length, a CRC mismatch) at offset end, the bytes
+// from end on are either a half-written tail or mid-log damage:
+//   - if any later offset holds a complete, CRC-valid frame, records written
+//     after the bad bytes exist, so cutting would drop them: ErrLogDamaged, and
+//     the file is left untouched;
+//   - otherwise they are a torn tail (a crash mid-append, or trailing zeros from
+//     a filesystem that extended the file before the data landed). The bytes are
+//     saved to <path>.torn-<unixnano>, the log is truncated to end and fsynced,
+//     and a warning is logged. Cutting BEFORE openWAL appends matters: appending
+//     after a half-written record would make every later record unreplayable.
 //
 // A missing file replays nothing.
 func replayFramed(path string, apply func(rec []byte) error) error {
@@ -647,39 +661,174 @@ func replayFramed(path string, apply func(rec []byte) error) error {
 		return err
 	}
 	defer func() { _ = f.Close() }()
+	st, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	size := st.Size()
 	br := bufio.NewReaderSize(f, 1<<16)
-	for {
+	var end int64 // offset of the first byte not yet consumed by a good record
+	for end < size {
 		var hdr [8]byte
 		if _, err := io.ReadFull(br, hdr[:]); err != nil {
-			return nil // EOF or torn header
+			break // short header
 		}
 		plen := binary.BigEndian.Uint32(hdr[0:4])
 		crc := binary.BigEndian.Uint32(hdr[4:8])
-		if plen == 0 || plen > maxWALRecord {
-			return nil // garbage length -> stop
+		if plen == 0 || plen > maxWALRecord || int64(plen) > size-end-8 {
+			break // zero, garbage or overlong length
 		}
 		payload := make([]byte, plen)
 		if _, err := io.ReadFull(br, payload); err != nil {
-			return nil // torn tail
+			return err // the length fits the stat'd size, so this is a read failure
 		}
 		if crc32.ChecksumIEEE(payload) != crc {
-			return nil // corrupt/torn -> stop at the durability boundary
+			break
 		}
 		if aerr := apply(payload); aerr != nil {
 			if errors.Is(aerr, errStopReplay) {
-				return nil // malformed body of a known tag (torn record) -> quiet stop
+				return damagedLog(path, end)
 			}
 			return aerr // unknown tag / unrecoverable -> fail loud
 		}
+		end += 8 + int64(plen)
 	}
+	if end >= size {
+		return nil
+	}
+	found, err := laterFrameExists(f, end+1, size)
+	if err != nil {
+		return err
+	}
+	if found {
+		return damagedLog(path, end)
+	}
+	return cutTornTail(f, path, end, size)
 }
 
-// errStopReplay signals a quiet replay stop at the durability boundary (a
-// malformed/truncated body of a KNOWN record tag, i.e. a torn final record).
-// replayFramed swallows it and stops without surfacing an error, matching the
-// historical torn-tail behavior. An apply func returns errUnknownWALRecord
-// instead when the frame is intact but the tag is unrecognized (fail loud).
-var errStopReplay = errors.New("vector: WAL replay stop (torn record)")
+// ErrLogDamaged is returned when a write-ahead log cannot be replayed and the
+// damage is not a half-written tail: a complete record follows the bad bytes,
+// or a record passes its checksum but cannot be decoded. The log is left as it
+// was; recovering means moving it aside by hand (losing the records it holds).
+var ErrLogDamaged = errors.New("vector: write-ahead log damaged")
+
+func damagedLog(path string, end int64) error {
+	return fmt.Errorf("%w: %s at offset %d", ErrLogDamaged, path, end)
+}
+
+// tornScanWindow is how much of the log laterFrameExists reads at a time, so a
+// long tail is scanned without loading it into memory.
+const tornScanWindow = 1 << 20
+
+// laterFrameExists reports whether any offset in [from, size) starts a complete
+// frame: a length in (0, maxWALRecord] that fits in the file and a payload whose
+// CRC matches. It reads bounded windows with ReadAt and stops at the first such
+// frame. Offsets whose length field is zero are skipped without a CRC, so a long
+// run of zeros costs one pass over its bytes.
+func laterFrameExists(f *os.File, from, size int64) (bool, error) {
+	buf := make([]byte, tornScanWindow+8)
+	for base := from; base+8 <= size; {
+		n := int64(len(buf))
+		if size-base < n {
+			n = size - base
+		}
+		win := buf[:n]
+		if _, err := f.ReadAt(win, base); err != nil {
+			return false, err
+		}
+		// Every offset whose 8-byte header lies inside win is examined; the
+		// window then advances so the next one starts at the first unexamined
+		// offset (headers straddling the boundary are re-read there).
+		last := n - 8
+		for i := int64(0); i <= last; i++ {
+			if win[i] == 0 {
+				// A frame needs a non-zero length, so skip to three bytes before
+				// the next non-zero byte (its length's last byte at the latest).
+				nz := i + 1
+				for nz < n && win[nz] == 0 {
+					nz++
+				}
+				if nz == n {
+					break // the rest of the window is zeros
+				}
+				if next := nz - 3; next > i {
+					i = next - 1
+					continue
+				}
+			}
+			plen := int64(binary.BigEndian.Uint32(win[i : i+4]))
+			if plen == 0 || plen > maxWALRecord || plen > size-(base+i)-8 {
+				continue
+			}
+			crc := binary.BigEndian.Uint32(win[i+4 : i+8])
+			var payload []byte
+			if i+8+plen <= n {
+				payload = win[i+8 : i+8+plen]
+			} else {
+				payload = make([]byte, plen)
+				if _, err := f.ReadAt(payload, base+i+8); err != nil {
+					return false, err
+				}
+			}
+			if crc32.ChecksumIEEE(payload) == crc {
+				return true, nil
+			}
+		}
+		base += last + 1
+	}
+	return false, nil
+}
+
+// cutTornTail saves the log's bytes from end on to <path>.torn-<unixnano>
+// (fsynced, with its directory), then truncates the log to end and fsyncs it.
+func cutTornTail(f *os.File, path string, end, size int64) error {
+	tornPath := fmt.Sprintf("%s.torn-%d", path, time.Now().UnixNano())
+	if err := saveTornBytes(io.NewSectionReader(f, end, size-end), tornPath); err != nil {
+		return fmt.Errorf("vector: save torn log tail %s: %w", tornPath, err)
+	}
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("vector: save torn log tail %s: %w", tornPath, err)
+	}
+	wf, err := os.OpenFile(path, os.O_WRONLY, 0) //nolint:gosec // caller-supplied path
+	if err != nil {
+		return fmt.Errorf("vector: cut torn log tail %s: %w", path, err)
+	}
+	terr := wf.Truncate(end)
+	if terr == nil {
+		terr = wf.Sync()
+	}
+	if cerr := wf.Close(); terr == nil {
+		terr = cerr
+	}
+	if terr != nil {
+		return fmt.Errorf("vector: cut torn log tail %s: %w", path, terr)
+	}
+	slog.Warn("vector: cut a half-written write-ahead log tail",
+		"log", path, "offset", end, "bytes", size-end, "saved", tornPath)
+	return nil
+}
+
+func saveTornBytes(r io.Reader, tornPath string) error {
+	out, err := os.OpenFile(tornPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // derived from the log path
+	if err != nil {
+		return err
+	}
+	_, werr := io.Copy(out, r)
+	if werr == nil {
+		werr = out.Sync()
+	}
+	if cerr := out.Close(); werr == nil {
+		werr = cerr
+	}
+	return werr
+}
+
+// errStopReplay is what a per-family decoder returns for a malformed body of a
+// KNOWN record tag. The frame passed its CRC, so the record was written whole:
+// replayFramed reports it as ErrLogDamaged at that record's offset. An apply func
+// returns errUnknownWALRecord instead when the frame is intact but the tag is
+// unrecognized (fail loud).
+var errStopReplay = errors.New("vector: WAL record body undecodable")
 
 // replayWAL reads path and invokes onInsert/onDelete/onSetPayload for each intact
 // DENSE record, in order. It is a thin wrapper over the shared replayFramed core:
@@ -700,7 +849,7 @@ func replayWAL(
 
 // replayRecord decodes one record payload and dispatches it. Returns nil on a
 // successfully applied record, errStopReplay on a malformed body of a KNOWN tag
-// (torn record → quiet stop), or errUnknownWALRecord on an unrecognized tag (an
+// (damage → ErrLogDamaged), or errUnknownWALRecord on an unrecognized tag (an
 // intact frame from a newer/downgraded binary → fail loud, not silent truncation).
 func replayRecord(
 	payload []byte,
