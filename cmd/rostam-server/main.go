@@ -657,7 +657,13 @@ func main() {
 	if err != nil {
 		fatal("server start failed", "err", err)
 	}
-	defer func() { _ = srv.Close() }()
+	defer func() {
+		// Close checkpoints durable collections; a failure leaves their logs to
+		// replay at the next start, so it is reported, not fatal.
+		if cerr := srv.Close(); cerr != nil {
+			slog.Error("server close failed", "err", cerr)
+		}
+	}()
 
 	// Attach the live store to the S3 tier (backup cron, cold-tier sweeper, admin
 	// surface) and, when cold tiering is on, inject the wall clock so the engine

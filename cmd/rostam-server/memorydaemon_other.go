@@ -19,3 +19,6 @@ func newDaemonSpawner(string, string) func() error {
 func stopDaemon(string, time.Duration) error { return errDaemonUnsupported }
 
 // processIsDaemon: unix-only; the Windows build has no daemon.
+
+// daemonStarting: there is no daemon here to wait for.
+func daemonStarting(string) bool { return false }

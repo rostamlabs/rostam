@@ -316,6 +316,41 @@ func isDaemonServerArgs(args []string, exeBase, data string) bool {
 	return hasPair("-data", data) && hasPair("-config", filepath.Join(data, daemonConfigName))
 }
 
+// daemonStarting reports whether a memory daemon demonstrably holds data and
+// is still starting, so a session should keep waiting for it to answer: the
+// pid file names a live memory daemon of data (its supervisor) or that
+// daemon's server, and the data-dir lock is held. The pid file is checked
+// first: the supervisor writes it only once it holds the lock, so the lock is
+// probed only while a daemon is known to hold it and the probe cannot race a
+// daemon that is just taking it. An embedded `mcp` (the lock, no pid file) and
+// a stale pid file are not a starting daemon.
+func daemonStarting(data string) bool {
+	raw, err := os.ReadFile(filepath.Join(data, daemonPidName)) //nolint:gosec // fixed name inside the data dir
+	if err != nil {
+		return false
+	}
+	live := false
+	for i, field := range strings.Fields(string(raw)) {
+		pid, perr := strconv.Atoi(field)
+		if perr != nil || pid <= 1 {
+			continue
+		}
+		if (i == 0 && processIsDaemon(pid, data)) || (i == 1 && processIsDaemonServer(pid, data)) {
+			live = true
+			break
+		}
+	}
+	if !live {
+		return false
+	}
+	unlock, err := lockDataDir(data)
+	if err == nil {
+		_ = unlock()
+		return false
+	}
+	return errors.Is(err, errDataDirBusy)
+}
+
 // processArgs returns pid's argv: /proc where it exists (Linux), else the
 // platform's own source (platformProcArgs).
 func processArgs(pid int) []string {

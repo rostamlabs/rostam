@@ -35,7 +35,8 @@ const (
 	spawnLockDirName  = "spawn.lock"
 
 	// daemonStartWait bounds how long a session waits for a freshly spawned
-	// daemon to accept an authenticated connection.
+	// daemon to accept an authenticated connection, unless the daemon is
+	// demonstrably still starting (see daemonStartMaxWait).
 	daemonStartWait = 5 * time.Second
 	// daemonStopWait bounds how long -stop (and a session replacing an older
 	// daemon) waits for a daemon to release its data directory.
@@ -210,6 +211,16 @@ func probeDaemon(ctx context.Context, addr, token string) error {
 	return nil
 }
 
+// daemonStartMaxWait bounds how long a session keeps waiting past
+// daemonStartWait for a daemon that is demonstrably still starting
+// (daemonStartingFn): its first start upgrades an existing store, which for a
+// large one can take minutes. A variable so tests can shorten it.
+var daemonStartMaxWait = 10 * time.Minute
+
+// daemonStartingFn reports whether a memory daemon process holds data's lock
+// and is starting (daemonStarting). A variable so tests can stand one in.
+var daemonStartingFn = daemonStarting
+
 // ensureDaemon makes sure an authenticated memory daemon answers at addr,
 // calling spawn at most once across all concurrent callers.
 func ensureDaemon(ctx context.Context, data, addr string, spawn func() error) error {
@@ -240,8 +251,23 @@ func ensureDaemonWith(ctx context.Context, data, addr string, spawn func() error
 		return err
 	}
 
-	notReady := fmt.Errorf("memory daemon did not become ready on %s within %s; see %s", addr, wait, logPath)
-	deadline := time.Now().Add(wait)
+	begin := time.Now()
+	deadline := begin.Add(wait)
+	hardDeadline := begin.Add(max(wait, daemonStartMaxWait))
+	// keepWaiting: within wait, or past it while a daemon process holds the
+	// data dir and is still starting (a first-start upgrade), up to hardDeadline.
+	// An embedded holder or a daemon that is not starting gets the short wait.
+	keepWaiting := func() bool {
+		now := time.Now()
+		return now.Before(deadline) || (now.Before(hardDeadline) && daemonStartingFn(data))
+	}
+	notReadyErr := func() error {
+		if el := time.Since(begin); el > wait+time.Second {
+			return fmt.Errorf("memory daemon did not become ready on %s within %s (it was still starting after %s); see %s",
+				addr, wait, el.Round(time.Second), logPath)
+		}
+		return fmt.Errorf("memory daemon did not become ready on %s within %s; see %s", addr, wait, logPath)
+	}
 	lockDir := filepath.Join(filepath.Dir(data), spawnLockDirName)
 
 	for {
@@ -258,7 +284,7 @@ func ensureDaemonWith(ctx context.Context, data, addr string, spawn func() error
 			if err := spawn(); err != nil {
 				return fmt.Errorf("starting memory daemon: %w (see %s)", err, logPath)
 			}
-			for time.Now().Before(deadline) {
+			for keepWaiting() {
 				if ok, err := up(); ok || err != nil {
 					return err
 				}
@@ -266,7 +292,7 @@ func ensureDaemonWith(ctx context.Context, data, addr string, spawn func() error
 					return err
 				}
 			}
-			return notReady
+			return notReadyErr()
 		}
 		if !errors.Is(lerr, errDataDirBusy) {
 			return fmt.Errorf("taking daemon spawn lock: %w", lerr)
@@ -278,8 +304,8 @@ func ensureDaemonWith(ctx context.Context, data, addr string, spawn func() error
 		if ok, err := up(); ok || err != nil {
 			return err
 		}
-		if !time.Now().Before(deadline) {
-			return notReady
+		if !keepWaiting() {
+			return notReadyErr()
 		}
 	}
 }
