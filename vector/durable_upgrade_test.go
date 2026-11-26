@@ -671,25 +671,227 @@ func TestCopyLivePointsRefusesInconsistentData(t *testing.T) {
 	})
 }
 
-// Past the commit point the collection is a log collection, and one that cannot
-// load fails the open as any log collection would; the old mapped files are
-// still beside it.
-func TestUpgradeCommittedButUnloadableKeepsOldFiles(t *testing.T) {
+// A failure to load the new form after the commit point puts the old manifest
+// back: the open succeeds in the old form, warns, and the next open retries.
+func TestUpgradeCommittedButUnloadableRollsBack(t *testing.T) {
 	dir := t.TempDir()
-	writeLegacyStore(t, dir)
+	want := writeLegacyStore(t, dir)
+	logs := captureLogs(t)
 	setUpgradeHook(t, func(s string) error {
 		if s == "manifest" {
 			return os.WriteFile(colFile(dir, ".snap"), []byte("not a snapshot"), 0o600)
 		}
 		return nil
 	})
-	if cs, err := OpenCollectionStoreWith(dir, StoreOptions{DurableCollections: []string{upgradeCol}}); err == nil {
-		_ = cs.Close()
-		t.Fatal("open succeeded over an unreadable snapshot")
+	cs := openDurable(t, dir, upgradeCol)
+	if cfg := manifestOf(t, dir, upgradeCol); !cfg.Persistent || cfg.WAL {
+		t.Fatalf("manifest: Persistent=%v WAL=%v, want the old form put back", cfg.Persistent, cfg.WAL)
 	}
+	assertLegacyPoints(t, cs, want, true)
+	assertSearchable(t, cs, want)
+	assertGone(t, colFile(dir, ".snap"))
+	if !strings.Contains(logs.String(), "not crash-safe") {
+		t.Fatalf("log = %q, want a not crash-safe warning", logs.String())
+	}
+	if err := cs.FlushPersistent(); err != nil {
+		t.Fatal(err)
+	}
+	_ = cs.Close()
+
+	upgradeStepHook = nil
+	cs = openDurable(t, dir, upgradeCol)
+	defer func() { _ = cs.Close() }()
+	assertDurableManifest(t, manifestOf(t, dir, upgradeCol))
+	assertLegacyPoints(t, cs, want, true)
+}
+
+// If putting the old manifest back fails too, the store still opens in the old
+// form and the warning names that case.
+func TestUpgradeRollbackFailureStillOpens(t *testing.T) {
+	dir := t.TempDir()
+	want := writeLegacyStore(t, dir)
+	logs := captureLogs(t)
+	setUpgradeHook(t, func(s string) error {
+		if s == "manifest" {
+			if err := os.Mkdir(colFile(dir, ".json.tmp"), 0o750); err != nil {
+				return err
+			}
+			return os.WriteFile(colFile(dir, ".snap"), []byte("not a snapshot"), 0o600)
+		}
+		return nil
+	})
+	cs := openDurable(t, dir, upgradeCol)
+	defer func() { _ = cs.Close() }()
+	assertLegacyPoints(t, cs, want, true)
+	if !strings.Contains(logs.String(), "could not be put back") {
+		t.Fatalf("log = %q, want the rollback failure named", logs.String())
+	}
+}
+
+// The new form is proven to load before the commit point: a snapshot that does
+// not restore fails the upgrade the ordinary way.
+func TestUpgradeUnloadableSnapshotFailsBeforeCommit(t *testing.T) {
+	dir := t.TempDir()
+	want := writeLegacyStore(t, dir)
+	logs := captureLogs(t)
+	setUpgradeHook(t, func(s string) error {
+		if s == "snapshot" {
+			return os.WriteFile(colFile(dir, ".snap"), []byte("not a snapshot"), 0o600)
+		}
+		return nil
+	})
+	cs := openDurable(t, dir, upgradeCol)
+	defer func() { _ = cs.Close() }()
+	if cfg := manifestOf(t, dir, upgradeCol); !cfg.Persistent || cfg.WAL {
+		t.Fatalf("manifest: Persistent=%v WAL=%v, want the old form", cfg.Persistent, cfg.WAL)
+	}
+	assertGone(t, colFile(dir, ".snap"))
+	assertLegacyPoints(t, cs, want, true)
+	if !strings.Contains(logs.String(), "not crash-safe") {
+		t.Fatalf("log = %q, want a not crash-safe warning", logs.String())
+	}
+}
+
+// writeConfig reported an error and the manifest cannot be read back: the old
+// manifest is written again, so the state is certain, and the old form stays.
+func TestUpgradeUnreadableManifestPutBack(t *testing.T) {
+	dir := t.TempDir()
+	want := writeLegacyStore(t, dir)
+	logs := captureLogs(t)
+	setUpgradeHook(t, func(s string) error {
+		if s == "manifest" {
+			if err := os.WriteFile(colFile(dir, ".json"), []byte("{torn"), 0o600); err != nil {
+				return err
+			}
+			return errors.New("injected")
+		}
+		return nil
+	})
+	cs := openDurable(t, dir, upgradeCol)
+	defer func() { _ = cs.Close() }()
+	if cfg := manifestOf(t, dir, upgradeCol); !cfg.Persistent || cfg.WAL {
+		t.Fatalf("manifest: Persistent=%v WAL=%v, want the old form written back", cfg.Persistent, cfg.WAL)
+	}
+	assertGone(t, colFile(dir, ".snap"))
+	assertLegacyPoints(t, cs, want, true)
+	if !strings.Contains(logs.String(), "not crash-safe") {
+		t.Fatalf("log = %q, want a not crash-safe warning", logs.String())
+	}
+}
+
+// writeConfig reported an error but its rename landed. The directory sync that
+// makes the rename durable failed, so the old files are not removed until it
+// succeeds: a later open still has them.
+func TestUpgradeUnsyncedManifestKeepsOldFiles(t *testing.T) {
+	dir := t.TempDir()
+	want := writeLegacyStore(t, dir)
+	prev := syncDirf
+	t.Cleanup(func() { syncDirf = prev })
+	setUpgradeHook(t, func(s string) error {
+		if s == "manifest" {
+			syncDirf = func(string) error { return errors.New("injected fsync") }
+			return errors.New("injected fsync")
+		}
+		return nil
+	})
+	cs := openDurable(t, dir, upgradeCol)
+	assertDurableManifest(t, manifestOf(t, dir, upgradeCol))
+	assertLegacyPoints(t, cs, want, true)
 	for _, p := range mappedFiles(dir) {
 		if _, err := os.Stat(p); err != nil {
-			t.Fatalf("%s removed although the log form did not load: %v", p, err)
+			t.Fatalf("%s removed although the manifest rename was not made durable: %v", p, err)
+		}
+	}
+	_ = cs.Close()
+
+	syncDirf = prev
+	upgradeStepHook = nil
+	cs = openDurable(t, dir, upgradeCol)
+	defer func() { _ = cs.Close() }()
+	assertLegacyPoints(t, cs, want, true)
+	assertGone(t, mappedFiles(dir)...)
+}
+
+// A Persistent manifest with no sidecar beside a snapshot is not a state the
+// upgrade produces, but if it is ever met the snapshot is kept aside, never
+// overwritten by the empty collection the old form opens as.
+func TestUpgradeKeepsOrphanSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	writeLegacyStore(t, dir)
+	cs := openDurable(t, dir, upgradeCol)
+	_ = cs.Close()
+	snapHash := fileHash(t, colFile(dir, ".snap"))
+	if err := writeConfig(colFile(dir, ".json"), legacyCfg()); err != nil {
+		t.Fatal(err)
+	}
+	logs := captureLogs(t)
+
+	cs = openDurable(t, dir, upgradeCol)
+	defer func() { _ = cs.Close() }()
+	kept, _ := filepath.Glob(colFile(dir, ".snap.kept-*"))
+	if len(kept) != 1 || fileHash(t, kept[0]) != snapHash {
+		t.Fatalf("kept snapshots = %v, want one copy of the original", kept)
+	}
+	if !strings.Contains(logs.String(), kept[0]) {
+		t.Fatalf("log = %q, want the kept snapshot named", logs.String())
+	}
+}
+
+// An empty snapshot beside a never-flushed collection, as an upgrade
+// interrupted after its snapshot step leaves, is not kept aside.
+func TestUpgradeEmptyOrphanSnapshotNotKept(t *testing.T) {
+	dir := t.TempDir()
+	cs := openDurable(t, dir)
+	if err := cs.CreateCollection(upgradeCol, legacyCfg()); err != nil {
+		t.Fatal(err)
+	}
+	_ = cs.Close()
+	crashed := filepath.Join(t.TempDir(), "crashed")
+	setUpgradeHook(t, func(s string) error {
+		if s == "snapshot" {
+			copyTree(t, dir, crashed)
+		}
+		return nil
+	})
+	cs = openDurable(t, dir, upgradeCol)
+	_ = cs.Close()
+	upgradeStepHook = nil
+
+	cs = openDurable(t, crashed, upgradeCol)
+	defer func() { _ = cs.Close() }()
+	assertDurableManifest(t, manifestOf(t, crashed, upgradeCol))
+	if kept, _ := filepath.Glob(colFile(crashed, ".snap.kept-*")); len(kept) != 0 {
+		t.Fatalf("empty snapshot kept aside: %v", kept)
+	}
+}
+
+// A log manifest left by an interrupted upgrade, with the old sidecar still
+// beside it, whose snapshot does not load, fails the open rather than falling
+// back to the old files: nothing proves the log form took no writes since, so
+// the old files may be older than the collection. Nothing is removed.
+func TestInterruptedUpgradeWithUnloadableSnapshotFailsOpen(t *testing.T) {
+	dir := t.TempDir()
+	writeLegacyStore(t, dir)
+	crashed := filepath.Join(t.TempDir(), "crashed")
+	setUpgradeHook(t, func(s string) error {
+		if s == "manifest" {
+			copyTree(t, dir, crashed)
+		}
+		return nil
+	})
+	cs := openDurable(t, dir, upgradeCol)
+	_ = cs.Close()
+	upgradeStepHook = nil
+	if err := os.WriteFile(colFile(crashed, ".snap"), []byte("not a snapshot"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if cs, err := OpenCollectionStoreWith(crashed, StoreOptions{DurableCollections: []string{upgradeCol}}); err == nil {
+		_ = cs.Close()
+		t.Fatal("open succeeded over an unloadable snapshot")
+	}
+	for _, p := range mappedFiles(crashed) {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("%s removed by a failed open: %v", p, err)
 		}
 	}
 }

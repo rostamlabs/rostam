@@ -182,90 +182,218 @@ func upgradeStep(step string) error {
 //
 // The live points are copied into a fresh in-memory collection, never the
 // mapped graph, which after an unclean stop can name slots that do not exist.
-// That collection is written as a synced snapshot, any stale log is removed, and
-// then the manifest is replaced: the commit point. Until then nothing the old
-// form reads has been touched, so any failure leaves it registered and working,
-// warns that the collection is not crash-safe, and returns nil; the next open
-// tries again. After the commit the old collection is closed and the collection
-// loads down the ordinary log path, whose error, if any, is returned.
+// That collection is written as a synced snapshot and proven to restore, any
+// stale log is removed, and then the manifest is replaced: the commit point.
+// Until then nothing the old form reads has been touched. The new form is then
+// loaded beside the old one, and only once it has loaded is the old one closed
+// and replaced. If it does not load, the old manifest is put back.
+//
+// No failure here fails the open: every one leaves the old form registered and
+// working, warns that the collection is not crash-safe, and the next open tries
+// again. The return value is always nil; it is kept for the caller's shape.
 func (s *CollectionStore) upgradeToDurable(canonical string, cfg Config, cfgPath, snapPath string) error {
 	old := s.collections[canonical]
 	walCfg := s.durableConfig(canonical, cfg)
-	committed, manifestTried, err := s.convertToDurable(canonical, old, cfg, walCfg, cfgPath, snapPath)
-	if !committed {
-		// The snapshot is only removed when the manifest was never attempted: a
-		// manifest that could not be read back may still have been replaced, and
-		// then the snapshot is the collection.
-		if !manifestTried {
-			_ = os.Remove(snapPath)
-		}
-		slog.Warn("vector: durable collection is not crash-safe: upgrading it to the write-ahead log failed, so it stays in its old form until a later open succeeds",
-			"collection", canonical, "err", err)
+	if !s.keepOrphanSnapshot(canonical, walCfg, snapPath) {
 		return nil
 	}
-	delete(s.collections, canonical)
+	res := s.convertToDurable(canonical, old, cfg, walCfg, cfgPath, snapPath)
+	if !res.committed {
+		if res.oldManifestCertain {
+			_ = os.Remove(snapPath)
+			slog.Warn("vector: durable collection is not crash-safe: upgrading it to the write-ahead log failed, so it stays in its old form until a later open succeeds",
+				"collection", canonical, "err", res.err)
+		} else {
+			// The snapshot is kept: the manifest may name the log form, and then
+			// the snapshot is the collection.
+			slog.Error("vector: durable collection is not crash-safe, and its manifest could not be read back or put back after a failed upgrade: it stays in its old form for now, but the next open may load the write-ahead log form instead and miss what is written until then",
+				"collection", canonical, "manifest", cfgPath, "err", res.err)
+		}
+		return nil
+	}
+
+	nc, err := s.buildWALCollection(canonical, walCfg, cfgPath, snapPath)
+	if err != nil {
+		s.rollbackUpgrade(canonical, cfg, cfgPath, snapPath, err)
+		return nil
+	}
+	s.collections[canonical] = nc
 	if cerr := old.Close(); cerr != nil {
 		slog.Warn("vector: closing the old form of an upgraded collection failed",
 			"collection", canonical, "err", cerr)
 	}
-	return s.loadWALCollection(canonical, walCfg, cfgPath, snapPath)
+	if res.manifestDurable {
+		s.removeMappedLeftovers(canonical)
+	} else {
+		slog.Warn("vector: the upgraded manifest of a durable collection may not be on disk yet, so the files of its old form are kept until a later open",
+			"collection", canonical, "manifest", cfgPath)
+	}
+	return nil
+}
+
+// rollbackUpgrade runs when the log form of a just-committed upgrade does not
+// load. The old manifest is put back, atomically, and the snapshot and the log
+// the load may have created are removed; the old form, still open, stays.
+func (s *CollectionStore) rollbackUpgrade(canonical string, cfg Config, cfgPath, snapPath string, loadErr error) {
+	if werr := writeConfig(cfgPath, cfg); werr != nil {
+		slog.Error("vector: durable collection is not crash-safe: its upgraded form did not load and the old manifest could not be put back; it stays in its old form for now, but the next open loads the write-ahead log form and may fail",
+			"collection", canonical, "manifest", cfgPath, "err", loadErr, "rollback_err", werr)
+		return
+	}
+	_, _, _, walPath := s.persistPaths(canonical)
+	_ = os.Remove(snapPath)
+	_ = os.Remove(walPath)
+	slog.Warn("vector: durable collection is not crash-safe: its upgraded form did not load, so the old manifest was put back and it stays in its old form until a later open succeeds",
+		"collection", canonical, "err", loadErr)
+}
+
+// keepOrphanSnapshot handles a listed collection whose Persistent manifest has
+// no sidecar beside it but a snapshot. The upgrade never leaves that state with
+// points in the snapshot (it removes the sidecar only after the log manifest is
+// durable), but if it is met the snapshot may hold the collection, and the
+// upgrade of the empty old form would overwrite it. A snapshot holding points,
+// or one that does not restore, is moved aside under a name the warning gives;
+// an empty one, as an interrupted upgrade of a never-flushed collection leaves,
+// is simply overwritten. It reports false, skipping the upgrade, when the
+// snapshot cannot be moved.
+func (s *CollectionStore) keepOrphanSnapshot(canonical string, walCfg Config, snapPath string) bool {
+	_, _, metaPath, _ := s.persistPaths(canonical)
+	if _, err := os.Stat(metaPath); err == nil {
+		return true
+	}
+	if _, err := os.Stat(snapPath); err != nil {
+		return true
+	}
+	if n, err := s.snapshotPoints(canonical, walCfg, snapPath); err == nil && n == 0 {
+		return true
+	}
+	kept := fmt.Sprintf("%s.kept-%d", snapPath, time.Now().UnixNano())
+	if err := renameDurable(snapPath, kept); err != nil {
+		slog.Warn("vector: durable collection is not crash-safe: it has a snapshot but no sidecar, and the snapshot could not be moved aside, so it is not upgraded",
+			"collection", canonical, "snapshot", snapPath, "err", err)
+		return false
+	}
+	slog.Warn("vector: a durable collection had a snapshot but no sidecar; the snapshot was kept aside before upgrading",
+		"collection", canonical, "kept", kept)
+	return true
+}
+
+// upgradeResult is the outcome of convertToDurable.
+type upgradeResult struct {
+	// committed: the manifest now names the log form.
+	committed bool
+	// manifestDurable: when committed, the manifest's rename is known to be
+	// on disk, so the old files may go.
+	manifestDurable bool
+	// oldManifestCertain: when not committed, the manifest is known to name the
+	// old form, so the snapshot may go.
+	oldManifestCertain bool
+	err                error
 }
 
 // convertToDurable runs the upgrade up to and including the commit point.
-// committed reports whether the manifest now says WAL; manifestTried whether
-// replacing it was attempted.
-func (s *CollectionStore) convertToDurable(canonical string, old *Collection, cfg, walCfg Config, cfgPath, snapPath string) (committed, manifestTried bool, err error) {
+func (s *CollectionStore) convertToDurable(canonical string, old *Collection, cfg, walCfg Config, cfgPath, snapPath string) upgradeResult {
+	fail := func(err error) upgradeResult { return upgradeResult{oldManifestCertain: true, err: err} }
 	h, ok := old.idx.(*hnsw)
 	if cfg.IndexType != IndexHNSW || !ok {
-		return false, false, fmt.Errorf("vector: only an HNSW collection can be upgraded (index type %v)", cfg.IndexType)
+		return fail(fmt.Errorf("vector: only an HNSW collection can be upgraded (index type %v)", cfg.IndexType))
 	}
 	fresh, err := NewCollection(canonical, walCfg)
 	if err != nil {
-		return false, false, err
+		return fail(err)
 	}
 	// The fresh collection is heap-backed and has no log; once its snapshot is
 	// written the ordinary load rebuilds it from that, so it is always dropped.
 	defer func() { _ = fresh.Close() }()
 	if err := copyLivePoints(h, fresh); err != nil {
-		return false, false, err
+		return fail(err)
 	}
 	if err := upgradeStep("loaded"); err != nil {
-		return false, false, err
+		return fail(err)
 	}
 	if err := s.writeSnapshotFile(fresh, snapPath); err != nil {
-		return false, false, fmt.Errorf("vector: writing the snapshot: %w", err)
+		return fail(fmt.Errorf("vector: writing the snapshot: %w", err))
 	}
 	if err := upgradeStep("snapshot"); err != nil {
-		return false, false, err
+		return fail(err)
+	}
+	if err := s.verifySnapshot(canonical, walCfg, snapPath, fresh.Stats().Size); err != nil {
+		return fail(err)
 	}
 	// A log left from an earlier life would replay over the snapshot. Its removal
 	// is made durable before the manifest can name the log path again.
 	_, _, _, walPath := s.persistPaths(canonical)
 	if err := os.Remove(walPath); err != nil && !os.IsNotExist(err) {
-		return false, false, fmt.Errorf("vector: removing a stale log: %w", err)
+		return fail(fmt.Errorf("vector: removing a stale log: %w", err))
 	}
 	if err := syncDirf(filepath.Dir(walPath)); err != nil {
-		return false, false, fmt.Errorf("vector: fsync dir %s: %w", filepath.Dir(walPath), err)
+		return fail(fmt.Errorf("vector: fsync dir %s: %w", filepath.Dir(walPath), err))
 	}
 	if err := upgradeStep("log-removed"); err != nil {
-		return false, false, err
+		return fail(err)
 	}
 	werr := writeConfig(cfgPath, walCfg)
 	if werr == nil {
 		werr = upgradeStep("manifest")
 	}
-	if werr != nil {
-		// writeConfig can fail after its rename has landed (the directory fsync).
-		// Then the upgrade has committed, and keeping the old form would accept
-		// writes the next open, which takes the log path, cannot see.
-		got, rerr := readConfig(cfgPath)
-		if rerr != nil || !got.WAL {
-			return false, true, fmt.Errorf("vector: replacing the manifest: %w", werr)
-		}
+	if werr == nil {
+		return upgradeResult{committed: true, manifestDurable: true}
+	}
+	// writeConfig can fail after its rename has landed (the directory fsync), so
+	// what the manifest says is read back.
+	got, rerr := readConfig(cfgPath)
+	switch {
+	case rerr == nil && got.WAL:
+		// Committed: keeping the old form would accept writes the next open,
+		// which takes the log path, cannot see. The failed directory sync may be
+		// the one that made the rename durable, so it is retried; until it
+		// succeeds the old files stay, since removing them could reach disk
+		// before the rename does.
 		slog.Warn("vector: the upgraded manifest reported an error but is in place; continuing with the write-ahead log",
 			"collection", canonical, "err", werr)
+		derr := syncDirf(filepath.Dir(cfgPath))
+		return upgradeResult{committed: true, manifestDurable: derr == nil}
+	case rerr == nil:
+		return fail(fmt.Errorf("vector: replacing the manifest: %w", werr))
 	}
-	return true, true, nil
+	// Unreadable: write the old manifest again so the state is certain.
+	if perr := writeConfig(cfgPath, cfg); perr != nil {
+		return upgradeResult{err: fmt.Errorf("vector: replacing the manifest: %w; reading it back: %v; putting the old one back: %v", werr, rerr, perr)}
+	}
+	return fail(fmt.Errorf("vector: replacing the manifest: %w; reading it back: %v", werr, rerr))
+}
+
+// verifySnapshot proves the snapshot just written restores, with the config the
+// log form will load with, to want points.
+func (s *CollectionStore) verifySnapshot(canonical string, walCfg Config, snapPath string, want int) error {
+	got, err := s.snapshotPoints(canonical, walCfg, snapPath)
+	if err != nil {
+		return fmt.Errorf("vector: the written snapshot does not restore: %w", err)
+	}
+	if got != want {
+		return fmt.Errorf("vector: the written snapshot restores %d points, want %d", got, want)
+	}
+	return nil
+}
+
+// snapshotPoints restores the snapshot at snapPath into a scratch collection
+// built with the log form's config and returns how many points it holds.
+func (s *CollectionStore) snapshotPoints(canonical string, walCfg Config, snapPath string) (int, error) {
+	scratch, err := NewCollection(canonical, s.effectiveConfig(canonical, walCfg))
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = scratch.Close() }()
+	f, err := os.Open(snapPath) //nolint:gosec // store-managed path
+	if err != nil {
+		return 0, err
+	}
+	rerr := scratch.Restore(f)
+	_ = f.Close()
+	if rerr != nil {
+		return 0, rerr
+	}
+	return scratch.Stats().Size, nil
 }
 
 // copyLivePoints copies every live point of src into dst with its version and

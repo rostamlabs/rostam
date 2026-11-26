@@ -310,39 +310,51 @@ func (s *CollectionStore) loadCollection(canonical, cfgPath, snapPath string) er
 // log forced to sync and, once loaded, any files of its earlier mapped form
 // removed.
 func (s *CollectionStore) loadWALCollection(canonical string, cfg Config, cfgPath, snapPath string) error {
+	c, err := s.buildWALCollection(canonical, cfg, cfgPath, snapPath)
+	if err != nil {
+		return err
+	}
+	s.collections[canonical] = c
+	if s.isDurable(canonical) {
+		s.removeMappedLeftovers(canonical)
+	}
+	return nil
+}
+
+// buildWALCollection is loadWALCollection without registering the collection
+// or removing any file.
+func (s *CollectionStore) buildWALCollection(canonical string, cfg Config, cfgPath, snapPath string) (*Collection, error) {
 	if s.isDurable(canonical) {
 		cfg = s.syncDurableWAL(canonical, cfg, cfgPath)
 	}
 	eff := s.effectiveConfig(canonical, cfg)
 	c, nerr := NewCollection(canonical, eff)
 	if nerr != nil {
-		return fmt.Errorf("vector: rebuild %s: %w", canonical, nerr)
+		return nil, fmt.Errorf("vector: rebuild %s: %w", canonical, nerr)
 	}
 	if f, oerr := os.Open(snapPath); oerr == nil {
 		rerr := c.Restore(f)
 		_ = f.Close()
 		if rerr != nil {
 			_ = c.Close()
-			return fmt.Errorf("vector: restore %s: %w", canonical, rerr)
+			return nil, fmt.Errorf("vector: restore %s: %w", canonical, rerr)
 		}
 	}
 	_, _, _, walPath := s.persistPaths(canonical)
 	if rerr := c.replayWAL(walPath); rerr != nil {
 		_ = c.Close()
-		return fmt.Errorf("vector: wal replay %s: %w", canonical, rerr)
+		return nil, fmt.Errorf("vector: wal replay %s: %w", canonical, rerr)
 	}
 	w, werr := openWAL(walPath, cfg.WALNoSync)
 	if werr != nil {
 		_ = c.Close()
-		return fmt.Errorf("vector: wal open %s: %w", canonical, werr)
+		return nil, fmt.Errorf("vector: wal open %s: %w", canonical, werr)
 	}
 	c.wal = w
 	if s.isDurable(canonical) {
 		s.checkpointLargeLog(canonical, walPath, c)
-		s.removeMappedLeftovers(canonical)
 	}
-	s.collections[canonical] = c
-	return nil
+	return c, nil
 }
 
 // collectionPath returns the on-disk paths (cfg, snap) for a canonical name.
