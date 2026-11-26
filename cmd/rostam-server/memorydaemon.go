@@ -318,26 +318,32 @@ func defaultProjectRoot(flagVal string, getenv func(string) string, getwd func()
 		}
 		dir = wd
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), hookBudget)
+	ctx, cancel := context.WithTimeout(context.Background(), mcpRegistryWait)
 	defer cancel()
-	root, _ = identifyProject(ctx, dir)
+	root, _, _ = identifyProject(ctx, dir)
 	return root, dir
 }
 
 // mcpProjectNamespace resolves the default namespace for an mcp session that
-// needs one, reporting registry trouble on warn (stderr).
-func mcpProjectNamespace(nsDir string, warn func(msg string)) string {
+// needs one. Registry trouble that the hooks see the same way (corrupt,
+// unreadable, lock failure) is a warning, and the hashed name is used by both.
+// When nothing could be decided in mcpRegistryWait (registry lock held, git
+// not answering) it returns an error: pinning a guessed name for the whole
+// session would split it from the hooks, which use the registered name.
+func mcpProjectNamespace(nsDir string, warn func(msg string)) (string, error) {
+	if nsDir == "" {
+		return "", errors.New("mcp: no project directory (the working directory could not be read); pass -project-root or -namespace")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), mcpRegistryWait)
 	defer cancel()
 	_, ns, err := resolveNamespace(ctx, nsDir)
-	if err != nil {
-		if errors.Is(err, errRegistryBusy) {
-			warn(fmt.Sprintf("mcp: %v; using namespace %q for this session (the hooks inject nothing while the registry is busy, and may use the registered name later)", err, ns))
-		} else {
-			warn(fmt.Sprintf("mcp: %v; using namespace %q (the hooks fall back to the same name)", err, ns))
-		}
+	switch {
+	case namespaceUndecided(err):
+		return "", fmt.Errorf("mcp: cannot determine the project namespace within %s: %w; retry, or pass -namespace to choose one", mcpRegistryWait, err)
+	case err != nil:
+		warn(fmt.Sprintf("mcp: %v; using namespace %q (the hooks fall back to the same name)", err, ns))
 	}
-	return ns
+	return ns, nil
 }
 
 // mcpDefaultNamespace is the namespace `mcp` uses when a tool call omits one

@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"io"
 	"os"
@@ -300,8 +299,8 @@ func hookWork(ctx context.Context, in io.Reader, d hookDeps) (eventName, text st
 }
 
 // hookProject picks the project root and namespace: see hookDeps. ok is false
-// when the namespace registry stayed busy past the hook's budget: the hook
-// then injects nothing rather than guess a namespace mcp may not be using.
+// when git or the namespace registry did not answer within the hook's budget:
+// the hook then injects nothing rather than guess (and registers nothing).
 // Any other registry problem yields the same hashed name mcp falls back to,
 // so the two still agree.
 func hookProject(ctx context.Context, d hookDeps, cwd string) (root, namespace string, ok bool) {
@@ -317,7 +316,7 @@ func hookProject(ctx context.Context, d hookDeps, cwd string) (root, namespace s
 		dir = d.projectDir
 	}
 	root, namespace, err := resolveNamespace(ctx, dir)
-	if errors.Is(err, errRegistryBusy) {
+	if namespaceUndecided(err) {
 		return "", "", false
 	}
 	if explicit != "" {

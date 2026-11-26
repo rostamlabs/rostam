@@ -8,12 +8,33 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 )
 
-func regID(identity, base string) projectID { return projectID{identity: identity, base: base} }
+func regID(identity, base string) projectID {
+	return projectID{identity: identity, base: base, stable: base}
+}
+
+func identifyProject3(t *testing.T, ctx context.Context, dir string) (string, projectID) {
+	t.Helper()
+	root, id, ok := identifyProject(ctx, dir)
+	if !ok {
+		t.Fatalf("identifyProject(%s) timed out", dir)
+	}
+	return root, id
+}
+
+func mustMcpNS(t *testing.T, nsDir string) string {
+	t.Helper()
+	ns, err := mcpProjectNamespace(nsDir, func(m string) { t.Error(m) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ns
+}
 
 func mustNS(t *testing.T, dir string, id projectID) string {
 	t.Helper()
@@ -47,8 +68,11 @@ func TestRegistryAssignsAndSticks(t *testing.T) {
 		t.Fatalf("second project again = %q, want %q (sticky)", ns, nb)
 	}
 	fi, err := os.Stat(filepath.Join(dir, nsRegistryName))
-	if err != nil || fi.Mode().Perm() != 0o600 {
-		t.Fatalf("registry file: %v, mode %v; want 0600", err, fi.Mode().Perm())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 { // no POSIX modes on Windows
+		t.Fatalf("registry file mode %v; want 0600", fi.Mode().Perm())
 	}
 	// Sticky even after the owner of "api" disappears: b keeps its name.
 	if err := os.RemoveAll(a.identity); err != nil {
@@ -70,8 +94,8 @@ func TestRegistryTakeover(t *testing.T) {
 	}
 	mustNS(t, dir, owner)
 
-	// Owner unreachable (EACCES), not gone: no takeover.
-	if os.Getuid() != 0 {
+	// Owner unreachable (EACCES), not gone: no takeover. Needs POSIX modes.
+	if os.Getuid() != 0 && runtime.GOOS != "windows" {
 		if err := os.Chmod(filepath.Join(parent, "repo"), 0); err != nil {
 			t.Fatal(err)
 		}
@@ -122,7 +146,13 @@ func TestRegistryConcurrentFirstSessions(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			got[i] = mustNS(t, dir, ids[i])
+			// t.Fatalf only on the test goroutine: report and return here.
+			ns, err := projectNamespace(context.Background(), dir, ids[i])
+			if err != nil {
+				t.Errorf("projectNamespace(%s): %v", ids[i].identity, err)
+				return
+			}
+			got[i] = ns
 		}(i)
 	}
 	wg.Wait()
@@ -161,7 +191,7 @@ func TestRegistryUnusableFallsBackToHashed(t *testing.T) {
 		t.Fatalf("corrupt registry was rewritten: %q", b)
 	}
 
-	if os.Getuid() != 0 {
+	if os.Getuid() != 0 && runtime.GOOS != "windows" { // chmod 0 does not deny reads on Windows
 		dir2 := t.TempDir()
 		p2 := filepath.Join(dir2, nsRegistryName)
 		if err := os.WriteFile(p2, []byte(`{"version":1,"projects":{}}`), 0o600); err != nil {
@@ -183,8 +213,8 @@ func TestRegistryUnusableFallsBackToHashed(t *testing.T) {
 
 // A registry held past the deadline decides nothing: errRegistryBusy.
 func TestRegistryBusy(t *testing.T) {
-	if !flockSupported {
-		t.Skip("no flock on this platform")
+	if !registryLocked {
+		t.Skip("the registry is not locked on this platform")
 	}
 	dir := t.TempDir()
 	unlock, err := lockFileCtx(context.Background(), filepath.Join(dir, nsRegistryLockName))
@@ -224,12 +254,12 @@ func TestIdentifyProject(t *testing.T) {
 	wt := filepath.Join(base, "api-feature")
 	run(t, repo, "git", "worktree", "add", "-q", wt)
 
-	_, want := identifyProject(ctx, repo)
+	_, want := identifyProject3(t, ctx, repo)
 	if want.identity != repo || want.base != "api" {
 		t.Fatalf("repo identity = %+v", want)
 	}
 	for _, d := range []string{filepath.Join(link, "api"), wt} {
-		if _, got := identifyProject(ctx, d); got != want {
+		if _, got := identifyProject3(t, ctx, d); got != want {
 			t.Errorf("identifyProject(%s) = %+v, want %+v", d, got, want)
 		}
 	}
@@ -243,13 +273,13 @@ func TestIdentifyProject(t *testing.T) {
 		}
 		run(t, co, "git", "init", "-q", "--separate-git-dir", filepath.Join(base, n+"-gitdir"))
 		run(t, co, "git", "commit", "-q", "--allow-empty", "-m", "init")
-		_, id := identifyProject(ctx, co)
+		_, id := identifyProject3(t, ctx, co)
 		if id.base != "api" || id.identity != filepath.Join(base, n+"-gitdir") {
 			t.Fatalf("separate git dir identity = %+v", id)
 		}
 		w := filepath.Join(base, n+"-wt")
 		run(t, co, "git", "worktree", "add", "-q", w)
-		if _, wid := identifyProject(ctx, w); wid.identity != id.identity {
+		if _, wid := identifyProject3(t, ctx, w); wid.identity != id.identity {
 			t.Errorf("worktree of a separate-git-dir repo split: %+v vs %+v", wid, id)
 		}
 		seps = append(seps, id)
@@ -263,7 +293,7 @@ func TestIdentifyProject(t *testing.T) {
 	if err := os.MkdirAll(plain, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if root, id := identifyProject(ctx, plain); root != plain || id.identity != plain || id.base != "plain" {
+	if root, id := identifyProject3(t, ctx, plain); root != plain || id.identity != plain || id.base != "plain" {
 		t.Fatalf("non-git: root %s id %+v", root, id)
 	}
 }
@@ -304,7 +334,7 @@ func TestSameNamedProjectsDoNotShareMemory(t *testing.T) {
 	noEnv := func(string) string { return "" }
 	nsFor := func(dir string) string {
 		_, nsDir := defaultProjectRoot("", noEnv, func() (string, error) { return dir, nil })
-		return mcpProjectNamespace(nsDir, func(m string) { t.Error(m) })
+		return mustMcpNS(t, nsDir)
 	}
 	nsA, nsB := nsFor(a), nsFor(b)
 	if nsA != "api" || nsB == "api" || !strings.HasPrefix(nsB, "api-") {
@@ -329,11 +359,11 @@ func TestSameNamedProjectsDoNotShareMemory(t *testing.T) {
 	}
 }
 
-// While the registry is held past the hook's budget, the hook stays silent
-// (it does not guess); mcp falls back to the hashed name and warns.
-func TestRegistryBusyHookSilentMcpWarns(t *testing.T) {
-	if !flockSupported {
-		t.Skip("no flock on this platform")
+// While the registry is held past the deadline, neither side guesses: the
+// hook stays silent and mcp refuses to start.
+func TestRegistryBusyHookSilentMcpRefuses(t *testing.T) {
+	if !registryLocked {
+		t.Skip("the registry is not locked on this platform")
 	}
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
@@ -353,11 +383,14 @@ func TestRegistryBusyHookSilentMcpWarns(t *testing.T) {
 	if out := runHookStr(t, d, e.payload("s", "Read", filepath.Join(root, "a.go"))); out != "" {
 		t.Fatalf("hook with a busy registry wrote %q", out)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 100e6)
-	defer cancel()
-	_, ns, err := resolveNamespace(ctx, root)
-	if !errors.Is(err, errRegistryBusy) || ns != hashedNamespace(projectID{identity: root, base: "busy"}) {
-		t.Fatalf("resolveNamespace busy = %q, %v; want the hashed fallback and errRegistryBusy", ns, err)
+	// mcp does not pin a guessed name for the whole session: it refuses to
+	// start, telling the user to retry or pass -namespace.
+	orig := mcpRegistryWait
+	mcpRegistryWait = 100e6
+	t.Cleanup(func() { mcpRegistryWait = orig })
+	ns, err := mcpProjectNamespace(root, func(m string) { t.Errorf("unexpected warning %q", m) })
+	if err == nil || !errors.Is(err, errRegistryBusy) || !strings.Contains(err.Error(), "-namespace") || ns != "" {
+		t.Fatalf("mcp with a busy registry: %q, %v; want an error naming -namespace", ns, err)
 	}
 }
 
@@ -373,12 +406,114 @@ func TestCorruptRegistryMcpAndHookAgree(t *testing.T) {
 	}
 	root := gitRepoNamed(t, "proj")
 	var warned string
-	ns := mcpProjectNamespace(root, func(m string) { warned = m })
+	ns, err := mcpProjectNamespace(root, func(m string) { warned = m })
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !strings.Contains(warned, "corrupt") || ns == "proj" {
 		t.Fatalf("mcp: ns %q, warning %q; want a hashed name and a corrupt warning", ns, warned)
 	}
 	e := hookEnv{st: hookHeapStore(t), root: root, state: t.TempDir()}
 	if _, hns, ok := hookProject(context.Background(), e.deps("pre-tool-use"), root); !ok || hns != ns {
 		t.Fatalf("hook namespace %q (ok %v), mcp's %q", hns, ok, ns)
+	}
+}
+
+// "null" (or any JSON without projects) is corrupt and left untouched, never
+// read as an empty registry and overwritten.
+func TestRegistryNullIsCorrupt(t *testing.T) {
+	for _, body := range []string{"null", "{}", `{"version":1}`} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, nsRegistryName)
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		id := regID("/x/api", "api")
+		ns, err := projectNamespace(context.Background(), dir, id)
+		if err == nil || ns != hashedNamespace(id) {
+			t.Errorf("%s: %q, %v; want the hashed name and a corrupt warning", body, ns, err)
+		}
+		if b, _ := os.ReadFile(path); string(b) != body {
+			t.Errorf("%s: registry rewritten to %q", body, b)
+		}
+	}
+}
+
+// A hashed name already held by another identity (a project whose directory
+// is literally called that, or a hash collision) is not reused.
+func TestRegistryHashedNameIsCollisionFree(t *testing.T) {
+	dir := t.TempDir()
+	owner := regID(filepath.Join(t.TempDir(), "api"), "api")
+	second := regID(filepath.Join(t.TempDir(), "api"), "api")
+	squatter := regID(filepath.Join(t.TempDir(), hashedNamespace(second)), hashedNamespace(second))
+	for _, id := range []projectID{owner, second, squatter} {
+		if err := os.MkdirAll(id.identity, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustNS(t, dir, owner)
+	if ns := mustNS(t, dir, squatter); ns != hashedNamespace(second) {
+		t.Fatalf("squatter got %q, want its plain name %q", ns, hashedNamespace(second))
+	}
+	ns := mustNS(t, dir, second)
+	if ns == "api" || ns == hashedNamespace(second) || !strings.HasPrefix(ns, "api-") {
+		t.Fatalf("second project got %q; want an unused hashed name", ns)
+	}
+}
+
+// Worktrees of a separate-git-dir repository have different directory names
+// but one identity, so their hashed (fallback) names agree.
+func TestHashedNameStableAcrossSeparateGitDirWorktrees(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	co := filepath.Join(base, "api")
+	if err := os.MkdirAll(co, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run(t, co, "git", "init", "-q", "--separate-git-dir", filepath.Join(base, "api.git"))
+	run(t, co, "git", "commit", "-q", "--allow-empty", "-m", "init")
+	wt := filepath.Join(base, "feature")
+	run(t, co, "git", "worktree", "add", "-q", wt)
+	_, a := identifyProject3(t, context.Background(), co)
+	_, b := identifyProject3(t, context.Background(), wt)
+	if a.base == b.base {
+		t.Fatalf("test premise: worktree names should differ (%q)", a.base)
+	}
+	if hashedNamespace(a) != hashedNamespace(b) || !strings.HasPrefix(hashedNamespace(a), "api-") {
+		t.Fatalf("fallback names differ across worktrees: %q vs %q", hashedNamespace(a), hashedNamespace(b))
+	}
+}
+
+// When git does not answer in time the project is not identified, so nothing
+// is registered (a subdirectory must never claim a plain name), the hook
+// stays silent, and mcp refuses.
+func TestIdentifyTimeoutRegistersNothing(t *testing.T) {
+	dir := t.TempDir()
+	withRegistryDir(t, dir)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, err := resolveNamespace(ctx, t.TempDir())
+	if !namespaceUndecided(err) {
+		t.Fatalf("resolveNamespace with an expired ctx: %v; want undecided", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, nsRegistryName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("registry written after a failed identification: %v", err)
+	}
+}
+
+// mcp with no readable working directory does not register a junk identity.
+func TestMcpNamespaceNeedsADirectory(t *testing.T) {
+	dir := t.TempDir()
+	withRegistryDir(t, dir)
+	if _, err := mcpProjectNamespace("", func(string) {}); err == nil {
+		t.Fatal("mcpProjectNamespace(\"\") = nil error")
+	}
+	if _, err := os.Stat(filepath.Join(dir, nsRegistryName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("registry written for an empty project dir: %v", err)
 	}
 }

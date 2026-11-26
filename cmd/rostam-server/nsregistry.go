@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -47,14 +48,32 @@ const (
 // A variable so tests use a temporary one.
 var nsRegistryDir = defaultMemoryDir
 
+// errLockBusy: a lock was held by someone else until the caller's ctx ended.
+var errLockBusy = errors.New("lock is busy")
+
 // errRegistryBusy means another process held the registry lock until the
 // caller's deadline: no namespace was decided. The hook then stays silent.
 var errRegistryBusy = errors.New("namespace registry is busy")
 
+// errIdentifyTimeout means git did not answer before the caller's deadline, so
+// the project could not be identified and nothing was registered.
+var errIdentifyTimeout = errors.New("timed out identifying the project (git)")
+
+// namespaceUndecided reports the errors that leave no namespace decided: the
+// hook then injects nothing, and mcp refuses to start rather than pin a name
+// the hooks would not use.
+func namespaceUndecided(err error) bool {
+	return errors.Is(err, errRegistryBusy) || errors.Is(err, errIdentifyTimeout)
+}
+
 // projectID identifies a project for the registry.
 type projectID struct {
 	identity string // canonical main-repository path (see identifyProject)
-	base     string // the directory name the namespace is derived from
+	base     string // the directory name the plain namespace is (as before the registry)
+	// stable names the hashed namespaces: base, except for a separate-git-dir
+	// repository, whose worktrees have different directory names but must
+	// still agree on the hashed (fallback) name.
+	stable string
 }
 
 type nsRegistryFile struct {
@@ -62,10 +81,40 @@ type nsRegistryFile struct {
 	Projects map[string]string `json:"projects"` // identity -> namespace
 }
 
-// hashedNamespace is the name for an identity that cannot have the plain one.
-func hashedNamespace(id projectID) string {
+// hashedNamespace is the name for an identity that cannot have the plain one,
+// and the fallback when the registry cannot be used: <stable>-<8 hex>.
+func hashedNamespace(id projectID) string { return hashedNamespaceN(id, 4) }
+
+// hashedNamespaceN uses n bytes of the identity's hash (n <= 32).
+func hashedNamespaceN(id projectID, n int) string {
 	sum := sha256.Sum256([]byte(id.identity))
-	return id.base + "-" + hex.EncodeToString(sum[:4])
+	stable := id.stable
+	if stable == "" {
+		stable = id.base
+	}
+	return stable + "-" + hex.EncodeToString(sum[:n])
+}
+
+// freeHashedNamespace is hashedNamespace unless another identity already holds
+// that name (a 32-bit collision, or a project whose directory is literally
+// called that): then a longer hash, then a counter, until the name is unused.
+func freeHashedNamespace(id projectID, reg nsRegistryFile) string {
+	taken := make(map[string]bool, len(reg.Projects))
+	for owner, name := range reg.Projects {
+		if owner != id.identity {
+			taken[name] = true
+		}
+	}
+	for _, n := range []int{4, 8, 16, 32} {
+		if ns := hashedNamespaceN(id, n); !taken[ns] {
+			return ns
+		}
+	}
+	for i := 2; ; i++ {
+		if ns := fmt.Sprintf("%s-%d", hashedNamespaceN(id, 32), i); !taken[ns] {
+			return ns
+		}
+	}
 }
 
 // projectNamespace returns id's namespace from the registry in dir, assigning
@@ -94,9 +143,13 @@ func projectNamespace(ctx context.Context, dir string, id projectID) (string, er
 	case err != nil:
 		return hashedNamespace(id), fmt.Errorf("namespace registry %s unreadable: %w", path, err)
 	default:
-		if err := json.Unmarshal(b, &reg); err != nil || reg.Projects == nil {
+		// A fresh value: "null" or "{}" must read as corrupt, not as the
+		// empty registry it would leave a pre-filled one.
+		var got nsRegistryFile
+		if err := json.Unmarshal(b, &got); err != nil || got.Projects == nil {
 			return hashedNamespace(id), fmt.Errorf("namespace registry %s is corrupt (left as is; move it aside to rebuild): %v", path, err)
 		}
+		reg = got
 	}
 	if ns, ok := reg.Projects[id.identity]; ok {
 		return ns, nil
@@ -109,7 +162,7 @@ func projectNamespace(ctx context.Context, dir string, id projectID) (string, er
 		if _, err := os.Stat(owner); errors.Is(err, fs.ErrNotExist) { //nolint:gosec // G703: a recorded project path, only stat'ed
 			delete(reg.Projects, owner) // the owner is gone: its name is free
 		} else {
-			ns = hashedNamespace(id) // owned (or unknown): never share it
+			ns = freeHashedNamespace(id, reg) // owned (or unknown): never share it
 		}
 		break
 	}
@@ -158,7 +211,10 @@ func writeRegistry(dir, path string, reg nsRegistryFile) error {
 //
 // "Canonical" means symlinks resolved, so two paths to one checkout agree.
 // The name part matches what the namespace was before the registry existed.
-func identifyProject(ctx context.Context, dir string) (root string, id projectID) {
+//
+// ok is false when ctx ran out during the git calls: the result may be a
+// subdirectory instead of the repository, so it must not be registered.
+func identifyProject(ctx context.Context, dir string) (root string, id projectID, ok bool) {
 	root = dir
 	if out, ok := gitOut(ctx, dir, "rev-parse", "--show-toplevel"); ok {
 		root = out
@@ -174,9 +230,15 @@ func identifyProject(ctx context.Context, dir string) (root string, id projectID
 			id = projectID{identity: canonicalPath(main), base: filepath.Base(main)}
 		} else {
 			id.identity = canonicalPath(out)
+			if s := strings.TrimSuffix(filepath.Base(id.identity), ".git"); s != "" {
+				id.stable = s
+			}
 		}
 	}
-	return root, id
+	if id.stable == "" {
+		id.stable = id.base
+	}
+	return root, id, ctx.Err() == nil
 }
 
 func canonicalPath(p string) string {
@@ -191,22 +253,24 @@ func canonicalPath(p string) string {
 
 // resolveNamespace is THE project-namespace function: the hook and `mcp` both
 // call it, so they always agree. It returns the project root for dir and the
-// namespace the registry assigns to dir's project. err is a warning (the
-// returned hashed name is still the one to use), or errRegistryBusy, with the
-// hashed name as a fallback for callers that cannot simply skip (mcp).
+// namespace the registry assigns to dir's project. err is either a warning
+// (the returned hashed name is still the one to use, and the other side gets
+// the same one) or, when namespaceUndecided(err), a sign that no name was
+// decided and the caller must not use one.
 func resolveNamespace(ctx context.Context, dir string) (root, ns string, err error) {
-	root, id := identifyProject(ctx, dir)
+	root, id, ok := identifyProject(ctx, dir)
+	if !ok {
+		return root, hashedNamespace(id), errIdentifyTimeout
+	}
 	regDir, derr := nsRegistryDir()
 	if derr != nil {
 		regDir = ""
 	}
 	ns, err = projectNamespace(ctx, regDir, id)
-	if errors.Is(err, errRegistryBusy) {
-		ns = hashedNamespace(id)
-	}
 	return root, ns, err
 }
 
-// mcpRegistryWait bounds how long `mcp` waits for the registry lock; the hook
-// waits only as long as its own budget allows.
-const mcpRegistryWait = 5 * time.Second
+// mcpRegistryWait bounds how long `mcp` waits for git and the registry lock at
+// startup; the hook waits only as long as its own budget allows.
+// A variable so tests need not wait it out.
+var mcpRegistryWait = 30 * time.Second

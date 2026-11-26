@@ -248,7 +248,13 @@ func runMcpCmd(args []string) {
 	root, nsDir := defaultProjectRoot(*projectRoot, os.Getenv, os.Getwd)
 	resolvedNS := ""
 	if !visited["namespace"] && (*autostart || *projectRoot != "") {
-		resolvedNS = mcpProjectNamespace(nsDir, func(msg string) { log.Warn(msg) })
+		ns, err := mcpProjectNamespace(nsDir, func(msg string) { log.Warn(msg) })
+		if err != nil {
+			_ = rt.store.Close()
+			_ = unlock()
+			fatal(err.Error())
+		}
+		resolvedNS = ns
 	}
 	srv, err := mcp.NewServer(context.Background(), mcp.Config{
 		Store:            rt.store,

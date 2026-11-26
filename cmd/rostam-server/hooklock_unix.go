@@ -32,7 +32,7 @@ func lockSession(ctx context.Context, dir, sessionID string) (func(), bool) {
 		if err != nil {
 			return nil, false
 		}
-		if !flockWait(ctx, f) {
+		if flockWait(ctx, f) != nil {
 			_ = f.Close()
 			return nil, false
 		}
@@ -48,23 +48,24 @@ func lockSession(ctx context.Context, dir, sessionID string) (func(), bool) {
 var lockContendedHook func()
 
 // flockWait takes an exclusive flock on f, waiting out contention until ctx
-// ends. Only contention is worth waiting out; any other failure (ENOLCK,
-// ENOTSUP on a filesystem without flock) will not clear within the budget.
-func flockWait(ctx context.Context, f *os.File) bool {
+// ends (errLockBusy). Only contention is worth waiting out; any other failure
+// (ENOLCK, ENOTSUP on a filesystem without flock) will not clear within the
+// budget and is returned at once.
+func flockWait(ctx context.Context, f *os.File) error {
 	for first := true; ; first = false {
 		err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
 		if err == nil {
-			return true
+			return nil
 		}
 		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
-			return false
+			return err
 		}
 		if first && lockContendedHook != nil {
 			lockContendedHook()
 		}
 		select {
 		case <-ctx.Done():
-			return false
+			return errLockBusy
 		case <-time.After(2 * time.Millisecond):
 		}
 	}
@@ -79,9 +80,6 @@ func sameFileAsPath(f *os.File, path string) bool {
 	return err == nil && os.SameFile(fi, pi)
 }
 
-// errLockBusy: the lock was held by someone else until ctx ended.
-var errLockBusy = errors.New("lock is busy")
-
 // lockFileCtx takes an exclusive flock on path (created 0600), waiting out
 // contention until ctx ends (errLockBusy). Any other flock failure is
 // returned as is. The file is never unlinked.
@@ -90,23 +88,15 @@ func lockFileCtx(ctx context.Context, path string) (func(), error) {
 	if err != nil {
 		return nil, err
 	}
-	for {
-		err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
-		if err == nil {
-			return func() { _ = f.Close() }, nil
-		}
-		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
-			_ = f.Close()
-			return nil, err
-		}
-		select {
-		case <-ctx.Done():
-			_ = f.Close()
-			return nil, errLockBusy
-		case <-time.After(2 * time.Millisecond):
-		}
+	if err := flockWait(ctx, f); err != nil {
+		_ = f.Close()
+		return nil, err
 	}
+	return func() { _ = f.Close() }, nil
 }
+
+// registryLocked: the namespace registry is serialised across processes.
+const registryLocked = true
 
 // removeLockIfFree unlinks a session lock file only while holding its flock,
 // so no hook is inside its critical section; a hook already waiting on the
