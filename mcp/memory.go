@@ -32,8 +32,8 @@ const (
 	// else stays user metadata. Memories written before it existed sort by
 	// seconds, as before.
 	updatedNsField = "__updated_ns"
-	defaultNS     = "default"        // namespace used when the caller omits one
-	kvEmbedder    = "__mcp/embedder" // KV key: the embedIdentity this store was bootstrapped with
+	defaultNS      = "default"        // namespace used when the caller omits one
+	kvEmbedder     = "__mcp/embedder" // KV key: the embedIdentity this store was bootstrapped with
 )
 
 // embedIdentity fingerprints the embedder a data dir's mcp_memory collection
