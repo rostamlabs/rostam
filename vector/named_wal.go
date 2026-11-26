@@ -111,8 +111,8 @@ func writeNamedSparseVectors(buf *bytes.Buffer, sparseVectors map[string]*Sparse
 
 // readNamedSparseVectors is the inverse of writeNamedSparseVectors. It tolerates
 // EOF (a dense-only record with no trailing block) by returning (nil, true). A
-// present flag with a truncated body returns (nil, false) so replay stops at the
-// durability boundary.
+// present flag with a truncated body returns (nil, false), and replay fails with
+// ErrLogDamaged.
 func readNamedSparseVectors(r *bytes.Reader) (map[string]*SparseVector, bool) {
 	var flag [1]byte
 	if _, err := io.ReadFull(r, flag[:]); err != nil {
@@ -189,8 +189,8 @@ func replayNamedWAL(path string, nc *NamedCollection) error {
 }
 
 // replayNamedRecord decodes one named record payload and re-applies it onto nc.
-// Returns false on a malformed body so replay stops at the durability boundary
-// (mirrors dense replayRecord). Apply errors from the mutators are swallowed —
+// Returns errStopReplay on a malformed body, which replayFramed reports as
+// ErrLogDamaged (mirrors dense replayRecord). Apply errors from the mutators are swallowed —
 // replay is idempotent on top of the snapshot checkpoint.
 func replayNamedRecord(payload []byte, nc *NamedCollection) error {
 	r := bytes.NewReader(payload)

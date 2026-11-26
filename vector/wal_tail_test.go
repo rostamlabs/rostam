@@ -427,3 +427,105 @@ func TestLaterFrameExistsAcrossWindows(t *testing.T) {
 		})
 	}
 }
+
+// TestWALFailedWriteNeverAcksBehindPartialFrame injects a write that lands only
+// part of a frame (ENOSPC after the header, mid-header, or mid-payload). The
+// failed append must not be acknowledged, no later append may be acknowledged
+// behind the partial bytes, and reopening must succeed with every acknowledged
+// record. The "cut fails" case closes the file inside the failed write, so the
+// partial bytes stay on disk and the next open must treat them as a torn tail.
+func TestWALFailedWriteNeverAcksBehindPartialFrame(t *testing.T) {
+	recA := []byte{byte(walDelete), 0, 0, 0, 0, 0, 0, 0, 1}
+	recB := []byte{byte(walDelete), 0, 0, 0, 0, 0, 0, 0, 2}
+	recC := []byte{byte(walDelete), 0, 0, 0, 0, 0, 0, 0, 3}
+	cases := []struct {
+		name     string
+		keep     int // bytes of the failing frame that reach the file
+		closeFil bool
+	}{
+		{"mid header", 3, false},
+		{"header only", 8, false},
+		{"mid payload", 12, false},
+		{"mid payload, cut fails", 12, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "x.wal")
+			w, err := openWAL(path, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := w.appendFramed(recA); err != nil {
+				t.Fatalf("append A: %v", err)
+			}
+
+			left := tc.keep // bytes the failing frame may still write
+			w.writeHook = func(f *os.File, p []byte) (int, error) {
+				n := len(p)
+				if n > left {
+					n = left
+				}
+				left -= n
+				m, err := f.Write(p[:n])
+				if err != nil {
+					return m, err
+				}
+				if m < len(p) {
+					if tc.closeFil {
+						_ = f.Close()
+					}
+					return m, errors.New("injected: no space left on device")
+				}
+				return m, nil
+			}
+			seqB, err := w.appendFramedStaged(recB)
+			if err == nil {
+				if cerr := w.commitWaitStaged(seqB); cerr == nil {
+					t.Fatal("append B acknowledged despite a failed write")
+				}
+			}
+			w.writeHook = nil
+
+			seqC, err := w.appendFramedStaged(recC)
+			if err == nil {
+				if cerr := w.commitWaitStaged(seqC); cerr == nil {
+					t.Fatal("append C acknowledged behind a failed write")
+				}
+			}
+			if err := w.appendFramed(recC); err == nil {
+				t.Fatal("blocking append acknowledged behind a failed write")
+			}
+			_ = w.close()
+
+			var got [][]byte
+			if err := replayFramed(path, func(rec []byte) error {
+				got = append(got, append([]byte(nil), rec...))
+				return nil
+			}); err != nil {
+				t.Fatalf("replay after failed write: %v", err)
+			}
+			if len(got) != 1 || !bytes.Equal(got[0], recA) {
+				t.Fatalf("replayed %v, want only record A", got)
+			}
+
+			w2, err := openWAL(path, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := w2.appendFramed(recC); err != nil {
+				t.Fatalf("append after reopen: %v", err)
+			}
+			_ = w2.close()
+			got = nil
+			if err := replayFramed(path, func(rec []byte) error {
+				got = append(got, append([]byte(nil), rec...))
+				return nil
+			}); err != nil {
+				t.Fatalf("second replay: %v", err)
+			}
+			if len(got) != 2 || !bytes.Equal(got[0], recA) || !bytes.Equal(got[1], recC) {
+				t.Fatalf("replayed %v, want A then C", got)
+			}
+		})
+	}
+}

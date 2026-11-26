@@ -147,6 +147,9 @@ type wal struct {
 	// park followers behind one in-flight flight (proving batch-on-contention).
 	onSync     func()
 	beforeSync func()
+	// writeHook, when set, replaces w.f.Write in the append path so a test can
+	// land a short write (e.g. ENOSPC partway through a frame).
+	writeHook func(f *os.File, p []byte) (int, error)
 }
 
 // ErrWALPoisoned is returned by every append/commit-wait entry point once the
@@ -237,7 +240,8 @@ func writeOptVersion(buf *bytes.Buffer, version uint64) {
 // readOptVersion is the inverse of writeOptVersion. It tolerates EOF (an OLD
 // record predating the version block) by returning (0, true) — replay then
 // defaults the version (a fresh insert → 1, a payload restore → leave as-is). A
-// torn block (flag present but truncated body) returns (0, false) so replay stops.
+// malformed block (flag present but truncated body) returns (0, false), and
+// replay fails with ErrLogDamaged.
 func readOptVersion(r io.Reader) (uint64, bool) {
 	var flag [1]byte
 	if _, err := io.ReadFull(r, flag[:]); err != nil {
@@ -386,14 +390,7 @@ func (w *wal) appendFramed(payload []byte) error {
 		w.mu.Unlock()
 		return ErrWALPoisoned
 	}
-	var hdr [8]byte
-	binary.BigEndian.PutUint32(hdr[0:4], uint32(len(payload))) //nolint:gosec
-	binary.BigEndian.PutUint32(hdr[4:8], crc32.ChecksumIEEE(payload))
-	if _, err := w.f.Write(hdr[:]); err != nil {
-		w.mu.Unlock()
-		return err
-	}
-	if _, err := w.f.Write(payload); err != nil {
+	if err := w.writeFrameLocked(payload); err != nil {
 		w.mu.Unlock()
 		return err
 	}
@@ -411,6 +408,54 @@ func (w *wal) appendFramed(payload []byte) error {
 		return nil // noSync path unchanged: write only, no fsync, no commit-wait.
 	}
 	return w.commitWait(mySeq)
+}
+
+// writeFrameLocked appends [payloadLen u32][crc32 u32][payload]. Caller holds
+// w.mu.
+//
+// A FAILED WRITE POISONS THE LOG. A write that fails (ENOSPC, EIO) may have
+// landed part of the frame. If the log kept accepting appends, later records
+// would be written, fsynced and acknowledged BEHIND those partial bytes, and the
+// next open would refuse the log as damaged (a complete record follows bad
+// bytes), stranding every one of those acknowledged writes. So the first failed
+// write trips the same terminal latch as a failed fsync: no later append is
+// accepted and no waiter is acknowledged until a reopen. The partial bytes are
+// then cut back (best effort, still under w.mu so no other frame is behind them);
+// if the cut fails they stay at the end of the file, where the next open's
+// replay reads them as a torn tail and cuts them itself.
+//
+// Poisoning rather than cutting and carrying on is the safer choice with group
+// commit: the device has just refused a write, and a writer whose complete bytes
+// precede the failed frame is at worst told its write failed (it may still
+// replay — the same at-least-once outcome as an errored in-flight write), never
+// acknowledged on bytes that a later open could refuse.
+func (w *wal) writeFrameLocked(payload []byte) error {
+	var hdr [8]byte
+	binary.BigEndian.PutUint32(hdr[0:4], uint32(len(payload))) //nolint:gosec
+	binary.BigEndian.PutUint32(hdr[4:8], crc32.ChecksumIEEE(payload))
+	n, err := w.write(hdr[:])
+	if err == nil {
+		var m int
+		m, err = w.write(payload)
+		n += m
+	}
+	if err == nil {
+		return nil
+	}
+	w.poisoned.Store(true)
+	if n > 0 {
+		if st, serr := w.f.Stat(); serr == nil && st.Size() >= int64(n) {
+			_ = w.f.Truncate(st.Size() - int64(n))
+		}
+	}
+	return err
+}
+
+func (w *wal) write(p []byte) (int, error) {
+	if w.writeHook != nil {
+		return w.writeHook(w.f, p)
+	}
+	return w.f.Write(p)
 }
 
 // appendFramedStaged is appendFramed's WRITE phase only: identical bytes,
@@ -449,14 +494,7 @@ func (w *wal) appendFramedStaged(payload []byte) (uint64, error) {
 		w.mu.Unlock()
 		return 0, ErrWALPoisoned
 	}
-	var hdr [8]byte
-	binary.BigEndian.PutUint32(hdr[0:4], uint32(len(payload))) //nolint:gosec
-	binary.BigEndian.PutUint32(hdr[4:8], crc32.ChecksumIEEE(payload))
-	if _, err := w.f.Write(hdr[:]); err != nil {
-		w.mu.Unlock()
-		return 0, err
-	}
-	if _, err := w.f.Write(payload); err != nil {
+	if err := w.writeFrameLocked(payload); err != nil {
 		w.mu.Unlock()
 		return 0, err
 	}
@@ -708,8 +746,10 @@ func replayFramed(path string, apply func(rec []byte) error) error {
 
 // ErrLogDamaged is returned when a write-ahead log cannot be replayed and the
 // damage is not a half-written tail: a complete record follows the bad bytes,
-// or a record passes its checksum but cannot be decoded. The log is left as it
-// was; recovering means moving it aside by hand (losing the records it holds).
+// or a record passes its checksum but cannot be decoded. The error names the
+// file and the offset, and the log is left as it was. To recover, stop the
+// process, keep a copy of the named file, then truncate it at the named offset:
+// that keeps every record before the offset and loses the ones after it.
 var ErrLogDamaged = errors.New("vector: write-ahead log damaged")
 
 func damagedLog(path string, end int64) error {
@@ -833,9 +873,9 @@ var errStopReplay = errors.New("vector: WAL record body undecodable")
 // replayWAL reads path and invokes onInsert/onDelete/onSetPayload for each intact
 // DENSE record, in order. It is a thin wrapper over the shared replayFramed core:
 // the per-record apply closure runs the dense replayRecord switch over the 3
-// dense record types, returning false on an unknown tag or malformed body so
-// replay stops at the durability boundary exactly as before. A missing file
-// replays nothing.
+// dense record types. A malformed body fails the replay with ErrLogDamaged and an
+// unknown tag with errUnknownWALRecord; a torn tail is cut by replayFramed. A
+// missing file replays nothing.
 func replayWAL(
 	path string,
 	onInsert func(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64),
@@ -966,7 +1006,7 @@ func readOptMeta(r io.Reader) (Metadata, bool) {
 // readOptKeyExpires is the inverse of writeOptKeyExpires. It tolerates EOF (an
 // OLD walSetPayload record predating the per-key-TTL block) by returning
 // (nil, true) — no per-key TTL, replay continues. A torn block (flag present but
-// truncated body) returns (nil, false) so replay stops at the durability boundary.
+// truncated body) returns (nil, false), and replay fails with ErrLogDamaged.
 func readOptKeyExpires(r io.Reader) (map[string]uint64, bool) {
 	var flag [1]byte
 	if _, err := io.ReadFull(r, flag[:]); err != nil {

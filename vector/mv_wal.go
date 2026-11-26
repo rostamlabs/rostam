@@ -89,8 +89,8 @@ func writeOptMVSparse(buf *bytes.Buffer, sparse *SparseVector) {
 
 // readOptMVSparse is the inverse of writeOptMVSparse. It tolerates EOF (a
 // dense-only record with no trailing block) by returning (nil, true). A present
-// flag with a truncated body returns (nil, false) so replay stops at the
-// durability boundary.
+// flag with a truncated body returns (nil, false), and replay fails with
+// ErrLogDamaged.
 func readOptMVSparse(r *bytes.Reader) (*SparseVector, bool) {
 	var flag [1]byte
 	if _, err := io.ReadFull(r, flag[:]); err != nil {
@@ -154,8 +154,8 @@ func replayMVWAL(path string, m *MultiVectorIndex) error {
 }
 
 // replayMVRecord decodes one MV record payload and re-applies it onto m. Returns
-// false on a malformed body so replay stops at the durability boundary (mirrors
-// named replayNamedRecord). Apply errors from the mutators are swallowed — replay
+// errStopReplay on a malformed body, which replayFramed reports as ErrLogDamaged
+// (mirrors named replayNamedRecord). Apply errors from the mutators are swallowed — replay
 // is idempotent on top of the snapshot checkpoint.
 func replayMVRecord(payload []byte, m *MultiVectorIndex) error {
 	r := bytes.NewReader(payload)
@@ -238,7 +238,7 @@ func replayMVRecord(payload []byte, m *MultiVectorIndex) error {
 		}
 		// Optional trailing doc-level sparse block (AFTER the version). An OLD record
 		// (no block) reads nil → the dense-only path; a present-but-truncated block
-		// stops replay at the durability boundary.
+		// fails replay with ErrLogDamaged.
 		sparse, ok := readOptMVSparse(r)
 		if !ok {
 			return errStopReplay
