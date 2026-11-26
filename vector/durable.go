@@ -5,6 +5,7 @@ package vector
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"maps"
 	"os"
@@ -56,6 +57,19 @@ func (s *CollectionStore) isDurable(canonical string) bool {
 	}
 	_, ok := s.durable[canonical]
 	return ok
+}
+
+// warnNotDurable warns, when canonical is listed as durable, that this
+// collection does not get the synced write-ahead log: kind says what it is (a
+// named-vector or multi-vector collection, or a dense one on a store with no
+// data directory, whose files are removed at Close). Called at create and at
+// open, so a listed name is never left unprotected silently.
+func (s *CollectionStore) warnNotDurable(canonical, kind string) {
+	if !s.isDurable(canonical) {
+		return
+	}
+	slog.Warn("vector: durable collection is not crash-safe: only a dense collection in a store with a data directory runs with the synced write-ahead log",
+		"collection", canonical, "kind", kind)
 }
 
 // durableConfig returns cfg with the durable mode applied when canonical is a
@@ -268,7 +282,13 @@ func (s *CollectionStore) keepOrphanSnapshot(canonical string, walCfg Config, sn
 		return true
 	}
 	kept := fmt.Sprintf("%s.kept-%d", snapPath, time.Now().UnixNano())
-	if err := renameDurable(snapPath, kept); err != nil {
+	// Not renameDurable: it removes its source when the rename fails, and the
+	// source here is the snapshot that may hold the collection.
+	err := os.Rename(snapPath, kept)
+	if err == nil {
+		err = syncDirf(filepath.Dir(kept))
+	}
+	if err != nil {
 		slog.Warn("vector: durable collection is not crash-safe: it has a snapshot but no sidecar, and the snapshot could not be moved aside, so it is not upgraded",
 			"collection", canonical, "snapshot", snapPath, "err", err)
 		return false
@@ -320,11 +340,12 @@ func (s *CollectionStore) convertToDurable(canonical string, old *Collection, cf
 	if err := s.verifySnapshot(canonical, walCfg, snapPath, fresh.Stats().Size); err != nil {
 		return fail(err)
 	}
-	// A log left from an earlier life would replay over the snapshot. Its removal
-	// is made durable before the manifest can name the log path again.
+	// A log left from an earlier life would replay over the snapshot. It is
+	// moved aside (or, when empty, removed), durably, before the manifest can
+	// name the log path again.
 	_, _, _, walPath := s.persistPaths(canonical)
-	if err := os.Remove(walPath); err != nil && !os.IsNotExist(err) {
-		return fail(fmt.Errorf("vector: removing a stale log: %w", err))
+	if err := setStaleLogAside(canonical, walPath); err != nil {
+		return fail(err)
 	}
 	if err := syncDirf(filepath.Dir(walPath)); err != nil {
 		return fail(fmt.Errorf("vector: fsync dir %s: %w", filepath.Dir(walPath), err))
@@ -361,6 +382,36 @@ func (s *CollectionStore) convertToDurable(canonical string, old *Collection, cf
 		return upgradeResult{err: fmt.Errorf("vector: replacing the manifest: %w; reading it back: %v; putting the old one back: %v", werr, rerr, perr)}
 	}
 	return fail(fmt.Errorf("vector: replacing the manifest: %w; reading it back: %v", werr, rerr))
+}
+
+// setStaleLogAside clears the log path of a collection being upgraded. A log
+// there is normally left from an earlier life, but it can hold acknowledged
+// writes: a log-form manifest whose directory sync failed, then a power loss,
+// leaves the old manifest in force over a log that was written to. So a
+// non-empty one is never deleted: it is renamed to <log>.stale-<unixnano>, which
+// no open reads, and a warning names it. An empty one is removed. The caller
+// syncs the directory.
+func setStaleLogAside(canonical, walPath string) error {
+	st, err := os.Lstat(walPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("vector: checking for a stale log: %w", err)
+	}
+	if st.Size() == 0 {
+		if err := os.Remove(walPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("vector: removing an empty stale log: %w", err)
+		}
+		return nil
+	}
+	kept := fmt.Sprintf("%s.stale-%d", walPath, time.Now().UnixNano())
+	if err := os.Rename(walPath, kept); err != nil {
+		return fmt.Errorf("vector: moving a stale log aside: %w", err)
+	}
+	slog.Warn("vector: a durable collection being upgraded had a log beside its old manifest; it was moved aside, not replayed, and may hold writes made before an earlier interrupted upgrade",
+		"collection", canonical, "kept", kept, "bytes", st.Size())
+	return nil
 }
 
 // verifySnapshot proves the snapshot just written restores, with the config the

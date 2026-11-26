@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -229,6 +230,31 @@ func OpenCollectionStoreWith(dir string, opts StoreOptions) (store *CollectionSt
 	return s, nil
 }
 
+// fileExists reports whether path names an existing file. An error other than
+// not-exist counts as existing, so a caller refusing on it stays safe.
+func fileExists(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil || !errors.Is(err, fs.ErrNotExist)
+}
+
+// openSnapshotFile opens a snapshot for reading. A variable so tests can make
+// the open fail.
+var openSnapshotFile = os.Open
+
+// openSnapshot opens the snapshot at path. A missing file is "no snapshot" and
+// returns (nil, nil); any other error is returned, so a snapshot that exists
+// but cannot be read fails the open instead of loading the collection empty.
+func openSnapshot(path string) (*os.File, error) {
+	f, err := openSnapshotFile(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return f, nil
+}
+
 // loadCollection reads cfg + snapshot for one collection and registers it
 // under its canonical name. Used by OpenCollectionStore's two passes.
 func (s *CollectionStore) loadCollection(canonical, cfgPath, snapPath string) error {
@@ -294,7 +320,12 @@ func (s *CollectionStore) loadCollection(canonical, cfgPath, snapPath string) er
 	if err != nil {
 		return fmt.Errorf("vector: rebuild %s: %w", canonical, err)
 	}
-	if f, err := os.Open(snapPath); err == nil {
+	f, err := openSnapshot(snapPath)
+	if err != nil {
+		_ = c.Close()
+		return fmt.Errorf("vector: open snapshot %s: %w", canonical, err)
+	}
+	if f != nil {
 		rerr := c.Restore(f)
 		_ = f.Close()
 		if rerr != nil {
@@ -332,12 +363,26 @@ func (s *CollectionStore) buildWALCollection(canonical string, cfg Config, cfgPa
 	if nerr != nil {
 		return nil, fmt.Errorf("vector: rebuild %s: %w", canonical, nerr)
 	}
-	if f, oerr := os.Open(snapPath); oerr == nil {
+	f, oerr := openSnapshot(snapPath)
+	if oerr != nil {
+		_ = c.Close()
+		return nil, fmt.Errorf("vector: open snapshot %s: %w", canonical, oerr)
+	}
+	if f != nil {
 		rerr := c.Restore(f)
 		_ = f.Close()
 		if rerr != nil {
 			_ = c.Close()
 			return nil, fmt.Errorf("vector: restore %s: %w", canonical, rerr)
+		}
+	} else if s.isDurable(canonical) {
+		// The upgrade writes the snapshot before the manifest names the log form,
+		// so a missing snapshot beside the earlier form's sidecar was lost, not
+		// never written: loading would serve an empty collection and remove the
+		// sidecar. Fail the open and touch nothing.
+		if _, _, metaPath, _ := s.persistPaths(canonical); fileExists(metaPath) {
+			_ = c.Close()
+			return nil, fmt.Errorf("vector: open %s: the manifest names the write-ahead log form but its snapshot %s is missing while the sidecar %s of its earlier form is still there; nothing was changed", canonical, snapPath, metaPath)
 		}
 	}
 	_, _, _, walPath := s.persistPaths(canonical)
@@ -550,6 +595,9 @@ func (s *CollectionStore) CreateCollection(name string, cfg Config) error {
 		return err
 	}
 	cfg = s.durableConfig(canonical, cfg)
+	if s.ephemeralDir {
+		s.warnNotDurable(canonical, "dense collection in a store with no data directory")
+	}
 	defer s.lockName(canonical)()
 	s.mu.Lock()
 	defer s.mu.Unlock()

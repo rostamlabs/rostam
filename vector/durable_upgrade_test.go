@@ -895,3 +895,53 @@ func TestInterruptedUpgradeWithUnloadableSnapshotFailsOpen(t *testing.T) {
 		}
 	}
 }
+
+// TestUpgradeMovesANonEmptyStaleLogAside: a log beside a Persistent manifest
+// may hold acknowledged writes (a log-form manifest whose directory sync failed,
+// then a power loss, puts the old manifest back over it). The upgrade never
+// deletes a non-empty one: it is moved aside under a distinct name, with a
+// warning, and an empty one is simply removed.
+func TestUpgradeMovesANonEmptyStaleLogAside(t *testing.T) {
+	for _, stale := range [][]byte{[]byte("stale log bytes"), {}} {
+		name := "non-empty"
+		if len(stale) == 0 {
+			name = "empty"
+		}
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			want := writeLegacyStore(t, dir)
+			walPath := colFile(dir, ".wal")
+			if err := os.WriteFile(walPath, stale, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			logs := captureLogs(t)
+			cs := openDurable(t, dir, upgradeCol)
+			defer func() { _ = cs.Close() }()
+			assertDurableManifest(t, manifestOf(t, dir, upgradeCol))
+			assertLegacyPoints(t, cs, want, true)
+			if got := fileSize(t, walPath); got != 0 {
+				t.Fatalf("log after upgrade is %d bytes, want a fresh empty log", got)
+			}
+			kept, _ := filepath.Glob(walPath + ".stale-*")
+			if len(stale) == 0 {
+				if len(kept) != 0 {
+					t.Fatalf("an empty stale log was kept aside: %v", kept)
+				}
+				return
+			}
+			if len(kept) != 1 {
+				t.Fatalf("stale log kept aside as %v, want one file", kept)
+			}
+			got, err := os.ReadFile(kept[0]) //nolint:gosec // test temp dir
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, stale) {
+				t.Fatalf("kept-aside log holds %q, want %q", got, stale)
+			}
+			if !strings.Contains(logs.String(), kept[0]) {
+				t.Fatalf("no warning names the kept-aside log %s:\n%s", kept[0], logs.String())
+			}
+		})
+	}
+}

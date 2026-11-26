@@ -85,6 +85,7 @@ func (s *CollectionStore) CreateNamedConfig(name string, cfg NamedConfig) error 
 	if verr := validateNamedVectors(cfg.Spaces); verr != nil {
 		return verr
 	}
+	s.warnNotDurable(canonical, "named-vector collection")
 	// Cluster mode: Raft/SnapshotAll is the durability authority — never enable a
 	// single-node WAL (mirror dense effectiveClusterConfig forcing WAL=false). DO
 	// NOT touch the cluster snapshot/Raft path.
@@ -147,6 +148,7 @@ func (s *CollectionStore) loadNamed(canonical, cfgPath string) error {
 	if err != nil {
 		return fmt.Errorf("vector: load named %s: %w", canonical, err)
 	}
+	s.warnNotDurable(canonical, "named-vector collection")
 	nc, err := NewNamedCollection(canonical, cfg.Spaces)
 	if err != nil {
 		return fmt.Errorf("vector: rebuild named %s: %w", canonical, err)
@@ -154,7 +156,12 @@ func (s *CollectionStore) loadNamed(canonical, cfgPath string) error {
 	nc.suppressSweep = s.persistentCluster // cluster: sweeper off (#4 B3a; see CreateNamedConfig)
 	_, snapPath, walPath := s.namedPaths(canonical)
 	// Restore the consistent checkpoint (if any), then replay the WAL tail on top.
-	if f, oerr := os.Open(snapPath); oerr == nil { //nolint:gosec // store-managed path
+	f, oerr := openSnapshot(snapPath)
+	if oerr != nil {
+		_ = nc.Close()
+		return fmt.Errorf("vector: open snapshot named %s: %w", canonical, oerr)
+	}
+	if f != nil {
 		rerr := nc.Restore(f)
 		_ = f.Close()
 		if rerr != nil {
