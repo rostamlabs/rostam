@@ -9,10 +9,9 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   directory and in the memory daemon, the memory collection now has a
   write-ahead log: a `remember` or `forget` that was acknowledged is still there
   after the process is killed, at the price of one disk sync per remembered or
-  forgotten memory. One exception: if a memory is being replaced (same `key`, or
-  identical content) and the process is killed before the call answers, the old
-  version can be gone without the new one stored. A killed process is what is
-  tested; power-loss safety rests on the disk sync and is not claimed as tested.
+  forgotten memory. Replacing a memory (same `key`, or identical content) is one
+  log record, so a kill before the call answers leaves the old version or the
+  new one, never neither. A killed process is what is tested; power-loss safety rests on the disk sync and is not claimed as tested.
   An existing store is converted in place at the first start; if that fails it
   opens in its old form with a `not crash-safe` warning and the next start tries
   again. The memory collection is now held in RAM. `mcp -autostart` replaces a

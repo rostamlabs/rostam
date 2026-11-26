@@ -316,6 +316,9 @@ func (s *CollectionStore) FlushMVWAL(name string) error {
 // intact. It uses the MV snapshot/restore HEAP codec (not the mmap SavePersist
 // sidecar) — the destination that makes WAL mode distinct from Persistent.
 func (s *CollectionStore) writeMVWALSnapshotFile(idx *MultiVectorIndex, path string) error {
+	if err := idx.wal.refuseCheckpoint(); err != nil {
+		return err // memory may be ahead of a poisoned log; see refuseCheckpoint
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return err
 	}

@@ -1094,11 +1094,13 @@ func (s *CollectionStore) Flush(name string) error {
 	// on a different lock. It also costs a lot: the "checkpoint subsumes the
 	// truncated log" invariant above stops being free (wal.truncate is
 	// Truncate(0); a prefix truncate would need new crash-safe machinery), and
-	// dense replay is not a general replay-over-a-newer-snapshot primitive —
-	// an insert record for an already-live id is silently dropped
-	// (vector/arena.go:376, error discarded at collection.go's replayWAL).
-	// See vector/flush_snapshot_lock_test.go, which pins both facts and flips to
-	// failing if snapshot serialization ever stops excluding writers.
+	// replay over a snapshot is only known correct when the snapshot holds the
+	// state at the START or the END of the log (an insert record replaces the
+	// id's point via restoreReplace, so either way the log's last record per id
+	// wins); a snapshot cut mid-log, which writes landing during serialization
+	// would produce, is not designed for. See vector/flush_snapshot_lock_test.go,
+	// which flips to failing if snapshot serialization ever stops excluding
+	// writers.
 	if c.cfg.WAL {
 		c.opMu.Lock()
 		defer c.opMu.Unlock()
@@ -1123,6 +1125,9 @@ func (s *CollectionStore) Flush(name string) error {
 
 // writeSnapshotFile atomically writes c's snapshot to path (tmp + fsync + rename).
 func (s *CollectionStore) writeSnapshotFile(c *Collection, path string) error {
+	if err := c.wal.refuseCheckpoint(); err != nil {
+		return err // memory may be ahead of a poisoned log; see refuseCheckpoint
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return err
 	}

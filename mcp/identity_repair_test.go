@@ -225,7 +225,7 @@ func TestRepairIdentityOtherEmbedderSameDim(t *testing.T) {
 func putPoint(t *testing.T, st rostam.Store, id uint64, content string, wrong bool) {
 	t.Helper()
 	ctx := context.Background()
-	var emb semcache.Embedder = semcache.NewStubEmbedder("stub", 64)
+	emb := semcache.NewStubEmbedder("stub", 64)
 	if wrong {
 		emb = newSaltedEmbedder()
 	}

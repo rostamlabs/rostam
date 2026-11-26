@@ -73,11 +73,12 @@ disk sync per `remember` and one per forgotten memory. A killed process is what
 is tested. Safety against power loss rests on that sync and is not claimed as
 tested.
 
-One case is not covered. Replacing a memory (a `remember` with a `key` that
-already exists, or of content identical to an earlier one) removes the old
-version and then adds the new one. If the process is killed, or the log write
-fails, before that call has answered, the old version can be gone without the
-new one having been stored. Run the `remember` again.
+Replacing a memory (a `remember` with a `key` that already exists, or of
+content identical to an earlier one) is written to the log as one record. If
+the process is killed, or the log write fails, before that call has answered,
+the store holds either the old version or the new one, never neither; once the
+call has answered, it holds the new one. A replace that is refused (an error
+from the call) leaves the old version.
 
 On a clean shutdown (the client closing the connection, `SIGINT` or `SIGTERM`)
 the log is folded into a snapshot and emptied. The same happens at startup when
@@ -85,11 +86,12 @@ the log has grown past 16 MiB. The memory collection is held in RAM and loaded
 from the snapshot and the log at startup.
 
 If writing the log fails (a full disk, for example), the collection refuses
-further writes until the process holding the store is restarted. Free the space
-first, then restart the session, or for the shared daemon run
-`rostam-server memory-daemon -stop` and start a new session. A change that was
-reported as failed may or may not be there afterwards, so check before relying
-on it.
+further writes until the process holding the store is restarted, and the
+shutdown does not fold the log into the snapshot: the files are left as they
+were, and the next start replays them. Free the space first, then restart the
+session, or for the shared daemon run `rostam-server memory-daemon -stop` and
+start a new session. A change that was reported as failed may or may not be
+there afterwards, so check before relying on it.
 
 Only `mcp_memory` gets this. Collections made with the generic tools keep their
 own mode: a `persistent` one is saved at a clean shutdown, and a forced stop can

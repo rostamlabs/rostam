@@ -228,10 +228,11 @@ func recordMalformedErr(key string, err error) error {
 // before the engine body they delegate to runs its own gate, so their pass
 // cannot be dropped or downgraded to size-only:
 //
-//   - Upsert is delete-then-insert. Its wrapper pass runs before
-//     idxDeleteLogged; without it a malformed record deletes the existing point
-//     and only then fails in insertBody, so a REJECTED write destroys the data it
-//     was replacing. TestMalformedRecordRejectedAtIngestDense fails exactly that
+//   - Upsert without a log is delete-then-insert. Its wrapper pass runs before
+//     the delete; without it a malformed record deletes the existing point and
+//     only then fails in insertBody, so a REJECTED write destroys the data it
+//     was replacing. (A log-backed upsert replaces atomically and would refuse
+//     cleanly, but shares the wrapper.) TestMalformedRecordRejectedAtIngestDense fails exactly that
 //     way if the wrapper is downgraded.
 //   - BuildStaged hands the staged slices to the engine and CLEARS the stage
 //     buffer before BuildConcurrentMeta's gate runs, so a record that got past

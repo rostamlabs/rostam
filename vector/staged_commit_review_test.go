@@ -50,6 +50,13 @@ func (p *panicOnceIndex) Delete(id uint64, cas CASCond) (bool, error) {
 	return p.VectorIndex.Delete(id, cas)
 }
 
+func (p *panicOnceIndex) replaceInsert(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond, stamped bool, nowMs uint64) (uint64, map[string]uint64, error) {
+	if p.target == "replaceInsert" && p.armed.CompareAndSwap(true, false) {
+		panic("panicOnceIndex: forced panic (B1 opMu-leak regression test)")
+	}
+	return p.VectorIndex.replaceInsert(id, vec, ttl, meta, sparse, keyTTLMs, cas, stamped, nowMs)
+}
+
 func (p *panicOnceIndex) RestoreInsert(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64) error {
 	if p.target == "RestoreInsert" && p.armed.CompareAndSwap(true, false) {
 		panic("panicOnceIndex: forced panic (B1 opMu-leak regression test)")
@@ -118,11 +125,9 @@ func TestOpMuReleasedOnPanicInsert(t *testing.T) {
 	})
 }
 
-// TestOpMuReleasedOnPanicUpsert is the B1 regression test for the
-// delete-then-insert staged closure (Collection.UpsertCASKeyTTL,
-// collection.go:661), which has the extra delSeq bookkeeping B2 added — a
-// panic inside idx.Delete (BEFORE the insert even runs) while opMu is held
-// must still release opMu.
+// TestOpMuReleasedOnPanicUpsert is the B1 regression test for the logged
+// upsert's staged closure (Collection.upsertLogged): a panic inside the
+// index's atomic replace while opMu is held must still release opMu.
 func TestOpMuReleasedOnPanicUpsert(t *testing.T) {
 	dir := t.TempDir()
 	cs, err := OpenCollectionStore(dir)
@@ -146,7 +151,7 @@ func TestOpMuReleasedOnPanicUpsert(t *testing.T) {
 	if err := c.Insert(1, vec, 0, nil, nil); err != nil {
 		t.Fatalf("initial Insert: %v", err)
 	}
-	c.idx = newPanicOnceIndex(c.idx, "Delete")
+	c.idx = newPanicOnceIndex(c.idx, "replaceInsert")
 
 	func() {
 		defer func() {
@@ -164,15 +169,12 @@ func TestOpMuReleasedOnPanicUpsert(t *testing.T) {
 	})
 }
 
-// TestUpsertDimMismatchWaitsOnStagedDelete is the B2 regression test
-// (wall-clock path, collection.go:UpsertCASKeyTTL): idxDeleteLogged stages the
-// replace-delete (no wait of its own); the following idx.Insert then fails
-// with an ordinary bad request (ErrDimMismatch). The error must still surface,
-// but the staged delete must be fsync-covered (commitWaitStaged called) BEFORE
-// the function returns — otherwise a crash right after could leave the
-// in-memory delete durable-but-unlogged, and replay would resurrect a point no
-// client ever observed as deleted.
-func TestUpsertDimMismatchWaitsOnStagedDelete(t *testing.T) {
+// TestUpsertDimMismatchKeepsOldPoint (wall-clock path, Collection.UpsertCASKeyTTL):
+// a replace refused with an ordinary bad request (ErrDimMismatch) surfaces the
+// error and changes nothing — the old point stays live in memory and nothing
+// is logged, so memory and log agree. (It used to delete the point and stage a
+// delete record before the insert failed.)
+func TestUpsertDimMismatchKeepsOldPoint(t *testing.T) {
 	dir := t.TempDir()
 	cs, err := OpenCollectionStore(dir)
 	if err != nil {
@@ -205,19 +207,17 @@ func TestUpsertDimMismatchWaitsOnStagedDelete(t *testing.T) {
 		t.Fatalf("Upsert with wrong dim: err = %v, want ErrDimMismatch", err)
 	}
 
-	if got := syncs.Load(); got == 0 {
-		t.Fatal("B2 regression: the staged replace-delete was never fsync-covered before the insert error surfaced")
+	if got := syncs.Load(); got != 0 {
+		t.Fatalf("a refused replace synced the log %d times; it must log nothing", got)
 	}
-	// The delete already applied in memory (apply-then-log discipline); the
-	// point is gone even though the re-insert failed.
-	if c.Exists(1) {
-		t.Fatal("point 1 should have been removed by the replace-delete even though the re-insert failed")
+	if !c.Exists(1) {
+		t.Fatal("a refused replace removed the point it was replacing")
 	}
 }
 
-// TestUpsertAtDimMismatchWaitsOnStagedDelete is the B2 regression test for the
-// leader-apply-stamped variant (UpsertCASKeyTTLAt, collection.go:1023).
-func TestUpsertAtDimMismatchWaitsOnStagedDelete(t *testing.T) {
+// TestUpsertAtDimMismatchKeepsOldPoint is TestUpsertDimMismatchKeepsOldPoint for
+// the leader-apply-stamped variant (UpsertCASKeyTTLAt).
+func TestUpsertAtDimMismatchKeepsOldPoint(t *testing.T) {
 	dir := t.TempDir()
 	cs, err := OpenCollectionStore(dir)
 	if err != nil {
@@ -250,11 +250,11 @@ func TestUpsertAtDimMismatchWaitsOnStagedDelete(t *testing.T) {
 	if !errors.Is(err, ErrDimMismatch) {
 		t.Fatalf("UpsertCASKeyTTLAt with wrong dim: err = %v, want ErrDimMismatch", err)
 	}
-	if got := syncs.Load(); got == 0 {
-		t.Fatal("B2 regression (At variant): the staged replace-delete was never fsync-covered before the insert error surfaced")
+	if got := syncs.Load(); got != 0 {
+		t.Fatalf("a refused replace synced the log %d times; it must log nothing", got)
 	}
-	if c.Exists(1) {
-		t.Fatal("point 1 should have been removed by the replace-delete even though the re-insert failed")
+	if !c.Exists(1) {
+		t.Fatal("a refused replace removed the point it was replacing")
 	}
 }
 

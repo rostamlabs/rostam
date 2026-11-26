@@ -154,9 +154,8 @@ must stay the same for the life of `~/.rostam/memory`.
 
 The daemon runs its server with `-durable-collections mcp_memory`, so a
 `remember` or `forget` that was acknowledged survives the daemon being killed,
-at the price of a disk sync per change. The rules, and the one exception
-(replacing a memory and being killed before the call answers), are the same as
-for plain `mcp`: see [What survives a crash](mcp.md#what-survives-a-crash).
+at the price of a disk sync per change. The rules are the same as for plain
+`mcp`: see [What survives a crash](mcp.md#what-survives-a-crash).
 
 - **Existing stores** are [converted](mcp.md#upgrading-an-existing-store) when
   the new daemon first starts. If that fails, the daemon still runs and logs a

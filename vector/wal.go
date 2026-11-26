@@ -350,12 +350,10 @@ func writeOptKeyExpires(buf *bytes.Buffer, ke map[string]uint64) {
 // appendFramedStaged): it returns the assigned commit sequence and the caller
 // waits on it outside opMu.
 //
-// Two callers, two ways of satisfying the staged-write contract. DeleteCAS /
-// DeleteCASAt commitWaitStaged the returned seq directly. An upsert's
-// replace-delete does NOT wait separately: its durability is subsumed by the
-// commit-wait on the FOLLOWING insert's sequence (the delete's bytes are written
-// first under the same opMu, so any Sync covering the insert's seq also covers
-// this earlier seq).
+// Its callers, DeleteCAS / DeleteCASAt, commitWaitStaged the returned seq. An
+// upsert never logs a delete: a replace is ONE insert record (see
+// Collection.upsertLogged), so no crash can land between a delete and the
+// insert that was meant to follow it.
 func (w *wal) appendDeleteStaged(id uint64) (uint64, error) {
 	var buf bytes.Buffer
 	buf.WriteByte(byte(walDelete))
@@ -462,8 +460,7 @@ func (w *wal) write(p []byte) (int, error) {
 // identical ordering under w.mu, but it returns the assigned commit sequence
 // instead of blocking on the durability wait. The caller MUST eventually call
 // commitWaitStaged(seq) (directly or via a later staged write whose own wait
-// covers this seq, e.g. an upsert's staged delete folded into its insert's
-// wait) so every staged write is either waited on or provably subsumed by a
+// covers this seq) so every staged write is either waited on or provably subsumed by a
 // later one on the SAME wal — the durability contract from appendFramed still
 // applies, just decoupled from the caller's lock hold time. This is the
 // STAGED half of the split-commit optimization described in the wal type doc:
@@ -643,6 +640,26 @@ func (w *wal) truncate() error {
 	}
 	w.cond.Broadcast()
 	w.syncMu.Unlock()
+	return nil
+}
+
+// refuseCheckpoint returns ErrWALPoisoned when w is poisoned, nil otherwise
+// (and for a nil w: a collection without a log).
+//
+// EVERY PATH THAT WRITES A SNAPSHOT OF A LOG-BACKED COLLECTION CALLS IT FIRST,
+// under the collection's opMu. Once the log is poisoned, memory may be AHEAD of
+// it: a write refused after its in-memory apply (a delete, a replace, an insert
+// whose append or fsync failed) is still applied in memory. A snapshot written
+// from that state would make the refused write permanent, and the truncate that
+// follows would fail only after the snapshot had replaced the good one, so an
+// acknowledged old version would be gone for good. Refusing before the snapshot
+// leaves the snapshot and the log on disk exactly as they were, and a reopen
+// replays the acknowledged state. truncate's own poison check stays as the
+// second line.
+func (w *wal) refuseCheckpoint() error {
+	if w != nil && w.poisoned.Load() {
+		return ErrWALPoisoned
+	}
 	return nil
 }
 

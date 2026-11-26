@@ -214,6 +214,9 @@ func (s *CollectionStore) FlushNamed(name string) error {
 // rename), mirroring writeSnapshotFile so a crash mid-write leaves the prior good
 // checkpoint intact.
 func (s *CollectionStore) writeNamedSnapshotFile(nc *NamedCollection, path string) error {
+	if err := nc.wal.refuseCheckpoint(); err != nil {
+		return err // memory may be ahead of a poisoned log; see refuseCheckpoint
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return err
 	}

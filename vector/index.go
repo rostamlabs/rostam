@@ -462,6 +462,19 @@ type VectorIndex interface {
 	// still installed VERBATIM) — the replicated version-preserving insert path (#4
 	// vector TTL determinism).
 	RestoreInsertAt(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64, nowMs int64) error
+	// replaceInsert is Insert (stamped=false, wall clock) or InsertAt
+	// (stamped=true, judged at nowMs) that also accepts a LIVE id: cas is judged
+	// against the id's live version, and the old point is replaced by the new one
+	// in the same critical section, past every check that can refuse the write
+	// (rate limit, dimension, quota, CAS). A refused replace changes nothing, and
+	// no reader sees the id absent in between. The resulting version is 1, as
+	// for a fresh insert. It is the write a log-backed Collection's upsert logs as
+	// ONE insert record, so a crash can never leave the old point deleted and the
+	// new one missing.
+	replaceInsert(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond, stamped bool, nowMs uint64) (version uint64, keyExpires map[string]uint64, err error)
+	// restoreReplace is RestoreInsert that also accepts a LIVE id, replacing its
+	// point in one critical section — how a dense insert record is replayed.
+	restoreReplace(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64) error
 	// InsertIfAbsent inserts only if id is not currently live (returns
 	// inserted=false on a no-op), atomically (one critical section, no
 	// check-then-act gap). The online-copy primitive that, with Raft

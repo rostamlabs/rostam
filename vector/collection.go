@@ -815,9 +815,9 @@ func (c *Collection) BuildStaged(workers int) error {
 
 // Upsert inserts or replaces the record for id with the given vector, document
 // content, TTL, metadata, and sparse vector — the RAG-store write path. Content
-// is retrievable via SearchDocs and survives persistence. Replace is
-// delete-then-insert (HNSW has no in-place vector update); both ops are WAL-
-// logged when a WAL is configured.
+// is retrievable via SearchDocs and survives persistence. With a WAL the replace
+// is one atomic index step logged as one insert record (see upsertLogged);
+// without one it is delete-then-insert (HNSW has no in-place vector update).
 func (c *Collection) Upsert(id uint64, vec []float32, content string, ttl time.Duration, meta Metadata, sparse *SparseVector) error {
 	_, err := c.UpsertCAS(id, vec, content, ttl, meta, sparse, CASCond{})
 	return err
@@ -830,12 +830,12 @@ func (c *Collection) UpsertKeyTTL(id uint64, vec []float32, content string, ttl 
 	return err
 }
 
-// UpsertCAS is Upsert with an optimistic-CAS precondition. Because Upsert is
-// delete-then-insert (HNSW has no in-place vector update), the version would reset
-// across the delete; so the precondition is checked against the point's CURRENT
-// version (before the delete) under opMu, then the replace runs unconditionally
-// and the resulting version is returned. A mismatch returns ErrVersionConflict
-// with NO mutation. The fresh-insert version is always 1.
+// UpsertCAS is Upsert with an optimistic-CAS precondition. Because a replace
+// resets the version (HNSW has no in-place vector update), the precondition is
+// checked against the point's CURRENT version (before the replace) under opMu,
+// then the replace runs and the resulting version is returned. A mismatch
+// returns ErrVersionConflict with NO mutation. The fresh-insert version is
+// always 1.
 func (c *Collection) UpsertCAS(id uint64, vec []float32, content string, ttl time.Duration, meta Metadata, sparse *SparseVector, cas CASCond) (uint64, error) {
 	return c.UpsertCASKeyTTL(id, vec, content, ttl, meta, sparse, nil, cas)
 }
@@ -845,104 +845,79 @@ func (c *Collection) UpsertCAS(id uint64, vec []float32, content string, ttl tim
 // deadlines; the WAL logs them so replay restores them verbatim. Empty/nil
 // keyTTLMs is the zero-overhead path.
 func (c *Collection) UpsertCASKeyTTL(id uint64, vec []float32, content string, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond) (uint64, error) {
-	// THE FULL GATE, HERE, EVEN THOUGH insertBody RUNS IT AGAIN. Upsert is
-	// delete-then-insert, and the delete below is irreversible: downgrade this to
-	// checkRecordValuesSize and a malformed record deletes the existing point and
-	// only THEN fails inside c.idx.Insert, so a REFUSED write destroys the data it
-	// was replacing. That is the one shape of this bug that is worse than the
-	// poison the gate prevents, so this path decodes the record twice on purpose.
+	// THE FULL GATE, HERE, EVEN THOUGH insertBody RUNS IT AGAIN. Upsert without a
+	// log is delete-then-insert, and the delete below is irreversible: downgrade
+	// this to checkRecordValuesSize and a malformed record deletes the existing
+	// point and only THEN fails inside c.idx.Insert, so a REFUSED write destroys
+	// the data it was replacing. That is the one shape of this bug that is worse
+	// than the poison the gate prevents, so this path decodes the record twice on
+	// purpose.
 	// See checkRecordValues' doc and TestRecordValidationCountPerWrite.
 	if err := checkRecordValues(meta); err != nil {
 		return 0, err
 	}
 	c.startSweeper()
-	// opMu is held across {apply + WAL WRITE} only, scoped to a closure (see
-	// InsertCASKeyTTL) so a panic inside idx.Get/Delete/Insert or a WAL append
-	// still unlocks opMu via the deferred Unlock instead of leaking it forever.
-	//
-	// waitSeq is the seq the caller must wait on AFTER the closure returns: the
-	// insert's seq on the happy path (which also covers the earlier staged
-	// delete — same file, same opMu, so a Sync covering the insert covers the
-	// delete too), or the delete's OWN seq if the insert never got a seq of its
-	// own (a CAS mismatch, dim mismatch, quota rejection, or the append itself
-	// failing) — an already-staged delete write is never made durable by
-	// anything else, so it must still be waited on before the error surfaces (0
-	// = nothing was staged, a no-op wait).
-	version, waitSeq, err := func() (uint64, uint64, error) {
+	if c.wal == nil {
+		// Without a log: delete-then-insert, unchanged (the CAS judged against the
+		// version before the delete; passing it to the insert would re-check it
+		// against the post-delete version of 0).
 		c.opMu.Lock()
 		defer c.opMu.Unlock()
 		if cas.Has {
 			_, _, _, _, cur, _ := c.idx.Get(id) // current version (0 if absent)
 			if cur != cas.Expected {
-				return 0, 0, ErrVersionConflict
+				return 0, ErrVersionConflict
 			}
 		}
-		// Unconditional delete-then-insert; the CAS was already enforced above
-		// (passing the engine cas here would re-check against the post-delete
-		// version of 0). A failed delete-WAL-append fails the upsert (delSeq is 0
-		// on error, so nothing is left to wait on).
-		delSeq, derr := c.idxDeleteLogged(id)
-		if derr != nil {
-			return 0, 0, derr
-		}
-		version, keyExpires, err := c.idx.Insert(id, vec, ttl, withContent(meta, content), sparse, keyTTLMs, CASCond{})
+		_, _ = c.idx.Delete(id, CASCond{})
+		version, _, err := c.idx.Insert(id, vec, ttl, withContent(meta, content), sparse, keyTTLMs, CASCond{})
+		return version, err
+	}
+	return c.upsertLogged(id, vec, content, ttl, meta, sparse, func(m Metadata) (uint64, map[string]uint64, error) {
+		return c.idx.replaceInsert(id, vec, ttl, m, sparse, keyTTLMs, cas, false, 0)
+	})
+}
+
+// upsertLogged is the replace of a log-backed collection: apply replaces the
+// point in the index in ONE step (VectorIndex.replaceInsert, which refuses
+// without touching the old point), and the result is logged as ONE insert record,
+// which replay applies as "the id now holds this point" (restoreReplace). There
+// is no delete record, so no interruption — a kill, a torn tail, a short write, a
+// failed fsync — can leave a log that deletes the old version without adding the
+// new one: a reopen holds one or the other, and the new one once acknowledged.
+//
+// A failure to log after apply has replaced the point in memory leaves memory
+// AHEAD of the log. A failed write already poisons the log; any other append
+// error (an encode failure, which checkRecordValues makes unreachable) poisons it
+// here, so the in-memory state the caller was refused is never checkpointed (see
+// writeSnapshotFile) and a reopen holds the log's state: the old version.
+//
+// opMu is held across {apply + WAL WRITE} only, scoped to a closure (see
+// InsertCASKeyTTL) so a panic inside apply or the append still unlocks it, then
+// released before the durability wait so concurrent writers group-commit.
+func (c *Collection) upsertLogged(id uint64, vec []float32, content string, ttl time.Duration, meta Metadata, sparse *SparseVector, apply func(Metadata) (uint64, map[string]uint64, error)) (uint64, error) {
+	version, seq, err := func() (uint64, uint64, error) {
+		c.opMu.Lock()
+		defer c.opMu.Unlock()
+		m := withContent(meta, content)
+		version, keyExpires, err := apply(m)
 		if err != nil {
-			return 0, delSeq, err
+			return 0, 0, err
 		}
-		if c.wal == nil {
-			return version, 0, nil
-		}
-		// Only the LAST record (the insert) needs the durability wait: the delete's
-		// bytes were staged (written, not waited-on) earlier under this same opMu, so
-		// a Sync covering the insert's seq also covers the delete's — one fsync per
-		// upsert instead of two.
-		seq, err := c.wal.appendInsertStaged(id, vec, ttl, withContent(meta, content), sparse, keyExpires, version)
+		seq, err := c.wal.appendInsertStaged(id, vec, ttl, m, sparse, keyExpires, version)
 		if err != nil {
-			return 0, delSeq, err
+			c.wal.poisoned.Store(true)
+			return 0, 0, err
 		}
 		return version, seq, nil
 	}()
 	if err != nil {
-		if waitSeq != 0 {
-			// Ensure the already-staged delete is durable before surfacing the
-			// error (best-effort, mirrors idxDeleteLogged's own discipline): the
-			// in-memory delete already happened, so its WAL record must not be
-			// left un-waited (appendFramedStaged's contract).
-			_ = c.wal.commitWaitStaged(waitSeq)
-		}
 		return 0, err
 	}
-	if waitSeq != 0 {
-		if werr := c.wal.commitWaitStaged(waitSeq); werr != nil {
-			return 0, werr
-		}
+	if err := c.wal.commitWaitStaged(seq); err != nil {
+		return 0, err
 	}
 	return version, nil
-}
-
-// idxDeleteLogged deletes id (unconditionally) and, on a WAL-mode collection,
-// stages the delete's WAL write. Caller holds opMu. Returns the assigned staged
-// sequence (0 when nothing was staged: no WAL, or the delete was a no-op) and
-// the WAL append error, if any.
-//
-// The append error is PROPAGATED, not swallowed: idempotent replay tolerates a
-// torn/duplicate delete record, but it must not mask a durability FAILURE — the
-// caller fails the whole upsert so the client is never acked on a replace whose
-// tombstone never reached disk.
-//
-// Does NOT wait on this write's own sequence — the upsert replace path folds it
-// into the FOLLOWING insert's single commit-wait (fix for the double-fsync-per-
-// upsert: the delete's bytes precede the insert's in the file, written under the
-// same opMu, so a Sync covering the insert's seq covers this delete's too) — or,
-// if the insert never reaches its own append, the CALLER must explicitly wait on
-// the returned seq before returning (see UpsertCASKeyTTL): a staged write is
-// never itself durable without a later wait on its seq or a larger one.
-func (c *Collection) idxDeleteLogged(id uint64) (uint64, error) {
-	ok, _ := c.idx.Delete(id, CASCond{})
-	if !ok || c.wal == nil {
-		return 0, nil
-	}
-	return c.wal.appendDeleteStaged(id)
 }
 
 // SearchDocs runs a filtered KNN search and returns each hit enriched with its
@@ -1358,79 +1333,35 @@ func (c *Collection) DeleteByFilterAt(filter Filter, nowMs int64) (int, error) {
 }
 
 // UpsertCASKeyTTLAt is UpsertCASKeyTTL under a leader apply stamp: it enforces the
-// CAS precondition against the STAMP-live version and tombstones the prior point via
-// DeleteAt (a CAS-enforcing stamped delete — the At analog of the wall-clock Get
-// precheck + unconditional delete), then re-inserts via InsertAt so the point/per-key
-// deadlines are stamped identically on every replica (#4 vector TTL determinism).
+// CAS precondition against the STAMP-live version and stamps the point/per-key
+// deadlines at nowMs so they are identical on every replica (#4 vector TTL
+// determinism). Without a log it tombstones the prior point via DeleteAt (a
+// CAS-enforcing stamped delete) and re-inserts via InsertAt; with one it replaces
+// atomically and logs one record, as UpsertCASKeyTTL does.
 func (c *Collection) UpsertCASKeyTTLAt(id uint64, vec []float32, content string, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond, nowMs int64) (uint64, error) {
 	// The full gate before the tombstone, for the reason UpsertCASKeyTTL states:
-	// this path deletes before it inserts, so a size-only check here would let a
-	// malformed record destroy the point it was refused from replacing.
+	// without a log this path deletes before it inserts, so a size-only check
+	// here would let a malformed record destroy the point it was refused from
+	// replacing.
 	if err := checkRecordValues(meta); err != nil {
 		return 0, err
 	}
 	c.startSweeper()
-	// opMu is held across {apply + WAL WRITE} only, scoped to a closure (see
-	// UpsertCASKeyTTL) so a panic inside idx.DeleteAt/InsertAt or a WAL append
-	// still unlocks opMu via the deferred Unlock instead of leaking it forever.
-	// waitSeq follows the same contract as UpsertCASKeyTTL's: the insert's seq on
-	// the happy path (covers the earlier staged delete too), or the delete's own
-	// seq if the insert never got one of its own — 0 means nothing was staged.
-	version, waitSeq, err := func() (uint64, uint64, error) {
+	if c.wal == nil {
+		// Without a log: delete-then-insert, unchanged. DeleteAt enforces the CAS
+		// against the stamp-live version with no mutation on a mismatch.
 		c.opMu.Lock()
 		defer c.opMu.Unlock()
-		// CAS-enforcing stamped delete: on a mismatch it returns ErrVersionConflict
-		// with no mutation (like the non-At Get precheck); with CASCond{} it is the
-		// unconditional replace-delete. Judges liveness on the stamp.
-		removed, err := c.idx.DeleteAt(id, cas, nowMs)
-		if err != nil {
-			return 0, 0, err
+		if _, err := c.idx.DeleteAt(id, cas, nowMs); err != nil {
+			return 0, err
 		}
-		// Stage the delete's WAL write (no wait of its own): its durability is
-		// folded into the following insert's single commit-wait on the happy path,
-		// or explicitly waited on by the caller below otherwise.
-		var delSeq uint64
-		if removed && c.wal != nil {
-			// Propagate the delete-WAL-append error (mirrors UpsertCASKeyTTL): a
-			// durability failure fails the upsert rather than silently acking a
-			// replace whose tombstone never reached disk. delSeq stays 0 on error.
-			var derr error
-			delSeq, derr = c.wal.appendDeleteStaged(id)
-			if derr != nil {
-				return 0, delSeq, derr
-			}
-		}
-		version, keyExpires, err := c.idx.InsertAt(id, vec, ttl, withContent(meta, content), sparse, keyTTLMs, CASCond{}, nowMs)
-		if err != nil {
-			return 0, delSeq, err
-		}
-		if c.wal == nil {
-			return version, 0, nil
-		}
-		// Only the LAST record (the insert) needs the durability wait: the delete's
-		// bytes were staged earlier under this same opMu, so a Sync covering the
-		// insert's seq also covers the delete's — one fsync per upsert instead of two.
-		seq, err := c.wal.appendInsertStaged(id, vec, ttl, withContent(meta, content), sparse, keyExpires, version)
-		if err != nil {
-			return 0, delSeq, err
-		}
-		return version, seq, nil
-	}()
-	if err != nil {
-		if waitSeq != 0 {
-			// Ensure the already-staged delete is durable before surfacing the
-			// error: the in-memory delete already happened, so its WAL record must
-			// not be left un-waited (appendFramedStaged's contract).
-			_ = c.wal.commitWaitStaged(waitSeq)
-		}
-		return 0, err
+		version, _, err := c.idx.InsertAt(id, vec, ttl, withContent(meta, content), sparse, keyTTLMs, CASCond{}, nowMs)
+		return version, err
 	}
-	if waitSeq != 0 {
-		if werr := c.wal.commitWaitStaged(waitSeq); werr != nil {
-			return 0, werr
-		}
-	}
-	return version, nil
+	// One atomic replace logged as one record; see upsertLogged.
+	return c.upsertLogged(id, vec, content, ttl, meta, sparse, func(m Metadata) (uint64, map[string]uint64, error) {
+		return c.idx.replaceInsert(id, vec, ttl, m, sparse, keyTTLMs, cas, true, uint64(nowMs)) //nolint:gosec // stamped unix-millis is non-negative
+	})
 }
 
 // payloadOpCASChanged is payloadOpCAS for an op that may legitimately apply
@@ -1497,13 +1428,18 @@ func (c *Collection) payloadOpCAS(cas CASCond, op func(CASCond) (Metadata, map[s
 // errors are ignored — replay is meant to be idempotent on top of the checkpoint.
 func (c *Collection) replayWAL(path string) error {
 	return replayWAL(path,
-		// Replay an insert via the version-preserving RestoreInsert so the logged
-		// version is restored VERBATIM (NOT re-bumped). An old WAL record (no version
-		// block) replays version 0 → RestoreInsert defaults a fresh insert to 1.
+		// An insert record says "after this op the id holds this point": a logged
+		// upsert over a live id is ONE such record (see upsertLogged), so replay
+		// replaces a live point rather than colliding with it. Every insert record
+		// ever logged has that meaning — a plain insert is logged only when the id
+		// was absent or dead — so the same rule replays logs written before the
+		// change, whose upserts are a delete record and then an insert record. The
+		// version is restored VERBATIM (NOT re-bumped); an old WAL record (no
+		// version block) replays version 0 → a fresh insert defaults to 1.
 		func(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64) {
 			// Restore the logged absolute per-key deadlines VERBATIM (NOT recomputed
 			// now+ttl) so pending key deadlines survive a crash time-stable.
-			_ = c.idx.RestoreInsert(id, vec, ttl, meta, sparse, keyExpires, version)
+			_ = c.idx.restoreReplace(id, vec, ttl, meta, sparse, keyExpires, version)
 		},
 		func(id uint64) { _, _ = c.idx.Delete(id, CASCond{}) },
 		// Replay a payload mutation by restoring the logged resulting payload AND
