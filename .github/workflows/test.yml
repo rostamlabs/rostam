@@ -340,6 +340,14 @@ jobs:
       - name: Test (vector mmap/persist round-trip, targeted)
         run: go test -count=1 -timeout 15m -run 'Mmap|Persist|Reopen|Grow|Reserve|Slab' -skip 'Concurrent|Latency|SIFT' ./vector/
 
+      # The namespace registry's Windows lock (cmd/rostam-server/
+      # nslock_windows.go: LockFileEx with a retry loop) is what keeps two
+      # first sessions of same-named projects from both taking the plain name;
+      # no other lane runs it. The registry tests are pure Go and need only the
+      # filesystem (and git, which the runner has).
+      - name: Test (namespace registry, targeted)
+        run: go test -count=1 -timeout 10m -run '^TestRegistry' ./cmd/rostam-server/
+
       # The filesystem backup store publishes a write-once snapshot with a hard
       # link (CreateHardLinkW here), whose refusal of an existing name is what
       # makes concurrent backups at one timestamp publish exactly once. Linux

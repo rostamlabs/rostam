@@ -131,6 +131,9 @@ func TestRegistryTakeover(t *testing.T) {
 // Many first sessions of same-named projects at once: exactly one gets the
 // plain name, and every identity ends up with one stable name.
 func TestRegistryConcurrentFirstSessions(t *testing.T) {
+	if !registryLocked {
+		t.Skip("the registry is not locked on this platform")
+	}
 	dir := t.TempDir()
 	const n = 16
 	ids := make([]projectID, n)

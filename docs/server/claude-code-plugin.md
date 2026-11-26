@@ -102,8 +102,12 @@ Limits:
   hashed name is used and the file is left untouched; `mcp` says so on stderr
   and the hooks use the same name. That fallback name is not checked against
   other projects (the registry could not be read), so in this state two
-  projects could in principle share a name (a 32-bit hash collision). Fix or
-  move aside the file to restore the checked assignments.
+  projects could in principle share a name (a 32-bit hash collision). Repairing
+  `namespaces.json` restores the checked assignments; moving it aside instead
+  rebuilds the registry from scratch, so the first same-named project to open
+  then takes the plain name. A lock failure is about `namespaces.lock` or the
+  `~/.rostam/memory` directory itself (permissions, a filesystem without
+  locking): fix that, since moving `namespaces.json` does not help.
 - If the registry stays locked, or git does not answer, past the caller's
   deadline, no name is decided and none is registered: that hook injects
   nothing (800 ms budget), and `mcp` refuses to start after 30 s with an error
