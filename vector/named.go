@@ -2218,6 +2218,11 @@ const namedSnapshotMinReadVersion = 1
 // space name + the shared per-point meta/ttl/ids state) to w. Mirrors
 // MultiVectorIndex.snapshot. Safe to call concurrently with reads.
 func (nc *NamedCollection) Snapshot(w io.Writer) error {
+	// Refused while the log is poisoned: memory may be ahead of it (see
+	// wal.refuseCheckpoint).
+	if err := nc.wal.refuseCheckpoint(); err != nil {
+		return err
+	}
 	nc.mu.RLock()
 	defer nc.mu.RUnlock()
 	bw := bufio.NewWriter(w)

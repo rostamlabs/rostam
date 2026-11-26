@@ -188,30 +188,20 @@ func TestSnapshotSerializationBlocksWritersMV(t *testing.T) {
 	}
 }
 
-// TestReplayInsertOverLiveIDIsANoOp records the SECOND reason the Flush
-// restructure is not a small change: even if serialization were made
-// non-blocking, dense WAL replay is NOT a general "replay over a newer snapshot"
-// primitive.
+// TestReplayInsertOverLiveIDIsANoOp pins that the index primitive RestoreInsert
+// still COLLIDES with a live id (ErrDuplicateID, state unchanged). Dense WAL
+// replay no longer uses it: it applies an insert record with restoreReplace,
+// which replaces a live point (see Collection.replayWAL and
+// TestReplaceReplayOverCheckpoint). What this guards is everyone ELSE that calls
+// RestoreInsert — the reshard/resplit copy and Collection.RestoreInsert, which
+// rely on the collision never clobbering a live value — and, for older binaries,
+// what their replay does with a replace record: it collides, the error is
+// discarded, and the old version stays.
 //
-// Replay applies inserts via RestoreInsert (vector/collection.go:1242) and
-// DISCARDS the error. RestoreInsert bottoms out in arena.Insert, which returns
-// ErrDuplicateID when the id is already live (vector/arena.go:376-378; see also
-// the note at vector/hnsw.go:1571: "HNSW has no in-place vector update — a live
-// id collides (ErrDuplicateID) and Collection.Upsert is delete+insert"). So
-// replaying an insert record for an id that is ALREADY LIVE silently does
-// NOTHING.
-//
-// Today that is harmless, and only because Flush holds opMu across
-// {snapshot + truncate}: every record that survives into a replay is already
-// subsumed by the checkpoint, so "do nothing" IS the correct outcome. Let writes
-// land during serialization and that stops being true — a surviving record could
-// carry a value NEWER than the snapshot for an id the snapshot has live, and the
-// no-op would silently drop it. The dense upsert lane happens to be safe (an
-// upsert logs delete+insert as one opMu-atomic pair, and the delete frees the
-// slot), but the safety is incidental, not designed.
-//
-// This test pins the primitive's actual behavior so the hazard is visible to
-// anyone who revisits the restructure.
+// It does not make the Flush restructure safe: replay is only known correct over
+// a snapshot taken at the start or the end of the log (see the note on
+// CollectionStore.Flush), never one cut mid-log by writes landing during
+// serialization.
 func TestReplayInsertOverLiveIDIsANoOp(t *testing.T) {
 	cs := newCollectionStore(t)
 	if err := cs.CreateCollection("docs", walCfg()); err != nil {

@@ -4,6 +4,7 @@ package vector
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -11,6 +12,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/rostamlabs/rostam/objstore"
 )
 
 // A replacing write (an upsert over a live id) on a log-backed collection must
@@ -473,5 +476,76 @@ func TestNamedAndMVReplaceLogCutAtEveryByte(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// poisonedStore opens a store whose durable replaceCol holds acknowledged
+// points in its snapshot and its log, then poisons the log and has a delete and
+// an overwrite refused after their in-memory apply.
+func poisonedStore(t *testing.T, dir string) (*CollectionStore, map[uint64]string) {
+	t.Helper()
+	cs := openReplaceStore(t, dir, durablePersistentCfg())
+	if err := cs.CheckpointDurable(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cs.Upsert(replaceCol, 3, durableVec(4), "third", 0, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	c := acquire(t, cs)
+	c.wal.poisoned.Store(true) // what commitWait does when f.Sync fails
+	if _, err := c.DeleteCAS(2, CASCond{}); err == nil {
+		t.Fatal("a delete on a poisoned log was acknowledged")
+	}
+	if _, err := c.UpsertCAS(1, durableVec(6), "first, rewritten", 0, nil, nil, CASCond{}); err == nil {
+		t.Fatal("an overwrite on a poisoned log was acknowledged")
+	}
+	c.Release()
+	return cs, map[uint64]string{1: "old", 2: "other", 3: "third"}
+}
+
+// TestEvictRefusesPoisonedLog: cold-tier eviction of a collection whose log is
+// poisoned fails, writes no cold object, keeps the collection resident and its
+// files untouched, and a reopen holds the acknowledged state.
+func TestEvictRefusesPoisonedLog(t *testing.T) {
+	dir := t.TempDir()
+	cs, acked := poisonedStore(t, dir)
+	files := readFiles(t, dir)
+
+	obj := objstore.NewMemStore()
+	err := cs.EvictCollection(context.Background(), replaceCol, obj, "acme", time.Unix(0, 0).UTC())
+	if !errors.Is(err, ErrWALPoisoned) {
+		t.Fatalf("evict of a poisoned log = %v, want ErrWALPoisoned", err)
+	}
+	if objs, lerr := obj.List(context.Background(), ""); lerr != nil || len(objs) != 0 {
+		t.Fatalf("evict of a poisoned log wrote cold objects %v (list err %v)", objs, lerr)
+	}
+	if cs.IsCold(replaceCol) {
+		t.Fatal("a collection whose eviction was refused went cold")
+	}
+	if got := readFiles(t, dir); !bytes.Equal(got.snap, files.snap) || !bytes.Equal(got.wal, files.wal) {
+		t.Fatal("a refused eviction changed the snapshot or the log")
+	}
+	_ = cs.Close()
+	assertPoints(t, reopenPoints(t, dir), acked)
+}
+
+// TestStoreBackupRefusesPoisonedLog: neither the store-wide export (SnapshotAll)
+// nor a collection snapshot exports the state of a poisoned log.
+func TestStoreBackupRefusesPoisonedLog(t *testing.T) {
+	dir := t.TempDir()
+	cs, _ := poisonedStore(t, dir)
+	defer func() { _ = cs.Close() }()
+	var buf bytes.Buffer
+	if err := cs.SnapshotAll(&buf); !errors.Is(err, ErrWALPoisoned) {
+		t.Fatalf("SnapshotAll with a poisoned log = %v, want ErrWALPoisoned", err)
+	}
+	c := acquire(t, cs)
+	defer c.Release()
+	buf.Reset()
+	if err := c.Snapshot(&buf); !errors.Is(err, ErrWALPoisoned) {
+		t.Fatalf("Snapshot with a poisoned log = %v, want ErrWALPoisoned", err)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("a refused snapshot wrote %d bytes", buf.Len())
 	}
 }

@@ -77,8 +77,10 @@ Replacing a memory (a `remember` with a `key` that already exists, or of
 content identical to an earlier one) is written to the log as one record. If
 the process is killed, or the log write fails, before that call has answered,
 the store holds either the old version or the new one, never neither; once the
-call has answered, it holds the new one. A replace that is refused (an error
-from the call) leaves the old version.
+call has answered, it holds the new one. A replace refused before anything is
+written (invalid input, a version conflict, a full collection or the insert
+rate limit) leaves the old version; one that failed writing or syncing the log
+may or may not have replaced it, as for any failed change below.
 
 On a clean shutdown (the client closing the connection, `SIGINT` or `SIGTERM`)
 the log is folded into a snapshot and emptied. The same happens at startup when

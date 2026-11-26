@@ -656,6 +656,16 @@ func (w *wal) truncate() error {
 // leaves the snapshot and the log on disk exactly as they were, and a reopen
 // replays the acknowledged state. truncate's own poison check stays as the
 // second line.
+//
+// It cannot cover a GROUP-COMMIT SYNC THAT FAILS AFTER THE CHECK. That fsync
+// runs outside opMu (see commitWait), so it can poison the log while a snapshot
+// that passed this check is being written; the snapshot then holds writes whose
+// bytes are in the log but whose fsync failed, and the truncate after it
+// refuses. Those writes were never acknowledged, so a reopen showing them is the
+// same at-least-once outcome as an in-flight write at a crash; no acknowledged
+// write is lost. Collection.Snapshot and its named and multi-vector twins also
+// call it, so callers that do not hold opMu (a backup) get the check too, with
+// the same caveat.
 func (w *wal) refuseCheckpoint() error {
 	if w != nil && w.poisoned.Load() {
 		return ErrWALPoisoned

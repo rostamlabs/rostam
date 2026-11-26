@@ -197,9 +197,17 @@ func (s *CollectionStore) putColdSnapshot(ctx context.Context, c *Collection, ob
 	// snapshot stream isn't seekable, so buffer it. Cold eviction is an
 	// idle-collection, off-hot-path operation — the transient buffer is acceptable;
 	// a streaming/temp-file variant is a follow-up.
+	//
+	// Snapshot refuses while the log is poisoned (memory may be ahead of it), so
+	// the eviction fails before any object is written and the collection stays
+	// resident with its files untouched. opMu is held across the snapshot so the
+	// check and the state it captures agree with every write applied under it.
 	var buf bytes.Buffer
-	if err := c.Snapshot(&buf); err != nil {
-		return fmt.Errorf("snapshot: %w", err)
+	c.opMu.Lock()
+	serr := c.Snapshot(&buf)
+	c.opMu.Unlock()
+	if serr != nil {
+		return fmt.Errorf("snapshot: %w", serr)
 	}
 	if err := obj.Put(ctx, key, bytes.NewReader(buf.Bytes()), int64(buf.Len())); err != nil {
 		return fmt.Errorf("put %q: %w", key, err)

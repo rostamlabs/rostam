@@ -11,7 +11,10 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   after the process is killed, at the price of one disk sync per remembered or
   forgotten memory. Replacing a memory (same `key`, or identical content) is one
   log record, so a kill before the call answers leaves the old version or the
-  new one, never neither. A killed process is what is tested; power-loss safety rests on the disk sync and is not claimed as tested.
+  new one, never neither. After an unclean stop, the previous release shows the
+  older version of memories replaced since the last checkpoint. A killed
+  process is what is tested; power-loss safety rests on the disk sync and is
+  not claimed as tested.
   An existing store is converted in place at the first start; if that fails it
   opens in its old form with a `not crash-safe` warning and the next start tries
   again. The memory collection is now held in RAM. `mcp -autostart` replaces a

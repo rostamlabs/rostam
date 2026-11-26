@@ -1458,8 +1458,16 @@ func (c *Collection) replayWAL(path string) error {
 // Persistent collection; see hnsw.SavePersist for the v1 constraints.
 func (c *Collection) SavePersist(metaPath string) error { return c.idx.SavePersist(metaPath) }
 
-// Snapshot delegates to the underlying index.
-func (c *Collection) Snapshot(w io.Writer) error { return c.idx.Snapshot(w) }
+// Snapshot delegates to the underlying index. It refuses (ErrWALPoisoned) while
+// the collection's log is poisoned, whoever asks — a checkpoint, cold-tier
+// eviction, a store or collection backup — because memory may then be ahead of
+// the log (see wal.refuseCheckpoint).
+func (c *Collection) Snapshot(w io.Writer) error {
+	if err := c.wal.refuseCheckpoint(); err != nil {
+		return err
+	}
+	return c.idx.Snapshot(w)
+}
 
 // Restore delegates to the underlying index.
 func (c *Collection) Restore(r io.Reader) error { return c.idx.Restore(r) }

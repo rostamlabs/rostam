@@ -43,6 +43,11 @@ func (m *MultiVectorIndex) Flush() error {
 // maps) to w for inclusion in a cluster FSM snapshot. The inner blob is
 // length-prefixed so restore can split it from the maps.
 func (m *MultiVectorIndex) snapshot(w io.Writer) error {
+	// Refused while the log is poisoned: memory may be ahead of it (see
+	// wal.refuseCheckpoint).
+	if err := m.wal.refuseCheckpoint(); err != nil {
+		return err
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	var inner bytes.Buffer
