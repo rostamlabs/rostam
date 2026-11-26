@@ -69,9 +69,16 @@ type procSocket struct {
 	state              string
 	v6                 bool // from tcp6
 	uid                int
+	inode              uint64 // 0: no process holds the socket (backlog, orphaned, time-wait)
 }
 
-const tcpListenState = "0A"
+// TCP states as /proc/net/tcp prints them.
+const (
+	tcpListenState      = "0A"
+	tcpEstablishedState = "01"
+	tcpSynRecvState     = "03"
+	tcpCloseWaitState   = "08"
+)
 
 // procAddr decodes HEX_IP:HEX_PORT: the port big-endian, the IP printed as one
 // (tcp) or four (tcp6) host-order 32-bit words.
@@ -112,8 +119,12 @@ func parseProcSockets(text []byte) []procSocket {
 		if !ok1 || !ok2 || err != nil || uid < 0 {
 			continue
 		}
+		var inode uint64
+		if len(f) > 9 {
+			inode, _ = strconv.ParseUint(f[9], 10, 64)
+		}
 		out = append(out, procSocket{localIP: lip, remIP: rip, localPort: lport, remPort: rport,
-			state: f[3], v6: len(lip) == net.IPv6len, uid: uid})
+			state: f[3], v6: len(lip) == net.IPv6len, uid: uid, inode: inode})
 	}
 	return out
 }
@@ -218,12 +229,22 @@ func listenerOwnerErr(addr string, read func(string) ([]byte, error), myUID int)
 	return nil
 }
 
+// serverEndClosed reports a server-side socket that no process holds any more
+// (the server closed it: orphaned, or a time-wait entry, which the kernel
+// prints with inode 0 and often uid 0). A socket waiting in the accept backlog
+// also has inode 0, but it is ESTABLISHED or SYN_RECV and will be handed to
+// the listener's owner, so its uid is checked like any other.
+func serverEndClosed(s procSocket) bool {
+	return s.inode == 0 && s.state != tcpEstablishedState && s.state != tcpSynRecvState
+}
+
 // connOwnerErr runs after a dial to addr and before the first request. The
 // pinned client module does not expose the new connection's own endpoints, so
-// it checks every connection this uid has ESTABLISHED to addr (the new one is
-// always among them): the server end of each (local = addr, remote = our
-// end), which the kernel creates with the listening socket's uid, must be
-// ours. One owned by another uid is a *portOwnerError; a server end that
+// it checks every connection this uid has open to addr, ESTABLISHED or
+// half-closed by the peer (CLOSE_WAIT); the new one is always among them, and
+// no other one can stand in for it. The server end of each (local = addr,
+// remote = our end), which the kernel creates with the listening socket's
+// uid, must be ours unless the server has closed it. One owned by another uid is a *portOwnerError; a server end that
 // cannot be found, or no connection to addr at all, cannot be verified and is
 // an error. This closes the window between listenerOwnerErr and the dial:
 // whoever accepted the connection is what is checked. It is conservative: a
@@ -252,10 +273,13 @@ func connOwnerErr(addr string, read func(string) ([]byte, error), myUID int) err
 	for _, b := range texts {
 		all = append(all, parseProcSockets(b)...)
 	}
-	const established = "01"
 	ours := 0
 	for _, c := range all {
-		if c.state != established || c.uid != myUID || c.remPort != port || !c.remIP.Equal(target) {
+		// The connection the token goes over is ESTABLISHED, or CLOSE_WAIT
+		// when the peer half-closed it (we can still send). Sockets past
+		// that (time-wait and the like) can carry nothing and are ignored.
+		if (c.state != tcpEstablishedState && c.state != tcpCloseWaitState) ||
+			c.uid != myUID || c.remPort != port || !c.remIP.Equal(target) {
 			continue
 		}
 		ours++
@@ -266,11 +290,17 @@ func connOwnerErr(addr string, read func(string) ([]byte, error), myUID int) err
 				continue
 			}
 			found = true
+			if serverEndClosed(s) {
+				continue // nobody holds it any more: nothing sent there is read
+			}
 			if s.uid != myUID {
 				return &portOwnerError{port: portStr, uid: s.uid}
 			}
 		}
-		if !found {
+		// A half-closed connection whose server end is gone entirely was
+		// closed by the server: data sent there is discarded. An open one
+		// with no server end in the table cannot be verified.
+		if !found && c.state != tcpCloseWaitState {
 			return fmt.Errorf("cannot verify the owner of %s: the server end of a connection to it is not in the socket table", addr)
 		}
 	}

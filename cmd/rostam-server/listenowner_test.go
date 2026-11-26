@@ -213,9 +213,13 @@ func TestOwnerChecksFailClosedOnUnreadableTable(t *testing.T) {
 
 // procConn is one socket line with explicit local/remote endpoints.
 func procConn(lip string, lport int, rip string, rport int, state string, uid int) string {
+	return procConnInode(lip, lport, rip, rport, state, uid, 4242)
+}
+
+func procConnInode(lip string, lport int, rip string, rport int, state string, uid int, inode uint64) string {
 	v6 := strings.Contains(lip, ":")
-	return fmt.Sprintf("   0: %s:%04X %s:%04X %s 00000000:00000000 00:00000000 00000000 %5d        0 4242 1 0000000000000000 100 0 0 10 0\n",
-		procHex(net.ParseIP(lip), v6), lport, procHex(net.ParseIP(rip), v6), rport, state, uid)
+	return fmt.Sprintf("   0: %s:%04X %s:%04X %s 00000000:00000000 00:00000000 00000000 %5d        0 %d 1 0000000000000000 100 0 0 10 0\n",
+		procHex(net.ParseIP(lip), v6), lport, procHex(net.ParseIP(rip), v6), rport, state, uid, inode)
 }
 
 func TestConnOwner(t *testing.T) {
@@ -236,7 +240,17 @@ func TestConnOwner(t *testing.T) {
 		{"other users' connections are not ours to check", procHeader + client(50000, me) + server(50000, "01", me) + client(50002, other) + server(50002, "01", 0), "", 0},
 		{"server end missing", procHeader + client(50000, me), "", unverified},
 		{"no connection of ours", procHeader + procLine(0, "127.0.0.1", 7480, "0A", me), "", unverified},
-		{"closing connection of ours does not count", procHeader + procConn("127.0.0.1", 50000, "127.0.0.1", 7480, "08", me), "", unverified},
+		{"time-wait connection of ours does not count", procHeader + procConn("127.0.0.1", 50000, "127.0.0.1", 7480, "06", 0), "", unverified},
+		// A foreign listener that half-closes our dial (shutdown(SHUT_WR))
+		// leaves it CLOSE_WAIT; an older healthy connection must not cover it.
+		{"half-closed by a foreign server", procHeader + client(50000, me) + server(50000, "01", me) +
+			procConn("127.0.0.1", 50001, "127.0.0.1", 7480, "08", me) + server(50001, "05", other), "", other},
+		{"half-closed, server end closed (orphan, inode 0)", procHeader + procConn("127.0.0.1", 50001, "127.0.0.1", 7480, "08", me) +
+			procConnInode("127.0.0.1", 7480, "127.0.0.1", 50001, "05", 0, 0), "", 0},
+		{"half-closed, server end gone", procHeader + client(50000, me) + server(50000, "01", me) +
+			procConn("127.0.0.1", 50001, "127.0.0.1", 7480, "08", me), "", 0},
+		{"backlog server end (inode 0) other user is still checked", procHeader + client(50000, me) +
+			procConnInode("127.0.0.1", 7480, "127.0.0.1", 50000, "01", other, 0), "", other},
 		{"v4-mapped server end other user", procHeader + client(50000, me), procHeader + procConn("::ffff:127.0.0.1", 7480, "::ffff:127.0.0.1", 50000, "01", other), other},
 	} {
 		t.Run(c.name, func(t *testing.T) {
