@@ -258,56 +258,35 @@ func (s *CollectionStore) loadCollection(canonical, cfgPath, snapPath string) er
 	// the live mmap diverges from any sidecar. Restore rebuilds a consistent
 	// graph (into a fresh mmap when Persistent), then replay applies the tail.
 	if cfg.WAL {
-		eff := s.effectiveConfig(canonical, cfg)
-		c, nerr := NewCollection(canonical, eff)
-		if nerr != nil {
-			return fmt.Errorf("vector: rebuild %s: %w", canonical, nerr)
-		}
-		if f, oerr := os.Open(snapPath); oerr == nil {
-			rerr := c.Restore(f)
-			_ = f.Close()
-			if rerr != nil {
-				_ = c.Close()
-				return fmt.Errorf("vector: restore %s: %w", canonical, rerr)
-			}
-		}
-		_, _, _, walPath := s.persistPaths(canonical)
-		if rerr := c.replayWAL(walPath); rerr != nil {
-			_ = c.Close()
-			return fmt.Errorf("vector: wal replay %s: %w", canonical, rerr)
-		}
-		w, werr := openWAL(walPath, cfg.WALNoSync)
-		if werr != nil {
-			_ = c.Close()
-			return fmt.Errorf("vector: wal open %s: %w", canonical, werr)
-		}
-		c.wal = w
-		if s.isDurable(canonical) {
-			s.checkpointLargeLog(canonical, walPath, c)
-		}
-		s.collections[canonical] = c
-		return nil
+		return s.loadWALCollection(canonical, cfg, cfgPath, snapPath)
 	}
 
 	// Persistent collections instant-restart: map their vector + graph files and
 	// the sidecar, no graph rebuild. A collection created but never flushed has
-	// no sidecar yet — open it as a fresh empty (mmap-backed) index.
+	// no sidecar yet — open it as a fresh empty (mmap-backed) index. A listed
+	// durable collection is then upgraded to the write-ahead log; a failed
+	// upgrade leaves it registered in this form.
 	if cfg.Persistent {
 		eff := s.effectiveConfig(canonical, cfg)
 		_, _, metaPath, _ := s.persistPaths(canonical)
+		var c *Collection
 		if _, statErr := os.Stat(metaPath); statErr == nil {
-			c, oerr := openPersistentCollection(canonical, eff, metaPath)
+			oc, oerr := openPersistentCollection(canonical, eff, metaPath)
 			if oerr != nil {
 				return fmt.Errorf("vector: instant-open %s: %w", canonical, oerr)
 			}
-			s.collections[canonical] = c
-			return nil
-		}
-		c, nerr := NewCollection(canonical, eff)
-		if nerr != nil {
-			return fmt.Errorf("vector: rebuild %s: %w", canonical, nerr)
+			c = oc
+		} else {
+			nc, nerr := NewCollection(canonical, eff)
+			if nerr != nil {
+				return fmt.Errorf("vector: rebuild %s: %w", canonical, nerr)
+			}
+			c = nc
 		}
 		s.collections[canonical] = c
+		if s.isDurable(canonical) {
+			return s.upgradeToDurable(canonical, cfg, cfgPath, snapPath)
+		}
 		return nil
 	}
 
@@ -321,6 +300,46 @@ func (s *CollectionStore) loadCollection(canonical, cfgPath, snapPath string) er
 		if rerr != nil {
 			return fmt.Errorf("vector: restore %s: %w", canonical, rerr)
 		}
+	}
+	s.collections[canonical] = c
+	return nil
+}
+
+// loadWALCollection restores a write-ahead log collection from its snapshot
+// and replays its log, then registers it. A listed durable collection has its
+// log forced to sync and, once loaded, any files of its earlier mapped form
+// removed.
+func (s *CollectionStore) loadWALCollection(canonical string, cfg Config, cfgPath, snapPath string) error {
+	if s.isDurable(canonical) {
+		cfg = s.syncDurableWAL(canonical, cfg, cfgPath)
+	}
+	eff := s.effectiveConfig(canonical, cfg)
+	c, nerr := NewCollection(canonical, eff)
+	if nerr != nil {
+		return fmt.Errorf("vector: rebuild %s: %w", canonical, nerr)
+	}
+	if f, oerr := os.Open(snapPath); oerr == nil {
+		rerr := c.Restore(f)
+		_ = f.Close()
+		if rerr != nil {
+			_ = c.Close()
+			return fmt.Errorf("vector: restore %s: %w", canonical, rerr)
+		}
+	}
+	_, _, _, walPath := s.persistPaths(canonical)
+	if rerr := c.replayWAL(walPath); rerr != nil {
+		_ = c.Close()
+		return fmt.Errorf("vector: wal replay %s: %w", canonical, rerr)
+	}
+	w, werr := openWAL(walPath, cfg.WALNoSync)
+	if werr != nil {
+		_ = c.Close()
+		return fmt.Errorf("vector: wal open %s: %w", canonical, werr)
+	}
+	c.wal = w
+	if s.isDurable(canonical) {
+		s.checkpointLargeLog(canonical, walPath, c)
+		s.removeMappedLeftovers(canonical)
 	}
 	s.collections[canonical] = c
 	return nil

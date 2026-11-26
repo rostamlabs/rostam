@@ -6,7 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
+	"path/filepath"
+	"sort"
+	"time"
 )
 
 // StoreOptions configures OpenCollectionStoreWith.
@@ -128,4 +132,206 @@ func (s *CollectionStore) CheckpointDurable() error {
 		c.Release()
 	}
 	return errors.Join(errs...)
+}
+
+// syncDurableWAL is run at open for a listed collection whose manifest already
+// says WAL. A manifest that asked for an unsynced log is rewritten to a synced
+// one; a failed rewrite only warns, because the returned config, which the log
+// is opened with, syncs regardless.
+func (s *CollectionStore) syncDurableWAL(canonical string, cfg Config, cfgPath string) Config {
+	if cfg.WALNoSync {
+		cfg.WALNoSync = false
+		if err := writeConfig(cfgPath, cfg); err != nil {
+			slog.Warn("vector: rewriting a durable collection's manifest to a synced log failed; its log syncs anyway",
+				"collection", canonical, "manifest", cfgPath, "err", err)
+		}
+	}
+	return cfg
+}
+
+// removeMappedLeftovers removes, best effort, the mapped files and sidecar of a
+// listed collection's earlier Persistent form. It runs only once the log form
+// has loaded, so a log form that fails to load still has them beside it. Files
+// that cannot be removed (Windows keeps a file that is still mapped) are left for
+// the next open.
+func (s *CollectionStore) removeMappedLeftovers(canonical string) {
+	vecsPath, graphPath, metaPath, _ := s.persistPaths(canonical)
+	for _, p := range []string{vecsPath, graphPath, metaPath} {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			slog.Warn("vector: removing a file left by an earlier form of a durable collection failed; the next open retries",
+				"collection", canonical, "file", p, "err", err)
+		}
+	}
+}
+
+// upgradeStepHook, when non-nil, is called after each step of upgradeToDurable
+// with the step's name: "loaded", "snapshot", "log-removed", "manifest". An
+// error it returns is that step's failure. Tests only; nil in production.
+var upgradeStepHook func(step string) error
+
+func upgradeStep(step string) error {
+	if upgradeStepHook != nil {
+		return upgradeStepHook(step)
+	}
+	return nil
+}
+
+// upgradeToDurable converts the listed Persistent collection canonical, just
+// opened and registered in its old form, to a write-ahead log collection. cfg is
+// its manifest, read from cfgPath; snapPath is where its snapshot goes.
+//
+// The live points are copied into a fresh in-memory collection, never the
+// mapped graph, which after an unclean stop can name slots that do not exist.
+// That collection is written as a synced snapshot, any stale log is removed, and
+// then the manifest is replaced: the commit point. Until then nothing the old
+// form reads has been touched, so any failure leaves it registered and working,
+// warns that the collection is not crash-safe, and returns nil; the next open
+// tries again. After the commit the old collection is closed and the collection
+// loads down the ordinary log path, whose error, if any, is returned.
+func (s *CollectionStore) upgradeToDurable(canonical string, cfg Config, cfgPath, snapPath string) error {
+	old := s.collections[canonical]
+	walCfg := s.durableConfig(canonical, cfg)
+	committed, manifestTried, err := s.convertToDurable(canonical, old, cfg, walCfg, cfgPath, snapPath)
+	if !committed {
+		// The snapshot is only removed when the manifest was never attempted: a
+		// manifest that could not be read back may still have been replaced, and
+		// then the snapshot is the collection.
+		if !manifestTried {
+			_ = os.Remove(snapPath)
+		}
+		slog.Warn("vector: durable collection is not crash-safe: upgrading it to the write-ahead log failed, so it stays in its old form until a later open succeeds",
+			"collection", canonical, "err", err)
+		return nil
+	}
+	delete(s.collections, canonical)
+	if cerr := old.Close(); cerr != nil {
+		slog.Warn("vector: closing the old form of an upgraded collection failed",
+			"collection", canonical, "err", cerr)
+	}
+	return s.loadWALCollection(canonical, walCfg, cfgPath, snapPath)
+}
+
+// convertToDurable runs the upgrade up to and including the commit point.
+// committed reports whether the manifest now says WAL; manifestTried whether
+// replacing it was attempted.
+func (s *CollectionStore) convertToDurable(canonical string, old *Collection, cfg, walCfg Config, cfgPath, snapPath string) (committed, manifestTried bool, err error) {
+	h, ok := old.idx.(*hnsw)
+	if cfg.IndexType != IndexHNSW || !ok {
+		return false, false, fmt.Errorf("vector: only an HNSW collection can be upgraded (index type %v)", cfg.IndexType)
+	}
+	fresh, err := NewCollection(canonical, walCfg)
+	if err != nil {
+		return false, false, err
+	}
+	// The fresh collection is heap-backed and has no log; once its snapshot is
+	// written the ordinary load rebuilds it from that, so it is always dropped.
+	defer func() { _ = fresh.Close() }()
+	if err := copyLivePoints(h, fresh); err != nil {
+		return false, false, err
+	}
+	if err := upgradeStep("loaded"); err != nil {
+		return false, false, err
+	}
+	if err := s.writeSnapshotFile(fresh, snapPath); err != nil {
+		return false, false, fmt.Errorf("vector: writing the snapshot: %w", err)
+	}
+	if err := upgradeStep("snapshot"); err != nil {
+		return false, false, err
+	}
+	// A log left from an earlier life would replay over the snapshot. Its removal
+	// is made durable before the manifest can name the log path again.
+	_, _, _, walPath := s.persistPaths(canonical)
+	if err := os.Remove(walPath); err != nil && !os.IsNotExist(err) {
+		return false, false, fmt.Errorf("vector: removing a stale log: %w", err)
+	}
+	if err := syncDirf(filepath.Dir(walPath)); err != nil {
+		return false, false, fmt.Errorf("vector: fsync dir %s: %w", filepath.Dir(walPath), err)
+	}
+	if err := upgradeStep("log-removed"); err != nil {
+		return false, false, err
+	}
+	werr := writeConfig(cfgPath, walCfg)
+	if werr == nil {
+		werr = upgradeStep("manifest")
+	}
+	if werr != nil {
+		// writeConfig can fail after its rename has landed (the directory fsync).
+		// Then the upgrade has committed, and keeping the old form would accept
+		// writes the next open, which takes the log path, cannot see.
+		got, rerr := readConfig(cfgPath)
+		if rerr != nil || !got.WAL {
+			return false, true, fmt.Errorf("vector: replacing the manifest: %w", werr)
+		}
+		slog.Warn("vector: the upgraded manifest reported an error but is in place; continuing with the write-ahead log",
+			"collection", canonical, "err", werr)
+	}
+	return true, true, nil
+}
+
+// copyLivePoints copies every live point of src into dst with its version and
+// per-key deadlines verbatim. The stored data of a store once stopped uncleanly
+// can be inconsistent; a panic while reading it is returned as an error, so the
+// upgrade fails and the store still opens.
+func copyLivePoints(src *hnsw, dst *Collection) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("vector: reading the stored points: %v", r)
+		}
+	}()
+	return src.forEachLive(func(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64) error {
+		if err := dst.RestoreInsert(id, vec, ttl, meta, sparse, keyExpires, version); err != nil {
+			return fmt.Errorf("vector: copying point %d: %w", id, err)
+		}
+		return nil
+	})
+}
+
+// forEachLive calls fn, in slot order, for every point that is neither deleted
+// nor expired, with copies the caller owns: the stored vector, the remaining
+// point TTL (0 = none), the metadata, the sparse vector, the per-key deadlines
+// and the version. It never reads graph edges. It stops at fn's first error. A
+// point whose slot lies outside the stored data, or whose vector cannot be read,
+// is an error.
+func (h *hnsw) forEachLive(fn func(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64) error) error {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if h.arena.poisoned.Load() {
+		return ErrIndexPoisoned
+	}
+	type point struct {
+		id   uint64
+		slot uint32
+	}
+	points := make([]point, 0, len(h.arena.idMap))
+	for id, slot := range h.arena.idMap {
+		points = append(points, point{id, slot})
+	}
+	sort.Slice(points, func(i, j int) bool { return points[i].slot < points[j].slot })
+	slots := h.arena.Capacity()
+	now := uint64(h.now()) //nolint:gosec // unix millis are non-negative
+	for _, p := range points {
+		if int(p.slot) >= slots {
+			return fmt.Errorf("vector: point %d names slot %d of %d", p.id, p.slot, slots)
+		}
+		if h.tombstoned[p.slot] || h.isExpiredAt(p.slot, now) {
+			continue
+		}
+		stored := h.vecFor(p.slot)
+		if len(stored) != h.cfg.Dim {
+			return fmt.Errorf("vector: point %d has no readable vector", p.id)
+		}
+		var ttl time.Duration
+		if exp := h.arena.ExpiresAt(p.slot); exp != 0 {
+			ttl = time.Duration(exp-now) * time.Millisecond // exp > now: expired points were skipped
+		}
+		var sparse *SparseVector
+		if sv := h.arena.Sparse(p.slot); sv != nil {
+			sparse = sv.Clone()
+		}
+		if err := fn(p.id, append([]float32(nil), stored...), ttl, cloneMeta(h.arena.Metadata(p.slot)),
+			sparse, maps.Clone(h.arena.KeyExpires(p.slot)), h.arena.Version(p.slot)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
