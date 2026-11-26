@@ -58,8 +58,8 @@ func (s *Server) RecentMemoriesExcept(ctx context.Context, ns string, k int, ski
 }
 
 // newestMemories scrolls every match of f (memory sets are small), drops the
-// ids skip reports, sorts by Updated descending (id ascending breaks ties so
-// output is stable), keeps k, and marks staleness on the survivors only.
+// ids skip reports, sorts newest first (nanosecond write time where stored,
+// else Updated; id ascending breaks ties so output is stable), keeps k, and marks staleness on the survivors only.
 func (s *Server) newestMemories(ctx context.Context, f rostam.VectorFilter, k int, skip func(uint64) bool, drop func(*MemoryHit) bool) ([]MemoryHit, error) {
 	if err := s.ensureMemory(ctx); err != nil {
 		return nil, err
@@ -86,12 +86,7 @@ func (s *Server) newestMemories(ctx context.Context, f rostam.VectorFilter, k in
 		}
 		cursor = next
 	}
-	sort.Slice(hits, func(i, j int) bool {
-		if hits[i].Updated != hits[j].Updated {
-			return hits[i].Updated > hits[j].Updated
-		}
-		return hits[i].ID < hits[j].ID
-	})
+	sort.Slice(hits, func(i, j int) bool { return newerThan(hits[i], hits[j]) })
 	if k > 0 && len(hits) > k {
 		hits = hits[:k]
 	}

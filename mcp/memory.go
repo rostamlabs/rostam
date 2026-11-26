@@ -25,6 +25,13 @@ const (
 	createdField  = "__created_unix" // metadata field: unix-seconds creation time
 	keyField      = "__key"          // metadata field: caller's stable key (keyed memories only)
 	updatedField  = "__updated_unix" // metadata field: unix-seconds last-write time
+	// updatedNsField: unix-nanoseconds last-write time, for newest-first order
+	// within one second. Additive: `updated` stays seconds. An older version
+	// could have stored a user field of this name, so it is read (and hidden)
+	// as ours only when it agrees with __updated_unix to the second; anything
+	// else stays user metadata. Memories written before it existed sort by
+	// seconds, as before.
+	updatedNsField = "__updated_ns"
 	defaultNS     = "default"        // namespace used when the caller omits one
 	kvEmbedder    = "__mcp/embedder" // KV key: the embedIdentity this store was bootstrapped with
 )
@@ -299,6 +306,9 @@ type memoryHit struct {
 	Symbol   string `json:"symbol,omitempty"`
 	Stale    any    `json:"stale,omitempty"`
 	fileHash string
+	// updatedNs is the nanosecond write time when stored (0 for older
+	// memories): ordering only, never on the wire.
+	updatedNs int64
 }
 
 // registerMemoryTools registers remember, recall, forget, list_memories, and
@@ -404,7 +414,7 @@ func (s *Server) handleRemember(ctx context.Context, raw json.RawMessage) (any, 
 		return nil, fmt.Errorf("mcp: remember: content is required")
 	}
 	ns := s.namespaceOr(args.Namespace)
-	for _, reserved := range [...]string{nsField, createdField, keyField, updatedField, pathField, symbolField, fileHashField, linkField, "$content"} {
+	for _, reserved := range [...]string{nsField, createdField, keyField, updatedField, updatedNsField, pathField, symbolField, fileHashField, linkField, "$content"} {
 		if _, ok := args.Metadata[reserved]; ok {
 			return nil, fmt.Errorf("mcp: remember: metadata key %q is reserved", reserved)
 		}
@@ -434,9 +444,11 @@ func (s *Server) handleRemember(ctx context.Context, raw json.RawMessage) (any, 
 	if md == nil {
 		md = make(rostam.VectorMetadata, 2)
 	}
-	now := time.Now().Unix()
+	wrote := time.Now()
+	now := wrote.Unix()
 	md[nsField] = vector.NewString(ns)
 	md[updatedField] = vector.NewInt(now)
+	md[updatedNsField] = vector.NewInt(wrote.UnixNano())
 	if relPath != "" {
 		hash, _ := fileHash(s.projectRoot, relPath) // "" when unreadable: link is still stored
 		md[pathField] = vector.NewString(relPath)
@@ -646,8 +658,31 @@ func toMemoryHit(id uint64, content string, score float32, md rostam.VectorMetad
 			hit.fileHash = v.Str
 		}
 	}
-	hit.Metadata = metadataToJSON(stripReservedMetadata(md, link))
+	sm := stripReservedMetadata(md, link)
+	if v, ok := md[updatedNsField]; ok && v.Kind == vector.ValueInt && ownUpdatedNs(v.Int, hit.Updated) {
+		hit.updatedNs = v.Int
+		delete(sm, updatedNsField)
+	}
+	hit.Metadata = metadataToJSON(sm)
 	return hit
+}
+
+// ownUpdatedNs reports whether ns is the write time remember stored: it must
+// fall within the stored second. See updatedNsField.
+func ownUpdatedNs(ns, updated int64) bool {
+	return updated != 0 && ns >= updated*1e9 && ns < (updated+1)*1e9
+}
+
+// newerThan orders memories newest first: nanoseconds when both have them,
+// else seconds; the id breaks remaining ties so output is stable.
+func newerThan(a, b memoryHit) bool {
+	if a.updatedNs != 0 && b.updatedNs != 0 && a.updatedNs != b.updatedNs {
+		return a.updatedNs > b.updatedNs
+	}
+	if a.Updated != b.Updated {
+		return a.Updated > b.Updated
+	}
+	return a.ID < b.ID
 }
 
 // toMemoryHitJSON is toMemoryHit's counterpart for recallHybrid, whose docs
@@ -675,6 +710,10 @@ func toMemoryHitJSON(id uint64, content string, score float32, md map[string]any
 		for _, r := range linkFields {
 			delete(md, r)
 		}
+	}
+	if v, ok := md[updatedNsField].(int64); ok && ownUpdatedNs(v, hit.Updated) {
+		hit.updatedNs = v
+		delete(md, updatedNsField)
 	}
 	for _, r := range reservedMetadataFields {
 		delete(md, r)

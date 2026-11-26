@@ -5,8 +5,10 @@ package mcp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rostamlabs/rostam"
 	"github.com/rostamlabs/rostam/vector"
@@ -148,6 +150,40 @@ func TestMemoriesExceptSkipsBeforeCap(t *testing.T) {
 	got, err = s.RecentMemoriesExcept(context.Background(), "p", 1, skip)
 	if err != nil || len(got) != 1 || got[0].Content != "old" {
 		t.Fatalf("RecentMemoriesExcept = %+v, %v; want just the unseen \"old\"", got, err)
+	}
+}
+
+// Memories written within one second still come back newest first, by the
+// nanosecond write time remember stores alongside the seconds field; and a
+// user field of that name that does not match the stored second stays data.
+func TestMemoriesSubSecondOrder(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "a.go", "package a\n")
+	c := startServer(t, Config{Store: newHeapStore(t), ProjectRoot: root})
+	c.initialize()
+	const n = 8
+	for i := 0; i < n; i++ {
+		c.callTool("remember", map[string]any{"content": fmt.Sprintf("burst-%d", i), "namespace": "p", "path": "a.go"}, nil, false)
+		time.Sleep(time.Millisecond) // distinct nanosecond stamps even on coarse clocks
+	}
+	var out struct {
+		Memories []memoryHit `json:"memories"`
+	}
+	c.callTool("recall_for_file", map[string]any{"path": "a.go", "namespace": "p", "k": 5}, &out, false)
+	if len(out.Memories) != 5 {
+		t.Fatalf("got %d memories", len(out.Memories))
+	}
+	for i, h := range out.Memories {
+		if want := fmt.Sprintf("burst-%d", n-1-i); h.Content != want {
+			t.Fatalf("position %d = %q, want %q (newest first)", i, h.Content, want)
+		}
+		if _, ok := h.Metadata[updatedNsField]; ok {
+			t.Fatalf("own %s leaked into metadata: %v", updatedNsField, h.Metadata)
+		}
+	}
+	hj := toMemoryHitJSON(1, "x", 0, map[string]any{updatedField: int64(100), updatedNsField: int64(5)})
+	if hj.updatedNs != 0 || hj.Metadata[updatedNsField] != int64(5) {
+		t.Fatalf("a mismatching %s was taken as ours: %+v", updatedNsField, hj)
 	}
 }
 
