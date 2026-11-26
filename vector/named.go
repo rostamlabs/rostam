@@ -535,6 +535,9 @@ func (nc *NamedCollection) insertCASKeyTTLBody(id uint64, vectors map[string][]f
 	version, seq, err := func() (uint64, uint64, error) {
 		nc.opMu.Lock()
 		defer nc.opMu.Unlock()
+		if err := nc.wal.refuseWrite(); err != nil {
+			return 0, 0, err
+		}
 		now := nowMs
 		if !stamped {
 			now = nc.nowMs()
@@ -1099,6 +1102,9 @@ func (nc *NamedCollection) DeleteCAS(id uint64, cas CASCond) (removed bool, prev
 	err = func() error {
 		nc.opMu.Lock()
 		defer nc.opMu.Unlock()
+		if err := nc.wal.refuseWrite(); err != nil {
+			return err
+		}
 		var derr error
 		removed, prevVersion, derr = nc.deleteLocked(id, cas)
 		if derr != nil {
@@ -1507,6 +1513,9 @@ func (nc *NamedCollection) logPayloadOpChanged(apply func() (Metadata, map[strin
 	err := func() error {
 		nc.opMu.Lock()
 		defer nc.opMu.Unlock()
+		if err := nc.wal.refuseWrite(); err != nil {
+			return err
+		}
 		meta, ke, v, ch, err := apply()
 		if err != nil {
 			return err

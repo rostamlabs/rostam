@@ -65,12 +65,11 @@ func TestDeleteCASPropagatesWALSyncError(t *testing.T) {
 	if !c.wal.poisoned.Load() {
 		t.Fatal("WAL not poisoned after the delete's fsync failed")
 	}
-	// A no-op delete of an absent id on the NOW-POISONED WAL stages nothing
-	// (commitWaitStaged(0) is a no-op), so it must still succeed as (false, nil):
-	// a no-op touches no durability and must not be turned into ErrWALPoisoned.
+	// A delete of an absent id on the NOW-POISONED WAL is refused too, before it
+	// looks: a retried delete must not report "not there" (wal.refuseWrite).
 	noop, nerr := c.DeleteCAS(4242, CASCond{})
-	if nerr != nil {
-		t.Fatalf("no-op DeleteCAS on a poisoned WAL returned %v, want nil (no-op touches no durability)", nerr)
+	if !errors.Is(nerr, ErrWALPoisoned) {
+		t.Fatalf("no-op DeleteCAS on a poisoned WAL returned %v, want ErrWALPoisoned", nerr)
 	}
 	if noop {
 		t.Fatal("no-op DeleteCAS reported removed=true for an absent id")

@@ -595,6 +595,9 @@ func (m *MultiVectorIndex) addCASKeyTTLSparseBody(docID uint64, tokens [][]float
 	version, seq, err := func() (uint64, uint64, error) {
 		m.opMu.Lock()
 		defer m.opMu.Unlock()
+		if err := m.wal.refuseWrite(); err != nil {
+			return 0, 0, err
+		}
 		version, keyExpires, err := m.addLockedAt(docID, tokens, meta, keyTTLMs, sparse, cas, now)
 		if err != nil {
 			return 0, 0, err
@@ -774,6 +777,9 @@ func (m *MultiVectorIndex) AddIfAbsent(docID uint64, tokens [][]float32, meta Me
 	inserted, seq, err := func() (bool, uint64, error) {
 		m.opMu.Lock()
 		defer m.opMu.Unlock()
+		if err := m.wal.refuseWrite(); err != nil {
+			return false, 0, err
+		}
 		inserted, err := m.addIfAbsentLocked(docID, tokens, meta, nil)
 		if err != nil || !inserted {
 			return inserted, 0, err
@@ -873,6 +879,9 @@ func (m *MultiVectorIndex) MultiAddIfAbsentVersionSparse(docID uint64, tokens []
 	inserted, seq, err := func() (bool, uint64, error) {
 		m.opMu.Lock()
 		defer m.opMu.Unlock()
+		if err := m.wal.refuseWrite(); err != nil {
+			return false, 0, err
+		}
 		inserted, stored, err := m.addIfAbsentVersionLocked(docID, tokens, meta, keyExpires, version, sparse)
 		if err != nil || !inserted {
 			return inserted, 0, err
@@ -989,6 +998,9 @@ func (m *MultiVectorIndex) MultiRestoreAddSparse(docID uint64, tokens [][]float3
 	seq, err := func() (uint64, error) {
 		m.opMu.Lock()
 		defer m.opMu.Unlock()
+		if err := m.wal.refuseWrite(); err != nil {
+			return 0, err
+		}
 		if err := m.restoreAdd(docID, tokens, meta, keyExpires, version, sparse); err != nil {
 			return 0, err
 		}
@@ -1020,7 +1032,13 @@ func (m *MultiVectorIndex) MultiRestoreAddSparse(docID uint64, tokens [][]float3
 // empty index, like dense BuildStaged). Like dense BuildConcurrent it does NOT
 // WAL-log: durability rides the Raft-replicated batch op that re-executes this on
 // replay (mirrors the dense bulk path), so callers must drive it through an op.
+//
+// A WAL-mode index whose log is poisoned refuses it, as dense BuildConcurrent
+// does.
 func (m *MultiVectorIndex) MultiBulkBuild(recs []MultiScanRecord, workers int) (bool, error) {
+	if err := m.wal.refuseWrite(); err != nil {
+		return false, err
+	}
 	for i, r := range recs {
 		if len(r.Tokens) == 0 {
 			return false, ErrEmptyDocument
@@ -1133,6 +1151,9 @@ func (m *MultiVectorIndex) DeleteCAS(docID uint64, cas CASCond) (removed bool, p
 	err = func() error {
 		m.opMu.Lock()
 		defer m.opMu.Unlock()
+		if err := m.wal.refuseWrite(); err != nil {
+			return err
+		}
 		var derr error
 		removed, prevVersion, derr = m.deleteLocked(docID, cas)
 		if derr != nil {
@@ -1701,6 +1722,9 @@ func (m *MultiVectorIndex) logPayloadOpChanged(apply func() (Metadata, map[strin
 	err := func() error {
 		m.opMu.Lock()
 		defer m.opMu.Unlock()
+		if err := m.wal.refuseWrite(); err != nil {
+			return err
+		}
 		meta, ke, v, ch, err := apply()
 		if err != nil {
 			return err

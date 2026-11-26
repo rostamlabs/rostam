@@ -248,6 +248,9 @@ func (c *Collection) InsertCASKeyTTL(id uint64, vec []float32, ttl time.Duration
 	version, seq, err := func() (uint64, uint64, error) {
 		c.opMu.Lock()
 		defer c.opMu.Unlock()
+		if err := c.wal.refuseWrite(); err != nil {
+			return 0, 0, err
+		}
 		version, keyExpires, err := c.idx.Insert(id, vec, ttl, meta, sparse, keyTTLMs, cas)
 		if err != nil {
 			return 0, 0, err
@@ -288,6 +291,9 @@ func (c *Collection) InsertCASKeyTTLAt(id uint64, vec []float32, ttl time.Durati
 	version, seq, err := func() (uint64, uint64, error) {
 		c.opMu.Lock()
 		defer c.opMu.Unlock()
+		if err := c.wal.refuseWrite(); err != nil {
+			return 0, 0, err
+		}
 		version, keyExpires, err := c.idx.InsertAt(id, vec, ttl, meta, sparse, keyTTLMs, cas, nowMs)
 		if err != nil {
 			return 0, 0, err
@@ -333,6 +339,9 @@ func (c *Collection) RestoreInsert(id uint64, vec []float32, ttl time.Duration, 
 	seq, err := func() (uint64, error) {
 		c.opMu.Lock()
 		defer c.opMu.Unlock()
+		if err := c.wal.refuseWrite(); err != nil {
+			return 0, err
+		}
 		if err := c.idx.RestoreInsert(id, vec, ttl, meta, sparse, keyExpires, version); err != nil {
 			return 0, err
 		}
@@ -361,6 +370,9 @@ func (c *Collection) RestoreInsertAt(id uint64, vec []float32, ttl time.Duration
 	seq, err := func() (uint64, error) {
 		c.opMu.Lock()
 		defer c.opMu.Unlock()
+		if err := c.wal.refuseWrite(); err != nil {
+			return 0, err
+		}
 		if err := c.idx.RestoreInsertAt(id, vec, ttl, meta, sparse, keyExpires, version, nowMs); err != nil {
 			return 0, err
 		}
@@ -400,6 +412,9 @@ func (c *Collection) InsertIfAbsentVersion(id uint64, vec []float32, ttl time.Du
 	inserted, seq, err := func() (bool, uint64, error) {
 		c.opMu.Lock()
 		defer c.opMu.Unlock()
+		if err := c.wal.refuseWrite(); err != nil {
+			return false, 0, err
+		}
 		inserted, err := c.idx.InsertIfAbsentVersion(id, vec, ttl, meta, sparse, keyExpires, version)
 		if err != nil || !inserted {
 			return inserted, 0, err
@@ -436,6 +451,9 @@ func (c *Collection) InsertIfAbsentVersionAt(id uint64, vec []float32, ttl time.
 	inserted, seq, err := func() (bool, uint64, error) {
 		c.opMu.Lock()
 		defer c.opMu.Unlock()
+		if err := c.wal.refuseWrite(); err != nil {
+			return false, 0, err
+		}
 		inserted, err := c.idx.InsertIfAbsentVersionAt(id, vec, ttl, meta, sparse, keyExpires, version, nowMs)
 		if err != nil || !inserted {
 			return inserted, 0, err
@@ -693,13 +711,24 @@ func (c *Collection) RecommendVecs(k int, opts RecommendVecsOpts) ([]Result, err
 // goroutines (0 = GOMAXPROCS), exploiting multiple cores for the HNSW build.
 // See hnsw.BuildConcurrent for constraints (empty index, heap storage, no
 // TTL/metadata/sparse).
+//
+// A bulk build is not logged, but a log-backed collection whose log is poisoned
+// refuses it like every other write (see wal.refuseWrite): no checkpoint can be
+// taken from that state, so the build could never become durable.
 func (c *Collection) BuildConcurrent(ids []uint64, vecs [][]float32, workers int) error {
+	if err := c.wal.refuseWrite(); err != nil {
+		return err
+	}
 	return c.idx.BuildConcurrent(ids, vecs, workers)
 }
 
 // BuildConcurrentMeta is BuildConcurrent carrying an OPTIONAL per-point payload
 // (nil/empty metas, or exactly one entry per id). See hnsw.BuildConcurrentMeta.
+// A poisoned log refuses it, as BuildConcurrent states.
 func (c *Collection) BuildConcurrentMeta(ids []uint64, vecs [][]float32, metas []Metadata, workers int) error {
+	if err := c.wal.refuseWrite(); err != nil {
+		return err
+	}
 	return c.idx.BuildConcurrentMeta(ids, vecs, metas, workers)
 }
 
@@ -802,7 +831,13 @@ func (c *Collection) StageBulkPayloads(ids []uint64, vecs [][]float32, metas []M
 // payloads as part of the build. The index must be empty (bulk load is the
 // initial-load path); see hnsw.BuildConcurrentMeta. A no-op when nothing is
 // staged.
+//
+// A poisoned log refuses it, as BuildConcurrent states, before the buffer is
+// taken, so the staged batch is kept.
 func (c *Collection) BuildStaged(workers int) error {
+	if err := c.wal.refuseWrite(); err != nil {
+		return err
+	}
 	c.stageMu.Lock()
 	ids, vecs, metas := c.stageIDs, c.stageVecs, c.stageMetas
 	c.stageIDs, c.stageVecs, c.stageMetas = nil, nil, nil
@@ -899,6 +934,9 @@ func (c *Collection) upsertLogged(id uint64, vec []float32, content string, ttl 
 	version, seq, err := func() (uint64, uint64, error) {
 		c.opMu.Lock()
 		defer c.opMu.Unlock()
+		if err := c.wal.refuseWrite(); err != nil {
+			return 0, 0, err
+		}
 		m := withContent(meta, content)
 		version, keyExpires, err := apply(m)
 		if err != nil {
@@ -1054,6 +1092,9 @@ func (c *Collection) DeleteCAS(id uint64, cas CASCond) (bool, error) {
 	err := func() error {
 		c.opMu.Lock()
 		defer c.opMu.Unlock()
+		if err := c.wal.refuseWrite(); err != nil {
+			return err
+		}
 		var derr error
 		ok, derr = c.idx.Delete(id, cas)
 		if derr != nil {
@@ -1273,6 +1314,9 @@ func (c *Collection) DeleteCASAt(id uint64, cas CASCond, nowMs int64) (bool, err
 	err := func() error {
 		c.opMu.Lock()
 		defer c.opMu.Unlock()
+		if err := c.wal.refuseWrite(); err != nil {
+			return err
+		}
 		var derr error
 		ok, derr = c.idx.DeleteAt(id, cas, nowMs)
 		if derr != nil {
@@ -1385,6 +1429,9 @@ func (c *Collection) payloadOpCASChanged(cas CASCond, op func(CASCond) (Metadata
 	err := func() error {
 		c.opMu.Lock()
 		defer c.opMu.Unlock()
+		if err := c.wal.refuseWrite(); err != nil {
+			return err
+		}
 		resulting, ke, v, ch, err := op(cas)
 		if err != nil {
 			return err
