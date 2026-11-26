@@ -650,3 +650,52 @@ func TestIdentityOnlyOneConcurrentRepairerWins(t *testing.T) {
 		})
 	}
 }
+
+// refusingSetNXStore fails every set_nx and counts plain writes.
+type refusingSetNXStore struct {
+	rostam.Store
+	puts *int
+}
+
+func (s refusingSetNXStore) Call(ctx context.Context, op string, args []byte) ([]byte, error) {
+	if op == "set_nx" {
+		return nil, errInjected
+	}
+	return s.Store.Call(ctx, op, args)
+}
+
+func (s refusingSetNXStore) Put(ctx context.Context, key, value []byte, ttl time.Duration) error {
+	*s.puts++
+	return s.Store.Put(ctx, key, value, ttl)
+}
+
+// A failed set_nx is reported with the server version it may be down to, and
+// nothing is written another way.
+func TestIdentityFailedSetNXHintsAndWritesNothing(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		prepare func(*testing.T, rostam.Store)
+	}{
+		{"creator", func(*testing.T, rostam.Store) {}},
+		{"repair", func(t *testing.T, st rostam.Store) { storeWithoutIdentity(t, st, nil, "fact one") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newHeapStore(t)
+			tc.prepare(t, st)
+			puts := 0
+			s := newTestServer(t, Config{Store: refusingSetNXStore{st, &puts}})
+
+			err := s.ensureMemory(context.Background())
+			if !errors.Is(err, errInjected) {
+				t.Fatalf("ensureMemory = %v, want it to wrap the set_nx failure", err)
+			}
+			if msg := err.Error(); !strings.Contains(msg, "may") || !strings.Contains(msg, "-connect") || !strings.Contains(msg, "v0.5.0 or later") {
+				t.Fatalf("the error must hint at the server version: %v", err)
+			}
+			if puts != 0 || s.memReady {
+				t.Fatalf("puts = %d, memReady = %v; want nothing written and not ready", puts, s.memReady)
+			}
+			requireNoIdentity(t, st)
+		})
+	}
+}

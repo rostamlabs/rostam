@@ -125,7 +125,9 @@ func (s *Server) claimIdentity(ctx context.Context) error {
 	}
 	res, err := s.store.Call(ctx, "set_nx", ops.EncodeSetNXArgs([]byte(kvEmbedder), b, 0))
 	if err != nil {
-		return fmt.Errorf("mcp: storing embedder identity: %w", err)
+		// A hint, not a diagnosis: some servers answer an op they do not have
+		// with a bare internal error.
+		return fmt.Errorf("mcp: storing embedder identity: %w (over -connect this may mean the server is too old: recording the identity needs v0.5.0 or later)", err)
 	}
 	stored, err := ops.DecodeCASResult(res)
 	if err != nil {
