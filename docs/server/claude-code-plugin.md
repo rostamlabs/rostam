@@ -102,7 +102,11 @@ Limits:
   hashed name is used and the file is left untouched; `mcp` says so on stderr
   and the hooks use the same name. That fallback name is not checked against
   other projects (the registry could not be read), so in this state two
-  projects could in principle share a name (a 32-bit hash collision). Repairing
+  projects could in principle share a name (a 32-bit hash collision). Memories
+  saved in this state are stored under that fallback name; once the registry
+  works again the project uses its registered name, so unless that is the same
+  hashed name, reach them with an explicit `namespace` argument (the fallback
+  name is in `mcp`'s stderr warning). Repairing
   `namespaces.json` restores the checked assignments; moving it aside instead
   rebuilds the registry from scratch, so the first same-named project to open
   then takes the plain name. A lock failure is about `namespaces.lock` or the
