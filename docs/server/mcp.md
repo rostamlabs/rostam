@@ -106,11 +106,11 @@ complete. Memories already lost to an earlier forced stop cannot be recovered.
 
 If the conversion fails, the store still opens with the collection in its old
 form, a warning says it is `not crash-safe` and why, and the next start tries
-again. Until it succeeds, a forced stop can lose recent memories. Read that
-warning on stderr (the shared daemon writes it to
-`~/.rostam/memory/daemon.log`). If a conversion was interrupted and the new
-snapshot cannot be loaded, the store fails to open instead of falling back to
-the old files.
+again. Until it succeeds, a forced stop can lose recent memories. The warning
+goes to stderr. A shared daemon that `mcp -autostart` started has it in
+`~/.rostam/memory/daemon.log`; a `memory-daemon` you started yourself writes it
+to its own stderr. If a conversion was interrupted and the new snapshot cannot
+be loaded, the store fails to open instead of falling back to the old files.
 
 ### A damaged log
 
@@ -440,8 +440,12 @@ list the memory collection in
 [`-durable-collections`](running.md):
 
 ```sh
-rostam-server -tcp 127.0.0.1:7000 -data /var/lib/rostam -durable-collections mcp_memory
+rostam-server -tcp 127.0.0.1:7000 -http "" -data /var/lib/rostam -durable-collections mcp_memory
 ```
+
+`-http ""` turns the REST API off. It is on by default, on `:8080` on every
+interface, and the server refuses to start with that unless authentication is
+configured.
 
 The flag also converts an `mcp_memory` collection that already exists on that
 server, at startup (see [Upgrading an existing store](#upgrading-an-existing-store)),
@@ -454,6 +458,6 @@ there.
 ### Server version
 
 Creating a new memory store over `-connect`, and rebuilding a missing embedder
-record, need a server at **v0.5.0 or later**. A v0.4.x server with
-authorization on refuses it for any key without admin rights. An existing store
-that has its record is not affected.
+record, need a server at **v0.5.0 or later**. No v0.4.x server has the
+operation this needs, so the call fails there with any key, whether or not
+authorization is on. An existing store that has its record is not affected.

@@ -159,17 +159,25 @@ at the price of a disk sync per change. The rules, and the one exception
 for plain `mcp`: see [What survives a crash](mcp.md#what-survives-a-crash).
 
 - **Existing stores** are [converted](mcp.md#upgrading-an-existing-store) when
-  the new daemon first starts. If that fails, the daemon still runs, and
-  `~/.rostam/memory/daemon.log` carries a `not crash-safe` warning. The
-  conversion happens before the daemon answers; if a session gives up with "did
-  not become ready" and the log shows no error, start another session.
+  the new daemon first starts. If that fails, the daemon still runs and logs a
+  `not crash-safe` warning: in `~/.rostam/memory/daemon.log` when
+  `mcp -autostart` started the daemon, on stderr when you ran `memory-daemon`
+  yourself. The conversion happens before the daemon answers, so a session may
+  give up with "did not become ready" while it is still running; start another
+  session once it has finished. A session started while it is still running can
+  add this error to `daemon.log`, which is expected, because the first daemon
+  holds the data directory: `memory-daemon: another process (a running memory
+  daemon or an embedded mcp) already holds <data directory>: data directory is
+  held by another process: resource temporarily unavailable`.
 - **A failed log write** (a full disk, for example) makes memory refuse further
   writes until the daemon restarts. Free the space, run
   `rostam-server memory-daemon -stop`, and start a new session.
 - **A damaged log** keeps the daemon from starting. Sessions report that it did
-  not become ready, and `daemon.log` names the file
-  (`~/.rostam/memory/vectors/default/mcp_memory.wal`) and the offset. With no
-  daemon running, follow [A damaged log](mcp.md#a-damaged-log).
+  not become ready, and the daemon's error names the file
+  (`~/.rostam/memory/vectors/default/mcp_memory.wal`) and the offset. It is in
+  `daemon.log` when `mcp -autostart` started the daemon, and on stderr when you
+  ran `memory-daemon` yourself. With no daemon running, follow
+  [A damaged log](mcp.md#a-damaged-log).
 
 ### Replacing an older daemon
 

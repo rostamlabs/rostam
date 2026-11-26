@@ -21,19 +21,26 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   `-durable-collections mcp_memory`. `-data ""` stays non-durable.
   See [What survives a crash](server/mcp.md#what-survives-a-crash).
 - **`-durable-collections` and `DirectConfig.DurableCollections`.** A
-  single-node server, or an embedded store, can name dense vector collections
-  that always run with a write-ahead log synced before every acknowledged write.
-  Empty by default; ignored with `-cluster`.
+  single-node server, or an embedded store, can name dense vector collections to
+  run with a write-ahead log, synced before each write is acknowledged. This
+  covers a listed collection created or restored while listed, an existing
+  `Persistent` one (converted at startup; if that fails it keeps its old form,
+  with a warning, until a later start succeeds) and one that already has a log.
+  A listed collection that already exists with neither `Persistent` nor a log
+  keeps its mode. Empty by default; needs a data directory to keep anything
+  across a restart; ignored with `-cluster`.
   See [Running a server](server/running.md).
 - **Breaking: a damaged write-ahead log now stops the open.** This applies to
   every collection with a write-ahead log (dense, multi-vector and named).
   Before, replay stopped silently at the first bad record, and writes made after
   it could not be replayed later. Now a half-written tail is cut off and saved as
   `<file>.torn-<number>`, and the store opens. Damage followed by further
-  records, or a record that cannot be decoded, makes the store (and a server
-  using it) fail to start with the file and offset in the error. To recover,
-  stop the process, keep a copy of the file, and truncate it at that offset,
-  which loses the records after it.
+  records, or a record that passes its checksum but cannot be decoded, makes the
+  store (and a server using it) fail to start with the file and offset in the
+  error. To recover, stop the process, keep a copy of the file, and truncate it
+  at that offset, which loses the records after it. A record of an unknown type,
+  as a newer release may write, still fails the start as before; that error has
+  no offset and truncating is not the remedy: run the newer release.
   See [A damaged log](server/mcp.md#a-damaged-log).
 - **A failed log write stops further writes.** After a write to a write-ahead
   log fails (a full disk, for example), the collection refuses writes until the
@@ -42,9 +49,9 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   memory tool call checks the configured embedder against the stored memories
   and records it again.
 - **Over `mcp -connect`, a new memory store needs a server at v0.5.0 or later**,
-  as does rebuilding a missing embedder record. A v0.4.x server with
-  authorization on refuses it for non-admin keys. Existing stores that have the
-  record are unaffected.
+  as does rebuilding a missing embedder record. No v0.4.x server has the
+  operation this needs, so it fails there with any key, whether or not
+  authorization is on. Existing stores that have the record are unaffected.
 - **Code-linked memory and a Claude Code plugin.** `remember` takes an optional
   `path` (and `symbol`) that links a memory to a file, and `recall_for_file`
   lists what is linked to one. A linked memory whose file has since changed is
