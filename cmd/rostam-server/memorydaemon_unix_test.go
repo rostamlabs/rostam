@@ -95,7 +95,7 @@ func startHelperSupervisor(t *testing.T, data string) (*exec.Cmd, int) {
 	t.Helper()
 	exe, _ := os.Executable()
 	sup := exec.Command(exe, "-test.run=^TestHelperSupervisor$")
-	sup.Env = append(os.Environ(), "ROSTAM_TEST_SUPERVISOR_DATA="+data)
+	sup.Env = append(os.Environ(), "ROSTAM_TEST_SUPERVISOR_DATA="+data, "HOME="+t.TempDir())
 	if err := sup.Start(); err != nil {
 		t.Fatal(err)
 	}

@@ -171,6 +171,14 @@ func runMcpCmd(args []string) {
 			fatal("mcp: setup failed", "err", err)
 		}
 		autoEmbedder = &emb
+		// A daemon left running by an earlier release keeps memory without
+		// durability; stop it (cleanly, through -stop's verified path) so that
+		// ensureDaemon starts one that has it.
+		if err := retireNonDurableDaemon(context.Background(), dir, memoryDefaultAddr, probeDaemon,
+			func() error { return stopDaemon(dir, daemonStopWait) },
+			func(msg string) { fmt.Fprintln(os.Stderr, msg) }); err != nil {
+			fatal("mcp: " + err.Error())
+		}
 		if err := ensureDaemon(context.Background(), dir, memoryDefaultAddr, newDaemonSpawner(dir, memoryDefaultAddr)); err != nil {
 			fatal("mcp: " + err.Error())
 		}
@@ -381,9 +389,10 @@ func mcpSetupWith(fl mcpFlags, embedder semcache.Embedder, lookupEnv func(string
 		// far more than the handful of small bookkeeping keys the memory tools put
 		// in KV (the memories themselves live in the vector collection).
 		store, err = rostam.NewDirect(rostam.DirectConfig{
-			DataDir: fl.data,
-			Ops:     reg,
-			Cache:   rostam.CacheConfig{NumShardsPerNode: 8, MaxMemoryBytes: 256 << 20},
+			DataDir:            fl.data,
+			Ops:                reg,
+			Cache:              rostam.CacheConfig{NumShardsPerNode: 8, MaxMemoryBytes: 256 << 20},
+			DurableCollections: embeddedDurableCollections(fl.data),
 		})
 	}
 	if err != nil {
@@ -476,4 +485,15 @@ func connectStore(fl storeFlags, reg *ops.Registry, lookupEnv func(string) (stri
 		return nil, fmt.Errorf("rostam-server: connect to %q: %w", fl.connect, err)
 	}
 	return store, nil
+}
+
+// embeddedDurableCollections is the durable list for an embedded store on
+// dataDir: the memory collection, so an acknowledged remember survives the
+// process being killed. A heap store (-data "") keeps nothing across a restart
+// anyway, so it gets none rather than a synced log in a scratch directory.
+func embeddedDurableCollections(dataDir string) []string {
+	if dataDir == "" {
+		return nil
+	}
+	return []string{mcp.MemoryCollection}
 }
