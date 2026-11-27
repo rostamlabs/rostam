@@ -206,3 +206,19 @@ func TestEmbeddedDurableCollections(t *testing.T) {
 		t.Fatalf("heap store: durable collections %q, want none", got)
 	}
 }
+
+// A cancelled context stops nothing even when no sibling holds the spawn lock
+// and the old daemon answers.
+func TestRetireCancelledUncontendedStopsNothing(t *testing.T) {
+	data := filepath.Join(t.TempDir(), "memory")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	d := &oldDaemon{}
+	var w warnings
+	if err := retireNonDurableDaemon(ctx, data, noDaemonAddr, d.probe, d.stop, w.warn); !errors.Is(err, context.Canceled) {
+		t.Fatalf("retire = %v, want context.Canceled", err)
+	}
+	if got := d.stops.Load(); got != 0 {
+		t.Fatalf("stop called %d times after cancellation, want 0", got)
+	}
+}

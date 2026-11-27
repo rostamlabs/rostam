@@ -582,6 +582,10 @@ func retireNonDurableDaemon(ctx context.Context, data, addr string, probe probeF
 		}
 		return nil
 	}
+	// A session cancelled while it decided never stops the daemon.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	warn(fmt.Sprintf("mcp: the memory daemon on %s was started by an earlier release without durable memory; stopping it so a new one starts", addr))
 	if err := stop(); err != nil {
 		warn(fmt.Sprintf("mcp: could not stop the memory daemon on %s (%v); using it as it is, without durable memory. "+
