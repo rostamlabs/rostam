@@ -332,6 +332,10 @@ func grpcError(err error) error {
 		// server.clientFacingErr and httpapi.statusForError's 400 bucket for the
 		// same sentinel. Unclassified it fell to codes.Internal, which reads as a
 		// server fault and which standard gRPC retry policies hammer.
+		errIs(err, vector.ErrWALRecordTooLarge),
+		// vector.ErrWALRecordTooLarge: a write (a multi-vector document) whose
+		// log record would be larger than replay reads back. Refused, and the
+		// message names only the two sizes, so the same bucket as the cap above.
 		errIs(err, vector.ErrRecordMalformed),
 		// vector.ErrRecordMalformed: a payload carrying record bytes no operate
 		// engine can open. A caller mistake with a clear remedy (send a

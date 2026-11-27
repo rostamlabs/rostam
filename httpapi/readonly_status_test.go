@@ -17,8 +17,22 @@ func TestStatusForReadOnlyAndBusyEviction(t *testing.T) {
 		fmt.Errorf("vector: evict %q: %w", "default/docs", vector.ErrEvictBusy),
 		fmt.Errorf("%w: default/mcp_memory: restart", vector.ErrCollectionReadOnly),
 	} {
-		if got := statusForError(err); got != http.StatusConflict {
-			t.Fatalf("statusForError(%v) = %d, want 409", err, got)
+		got, msg := clientError("op", err)
+		if got != http.StatusConflict {
+			t.Fatalf("clientError(%v) status = %d, want 409", err, got)
 		}
+		if msg != err.Error() {
+			t.Fatalf("clientError(%v) message = %q, want the error's own message", err, msg)
+		}
+	}
+}
+
+// A multi-vector document too large for one log record is refused before it
+// applies: a 400 carrying the message, not a redacted 500.
+func TestStatusForWALRecordTooLarge(t *testing.T) {
+	err := fmt.Errorf("%w: the document's record takes 70000000 bytes, the limit is 67108864", vector.ErrWALRecordTooLarge)
+	got, msg := clientError("op", err)
+	if got != http.StatusBadRequest || msg != err.Error() {
+		t.Fatalf("clientError(%v) = (%d, %q), want 400 with the message", err, got, msg)
 	}
 }

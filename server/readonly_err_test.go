@@ -17,3 +17,12 @@ func TestReadOnlyCollectionErrorIsClientFacing(t *testing.T) {
 		t.Fatalf("clientFacingErr(%v) = false, want the message passed to the client", err)
 	}
 }
+
+// A multi-vector document too large for one log record is refused before it
+// applies: the caller's own mistake, so its message reaches the client.
+func TestWALRecordTooLargeIsClientFacing(t *testing.T) {
+	err := fmt.Errorf("%w: the document's record takes 70000000 bytes, the limit is 67108864", vector.ErrWALRecordTooLarge)
+	if !clientFacingErr(err) {
+		t.Fatalf("clientFacingErr(%v) = false, want the message passed to the client", err)
+	}
+}

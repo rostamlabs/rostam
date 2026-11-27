@@ -18,3 +18,10 @@ func TestReadOnlyCollectionIsFailedPrecondition(t *testing.T) {
 		t.Fatalf("code = %v, want FailedPrecondition", got)
 	}
 }
+
+func TestWALRecordTooLargeIsInvalidArgument(t *testing.T) {
+	err := grpcError(fmt.Errorf("%w: the document's record takes 70000000 bytes, the limit is 67108864", vector.ErrWALRecordTooLarge))
+	if got := status.Code(err); got != codes.InvalidArgument {
+		t.Fatalf("code = %v, want InvalidArgument", got)
+	}
+}
