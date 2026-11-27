@@ -221,12 +221,13 @@ func upgradeStep(step string) error {
 // loaded beside the old one, and only once it has loaded is the old one closed
 // and replaced. If it does not load, the old manifest is put back.
 //
-// A failure here leaves the old form registered and working, warns that the
-// collection is not crash-safe, and the next open tries again, as long as the
-// manifest is known to name the old form. When it is not (it could not be read
-// back or put back), an error fails the open and every file is kept: serving
-// the old form would accept writes that the next open, loading the log form,
-// would not see.
+// No failure here fails the open. A failure leaves the old form registered
+// and working, warns that the collection is not crash-safe, and the next open
+// tries again, as long as the manifest is known to name the old form. When it
+// is not (it could not be read back or put back), the old form is served
+// read-only (markReadOnly) and every file is kept: a write accepted now might
+// not be seen by the next open, which may load the log form. The return value
+// is always nil.
 func (s *CollectionStore) upgradeToDurable(canonical string, cfg Config, cfgPath, snapPath string) error {
 	old := s.collections[canonical]
 	walCfg := s.durableConfig(canonical, cfg)
@@ -242,15 +243,16 @@ func (s *CollectionStore) upgradeToDurable(canonical string, cfg Config, cfgPath
 			return nil
 		}
 		// The manifest could not be read back or put back, so nothing says
-		// which form the next open loads. Serving the old form would accept
-		// writes that open may not see, so the open fails and every file stays.
-		return fmt.Errorf("vector: open %s: upgrading it to the write-ahead log failed and its manifest %s could not be read back or put back, so which form it is in is unknown; nothing was removed: %w",
-			canonical, cfgPath, res.err)
+		// which form the next open loads. A write accepted now might not be
+		// seen by it, so the old form is served read-only and every file stays.
+		s.markReadOnly(canonical, old, cfgPath, fmt.Errorf("upgrading it to the write-ahead log failed and its manifest could not be read back or put back: %w", res.err))
+		return nil
 	}
 
 	nc, err := s.buildWALCollection(canonical, walCfg, cfgPath, snapPath)
 	if err != nil {
-		return s.rollbackUpgrade(canonical, cfg, cfgPath, snapPath, err)
+		s.rollbackUpgrade(canonical, old, cfg, cfgPath, snapPath, err)
+		return nil
 	}
 	s.collections[canonical] = nc
 	if cerr := old.Close(); cerr != nil {
@@ -268,22 +270,38 @@ func (s *CollectionStore) upgradeToDurable(canonical string, cfg Config, cfgPath
 
 // rollbackUpgrade runs when the log form of a just-committed upgrade does not
 // load. The old manifest is put back, atomically, and the snapshot and the log
-// the load may have created are removed; the old form, still open, stays, and
-// nil is returned. If the old manifest cannot be put back, the manifest names
-// the log form, which the next open loads: serving the old form now would
-// accept writes that open does not see. Then nothing is removed and the error
-// fails the open.
-func (s *CollectionStore) rollbackUpgrade(canonical string, cfg Config, cfgPath, snapPath string, loadErr error) error {
+// the load may have created are removed; the old form, still open, stays. If
+// the old manifest cannot be put back, the manifest names the log form, which
+// the next open loads, so a write accepted now would not be seen by it: the old
+// form is served read-only and nothing is removed.
+func (s *CollectionStore) rollbackUpgrade(canonical string, old *Collection, cfg Config, cfgPath, snapPath string, loadErr error) {
 	if werr := writeConfig(cfgPath, cfg); werr != nil {
-		return fmt.Errorf("vector: open %s: its upgraded write-ahead log form did not load (%w), and the old manifest could not be put back over %s (%v); nothing was removed, and the files of its old form are still there",
-			canonical, loadErr, cfgPath, werr)
+		s.markReadOnly(canonical, old, cfgPath, fmt.Errorf("its upgraded write-ahead log form did not load (%w), and the old manifest could not be put back (%v)", loadErr, werr))
+		return
 	}
 	_, _, _, walPath := s.persistPaths(canonical)
 	_ = os.Remove(snapPath)
 	_ = os.Remove(walPath)
 	slog.Warn("vector: durable collection is not crash-safe: its upgraded form did not load, so the old manifest was put back and it stays in its old form until a later open succeeds",
 		"collection", canonical, "err", loadErr)
-	return nil
+}
+
+// ErrCollectionReadOnly is returned for every change to a collection served
+// read-only: one whose upgrade to the write-ahead log ended in a state where
+// it is unknown which form the next open loads (see markReadOnly). Reads work.
+// The error says what happened; fixing the disk problem it names and
+// restarting lets the next open finish the job.
+var ErrCollectionReadOnly = errors.New("vector: collection is read-only")
+
+// markReadOnly serves c, the old form of canonical, read-only: every change to
+// it, and every flush, checkpoint, drop, restore over it and eviction of it, is
+// refused, and none of its files is written or removed. Called while the store
+// opens, before c can be reached by anyone else.
+func (s *CollectionStore) markReadOnly(canonical string, c *Collection, cfgPath string, why error) {
+	c.readOnly = fmt.Errorf("%w: %s: %v; which form its files are in is unknown, so it is served read-only from the old form and every file is kept. Fix the disk problem (see the server log for the manifest %s) and restart",
+		ErrCollectionReadOnly, canonical, why, cfgPath)
+	slog.Error("vector: durable collection is read-only: its upgrade ended with the form of its files unknown; reads work, every change is refused, every file is kept. Fix the disk problem and restart",
+		"collection", canonical, "manifest", cfgPath, "err", why)
 }
 
 // keepOrphanSnapshot handles a listed collection whose Persistent manifest has

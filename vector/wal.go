@@ -709,8 +709,11 @@ func (w *wal) truncate() error {
 // that fsync runs outside opMu (see commitWait). The snapshot itself therefore
 // goes through settle, under opMu, which waits for every record already written
 // to be synced and refuses if that fails: Collection.Snapshot and its named and
-// multi-vector twins take opMu and settle the log, so a checkpoint, a backup and
-// a cold-tier eviction all capture only writes whose records are on disk.
+// multi-vector twins take opMu and settle the log, so for a log that syncs
+// before acknowledging, a checkpoint, a backup and a cold-tier eviction all
+// capture only writes whose records are on disk. An unsynced (WALNoSync) log
+// promises no sync, so for it they capture only writes whose records were
+// written without error.
 func (w *wal) refuseCheckpoint() error {
 	if w != nil && w.poisoned.Load() {
 		return ErrWALPoisoned

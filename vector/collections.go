@@ -298,6 +298,11 @@ func (s *CollectionStore) loadCollection(canonical, cfgPath, snapPath string) er
 		return nil
 	}
 
+	// A durable restore stopped part way can leave its staged snapshot; no
+	// open reads it, so it is removed. Done before anything else, so a
+	// collection that then turns out read-only has its own files untouched.
+	removeRestoreLeftovers(snapPath)
+
 	// WAL collections recover from a CONSISTENT checkpoint (Snapshot) plus the
 	// WAL tail — not the mmap sidecar. Instant-restart's zero-copy mmap base is
 	// only valid when nothing mutates after Flush; with a WAL, post-checkpoint
@@ -812,6 +817,10 @@ func (s *CollectionStore) dropCollection(canonical string) error {
 		s.mu.Unlock()
 		return nil
 	}
+	if err := c.refuseReadOnly(); err != nil {
+		s.mu.Unlock()
+		return err
+	}
 	delete(s.collections, canonical)
 	s.mu.Unlock()
 	// Out of the lock: drain in-flight users (Acquire holders) before closing, so
@@ -823,6 +832,7 @@ func (s *CollectionStore) dropCollection(canonical string) error {
 	c.retire(func() {
 		_ = os.Remove(cfgPath)
 		_ = os.Remove(snapPath)
+		removeRestoreLeftovers(snapPath)
 		// Single-node persistent files + cluster generation files (no-ops if absent).
 		_ = os.Remove(vecsPath)
 		_ = os.Remove(graphPath)
@@ -943,8 +953,17 @@ func (s *CollectionStore) RestoreCollectionWithConfig(name string, cfg Config, r
 	s.mu.RLock()
 	_, multi := s.multi[canonical]
 	_, named := s.named[canonical]
+	var readOnly error
+	if cur, ok := s.collections[canonical]; ok {
+		readOnly = cur.refuseReadOnly()
+	}
 	nowFnMs := s.nowFnMs
 	s.mu.RUnlock()
+	if readOnly != nil {
+		// Refused before staging: a durable restore stages its snapshot in the
+		// collection's own directory, and a read-only collection keeps every file.
+		return fmt.Errorf("vector: restore %q: %w", canonical, readOnly)
+	}
 	if multi || named {
 		// A dense snapshot replaces a dense collection (hot or cold) or fills an
 		// absent name; it does not change a name's family. Publication drops through
@@ -1017,6 +1036,13 @@ func (s *CollectionStore) discardStaged(c *Collection) {
 	if s.persistentCluster {
 		removeClusterMmapFiles(c.cfg)
 	}
+}
+
+// removeRestoreLeftovers removes, best effort, the staged snapshot of a durable
+// restore that was stopped part way, and the staging file's own temporary.
+func removeRestoreLeftovers(snapPath string) {
+	_ = os.Remove(snapPath + restoreStageSuffix)
+	_ = os.Remove(snapPath + restoreStageSuffix + ".tmp")
 }
 
 // restoreStageSuffix names where a durable restore writes the restored snapshot
@@ -1193,6 +1219,9 @@ func (s *CollectionStore) Flush(name string) error {
 		return fmt.Errorf("vector: no collection %q", name)
 	}
 	defer c.Release()
+	if err := c.refuseReadOnly(); err != nil {
+		return err
+	}
 
 	snapPath := s.loadedSnapPath(canonical)
 
@@ -1241,6 +1270,9 @@ func (s *CollectionStore) Flush(name string) error {
 // writeSnapshotFile atomically writes c's snapshot to path (tmp + fsync + rename).
 // When c has a log the caller holds c.opMu (or c is not yet published).
 func (s *CollectionStore) writeSnapshotFile(c *Collection, path string) error {
+	if err := c.refuseReadOnly(); err != nil {
+		return err
+	}
 	if err := c.wal.refuseCheckpoint(); err != nil {
 		return err // memory may be ahead of a poisoned log; see refuseCheckpoint
 	}
@@ -1800,7 +1832,7 @@ func (s *CollectionStore) FlushPersistent() error {
 	s.mu.RLock()
 	names := make([]string, 0, len(s.collections))
 	for name, c := range s.collections {
-		if c.cfg.Persistent && !c.cfg.WAL {
+		if c.cfg.Persistent && !c.cfg.WAL && c.refuseReadOnly() == nil { // a read-only one writes nothing
 			names = append(names, name)
 		}
 	}

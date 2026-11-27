@@ -44,6 +44,13 @@ type Collection struct {
 	// CollectionStore.EvictCollection).
 	pins atomic.Uint64
 
+	// readOnly, when non-nil, is why this collection refuses every change: its
+	// files are kept exactly as they are, and every mutator, flush and
+	// checkpoint returns it (wrapping ErrCollectionReadOnly). Set once before
+	// the collection is published, never cleared; nil for every ordinary
+	// collection.
+	readOnly error
+
 	// lastAccess is the injected-clock unix-nanos timestamp of the most recent
 	// resolve (CollectionStore.Acquire) or promote, driving the idle cold-tier
 	// sweeper (CollectionStore.SweepCold). 0 = never stamped (a fresh/never-resolved
@@ -173,6 +180,14 @@ func openPersistentCollection(name string, cfg Config, metaPath string) (*Collec
 	return &Collection{name: name, cfg: cfg, idx: idx}, nil
 }
 
+// refuseReadOnly returns the collection's read-only error, nil when it accepts
+// changes. Every mutator calls it first.
+func (c *Collection) refuseReadOnly() error { return c.readOnly }
+
+// ReadOnly returns why the collection refuses changes, or nil when it accepts
+// them.
+func (c *Collection) ReadOnly() error { return c.readOnly }
+
 // Name returns the collection name.
 func (c *Collection) Name() string { return c.name }
 
@@ -232,6 +247,9 @@ func (c *Collection) InsertCAS(id uint64, vec []float32, ttl time.Duration, meta
 // verbatim, time-stable). Empty/nil keyTTLMs is the zero-overhead path
 // (byte-identical WAL record).
 func (c *Collection) InsertCASKeyTTL(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond) (uint64, error) {
+	if err := c.refuseReadOnly(); err != nil {
+		return 0, err
+	}
 	c.startSweeper()
 	if c.wal == nil {
 		version, _, err := c.idx.Insert(id, vec, ttl, meta, sparse, keyTTLMs, cas)
@@ -281,6 +299,9 @@ func (c *Collection) InsertCASKeyTTL(id uint64, vec []float32, ttl time.Duration
 // The WAL (single-node only; off under cluster replication) still logs the
 // resulting ABSOLUTE deadlines verbatim.
 func (c *Collection) InsertCASKeyTTLAt(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond, nowMs int64) (uint64, error) {
+	if err := c.refuseReadOnly(); err != nil {
+		return 0, err
+	}
 	c.startSweeper()
 	if c.wal == nil {
 		version, _, err := c.idx.InsertAt(id, vec, ttl, meta, sparse, keyTTLMs, cas, nowMs)
@@ -325,6 +346,9 @@ func (c *Collection) InsertCASKeyTTLAt(id uint64, vec []float32, ttl time.Durati
 // insert with that version + keyExpires so a later replay restores them too. Starts
 // the sweeper like Insert.
 func (c *Collection) RestoreInsert(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64) error {
+	if err := c.refuseReadOnly(); err != nil {
+		return err
+	}
 	// Checked HERE as well as in the engine body, because THIS layer owns the
 	// {apply, then append} ordering below: idx.RestoreInsert mutates the index
 	// before the WAL append runs, so a payload the codec cannot encode has to be
@@ -364,6 +388,9 @@ func (c *Collection) RestoreInsert(id uint64, vec []float32, ttl time.Duration, 
 // version-preserving insert path (reshard/resplit backfill) under an apply stamp
 // (#4 vector TTL determinism).
 func (c *Collection) RestoreInsertAt(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64, nowMs int64) error {
+	if err := c.refuseReadOnly(); err != nil {
+		return err
+	}
 	// See RestoreInsert: this layer applies before it appends.
 	if err := checkRecordValues(meta); err != nil {
 		return err
@@ -407,6 +434,9 @@ func (c *Collection) InsertIfAbsent(id uint64, vec []float32, ttl time.Duration,
 // online reshard copy keeps the point's original key deadlines time-stable; nil
 // keyExpires (a plain if-absent) is byte-identical to today's behavior.
 func (c *Collection) InsertIfAbsentVersion(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64) (bool, error) {
+	if err := c.refuseReadOnly(); err != nil {
+		return false, err
+	}
 	c.startSweeper()
 	if c.wal == nil {
 		return c.idx.InsertIfAbsentVersion(id, vec, ttl, meta, sparse, keyExpires, version)
@@ -449,6 +479,9 @@ func (c *Collection) InsertIfAbsentVersion(id uint64, vec []float32, ttl time.Du
 // skewed replicas agree on resurrection and stamp identical deadlines (#4 vector
 // TTL determinism).
 func (c *Collection) InsertIfAbsentVersionAt(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64, nowMs int64) (bool, error) {
+	if err := c.refuseReadOnly(); err != nil {
+		return false, err
+	}
 	c.startSweeper()
 	if c.wal == nil {
 		return c.idx.InsertIfAbsentVersionAt(id, vec, ttl, meta, sparse, keyExpires, version, nowMs)
@@ -497,7 +530,7 @@ func (c *Collection) Exists(id uint64) bool { return c.idx.Exists(id) }
 // Once is still consumed so a later call stays a no-op and lifecycle teardown
 // (which nil-checks sweepStop) is unaffected (#4 vector TTL determinism, B3a).
 func (c *Collection) startSweeper() {
-	if c.cfg.SuppressSweep {
+	if c.cfg.SuppressSweep || c.refuseReadOnly() != nil {
 		c.sweepStart.Do(func() {})
 		return
 	}
@@ -722,6 +755,9 @@ func (c *Collection) RecommendVecs(k int, opts RecommendVecsOpts) ([]Result, err
 // refuses it like every other write (see wal.refuseWrite): no checkpoint can be
 // taken from that state, so the build could never become durable.
 func (c *Collection) BuildConcurrent(ids []uint64, vecs [][]float32, workers int) error {
+	if err := c.refuseReadOnly(); err != nil {
+		return err
+	}
 	if err := c.wal.refuseWrite(); err != nil {
 		return err
 	}
@@ -732,6 +768,9 @@ func (c *Collection) BuildConcurrent(ids []uint64, vecs [][]float32, workers int
 // (nil/empty metas, or exactly one entry per id). See hnsw.BuildConcurrentMeta.
 // A poisoned log refuses it, as BuildConcurrent states.
 func (c *Collection) BuildConcurrentMeta(ids []uint64, vecs [][]float32, metas []Metadata, workers int) error {
+	if err := c.refuseReadOnly(); err != nil {
+		return err
+	}
 	if err := c.wal.refuseWrite(); err != nil {
 		return err
 	}
@@ -766,6 +805,9 @@ func (c *Collection) BuildConcurrentMeta(ids []uint64, vecs [][]float32, metas [
 // owns "is this batch self-consistent", which needs only the batch; this method
 // owns "does it fit this collection", which needs the config and nothing else.
 func (c *Collection) StageBulk(ids []uint64, vecs [][]float32) error {
+	if err := c.refuseReadOnly(); err != nil {
+		return err
+	}
 	return c.StageBulkPayloads(ids, vecs, nil)
 }
 
@@ -781,6 +823,9 @@ func (c *Collection) StageBulk(ids []uint64, vecs [][]float32) error {
 // point. Everything StageBulk documents about dimension checking applies here
 // unchanged.
 func (c *Collection) StageBulkPayloads(ids []uint64, vecs [][]float32, metas []Metadata) error {
+	if err := c.refuseReadOnly(); err != nil {
+		return err
+	}
 	// THE FULL GATE, HERE, EVEN THOUGH BuildConcurrentMeta RUNS IT AGAIN.
 	// BuildStaged takes the staged slices and CLEARS the buffer before it calls
 	// the engine, so a record that got past staging is discovered with the
@@ -841,6 +886,9 @@ func (c *Collection) StageBulkPayloads(ids []uint64, vecs [][]float32, metas []M
 // A poisoned log refuses it, as BuildConcurrent states, before the buffer is
 // taken, so the staged batch is kept.
 func (c *Collection) BuildStaged(workers int) error {
+	if err := c.refuseReadOnly(); err != nil {
+		return err
+	}
 	if err := c.wal.refuseWrite(); err != nil {
 		return err
 	}
@@ -886,6 +934,9 @@ func (c *Collection) UpsertCAS(id uint64, vec []float32, content string, ttl tim
 // deadlines; the WAL logs them so replay restores them verbatim. Empty/nil
 // keyTTLMs is the zero-overhead path.
 func (c *Collection) UpsertCASKeyTTL(id uint64, vec []float32, content string, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond) (uint64, error) {
+	if err := c.refuseReadOnly(); err != nil {
+		return 0, err
+	}
 	// THE FULL GATE, HERE, EVEN THOUGH insertBody RUNS IT AGAIN. Upsert without a
 	// log is delete-then-insert, and the delete below is irreversible: downgrade
 	// this to checkRecordValuesSize and a malformed record deletes the existing
@@ -1042,6 +1093,9 @@ func (c *Collection) ScanVectors() []ScanRecord { return c.idx.scanVectors() }
 // chunks of a document), returning the count removed. The deletes are WAL-logged.
 // A zero/match-all filter is rejected (ErrEmptyFilter).
 func (c *Collection) DeleteByFilter(filter Filter) (int, error) {
+	if err := c.refuseReadOnly(); err != nil {
+		return 0, err
+	}
 	pred, err := CompileFilter(filter)
 	if err != nil {
 		return 0, err
@@ -1082,6 +1136,9 @@ func (c *Collection) Delete(id uint64) bool {
 // with no mutation; otherwise removed reports whether id was live. The version is
 // dropped with the point (a later reinsert starts at 1).
 func (c *Collection) DeleteCAS(id uint64, cas CASCond) (bool, error) {
+	if err := c.refuseReadOnly(); err != nil {
+		return false, err
+	}
 	if c.wal == nil {
 		return c.idx.Delete(id, cas)
 	}
@@ -1309,6 +1366,9 @@ func (c *Collection) MutatePayloadRecordCASAt(id uint64, key string, fn RecordMu
 // apply stamp nowMs, so replicas agree on already-dead vs live and keep identical
 // tombstone sets (#4 vector TTL determinism).
 func (c *Collection) DeleteCASAt(id uint64, cas CASCond, nowMs int64) (bool, error) {
+	if err := c.refuseReadOnly(); err != nil {
+		return false, err
+	}
 	if c.wal == nil {
 		return c.idx.DeleteAt(id, cas, nowMs)
 	}
@@ -1356,6 +1416,9 @@ func (c *Collection) DeleteCASAt(id uint64, cas CASCond, nowMs int64) (bool, err
 // replicated delete-by-filter selects and tombstones the SAME id set on every
 // replica (#4 vector TTL determinism).
 func (c *Collection) DeleteByFilterAt(filter Filter, nowMs int64) (int, error) {
+	if err := c.refuseReadOnly(); err != nil {
+		return 0, err
+	}
 	pred, err := CompileFilter(filter)
 	if err != nil {
 		return 0, err
@@ -1389,6 +1452,9 @@ func (c *Collection) DeleteByFilterAt(filter Filter, nowMs int64) (int, error) {
 // CAS-enforcing stamped delete) and re-inserts via InsertAt; with one it replaces
 // atomically and logs one record, as UpsertCASKeyTTL does.
 func (c *Collection) UpsertCASKeyTTLAt(id uint64, vec []float32, content string, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond, nowMs int64) (uint64, error) {
+	if err := c.refuseReadOnly(); err != nil {
+		return 0, err
+	}
 	// The full gate before the tombstone, for the reason UpsertCASKeyTTL states:
 	// without a log this path deletes before it inserts, so a size-only check
 	// here would let a malformed record destroy the point it was refused from
@@ -1426,6 +1492,9 @@ func (c *Collection) UpsertCASKeyTTLAt(id uint64, vec []float32, content string,
 // outside opMu so concurrent payload writers group-commit instead of each paying
 // a serialized fsync under the collection's op lock.
 func (c *Collection) payloadOpCASChanged(cas CASCond, op func(CASCond) (Metadata, map[string]uint64, uint64, bool, error), id uint64) (uint64, error) {
+	if err := c.refuseReadOnly(); err != nil {
+		return 0, err
+	}
 	if c.wal == nil {
 		_, _, version, _, err := op(cas)
 		return version, err
@@ -1471,6 +1540,9 @@ func (c *Collection) payloadOpCASChanged(cas CASCond, op func(CASCond) (Metadata
 // mutator takes. Behaviour-preserving: payloadOpCASChanged tests err before it
 // reads changed, so the hard-coded true is never consulted on an error path.
 func (c *Collection) payloadOpCAS(cas CASCond, op func(CASCond) (Metadata, map[string]uint64, uint64, error), id uint64) (uint64, error) {
+	if err := c.refuseReadOnly(); err != nil {
+		return 0, err
+	}
 	return c.payloadOpCASChanged(cas, func(cc CASCond) (Metadata, map[string]uint64, uint64, bool, error) {
 		m, ke, v, err := op(cc)
 		return m, ke, v, true, err
@@ -1509,7 +1581,12 @@ func (c *Collection) replayWAL(path string) error {
 // SavePersist writes the collection's native instant-restart sidecar to
 // metaPath (the mmap-backed vectors/graph are flushed in place). Requires a
 // Persistent collection; see hnsw.SavePersist for the v1 constraints.
-func (c *Collection) SavePersist(metaPath string) error { return c.idx.SavePersist(metaPath) }
+func (c *Collection) SavePersist(metaPath string) error {
+	if err := c.refuseReadOnly(); err != nil {
+		return err
+	}
+	return c.idx.SavePersist(metaPath)
+}
 
 // Snapshot delegates to the underlying index. For a log-backed collection it
 // holds opMu, so no write applies meanwhile, and settles the log first (see
@@ -1536,7 +1613,12 @@ func (c *Collection) snapshotLocked(w io.Writer) error {
 }
 
 // Restore delegates to the underlying index.
-func (c *Collection) Restore(r io.Reader) error { return c.idx.Restore(r) }
+func (c *Collection) Restore(r io.Reader) error {
+	if err := c.refuseReadOnly(); err != nil {
+		return err
+	}
+	return c.idx.Restore(r)
+}
 
 // Stats delegates to the underlying index.
 func (c *Collection) Stats() Stats { return c.idx.Stats() }
@@ -1564,7 +1646,12 @@ func (c *Collection) Close() error {
 
 // Reclaim physically removes tombstoned vectors and prunes dangling edges.
 // Returns the number of slots reclaimed.
-func (c *Collection) Reclaim() int { return c.idx.Reclaim() }
+func (c *Collection) Reclaim() int {
+	if c.refuseReadOnly() != nil {
+		return 0 // reclaiming rewrites the stored data, which a read-only collection keeps as it is
+	}
+	return c.idx.Reclaim()
+}
 
 // TombstoneRatio returns the fraction of arena slots that are tombstoned.
 // Used by CollectionStore.MaybeReclaim to decide when reclaim is worth running.

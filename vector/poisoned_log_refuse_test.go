@@ -32,13 +32,17 @@ func denseStateOf(c *Collection) denseState {
 	return denseState{meta1: m1, version1: v1, meta2: m2, version2: v2, has9: c.Exists(9)}
 }
 
-func TestPoisonedLogRefusesEveryDenseMutator(t *testing.T) {
+type denseMutatorCase struct {
+	name string
+	op   func(c *Collection) error
+}
+
+// denseMutatorCases is every dense Collection mutator, aimed at ids 1 and 2
+// (live) and 9 and 4242 (absent).
+func denseMutatorCases() []denseMutatorCase {
 	now := time.Now().UnixMilli()
 	vec := durableVec(9)
-	cases := []struct {
-		name string
-		op   func(c *Collection) error
-	}{
+	return []denseMutatorCase{
 		{"Insert", func(c *Collection) error { return c.Insert(9, vec, 0, nil, nil) }},
 		{"InsertCASKeyTTLAt", func(c *Collection) error {
 			_, err := c.InsertCASKeyTTLAt(9, vec, 0, nil, nil, nil, CASCond{}, now)
@@ -80,7 +84,10 @@ func TestPoisonedLogRefusesEveryDenseMutator(t *testing.T) {
 			return err
 		}},
 	}
-	for _, tc := range cases {
+}
+
+func TestPoisonedLogRefusesEveryDenseMutator(t *testing.T) {
+	for _, tc := range denseMutatorCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			cs := openReplaceStore(t, t.TempDir(), durablePersistentCfg())
 			t.Cleanup(func() { _ = cs.Close() })

@@ -387,6 +387,10 @@ func grpcError(err error) error {
 		strings.Contains(err.Error(), "unknown collection"),
 		strings.Contains(err.Error(), "no collection"):
 		return status.Error(codes.NotFound, err.Error())
+	case errIs(err, vector.ErrCollectionReadOnly):
+		// Served read-only after an upgrade that left the form of its files
+		// unknown; the message says what to do.
+		return status.Error(codes.FailedPrecondition, err.Error())
 	case errIs(err, vector.ErrVersionConflict), strings.Contains(err.Error(), "version conflict"):
 		// Optimistic-CAS precondition miss: the point's current version did not match
 		// the request's expected_version. FailedPrecondition (the standard etcd/gRPC

@@ -794,6 +794,13 @@ func statusForError(err error) int {
 		// in sync with server.clientFacingErr as its contract requires.
 		strings.Contains(err.Error(), "op not registered"):
 		return http.StatusNotFound
+	case errors.Is(err, vector.ErrCollectionReadOnly),
+		// Served read-only after an upgrade that left the form of its files
+		// unknown; the message says what to do. Not retryable until a restart.
+		errors.Is(err, vector.ErrEvictBusy):
+		// The collection was in use while it was being evicted and stays
+		// resident; a later eviction can try again.
+		return http.StatusConflict
 	case errors.Is(err, vector.ErrVersionConflict),
 		strings.Contains(err.Error(), "version conflict"):
 		// Optimistic-CAS precondition miss: the point's current version did not match

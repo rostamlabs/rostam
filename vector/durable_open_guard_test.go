@@ -4,6 +4,7 @@ package vector
 
 import (
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -86,12 +87,25 @@ func TestFailedStoreOpenClosesLoadedCollections(t *testing.T) {
 	if err := os.WriteFile(dir+"/vectors/"+DefaultTenant+"/z.json", []byte("{torn"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// Only descriptors open on files inside dir are counted, so descriptors
+	// other goroutines or the runtime open meanwhile cannot move the count.
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	fds := func() int {
 		ents, err := os.ReadDir("/proc/self/fd")
 		if err != nil {
 			t.Fatal(err)
 		}
-		return len(ents)
+		n := 0
+		for _, e := range ents {
+			target, err := os.Readlink(filepath.Join("/proc/self/fd", e.Name()))
+			if err == nil && strings.HasPrefix(target, resolved+string(filepath.Separator)) {
+				n++
+			}
+		}
+		return n
 	}
 	before := fds()
 	for range 3 {
@@ -100,7 +114,7 @@ func TestFailedStoreOpenClosesLoadedCollections(t *testing.T) {
 			t.Fatal("open succeeded over a torn manifest")
 		}
 	}
-	if after := fds(); after > before {
-		t.Fatalf("open descriptors grew from %d to %d across failed opens", before, after)
+	if after := fds(); after != before || after != 0 {
+		t.Fatalf("descriptors open on the store's files: %d before, %d after the failed opens, want 0", before, after)
 	}
 }

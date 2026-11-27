@@ -124,3 +124,36 @@ func TestSweepColdSkipsBusyCollection(t *testing.T) {
 		t.Fatalf("a collection in use was evicted: %v", evicted)
 	}
 }
+
+// TestBusyEvictionRemovesItsObjects: an eviction that uploads its snapshot and
+// then finds the collection was used leaves no orphan objects behind.
+func TestBusyEvictionRemovesItsObjects(t *testing.T) {
+	s := newCollectionStore(t)
+	if err := s.CreateCollection("docs", restoreReplaceModes[0].cfg); err != nil {
+		t.Fatal(err)
+	}
+	insertIDs(t, s, "docs", restoreIDs(1, 5))
+	obj := objstore.NewMemStore()
+	evictCommitHook = func() { insertIDs(t, s, "docs", []uint64{999}) }
+	t.Cleanup(func() { evictCommitHook = nil })
+	err := s.EvictCollection(context.Background(), "docs", obj, "t", time.Unix(1, 0))
+	evictCommitHook = nil
+	if !errors.Is(err, ErrEvictBusy) {
+		t.Fatalf("evict = %v, want ErrEvictBusy", err)
+	}
+	left, lerr := obj.List(context.Background(), "")
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	if len(left) != 0 {
+		t.Fatalf("a busy eviction left %d objects: %+v", len(left), left)
+	}
+	// A later eviction that commits keeps its objects.
+	if err := s.EvictCollection(context.Background(), "docs", obj, "t", time.Unix(2, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if left, _ := obj.List(context.Background(), ""); len(left) != 2 {
+		t.Fatalf("a committed eviction holds %d objects, want 2", len(left))
+	}
+	requirePoints(t, s, "docs", append(restoreIDs(1, 5), 999), nil)
+}

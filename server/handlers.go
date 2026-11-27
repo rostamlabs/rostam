@@ -370,6 +370,10 @@ func clientFacingErr(err error) bool {
 		errors.Is(err, vector.ErrDuplicateID),
 		errors.Is(err, vector.ErrCollectionFull),
 		errors.Is(err, vector.ErrCollectionRateLimited),
+		// A collection served read-only after an upgrade that left the form of
+		// its files unknown: the message says what happened and what to do, and
+		// names only the collection and its manifest.
+		errors.Is(err, vector.ErrCollectionReadOnly),
 		errors.Is(err, vector.ErrNoNamed),
 		errors.Is(err, vector.ErrAPIKeyExists),
 		errors.Is(err, vector.ErrAPIKeyNotFound):

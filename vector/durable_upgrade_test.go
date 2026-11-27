@@ -4,6 +4,7 @@ package vector
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -14,10 +15,13 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/rostamlabs/rostam/objstore"
 )
 
 const (
@@ -705,59 +709,140 @@ func TestUpgradeCommittedButUnloadableRollsBack(t *testing.T) {
 	assertLegacyPoints(t, cs, want, true)
 }
 
+// dirHashes hashes every file in the collection directory.
+func dirHashes(t *testing.T, dir string) map[string][32]byte {
+	t.Helper()
+	out := map[string][32]byte{}
+	d := filepath.Join(dir, "vectors", DefaultTenant)
+	ents, err := os.ReadDir(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		if !e.IsDir() {
+			out[e.Name()] = fileHash(t, filepath.Join(d, e.Name()))
+		}
+	}
+	return out
+}
+
+// assertServedReadOnly checks a collection served read-only: every point reads
+// back, every change is refused with ErrCollectionReadOnly and changes nothing,
+// and no file in its directory is written, created or removed, through Close.
+func assertServedReadOnly(t *testing.T, dir string, cs *CollectionStore, want map[uint64]legacyPoint) {
+	t.Helper()
+	before := dirHashes(t, dir)
+	assertLegacyPoints(t, cs, want, true)
+	assertSearchable(t, cs, want)
+	isRO := func(what string, err error) {
+		t.Helper()
+		if !errors.Is(err, ErrCollectionReadOnly) {
+			t.Fatalf("%s on a read-only collection = %v, want ErrCollectionReadOnly", what, err)
+		}
+		if !strings.Contains(err.Error(), "restart") {
+			t.Fatalf("%s: error %q does not say what to do", what, err)
+		}
+	}
+	c, ok := cs.Acquire(upgradeCol)
+	if !ok {
+		t.Fatal("collection missing")
+	}
+	for _, tc := range denseMutatorCases() {
+		isRO(tc.name, tc.op(c))
+	}
+	if c.Delete(1) {
+		t.Fatal("Delete on a read-only collection removed a point")
+	}
+	_, err := c.DeleteByFilter(Filter{Op: FilterEq, Field: "kind", Value: NewString("k1")})
+	isRO("DeleteByFilter", err)
+	_, err = c.DeleteByFilterAt(Filter{Op: FilterEq, Field: "kind", Value: NewString("k1")}, time.Now().UnixMilli())
+	isRO("DeleteByFilterAt", err)
+	isRO("BuildConcurrent", c.BuildConcurrent([]uint64{900}, [][]float32{durableVecDim(1)}, 1))
+	isRO("BuildConcurrentMeta", c.BuildConcurrentMeta([]uint64{900}, [][]float32{durableVecDim(1)}, nil, 1))
+	isRO("StageBulk", c.StageBulk([]uint64{900}, [][]float32{durableVecDim(1)}))
+	isRO("BuildStaged", c.BuildStaged(1))
+	isRO("SavePersist", c.SavePersist(colFile(dir, ".meta")))
+	if n := c.Reclaim(); n != 0 {
+		t.Fatalf("Reclaim on a read-only collection reclaimed %d", n)
+	}
+	c.Release()
+
+	isRO("store Upsert", cs.Upsert(upgradeCol, 900, durableVecDim(1), "new", 0, nil, nil))
+	isRO("Flush", cs.Flush(upgradeCol))
+	if err := cs.FlushPersistent(); err != nil {
+		t.Fatalf("FlushPersistent: %v", err)
+	}
+	if err := cs.CheckpointDurable(); err != nil {
+		t.Fatalf("CheckpointDurable: %v", err)
+	}
+	isRO("DropCollection", cs.DropCollection(upgradeCol))
+	var snap bytes.Buffer
+	cr, _ := cs.Acquire(upgradeCol)
+	if err := cr.Snapshot(&snap); err != nil {
+		t.Fatalf("a backup snapshot of a read-only collection: %v", err)
+	}
+	cr.Release()
+	isRO("RestoreCollectionWithConfig", cs.RestoreCollectionWithConfig(upgradeCol, legacyCfg(), bytes.NewReader(snap.Bytes())))
+	isRO("EvictCollection", cs.EvictCollection(context.Background(), upgradeCol, objstore.NewMemStore(), "t", time.Unix(1, 0)))
+	var all bytes.Buffer
+	if err := cs.SnapshotAll(&all); err != nil {
+		t.Fatalf("store snapshot of a read-only collection: %v", err)
+	}
+	isRO("RestoreAll", cs.RestoreAll(bytes.NewReader(all.Bytes())))
+	assertLegacyPoints(t, cs, want, true)
+	if err := cs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if after := dirHashes(t, dir); !reflect.DeepEqual(after, before) {
+		t.Fatalf("files of a read-only collection changed:\nbefore %v\nafter  %v", keysOf(before), keysOf(after))
+	}
+}
+
+func keysOf(m map[string][32]byte) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // If putting the old manifest back fails too, the manifest names the log form
-// while the open would serve the old one, whose writes the next open (which
-// loads the log form) would not see. So the open fails, naming the manifest,
-// and every file is kept. The next open loads the log form, whose snapshot here
-// does not restore, and fails too: the outcome is a refusal, never a silent
-// fallback, and the old form's files stay for manual recovery.
-func TestUpgradeRollbackFailureFailsOpen(t *testing.T) {
+// while the old form is what is open, and a write accepted by the old form
+// would not be seen by the next open. The store opens and serves the old form
+// read-only, keeping every file.
+func TestUpgradeRollbackFailureServesReadOnly(t *testing.T) {
 	dir := t.TempDir()
-	writeLegacyStore(t, dir)
-	blocker := colFile(dir, ".json.tmp")
+	want := writeLegacyStore(t, dir)
+	logs := captureLogs(t)
 	setUpgradeHook(t, func(s string) error {
 		if s == "manifest" {
-			if err := os.Mkdir(blocker, 0o750); err != nil {
+			if err := os.Mkdir(colFile(dir, ".json.tmp"), 0o750); err != nil {
 				return err
 			}
 			return os.WriteFile(colFile(dir, ".snap"), []byte("not a snapshot"), 0o600)
 		}
 		return nil
 	})
-	cs, err := OpenCollectionStoreWith(dir, StoreOptions{DurableCollections: []string{upgradeCol}})
-	if err == nil {
-		_ = cs.Close()
-		t.Fatal("open succeeded with the old form while the manifest names the log form")
-	}
-	if !strings.Contains(err.Error(), "could not be put back") {
-		t.Fatalf("err = %v, want the failed rollback named", err)
-	}
-	for _, p := range append(mappedFiles(dir), colFile(dir, ".snap")) {
-		if _, serr := os.Stat(p); serr != nil {
-			t.Fatalf("%s removed by a failed open: %v", p, serr)
-		}
-	}
+	cs := openDurable(t, dir, upgradeCol)
 	upgradeStepHook = nil
-	if err := os.Remove(blocker); err != nil {
-		t.Fatal(err)
+	if !strings.Contains(logs.String(), "read-only") {
+		t.Fatalf("log = %q, want the read-only state named", logs.String())
 	}
-	if cs, err := OpenCollectionStoreWith(dir, StoreOptions{DurableCollections: []string{upgradeCol}}); err == nil {
-		_ = cs.Close()
-		t.Fatal("reopen succeeded over an unloadable snapshot")
-	}
-	for _, p := range mappedFiles(dir) {
-		if _, serr := os.Stat(p); serr != nil {
-			t.Fatalf("%s removed by a failed reopen: %v", p, serr)
+	assertServedReadOnly(t, dir, cs, want)
+	for _, p := range append(mappedFiles(dir), colFile(dir, ".snap")) {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("%s removed: %v", p, err)
 		}
 	}
 }
 
 // When writing the log-form manifest fails, it cannot be read back and the old
-// one cannot be put back, nothing says which form the next open loads. The open
-// fails and the files are kept.
-func TestUpgradeUnknownManifestFailsOpen(t *testing.T) {
+// one cannot be put back, nothing says which form the next open loads. The
+// store opens and serves the old form read-only, keeping every file.
+func TestUpgradeUnknownManifestServesReadOnly(t *testing.T) {
 	dir := t.TempDir()
-	writeLegacyStore(t, dir)
+	want := writeLegacyStore(t, dir)
 	setUpgradeHook(t, func(s string) error {
 		if s == "manifest" {
 			if err := os.WriteFile(colFile(dir, ".json"), []byte("{torn"), 0o600); err != nil {
@@ -770,14 +855,12 @@ func TestUpgradeUnknownManifestFailsOpen(t *testing.T) {
 		}
 		return nil
 	})
-	cs, err := OpenCollectionStoreWith(dir, StoreOptions{DurableCollections: []string{upgradeCol}})
-	if err == nil {
-		_ = cs.Close()
-		t.Fatal("open succeeded while the manifest's form is unknown")
-	}
+	cs := openDurable(t, dir, upgradeCol)
+	upgradeStepHook = nil
+	assertServedReadOnly(t, dir, cs, want)
 	for _, p := range append(mappedFiles(dir), colFile(dir, ".snap")) {
-		if _, serr := os.Stat(p); serr != nil {
-			t.Fatalf("%s removed by a failed open: %v", p, serr)
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("%s removed: %v", p, err)
 		}
 	}
 }

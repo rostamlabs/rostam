@@ -55,3 +55,43 @@ func TestDurableRestoreFailedSnapshotKeepsOldCollection(t *testing.T) {
 	defer func() { _ = re.Close() }()
 	assertPoints(t, pointsOf(t, re, "docs"), map[uint64]string{1: "old"})
 }
+
+// TestDurableRestoreLeftoversRemoved: a stop in the middle of a durable restore
+// can leave its staged snapshot (and the staging file's own temporary) beside
+// the collection. The next open removes them, and so does a drop.
+func TestDurableRestoreLeftoversRemoved(t *testing.T) {
+	dir := t.TempDir()
+	cs := openDurable(t, dir, "docs")
+	if err := cs.CreateCollection("docs", durablePersistentCfg()); err != nil {
+		t.Fatal(err)
+	}
+	_ = cs.Close()
+	snapPath := filepath.Join(dir, "vectors", DefaultTenant, "docs.snap")
+	plant := func() []string {
+		t.Helper()
+		ps := []string{snapPath + restoreStageSuffix, snapPath + restoreStageSuffix + ".tmp"}
+		for _, p := range ps {
+			if err := os.WriteFile(p, []byte("leftover"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return ps
+	}
+	left := plant()
+	cs = openDurable(t, dir, "docs")
+	defer func() { _ = cs.Close() }()
+	for _, p := range left {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("%s left after open (stat err %v)", p, err)
+		}
+	}
+	left = plant()
+	if err := cs.DropCollection("docs"); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range left {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("%s left after drop (stat err %v)", p, err)
+		}
+	}
+}
