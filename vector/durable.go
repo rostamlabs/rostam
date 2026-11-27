@@ -92,7 +92,7 @@ func (s *CollectionStore) durableConfig(canonical string, cfg Config) Config {
 func (s *CollectionStore) checkpoint(canonical string, c *Collection) error {
 	c.opMu.Lock()
 	defer c.opMu.Unlock()
-	_, snapPath := s.collectionPath(canonical)
+	snapPath := s.loadedSnapPath(canonical)
 	if err := s.writeSnapshotFile(c, snapPath); err != nil {
 		return err
 	}

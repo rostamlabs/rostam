@@ -410,6 +410,25 @@ func (s *CollectionStore) collectionPath(canonical string) (cfgPath, snapPath st
 	return filepath.Join(base, col+".json"), filepath.Join(base, col+".snap")
 }
 
+// loadedSnapPath returns the snapshot path an open loads canonical's snapshot
+// from, which is where a checkpoint or flush must write it. That is
+// collectionPath's, except for a default-tenant collection still in the legacy
+// flat layout (vectors/<col>.json with no vectors/<tenant>/<col>.json), which
+// the open reads from vectors/<col>.snap. Writing the tenant path for such a
+// collection and then emptying its log would lose what the log held.
+func (s *CollectionStore) loadedSnapPath(canonical string) string {
+	cfgPath, snapPath := s.collectionPath(canonical)
+	tenant, col, _ := splitTenant(canonical)
+	if tenant != DefaultTenant || fileExists(cfgPath) {
+		return snapPath
+	}
+	flat := filepath.Join(s.dir, "vectors", col)
+	if fileExists(flat + ".json") {
+		return flat + ".snap"
+	}
+	return snapPath
+}
+
 // persistPaths returns the mmap + sidecar + WAL paths the store manages for a
 // Persistent collection (vectors, level-0 graph, instant-restart sidecar, and
 // the write-ahead log).
@@ -529,6 +548,7 @@ func (s *CollectionStore) Acquire(name string) (*Collection, bool) {
 	c, ok := s.collections[canonical]
 	if ok {
 		c.inuse.Add(1)
+		c.pins.Add(1)
 	}
 	// Cold-tier resolve hook: only consult the cold catalog when it is non-empty,
 	// so a store with no evicted collections pays just this len()==0 branch (the
@@ -567,6 +587,7 @@ func (s *CollectionStore) Acquire(name string) (*Collection, bool) {
 	c, ok = s.collections[canonical]
 	if ok {
 		c.inuse.Add(1)
+		c.pins.Add(1)
 	}
 	s.mu.RUnlock()
 	return c, ok
@@ -1127,7 +1148,7 @@ func (s *CollectionStore) Flush(name string) error {
 	}
 	defer c.Release()
 
-	_, snapPath := s.collectionPath(canonical)
+	snapPath := s.loadedSnapPath(canonical)
 
 	// WAL collections checkpoint with a CONSISTENT snapshot (not the mmap
 	// sidecar) and rotate the log — atomically w.r.t. Insert/Delete via opMu, so
@@ -1172,6 +1193,7 @@ func (s *CollectionStore) Flush(name string) error {
 }
 
 // writeSnapshotFile atomically writes c's snapshot to path (tmp + fsync + rename).
+// When c has a log the caller holds c.opMu (or c is not yet published).
 func (s *CollectionStore) writeSnapshotFile(c *Collection, path string) error {
 	if err := c.wal.refuseCheckpoint(); err != nil {
 		return err // memory may be ahead of a poisoned log; see refuseCheckpoint
@@ -1184,7 +1206,7 @@ func (s *CollectionStore) writeSnapshotFile(c *Collection, path string) error {
 	if err != nil {
 		return err
 	}
-	if err := c.Snapshot(f); err != nil {
+	if err := c.snapshotLocked(f); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmp)
 		return err

@@ -128,10 +128,25 @@ func (s *CollectionStore) EvictCollection(ctx context.Context, name string, obj 
 	// collection's object is indistinguishable from a normal backup and can be
 	// restored by either path) but keep this self-contained to avoid a vector→backup
 	// import cycle.
-	c, ok := s.Acquire(canonical)
+	//
+	// The pin is taken under the write lock, and only when nobody else holds the
+	// collection: a holder that is already in flight could write after the
+	// snapshot. Any pin taken after this one moves c.pins, which the commit
+	// checks, so a write landing during the upload keeps the collection hot
+	// instead of being retired with it (ErrEvictBusy).
+	s.mu.Lock()
+	c, ok := s.collections[canonical]
 	if !ok {
+		s.mu.Unlock()
 		return fmt.Errorf("vector: evict %q: collection vanished", canonical)
 	}
+	if c.inuse.Load() != 0 {
+		s.mu.Unlock()
+		return fmt.Errorf("vector: evict %q: %w", canonical, ErrEvictBusy)
+	}
+	c.inuse.Add(1)
+	pins := c.pins.Load()
+	s.mu.Unlock()
 	cfg := c.Config()
 	key := coldSnapshotKey(tenant, canonical, ts)
 	if err := s.putColdSnapshot(ctx, c, obj, key, cfg); err != nil {
@@ -146,9 +161,10 @@ func (s *CollectionStore) EvictCollection(ctx context.Context, name string, obj 
 
 	// Register the stub and remove the live collection under the store lock, then
 	// retire the index out of the lock (drain in-flight users, close/unmap — the
-	// REAL memory release). A racing access between Acquire above and the lock here
-	// is harmless: it sees the collection still hot and serves normally; the next
-	// access sees the stub and lazily restores.
+	// REAL memory release). An access between the pin above and the lock here
+	// sees the collection still hot and serves normally, and the commit then
+	// leaves it hot (ErrEvictBusy), since its snapshot may miss that access's
+	// write; an access after the commit sees the stub and lazily restores.
 	//
 	// The commit holds the name lock, so it cannot interleave with a drop, create,
 	// promotion or restore of this name.
@@ -163,6 +179,12 @@ func (s *CollectionStore) EvictCollection(ctx context.Context, name string, obj 
 		// evict; the snapshot we wrote is just an extra backup. Not an error.
 		s.mu.Unlock()
 		return nil
+	}
+	if live.inuse.Load() != 0 || live.pins.Load() != pins {
+		// Used since the snapshot: a write may be missing from the uploaded
+		// object. New pins need s.mu, held here, so the check is final.
+		s.mu.Unlock()
+		return fmt.Errorf("vector: evict %q: %w", canonical, ErrEvictBusy)
 	}
 	if s.cold == nil {
 		s.cold = make(map[string]*coldEntry)
@@ -198,16 +220,14 @@ func (s *CollectionStore) putColdSnapshot(ctx context.Context, c *Collection, ob
 	// idle-collection, off-hot-path operation — the transient buffer is acceptable;
 	// a streaming/temp-file variant is a follow-up.
 	//
-	// Snapshot refuses while the log is poisoned (memory may be ahead of it), so
-	// the eviction fails before any object is written and the collection stays
-	// resident with its files untouched. opMu is held across the snapshot so the
-	// check and the state it captures agree with every write applied under it.
+	// Snapshot refuses while the log is poisoned or a pending sync fails (memory
+	// may be ahead of the log), so the eviction fails before any object is
+	// written and the collection stays resident with its files untouched. It
+	// holds opMu itself; a write landing after it is caught at the commit (see
+	// EvictCollection).
 	var buf bytes.Buffer
-	c.opMu.Lock()
-	serr := c.Snapshot(&buf)
-	c.opMu.Unlock()
-	if serr != nil {
-		return fmt.Errorf("snapshot: %w", serr)
+	if err := c.Snapshot(&buf); err != nil {
+		return fmt.Errorf("snapshot: %w", err)
 	}
 	if err := obj.Put(ctx, key, bytes.NewReader(buf.Bytes()), int64(buf.Len())); err != nil {
 		return fmt.Errorf("put %q: %w", key, err)
@@ -351,6 +371,9 @@ func (s *CollectionStore) SweepCold(now time.Time, idle time.Duration, obj objst
 	var errs []error
 	for _, name := range candidates {
 		if err := s.EvictCollection(context.Background(), name, obj, tenant, now); err != nil {
+			if errors.Is(err, ErrEvictBusy) {
+				continue // in use: stays hot, the next sweep tries again
+			}
 			errs = append(errs, err)
 			continue
 		}
@@ -384,3 +407,10 @@ func (s *CollectionStore) ColdNames() []string {
 	sortStrings(names)
 	return names
 }
+
+// ErrEvictBusy is returned by EvictCollection when the collection was in use
+// while it was being evicted: a caller held it when the eviction started, or
+// acquired it before the eviction committed. The collection stays resident
+// with everything written to it, and a later eviction can try again. SweepCold
+// skips such a collection without an error.
+var ErrEvictBusy = errors.New("vector: the collection was in use during the eviction; it stays resident")

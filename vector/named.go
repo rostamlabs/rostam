@@ -2225,11 +2225,22 @@ const namedSnapshotMinReadVersion = 1
 
 // Snapshot writes a self-contained image (every named sub-index framed by its
 // space name + the shared per-point meta/ttl/ids state) to w. Mirrors
-// MultiVectorIndex.snapshot. Safe to call concurrently with reads.
+// MultiVectorIndex.snapshot. Safe to call concurrently with reads. With a log it
+// holds opMu and settles the log first, so it refuses (ErrWALPoisoned) when
+// memory could be ahead of the log (see Collection.Snapshot and wal.settle).
 func (nc *NamedCollection) Snapshot(w io.Writer) error {
-	// Refused while the log is poisoned: memory may be ahead of it (see
-	// wal.refuseCheckpoint).
-	if err := nc.wal.refuseCheckpoint(); err != nil {
+	if nc.wal == nil {
+		return nc.snapshotLocked(w)
+	}
+	nc.opMu.Lock()
+	defer nc.opMu.Unlock()
+	return nc.snapshotLocked(w)
+}
+
+// snapshotLocked is Snapshot for a caller that holds opMu (or whose collection
+// has no log).
+func (nc *NamedCollection) snapshotLocked(w io.Writer) error {
+	if err := nc.wal.settle(); err != nil {
 		return err
 	}
 	nc.mu.RLock()

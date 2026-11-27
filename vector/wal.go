@@ -687,15 +687,12 @@ func (w *wal) truncate() error {
 // replays the acknowledged state. truncate's own poison check stays as the
 // second line.
 //
-// It cannot cover a GROUP-COMMIT SYNC THAT FAILS AFTER THE CHECK. That fsync
-// runs outside opMu (see commitWait), so it can poison the log while a snapshot
-// that passed this check is being written; the snapshot then holds writes whose
-// bytes are in the log but whose fsync failed, and the truncate after it
-// refuses. Those writes were never acknowledged, so a reopen showing them is the
-// same at-least-once outcome as an in-flight write at a crash; no acknowledged
-// write is lost. Collection.Snapshot and its named and multi-vector twins also
-// call it, so callers that do not hold opMu (a backup) get the check too, with
-// the same caveat.
+// On its own it cannot cover a GROUP-COMMIT SYNC THAT FAILS AFTER THE CHECK:
+// that fsync runs outside opMu (see commitWait). The snapshot itself therefore
+// goes through settle, under opMu, which waits for every record already written
+// to be synced and refuses if that fails: Collection.Snapshot and its named and
+// multi-vector twins take opMu and settle the log, so a checkpoint, a backup and
+// a cold-tier eviction all capture only writes whose records are on disk.
 func (w *wal) refuseCheckpoint() error {
 	if w != nil && w.poisoned.Load() {
 		return ErrWALPoisoned
@@ -719,6 +716,36 @@ func (w *wal) refuseCheckpoint() error {
 // acknowledged, and no checkpoint is taken from that state (refuseCheckpoint),
 // so a reopen holds the log's state.
 func (w *wal) refuseWrite() error { return w.refuseCheckpoint() }
+
+// settle runs before a snapshot is taken from memory, with the collection's
+// opMu held so no record can be written meanwhile. It waits until every record
+// already written is synced, and returns ErrWALPoisoned when the log was
+// poisoned or that sync fails. Once it returns nil, memory holds no write whose
+// record is not on disk and none that was refused: a write that applied but has
+// not finished its group-commit wait is made durable here, or the snapshot is
+// refused. An unsynced (WALNoSync) log promises no sync, so it is only checked
+// for poison. A nil w (no log) settles at once.
+func (w *wal) settle() error {
+	if w == nil {
+		return nil
+	}
+	if w.poisoned.Load() {
+		return ErrWALPoisoned
+	}
+	if w.noSync {
+		return nil
+	}
+	w.syncMu.Lock()
+	seq := w.writeSeq
+	w.syncMu.Unlock()
+	if err := w.commitWait(seq); err != nil {
+		if errors.Is(err, ErrWALPoisoned) {
+			return err
+		}
+		return fmt.Errorf("%w: %v", ErrWALPoisoned, err)
+	}
+	return nil
+}
 
 // close closes the underlying file. Idempotent.
 func (w *wal) close() error {

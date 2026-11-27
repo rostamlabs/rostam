@@ -334,7 +334,7 @@ func (s *CollectionStore) writeMVWALSnapshotFile(idx *MultiVectorIndex, path str
 	if err != nil {
 		return err
 	}
-	if err := idx.snapshot(f); err != nil {
+	if err := idx.snapshotLocked(f); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmp)
 		return err

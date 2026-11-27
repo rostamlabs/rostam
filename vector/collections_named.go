@@ -219,7 +219,7 @@ func (s *CollectionStore) FlushNamed(name string) error {
 
 // writeNamedSnapshotFile atomically writes nc's snapshot to path (tmp + fsync +
 // rename), mirroring writeSnapshotFile so a crash mid-write leaves the prior good
-// checkpoint intact.
+// checkpoint intact. When nc has a log the caller holds nc.opMu.
 func (s *CollectionStore) writeNamedSnapshotFile(nc *NamedCollection, path string) error {
 	if err := nc.wal.refuseCheckpoint(); err != nil {
 		return err // memory may be ahead of a poisoned log; see refuseCheckpoint
@@ -232,7 +232,7 @@ func (s *CollectionStore) writeNamedSnapshotFile(nc *NamedCollection, path strin
 	if err != nil {
 		return err
 	}
-	if err := nc.Snapshot(f); err != nil {
+	if err := nc.snapshotLocked(f); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmp)
 		return err

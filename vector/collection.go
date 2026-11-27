@@ -37,6 +37,12 @@ type Collection struct {
 	// storage under an in-flight reader (a fatal SIGBUS; benign-but-guarded for
 	// heap collections).
 	inuse atomic.Int64
+	// pins counts every pin taken through the store (Acquire), never
+	// decremented. An eviction compares it before and after its upload: a
+	// change means the collection was used in between, so the snapshot it
+	// uploaded may be missing a write, and it stays resident (see
+	// CollectionStore.EvictCollection).
+	pins atomic.Uint64
 
 	// lastAccess is the injected-clock unix-nanos timestamp of the most recent
 	// resolve (CollectionStore.Acquire) or promote, driving the idle cold-tier
@@ -1505,12 +1511,25 @@ func (c *Collection) replayWAL(path string) error {
 // Persistent collection; see hnsw.SavePersist for the v1 constraints.
 func (c *Collection) SavePersist(metaPath string) error { return c.idx.SavePersist(metaPath) }
 
-// Snapshot delegates to the underlying index. It refuses (ErrWALPoisoned) while
-// the collection's log is poisoned, whoever asks — a checkpoint, cold-tier
-// eviction, a store or collection backup — because memory may then be ahead of
-// the log (see wal.refuseCheckpoint).
+// Snapshot delegates to the underlying index. For a log-backed collection it
+// holds opMu, so no write applies meanwhile, and settles the log first (see
+// wal.settle): it refuses (ErrWALPoisoned) while the log is poisoned or when a
+// write already applied fails its sync, whoever asks — a store or collection
+// backup, a cold-tier eviction — because memory would then be ahead of the log.
+// A caller that already holds opMu uses snapshotLocked.
 func (c *Collection) Snapshot(w io.Writer) error {
-	if err := c.wal.refuseCheckpoint(); err != nil {
+	if c.wal == nil {
+		return c.idx.Snapshot(w)
+	}
+	c.opMu.Lock()
+	defer c.opMu.Unlock()
+	return c.snapshotLocked(w)
+}
+
+// snapshotLocked is Snapshot for a caller that holds opMu (or whose collection
+// has no log, or is not yet published).
+func (c *Collection) snapshotLocked(w io.Writer) error {
+	if err := c.wal.settle(); err != nil {
 		return err
 	}
 	return c.idx.Snapshot(w)
