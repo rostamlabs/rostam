@@ -27,9 +27,13 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   See [What survives a crash](server/mcp.md#what-survives-a-crash).
 - **`-durable-collections` and `DirectConfig.DurableCollections`.** A
   single-node server, or an embedded store, can name dense vector collections to
-  run with a write-ahead log, synced before each write is acknowledged (a bulk
-  build, which has no log record, is checkpointed before it returns, and a
-  failed checkpoint makes the collection refuse writes until a restart). This
+  run with a write-ahead log, synced before each write is acknowledged. A bulk
+  build has no log record: the store's `BuildStaged`, which the server's bulk
+  build uses, checkpoints it before returning, while the direct `Collection`
+  bulk-build methods do not, so their caller must keep writers out until its
+  own checkpoint. If that `BuildStaged` checkpoint fails, or the build on an
+  empty listed collection fails or panics after placing points, the collection
+  refuses writes until a restart, and the build may be missing after it. This
   covers a listed collection created or restored while listed, an existing
   `Persistent` one (converted at startup; if that fails it keeps its old form,
   with a warning, and each later start tries again) and one that already has a

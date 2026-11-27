@@ -123,10 +123,13 @@ and collections that are not listed behave as before.
 - A listed collection created or restored while the flag is set runs with a
   [write-ahead log](../vector/persistence.md), synced to disk before each write
   is acknowledged, whatever the request asked for. That costs a disk sync on the
-  write path. A bulk build has no log record, so it is checkpointed before it
-  returns, and writes to the collection wait for that checkpoint. If the
-  checkpoint fails, the collection refuses writes until a restart, and the
-  build may be missing after it.
+  write path. A bulk build has no log record. The store's `BuildStaged`, which
+  the server's bulk build uses, checkpoints it before returning, and writes to
+  the collection wait for that checkpoint. If the checkpoint fails, or the build
+  on an empty listed collection fails or panics after placing points, the
+  collection refuses writes until a restart, and the build may be missing after
+  it. The direct `Collection` bulk-build methods of the Go library do not
+  checkpoint: their caller must keep writers out until its own checkpoint.
 - A listed collection that already exists as `Persistent` is upgraded to the log
   at startup. Only an HNSW collection can be upgraded: a `Persistent` IVF (or
   other non-HNSW) collection keeps its form on every start, with the warning, so
