@@ -32,31 +32,57 @@ func blockSyncThenFail(w *wal) (inSync, release chan struct{}) {
 	return inSync, release
 }
 
+// settleWaitLimit bounds every wait in snapshotWaitsForFailedSync, so a
+// regression fails naming the phase instead of hanging the run.
+const settleWaitLimit = 30 * time.Second
+
+// recvWithin returns the value from ch, failing the test, named after phase,
+// if none arrives within settleWaitLimit.
+func recvWithin[T any](t *testing.T, ch <-chan T, phase string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(settleWaitLimit):
+		t.Fatalf("timed out after %v waiting for %s", settleWaitLimit, phase)
+		var zero T
+		return zero
+	}
+}
+
 // snapshotWaitsForFailedSync starts write, waits until its fsync is in flight,
 // then takes a snapshot. The snapshot must not return while that sync is
 // pending, and must refuse with ErrWALPoisoned once it fails.
 func snapshotWaitsForFailedSync(t *testing.T, w *wal, write func() error, snapshot func(*bytes.Buffer) error) {
 	t.Helper()
 	inSync, release := blockSyncThenFail(w)
+	var releaseOnce sync.Once
+	releaseSync := func() { releaseOnce.Do(func() { close(release) }) }
+	// A failed wait still unparks the blocked fsync, so its goroutine ends.
+	t.Cleanup(releaseSync)
 	wrote := make(chan error, 1)
 	go func() { wrote <- write() }()
-	<-inSync
+	select {
+	case <-inSync:
+	case <-time.After(settleWaitLimit):
+		t.Fatalf("timed out after %v waiting for the write's fsync to start", settleWaitLimit)
+	}
 
 	var buf bytes.Buffer
 	snapped := make(chan error, 1)
 	go func() { snapped <- snapshot(&buf) }()
 	select {
 	case err := <-snapped:
-		close(release)
-		<-wrote
+		releaseSync()
+		recvWithin(t, wrote, "the write after an early snapshot")
 		t.Fatalf("snapshot returned (err=%v, %d bytes) while a write's sync was still in flight", err, buf.Len())
 	case <-time.After(100 * time.Millisecond):
 	}
-	close(release)
-	if err := <-wrote; err == nil {
+	releaseSync()
+	if err := recvWithin(t, wrote, "the write to return after its fsync failed"); err == nil {
 		t.Fatal("a write whose fsync failed was acknowledged")
 	}
-	if err := <-snapped; !errors.Is(err, ErrWALPoisoned) {
+	if err := recvWithin(t, snapped, "the snapshot to return after the pending sync failed"); !errors.Is(err, ErrWALPoisoned) {
 		t.Fatalf("snapshot after the pending sync failed = %v, want ErrWALPoisoned", err)
 	}
 	if buf.Len() != 0 {

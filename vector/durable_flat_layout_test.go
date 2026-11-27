@@ -53,14 +53,15 @@ func TestCheckpointDurableFlatLayoutKeepsWrites(t *testing.T) {
 	if err := cs.CheckpointDurable(); err != nil {
 		t.Fatal(err)
 	}
-	if err := cs.Flush("docs"); err != nil {
-		t.Fatal(err)
-	}
+	// Reopen what CheckpointDurable left, before anything else writes: a copy
+	// taken now, while the store is still open (Close writes nothing either).
+	checkpointed := filepath.Join(t.TempDir(), "copy")
+	copyTree(t, dir, checkpointed)
 	if err := cs.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	re := openDurable(t, dir, "docs")
+	re := openDurable(t, checkpointed, "docs")
 	defer func() { _ = re.Close() }()
 	assertPoints(t, pointsOf(t, re, "docs"), map[uint64]string{1: "before", 2: "after"})
 }
