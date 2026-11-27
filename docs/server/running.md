@@ -131,8 +131,9 @@ and collections that are not listed behave as before.
   collection keeps its old form, a warning says it is not crash-safe, and the
   next start tries again. The exception is an upgrade that cannot tell which
   form the collection is in afterwards (writing the new manifest failed and the
-  old one could not be read back or put back, or the new form did not load and
-  the old manifest could not be put back): then the server starts and serves
+  old one could not be read back or put back, the new manifest is in place but
+  could not be synced to disk, or the new form did not load and the old
+  manifest could not be put back): then the server starts and serves
   that collection read-only from its old form. Reads and backups work; every
   write, delete, payload change, bulk build, flush, checkpoint, drop, restore
   over it and cold-tier eviction is refused with an error saying what happened

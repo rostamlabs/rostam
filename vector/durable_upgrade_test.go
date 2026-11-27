@@ -961,11 +961,15 @@ func TestUpgradeUnreadableManifestPutBack(t *testing.T) {
 }
 
 // writeConfig reported an error but its rename landed. The directory sync that
-// makes the rename durable failed, so the old files are not removed until it
-// succeeds: a later open still has them.
-func TestUpgradeUnsyncedManifestKeepsOldFiles(t *testing.T) {
+// makes the rename durable failed, and so did its retry. A crash could still
+// put the old manifest back, and the next open would then load the old form
+// and set the log aside: a write accepted now would be missing from it. So the
+// collection is served read-only and its old files are kept; a later open,
+// once the sync works, finishes the upgrade.
+func TestUpgradeUnsyncedManifestServesReadOnly(t *testing.T) {
 	dir := t.TempDir()
 	want := writeLegacyStore(t, dir)
+	logs := captureLogs(t)
 	prev := syncDirf
 	t.Cleanup(func() { syncDirf = prev })
 	setUpgradeHook(t, func(s string) error {
@@ -977,13 +981,15 @@ func TestUpgradeUnsyncedManifestKeepsOldFiles(t *testing.T) {
 	})
 	cs := openDurable(t, dir, upgradeCol)
 	assertDurableManifest(t, manifestOf(t, dir, upgradeCol))
-	assertLegacyPoints(t, cs, want, true)
+	if !strings.Contains(logs.String(), "read-only") {
+		t.Fatalf("log = %q, want the read-only state named", logs.String())
+	}
+	assertServedReadOnly(t, dir, cs, want)
 	for _, p := range mappedFiles(dir) {
 		if _, err := os.Stat(p); err != nil {
 			t.Fatalf("%s removed although the manifest rename was not made durable: %v", p, err)
 		}
 	}
-	_ = cs.Close()
 
 	syncDirf = prev
 	upgradeStepHook = nil

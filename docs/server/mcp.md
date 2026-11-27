@@ -119,20 +119,22 @@ goes to stderr. A shared daemon that `mcp -autostart` started has it in
 to its own stderr. If a conversion was interrupted and the new snapshot cannot
 be loaded, the store fails to open instead of falling back to the old files.
 
-Two double failures leave it unknown which form the next start will load:
+Three double failures leave it unknown which form the next start will load:
 writing the new manifest fails and the old one can be neither read back nor
-put back, or the new form does not load and the old manifest cannot be put
-back. In both, the store opens and serves memory **read-only** from the old
-form: `recall` and the other reads work, while `remember` and `forget` fail
-with an error that says memory is read-only and to fix the disk problem and
-restart (`forget` reports it per memory). Nothing is flushed or removed, at
-shutdown included, and every file is kept. Once the disk is fixed, the next
-start tries the conversion again: it may finish, leave memory read-only again
-or in its old form with a `not crash-safe` warning, or, if what is on disk
-still cannot be loaded (a torn manifest, or a new form that does not load),
-refuse to open with an error naming the collection, every file still there
-for manual recovery. The server log names the manifest and the underlying error; the
-error a client sees names only the collection.
+put back; the new manifest is in place but the sync that makes it durable
+fails twice, so a crash could still bring the old one back; or the new form
+does not load and the old manifest cannot be put back. In each, the store
+opens and serves memory **read-only** from the old form: `recall` and the
+other reads work, while `remember` and `forget` fail with an error that says
+memory is read-only and to fix the disk problem and restart (`forget` reports
+it per memory). Nothing is flushed or removed, at shutdown included, and every
+file is kept. Once the disk is fixed, the next start tries the conversion
+again: it may finish, leave memory read-only again or in its old form with a
+`not crash-safe` warning, or, if what is on disk still cannot be loaded (a
+torn manifest, or a new form that does not load), refuse to open with an error
+naming the collection, every file still there for manual recovery. The error a
+client sees names the collection, says what went wrong in plain words and what
+to do; the manifest path and the underlying error are only in the server log.
 
 ### A damaged log
 

@@ -224,10 +224,10 @@ func upgradeStep(step string) error {
 // No failure here fails the open. A failure leaves the old form registered
 // and working, warns that the collection is not crash-safe, and the next open
 // tries again, as long as the manifest is known to name the old form. When it
-// is not (it could not be read back or put back), the old form is served
-// read-only (markReadOnly) and every file is kept: a write accepted now might
-// not be seen by the next open, which may load the log form. The return value
-// is always nil.
+// is not (it could not be read back or put back), or when the new manifest is
+// in place but could not be made durable, the old form is served read-only
+// (markReadOnly) and every file is kept: a write accepted now might not be seen
+// by the next open, whichever form that loads. The return value is always nil.
 func (s *CollectionStore) upgradeToDurable(canonical string, cfg Config, cfgPath, snapPath string) error {
 	old := s.collections[canonical]
 	walCfg := s.durableConfig(canonical, cfg)
@@ -250,6 +250,17 @@ func (s *CollectionStore) upgradeToDurable(canonical string, cfg Config, cfgPath
 		return nil
 	}
 
+	if !res.manifestDurable {
+		// The manifest names the log form, but its rename may not be on disk: a
+		// crash can still bring the old manifest back, and that open sets the log
+		// aside. A write the log form accepted now would then be missing, so the
+		// old form, which holds the same points, is served read-only and every
+		// file stays. The next open loads whichever manifest is on disk.
+		s.markReadOnly(canonical, old, cfgPath,
+			"upgrading it to the write-ahead log could not make its new manifest durable", res.err)
+		return nil
+	}
+
 	nc, err := s.buildWALCollection(canonical, walCfg, cfgPath, snapPath)
 	if err != nil {
 		s.rollbackUpgrade(canonical, old, cfg, cfgPath, snapPath, err)
@@ -260,12 +271,7 @@ func (s *CollectionStore) upgradeToDurable(canonical string, cfg Config, cfgPath
 		slog.Warn("vector: closing the old form of an upgraded collection failed",
 			"collection", canonical, "err", cerr)
 	}
-	if res.manifestDurable {
-		s.removeMappedLeftovers(canonical)
-	} else {
-		slog.Warn("vector: the upgraded manifest of a durable collection may not be on disk yet, so the files of its old form are kept until a later open",
-			"collection", canonical, "manifest", cfgPath)
-	}
+	s.removeMappedLeftovers(canonical)
 	return nil
 }
 
@@ -360,7 +366,7 @@ type upgradeResult struct {
 	// committed: the manifest now names the log form.
 	committed bool
 	// manifestDurable: when committed, the manifest's rename is known to be
-	// on disk, so the old files may go.
+	// on disk, so the log form may take writes and the old files may go.
 	manifestDurable bool
 	// oldManifestCertain: when not committed, the manifest is known to name the
 	// old form, so the snapshot may go.
@@ -422,15 +428,16 @@ func (s *CollectionStore) convertToDurable(canonical string, old *Collection, cf
 	got, rerr := readConfig(cfgPath)
 	switch {
 	case rerr == nil && got.WAL:
-		// Committed: keeping the old form would accept writes the next open,
-		// which takes the log path, cannot see. The failed directory sync may be
-		// the one that made the rename durable, so it is retried; until it
-		// succeeds the old files stay, since removing them could reach disk
-		// before the rename does.
+		// Committed: keeping the old form writable would accept writes the next
+		// open, which takes the log path, cannot see. The failed directory sync
+		// may be the one that made the rename durable, so it is retried; if the
+		// retry fails too, the caller serves the old form read-only and keeps
+		// every file, since a crash could still bring the old manifest back.
 		slog.Warn("vector: the upgraded manifest reported an error but is in place; continuing with the write-ahead log",
 			"collection", canonical, "err", werr)
 		derr := syncDirf(filepath.Dir(cfgPath))
-		return upgradeResult{committed: true, manifestDurable: derr == nil}
+		return upgradeResult{committed: true, manifestDurable: derr == nil,
+			err: fmt.Errorf("vector: replacing the manifest: %w; syncing its directory again: %v", werr, derr)}
 	case rerr == nil:
 		return fail(fmt.Errorf("vector: replacing the manifest: %w", werr))
 	}
