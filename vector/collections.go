@@ -991,6 +991,11 @@ func (s *CollectionStore) discardStaged(c *Collection) {
 	}
 }
 
+// restoreStageSuffix names where a durable restore writes the restored snapshot
+// (<col>.snap<suffix>) before it removes the collection it replaces. No open
+// reads that name.
+const restoreStageSuffix = ".restoring"
+
 // publishRestore replaces canonical's current collection, if any, with the fully
 // restored c. The name resolves to no collection from the drop's catalog removal
 // until c is registered; see RestoreCollectionWithConfig. The caller holds
@@ -1018,6 +1023,20 @@ func (s *CollectionStore) publishRestore(canonical string, cfg Config, c *Collec
 		}
 		return fmt.Errorf("vector: restore %q: the snapshot restored, but the existing collection had already been removed when publishing the restored one failed: %w", canonical, err)
 	}
+	// A durable collection's restored points are acknowledged when this returns,
+	// and the fresh log holds none of them, so they are checkpointed. The
+	// snapshot is written under a name no open reads BEFORE the old collection is
+	// removed, so a snapshot that cannot be written fails the restore with the
+	// old collection and its files untouched; publication then only renames it.
+	stagedSnap := snapPath + restoreStageSuffix
+	if durable {
+		if err := s.writeSnapshotFile(c, stagedSnap); err != nil {
+			s.discardStaged(c)
+			_ = os.Remove(stagedSnap)
+			return fmt.Errorf("vector: restore %q: writing the restored snapshot: %w; the existing collection is unchanged", canonical, err)
+		}
+		defer func() { _ = os.Remove(stagedSnap) }() // gone once renamed; a leftover on failure
+	}
 	// Synchronous: returns once in-flight users have drained and the files are gone.
 	// Any other drop of this name finished before the name lock was granted, so no
 	// cleanup still pending can remove the files written below.
@@ -1034,12 +1053,11 @@ func (s *CollectionStore) publishRestore(canonical string, cfg Config, c *Collec
 		}
 		c.wal = w
 	}
-	// A durable collection's restored points are acknowledged when this returns,
-	// and the fresh log holds none of them: checkpoint them now. Written after the
-	// marker, so a stop before it leaves an empty collection, never a stale
-	// snapshot under no marker for a later create of the name to load.
+	// The staged snapshot takes its place after the marker, so a stop before it
+	// leaves an empty collection, never a stale snapshot under no marker for a
+	// later create of the name to load.
 	if durable {
-		if err := s.writeSnapshotFile(c, snapPath); err != nil {
+		if err := renameDurable(stagedSnap, snapPath); err != nil {
 			return fail(err)
 		}
 	}
