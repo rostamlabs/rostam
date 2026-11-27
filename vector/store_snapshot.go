@@ -235,6 +235,16 @@ func (s *CollectionStore) SnapshotAll(w io.Writer) error {
 // RestoreAll replaces the store's collections with those read from r. Existing
 // collections are closed first.
 func (s *CollectionStore) RestoreAll(r io.Reader) error {
+	// A whole-store restore replaces every collection, so a read-only one, whose
+	// files must be kept, refuses it.
+	s.mu.RLock()
+	for _, c := range s.collections {
+		if err := c.refuseReadOnly(); err != nil {
+			s.mu.RUnlock()
+			return fmt.Errorf("vector: restore all: %w", err)
+		}
+	}
+	s.mu.RUnlock()
 	br := bufio.NewReader(r)
 	magic := make([]byte, len(storeSnapshotMagic))
 	if _, err := io.ReadFull(br, magic); err != nil {

@@ -604,6 +604,12 @@ func statusForError(err error) int {
 		// merely wraps the sentinel, leaking it to the caller unredacted.
 		errors.Is(err, vector.ErrRecordTooLarge),
 		vector.IsRecordTooLargeMessage(err.Error()),
+		// A write whose log record would be larger than replay reads back (a
+		// multi-vector document): refused before it applies, and the message
+		// names only the two sizes. An applied write whose record is too large at
+		// the append is vector.ErrWALPoisoned instead: a redacted 500. Keeps this
+		// classifier in sync with server.clientFacingErr.
+		errors.Is(err, vector.ErrWALRecordTooLarge),
 		// Record bytes no operate engine can open: 400, not 500. Storing them
 		// would poison every accelerated filter under that payload key for the
 		// whole collection, so refusing at the door is the client-fixable
@@ -794,6 +800,13 @@ func statusForError(err error) int {
 		// in sync with server.clientFacingErr as its contract requires.
 		strings.Contains(err.Error(), "op not registered"):
 		return http.StatusNotFound
+	case errors.Is(err, vector.ErrCollectionReadOnly),
+		// Served read-only after an upgrade that left the form of its files
+		// unknown; the message says what to do. Not retryable until a restart.
+		errors.Is(err, vector.ErrEvictBusy):
+		// The collection was in use while it was being evicted and stays
+		// resident; a later eviction can try again.
+		return http.StatusConflict
 	case errors.Is(err, vector.ErrVersionConflict),
 		strings.Contains(err.Error(), "version conflict"):
 		// Optimistic-CAS precondition miss: the point's current version did not match

@@ -484,7 +484,7 @@ func (ix *ivf) liveLockedAt(id uint64, now uint64) bool {
 // to its nearest centroid's inverted list; untrained, it just lives in the arena
 // (the next search brute-forces, the next train sweeps it into a list).
 func (ix *ivf) Insert(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond) (uint64, map[string]uint64, error) {
-	return ix.insertBody(id, vec, ttl, meta, sparse, keyTTLMs, cas, false, 0)
+	return ix.insertBody(id, vec, ttl, meta, sparse, keyTTLMs, cas, false, 0, false)
 }
 
 // InsertAt is Insert with every TTL deadline computation and liveness check judged
@@ -492,10 +492,16 @@ func (ix *ivf) Insert(id uint64, vec []float32, ttl time.Duration, meta Metadata
 // apply stamps byte-identical state on every replica (#4 vector TTL determinism,
 // mirroring hnsw.InsertAt / cache.PutAt). Insert is byte-identical to before.
 func (ix *ivf) InsertAt(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond, nowMs int64) (uint64, map[string]uint64, error) {
-	return ix.insertBody(id, vec, ttl, meta, sparse, keyTTLMs, cas, true, uint64(nowMs)) //nolint:gosec // stamped unix-millis is non-negative
+	return ix.insertBody(id, vec, ttl, meta, sparse, keyTTLMs, cas, true, uint64(nowMs), false) //nolint:gosec // stamped unix-millis is non-negative
 }
 
-func (ix *ivf) insertBody(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond, stamped bool, nowMs uint64) (uint64, map[string]uint64, error) {
+// replaceInsert mirrors hnsw.replaceInsert: Insert/InsertAt that replaces a LIVE
+// id in the same critical section, after every check that can refuse the write.
+func (ix *ivf) replaceInsert(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond, stamped bool, nowMs uint64) (uint64, map[string]uint64, error) {
+	return ix.insertBody(id, vec, ttl, meta, sparse, keyTTLMs, cas, stamped, nowMs, true)
+}
+
+func (ix *ivf) insertBody(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond, stamped bool, nowMs uint64, replaceLive bool) (uint64, map[string]uint64, error) {
 	if err := checkRecordValues(meta); err != nil {
 		return 0, nil, err
 	}
@@ -524,7 +530,7 @@ func (ix *ivf) insertBody(id uint64, vec []float32, ttl time.Duration, meta Meta
 		return 0, nil, err
 	}
 	keyExpires := computeInsertKeyExpires(int64(now), meta, keyTTLMs) //nolint:gosec // unix-millis fits int64
-	version, err := ix.insertLockedAt(id, stored, ttl, meta, sparse, keyExpires, 0, now)
+	version, err := ix.insertLockedAt(id, stored, ttl, meta, sparse, keyExpires, 0, now, replaceLive)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -535,7 +541,13 @@ func (ix *ivf) insertBody(id uint64, vec []float32, ttl time.Duration, meta Meta
 // copy). Mirrors hnsw.RestoreInsert. keyExpires is the ABSOLUTE per-key deadline
 // map restored VERBATIM (NOT recomputed).
 func (ix *ivf) RestoreInsert(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64) error {
-	return ix.restoreInsertBody(id, vec, ttl, meta, sparse, keyExpires, version, false, 0)
+	return ix.restoreInsertBody(id, vec, ttl, meta, sparse, keyExpires, version, false, 0, false)
+}
+
+// restoreReplace mirrors hnsw.restoreReplace: RestoreInsert that replaces a LIVE
+// id (the replay of a dense insert record).
+func (ix *ivf) restoreReplace(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64) error {
+	return ix.restoreInsertBody(id, vec, ttl, meta, sparse, keyExpires, version, false, 0, true)
 }
 
 // RestoreInsertAt is RestoreInsert stamping the POINT ttl deadline and judging
@@ -543,10 +555,10 @@ func (ix *ivf) RestoreInsert(id uint64, vec []float32, ttl time.Duration, meta M
 // still installed VERBATIM). Replicated version-preserving insert path (#4 vector
 // TTL determinism).
 func (ix *ivf) RestoreInsertAt(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64, nowMs int64) error {
-	return ix.restoreInsertBody(id, vec, ttl, meta, sparse, keyExpires, version, true, uint64(nowMs)) //nolint:gosec // stamped unix-millis is non-negative
+	return ix.restoreInsertBody(id, vec, ttl, meta, sparse, keyExpires, version, true, uint64(nowMs), false) //nolint:gosec // stamped unix-millis is non-negative
 }
 
-func (ix *ivf) restoreInsertBody(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64, stamped bool, nowMs uint64) error {
+func (ix *ivf) restoreInsertBody(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64, stamped bool, nowMs uint64, replaceLive bool) error {
 	// REPLAY body: size only — the IVF twin of hnsw.restoreInsertBody. See
 	// checkRecordValuesSize.
 	if err := checkRecordValuesSize(meta); err != nil {
@@ -566,7 +578,7 @@ func (ix *ivf) restoreInsertBody(id uint64, vec []float32, ttl time.Duration, me
 	if !stamped {
 		now = uint64(ix.now())
 	}
-	_, err := ix.insertLockedAt(id, stored, ttl, meta, sparse, keyExpires, version, now)
+	_, err := ix.insertLockedAt(id, stored, ttl, meta, sparse, keyExpires, version, now, replaceLive)
 	return err
 }
 
@@ -586,7 +598,7 @@ func (ix *ivf) currentVersionLockedAt(id uint64, now uint64) uint64 {
 // point-TTL absolute deadline (now+ttl) judged against the caller-supplied `now`
 // (unix millis), so a replicated insert stamps byte-identical state on every
 // replica (#4 vector TTL determinism). Must hold ix.mu.
-func (ix *ivf) insertLockedAt(id uint64, stored []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, setVersion uint64, now uint64) (uint64, error) {
+func (ix *ivf) insertLockedAt(id uint64, stored []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, setVersion uint64, now uint64, replaceLive bool) (uint64, error) {
 	// Upsert replace: a dead (tombstoned or expired) slot for id is hard-removed
 	// so this insert resurrects the id. The stale list entry for the freed slot is
 	// tolerated — it is filtered by admits on the next scan, and slot reuse below
@@ -607,8 +619,11 @@ func (ix *ivf) insertLockedAt(id uint64, stored []float32, ttl time.Duration, me
 	// Judging each check against the accounting the reclaim is ABOUT to produce
 	// keeps the verdict identical to running it afterwards — in particular an
 	// upsert into an exactly-full collection is a replace and still succeeds.
+	//
+	// replaceLive extends the reclaim to a LIVE slot (an atomic replace, see
+	// replaceInsert), still only past every rejection.
 	reclaimSlot, reclaiming := uint32(0), false
-	if old, ok := ix.arena.Slot(id); ok && (ix.tombstoned[old] || ix.isExpiredAt(old, now)) {
+	if old, ok := ix.arena.Slot(id); ok && (replaceLive || ix.tombstoned[old] || ix.isExpiredAt(old, now)) {
 		reclaimSlot, reclaiming = old, true
 	}
 
@@ -1227,7 +1242,7 @@ func (ix *ivf) insertIfAbsentBody(id uint64, vec []float32, ttl time.Duration, m
 		ix.quotaRejects.Add(1)
 		return false, ErrCollectionRateLimited
 	}
-	if _, err := ix.insertLockedAt(id, stored, ttl, meta, sparse, keyExpires, version, now); err != nil {
+	if _, err := ix.insertLockedAt(id, stored, ttl, meta, sparse, keyExpires, version, now, false); err != nil {
 		return false, err
 	}
 	return true, nil

@@ -4,7 +4,9 @@ package vector
 
 import (
 	"bytes"
+	"fmt"
 	"io"
+	"math"
 )
 
 // Multi-vector (late-interaction) WAL record codec, layered on the family-agnostic
@@ -74,6 +76,40 @@ func (w *wal) appendMVAddStaged(docID uint64, tokens [][]float32, meta Metadata,
 	return w.appendFramedStaged(buf.Bytes())
 }
 
+// mvAddRecordFits refuses (ErrWALRecordTooLarge) a multi-vector document whose
+// add record would exceed what replay reads back. It runs before the document
+// applies, so an oversize document is never visible and the log stays healthy.
+// The token matrix is sized arithmetically; the tail (metadata, per-key
+// deadlines for the keys named in either map, version, sparse) is encoded at
+// its widest, so the result bounds what appendMVAddStaged writes.
+func mvAddRecordFits(tokens [][]float32, meta Metadata, keyExpires map[string]uint64, keyTTLMs map[string]int64, sparse *SparseVector) error {
+	size := int64(1 + 8 + 4)
+	for _, t := range tokens {
+		size += 4 + 4*int64(len(t))
+	}
+	if size > int64(walRecordLimit) {
+		return fmt.Errorf("%w: the document's tokens alone take %d bytes, the limit is %d", ErrWALRecordTooLarge, size, walRecordLimit)
+	}
+	var tail bytes.Buffer
+	if err := writeOptMeta(&tail, meta); err != nil {
+		return err
+	}
+	ke := make(map[string]uint64, len(keyExpires)+len(keyTTLMs))
+	for k := range keyExpires {
+		ke[k] = math.MaxUint64
+	}
+	for k := range keyTTLMs {
+		ke[k] = math.MaxUint64
+	}
+	writeOptKeyExpires(&tail, ke)
+	writeOptVersion(&tail, math.MaxUint64)
+	writeOptMVSparse(&tail, sparse)
+	if size += int64(tail.Len()); size > int64(walRecordLimit) {
+		return fmt.Errorf("%w: the document's record takes %d bytes, the limit is %d", ErrWALRecordTooLarge, size, walRecordLimit)
+	}
+	return nil
+}
+
 // writeOptMVSparse appends the optional doc-level sparse block. To keep a
 // dense-only record byte-identical it writes NOTHING when sparse is nil/zero (no
 // flag byte at all — the framing + EOF-tolerant reader cover the absence).
@@ -89,8 +125,8 @@ func writeOptMVSparse(buf *bytes.Buffer, sparse *SparseVector) {
 
 // readOptMVSparse is the inverse of writeOptMVSparse. It tolerates EOF (a
 // dense-only record with no trailing block) by returning (nil, true). A present
-// flag with a truncated body returns (nil, false) so replay stops at the
-// durability boundary.
+// flag with a truncated body returns (nil, false), and replay fails with
+// ErrLogDamaged.
 func readOptMVSparse(r *bytes.Reader) (*SparseVector, bool) {
 	var flag [1]byte
 	if _, err := io.ReadFull(r, flag[:]); err != nil {
@@ -144,9 +180,9 @@ func (w *wal) appendMVSetPayloadStaged(docID uint64, meta Metadata, keyExpires m
 // MultiVectorIndex via the shared replayFramed core. The per-record apply switches
 // on the MV tag and re-calls the idempotent mutator with VERBATIM absolute per-key
 // deadlines (restorePayload, not SetPayload — replay must not recompute now+ttl).
-// It stops at the first malformed/unknown record (returning false), the same
-// torn-tail/durability boundary the framed core enforces for a truncated final
-// record. A missing file replays nothing.
+// A malformed record fails the replay with ErrLogDamaged and an unknown tag with
+// errUnknownWALRecord; a torn tail is cut by the framed core (see replayFramed).
+// A missing file replays nothing.
 func replayMVWAL(path string, m *MultiVectorIndex) error {
 	return replayFramed(path, func(rec []byte) error {
 		return replayMVRecord(rec, m)
@@ -154,8 +190,8 @@ func replayMVWAL(path string, m *MultiVectorIndex) error {
 }
 
 // replayMVRecord decodes one MV record payload and re-applies it onto m. Returns
-// false on a malformed body so replay stops at the durability boundary (mirrors
-// named replayNamedRecord). Apply errors from the mutators are swallowed — replay
+// errStopReplay on a malformed body, which replayFramed reports as ErrLogDamaged
+// (mirrors named replayNamedRecord). Apply errors from the mutators are swallowed — replay
 // is idempotent on top of the snapshot checkpoint.
 func replayMVRecord(payload []byte, m *MultiVectorIndex) error {
 	r := bytes.NewReader(payload)
@@ -238,7 +274,7 @@ func replayMVRecord(payload []byte, m *MultiVectorIndex) error {
 		}
 		// Optional trailing doc-level sparse block (AFTER the version). An OLD record
 		// (no block) reads nil → the dense-only path; a present-but-truncated block
-		// stops replay at the durability boundary.
+		// fails replay with ErrLogDamaged.
 		sparse, ok := readOptMVSparse(r)
 		if !ok {
 			return errStopReplay

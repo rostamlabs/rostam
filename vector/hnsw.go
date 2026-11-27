@@ -1881,7 +1881,7 @@ func (h *hnsw) pickNeighbors(s *layerScratch, query []float32, candidates []slot
 // (or slot reuse, which clears it).
 func (h *hnsw) Insert(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond) (uint64, map[string]uint64, error) {
 	// stamped=false: snapshot the wall clock once under the lock (see insertBody).
-	return h.insertBody(id, vec, ttl, meta, sparse, keyTTLMs, cas, false, 0)
+	return h.insertBody(id, vec, ttl, meta, sparse, keyTTLMs, cas, false, 0, false)
 }
 
 // InsertAt is Insert with every TTL deadline computation AND liveness check judged
@@ -1891,7 +1891,16 @@ func (h *hnsw) Insert(id uint64, vec []float32, ttl time.Duration, meta Metadata
 // TTL determinism, mirroring cache.PutAt). Additive: Insert is byte-identical to
 // before.
 func (h *hnsw) InsertAt(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond, nowMs int64) (uint64, map[string]uint64, error) {
-	return h.insertBody(id, vec, ttl, meta, sparse, keyTTLMs, cas, true, uint64(nowMs)) //nolint:gosec // stamped unix-millis is non-negative
+	return h.insertBody(id, vec, ttl, meta, sparse, keyTTLMs, cas, true, uint64(nowMs), false) //nolint:gosec // stamped unix-millis is non-negative
+}
+
+// replaceInsert is Insert (stamped=false) or InsertAt (stamped=true, at nowMs)
+// that also takes a LIVE id: the CAS is judged against the live version and the
+// old point is replaced in the same critical section, after every check that can
+// refuse the write. A refused replace leaves the old point untouched, and no
+// reader sees the id absent in between. See VectorIndex.replaceInsert.
+func (h *hnsw) replaceInsert(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond, stamped bool, nowMs uint64) (uint64, map[string]uint64, error) {
+	return h.insertBody(id, vec, ttl, meta, sparse, keyTTLMs, cas, stamped, nowMs, true)
 }
 
 // insertBody is the shared implementation of Insert/InsertAt. When stamped it uses
@@ -1901,7 +1910,7 @@ func (h *hnsw) InsertAt(id uint64, vec []float32, ttl time.Duration, meta Metada
 // all of them — a single per-op clock read, consistent with the search path's
 // one-snapshot rule and byte-identical to the historical multi-read path under a
 // stable clock.
-func (h *hnsw) insertBody(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond, stamped bool, nowMs uint64) (uint64, map[string]uint64, error) {
+func (h *hnsw) insertBody(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond, stamped bool, nowMs uint64, replaceLive bool) (uint64, map[string]uint64, error) {
 	if err := checkRecordValues(meta); err != nil {
 		return 0, nil, err
 	}
@@ -1970,7 +1979,7 @@ func (h *hnsw) insertBody(id uint64, vec []float32, ttl time.Duration, meta Meta
 		// stays the zero-overhead path. The resulting map is returned so the Collection
 		// layer WAL-logs it verbatim (time-stable replay).
 		keyExpires = computeInsertKeyExpires(int64(now), meta, keyTTLMs) //nolint:gosec // unix-millis fits int64
-		return h.placeLockedAt(id, stored, ttl, meta, sparse, keyExpires, 0, now, &task)
+		return h.placeLockedAt(id, stored, ttl, meta, sparse, keyExpires, 0, now, replaceLive, &task)
 	}()
 	if err != nil {
 		return 0, nil, err
@@ -2000,7 +2009,15 @@ var linkGapHook func()
 // rather than bumped — the version-preserving primitive for WAL replay and
 // reshard copy. No CAS, no rate limit (replay/copy is internal and idempotent).
 func (h *hnsw) RestoreInsert(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64) error {
-	return h.restoreInsertBody(id, vec, ttl, meta, sparse, keyExpires, version, false, 0)
+	return h.restoreInsertBody(id, vec, ttl, meta, sparse, keyExpires, version, false, 0, false)
+}
+
+// restoreReplace is RestoreInsert that also takes a LIVE id, replacing its point
+// in one critical section: the replay of a dense insert record, which says "after
+// this op the id holds this point" whether or not the id was live before it. See
+// VectorIndex.restoreReplace.
+func (h *hnsw) restoreReplace(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64) error {
+	return h.restoreInsertBody(id, vec, ttl, meta, sparse, keyExpires, version, false, 0, true)
 }
 
 // RestoreInsertAt is RestoreInsert judging reclaim liveness and stamping the POINT
@@ -2010,10 +2027,10 @@ func (h *hnsw) RestoreInsert(id uint64, vec []float32, ttl time.Duration, meta M
 // stamps a deterministic point deadline on every replica (#4 vector TTL
 // determinism).
 func (h *hnsw) RestoreInsertAt(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64, nowMs int64) error {
-	return h.restoreInsertBody(id, vec, ttl, meta, sparse, keyExpires, version, true, uint64(nowMs)) //nolint:gosec // stamped unix-millis is non-negative
+	return h.restoreInsertBody(id, vec, ttl, meta, sparse, keyExpires, version, true, uint64(nowMs), false) //nolint:gosec // stamped unix-millis is non-negative
 }
 
-func (h *hnsw) restoreInsertBody(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64, stamped bool, nowMs uint64) error {
+func (h *hnsw) restoreInsertBody(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64, stamped bool, nowMs uint64, replaceLive bool) error {
 	// REPLAY body: size only. Its callers are Collection.RestoreInsert[At] —
 	// which already ran the full checkRecordValues on the caller's metadata —
 	// and WAL replay, which must never refuse an acked record. See
@@ -2044,7 +2061,7 @@ func (h *hnsw) restoreInsertBody(id uint64, vec []float32, ttl time.Duration, me
 		// keyExpires is the ABSOLUTE per-key deadline map logged by the WAL — restored
 		// VERBATIM (NOT recomputed now+ttl) so pending key deadlines survive a crash /
 		// reshard copy time-stable, exactly like RestorePayload.
-		_, err := h.placeLockedAt(id, stored, ttl, meta, sparse, keyExpires, version, now, &task)
+		_, err := h.placeLockedAt(id, stored, ttl, meta, sparse, keyExpires, version, now, replaceLive, &task)
 		return err
 	}()
 	if err != nil {
@@ -2085,9 +2102,11 @@ func (h *hnsw) currentVersionLockedAt(id uint64, now uint64) uint64 {
 // It places a fresh point and returns its resulting version. A new point's
 // version is 1, UNLESS setVersion != 0, in which case the version is set
 // VERBATIM (the WAL-replay / reshard-copy path, which must preserve the exact
-// version rather than reset it to 1). HNSW has no in-place vector update — a live
-// id collides (ErrDuplicateID) and Collection.Upsert is delete+insert — so every
-// successful insert here is a fresh point (version 1 / setVersion).
+// version rather than reset it to 1). HNSW has no in-place vector update: a live
+// id collides (ErrDuplicateID) unless replaceLive is set, in which case the old
+// point's slot is reclaimed and the id re-placed (the atomic replace, see
+// replaceInsert). Either way every successful insert here places a fresh point
+// (version 1 / setVersion).
 //
 // EVERY clock-dependent decision is judged against the caller-supplied `now`
 // (unix millis): the dead-slot reclaim liveness check, the point-TTL absolute
@@ -2100,7 +2119,7 @@ func (h *hnsw) currentVersionLockedAt(id uint64, now uint64) uint64 {
 // `out` receives the link task. It is left untouched on every path that places
 // nothing to link (an error, or the first node in an empty index), so a
 // zero-valued linkTask is a correct "nothing to do".
-func (h *hnsw) placeLockedAt(id uint64, stored []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, setVersion uint64, now uint64, out *linkTask) (uint64, error) {
+func (h *hnsw) placeLockedAt(id uint64, stored []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, setVersion uint64, now uint64, replaceLive bool, out *linkTask) (uint64, error) {
 	// PQDropVecs read-only: once the floats are dropped the index has no resident
 	// vectors to navigate/link a new node on (the build/link path scores on exact
 	// floats via buildScorer/selectNeighbors → arena.Vec). Rather than degrade the
@@ -2118,7 +2137,7 @@ func (h *hnsw) placeLockedAt(id uint64, stored []float32, ttl time.Duration, met
 	// (Size = arena.Size() - tombstoned). Reclaiming the expired case too lets
 	// InsertIfAbsent treat an expired slot as absent without colliding (Exists
 	// already reports it not-live). A LIVE id still collides — arena.Insert
-	// returns ErrDuplicateID below.
+	// returns ErrDuplicateID below — unless replaceLive is set (see below).
 	//
 	// FREE AND REUSE MUST BE ATOMIC, which is why the decision is taken here but
 	// the reclaim itself runs LOWER DOWN, past every check that can reject. The
@@ -2140,8 +2159,13 @@ func (h *hnsw) placeLockedAt(id uint64, stored []float32, ttl time.Duration, met
 	// check below is judged against the accounting the reclaim is ABOUT to produce
 	// — one fewer vector, one insert's worth of bytes released — which is the same
 	// arithmetic those checks saw when they ran after it.
+	//
+	// replaceLive extends the reclaim to a LIVE slot (an atomic replace, see
+	// replaceInsert): the old point is removed exactly as a Delete followed by
+	// this reclaim would remove it, but only past every rejection below, so a
+	// refused replace leaves it in place.
 	reclaimSlot, reclaiming := uint32(0), false
-	if old, ok := h.arena.Slot(id); ok && (h.tombstoned[old] || h.isExpiredAt(old, now)) {
+	if old, ok := h.arena.Slot(id); ok && (replaceLive || h.tombstoned[old] || h.isExpiredAt(old, now)) {
 		reclaimSlot, reclaiming = old, true
 	}
 
@@ -2246,10 +2270,12 @@ func (h *hnsw) placeLockedAt(id uint64, stored []float32, ttl time.Duration, met
 	}
 	h.arena.SetVersion(slot, version)
 	// id-set membership grew (a brand-new id, or a resurrected dead slot whose id
-	// the reclaim branch above removed from idMap before this Insert). A LIVE-id
-	// collision returned ErrDuplicateID above and never reaches here, so this bump
-	// fires ONLY when the live id set actually changes. Invalidates the scroll
-	// snapshot; this single increment under h.mu is the only write-path cost.
+	// the reclaim branch above removed from idMap before this Insert), or, for a
+	// replaceLive insert, the id moved to a new slot while the live id set stayed
+	// the same. A LIVE-id collision returned ErrDuplicateID above and never
+	// reaches here. The replace case bumps too: a conservative invalidation of
+	// the scroll snapshot, not a sign the set changed. This single increment
+	// under h.mu is the only write-path cost.
 	h.idSetVersion++
 	h.bumpData() // id-set change also invalidates the order_by snapshot
 	if ttl > 0 {
@@ -3406,7 +3432,7 @@ func (h *hnsw) insertIfAbsentBody(id uint64, vec []float32, ttl time.Duration, m
 		// keyExpires is the ABSOLUTE per-key deadline map set VERBATIM (NOT recomputed
 		// now+ttl) — nil for a plain if-absent, the carried deadlines for an online
 		// reshard copy. placeLockedAt sets it via arena.SetKeyExpires (mirror RestoreInsert).
-		if _, err := h.placeLockedAt(id, stored, ttl, meta, sparse, keyExpires, version, now, &task); err != nil {
+		if _, err := h.placeLockedAt(id, stored, ttl, meta, sparse, keyExpires, version, now, false, &task); err != nil {
 			return err
 		}
 		placed = true

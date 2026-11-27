@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -56,6 +57,11 @@ type CollectionStore struct {
 	// Persistent instant-restart), unchanged.
 	persistentCluster bool
 	gen               atomic.Uint64
+
+	// durable holds the canonical names of the dense collections that always run
+	// with the write-ahead log (see StoreOptions.DurableCollections). Set at open,
+	// read-only afterwards. Consulted only through isDurable.
+	durable map[string]struct{}
 
 	mu          sync.RWMutex
 	collections map[string]*Collection
@@ -112,7 +118,7 @@ type CollectionStore struct {
 // Legacy top-level files from subsystem 1 (no tenant subdir) are picked up
 // and remapped to the "default" tenant on load.
 func OpenCollectionStore(dir string) (*CollectionStore, error) {
-	return OpenCollectionStorePersistent(dir, false)
+	return OpenCollectionStoreWith(dir, StoreOptions{})
 }
 
 // OpenCollectionStorePersistent is OpenCollectionStore with the per-node
@@ -121,7 +127,18 @@ func OpenCollectionStore(dir string) (*CollectionStore, error) {
 // per-collection sidecar: stale on-disk vector data files are wiped at open and
 // repopulated from the Raft snapshot/log. Used by shard.New in a replicated
 // deployment (shard.Config.PersistentVectors).
-func OpenCollectionStorePersistent(dir string, persistentCluster bool) (store *CollectionStore, retErr error) {
+func OpenCollectionStorePersistent(dir string, persistentCluster bool) (*CollectionStore, error) {
+	return OpenCollectionStoreWith(dir, StoreOptions{PersistentCluster: persistentCluster})
+}
+
+// OpenCollectionStoreWith is OpenCollectionStore with explicit options: the
+// persistent-cluster policy and the durable collections (see StoreOptions).
+func OpenCollectionStoreWith(dir string, opts StoreOptions) (store *CollectionStore, retErr error) {
+	persistentCluster := opts.PersistentCluster
+	durable, err := canonicalDurable(opts.DurableCollections)
+	if err != nil {
+		return nil, err
+	}
 	// No directory configured means heap mode. Give the store a private temp dir
 	// rather than letting every path resolve relative to the process's working
 	// directory: the on-disk layout below is an implementation detail of the
@@ -149,7 +166,28 @@ func OpenCollectionStorePersistent(dir string, persistentCluster bool) (store *C
 	if err := os.MkdirAll(vd, 0o750); err != nil {
 		return nil, fmt.Errorf("vector: mkdir %s: %w", vd, err)
 	}
-	s := &CollectionStore{dir: dir, ephemeralDir: ephemeral, persistentCluster: persistentCluster, collections: make(map[string]*Collection), multi: make(map[string]*MultiVectorIndex), named: make(map[string]*NamedCollection)}
+	s := &CollectionStore{dir: dir, ephemeralDir: ephemeral, persistentCluster: persistentCluster, durable: durable, collections: make(map[string]*Collection), multi: make(map[string]*MultiVectorIndex), named: make(map[string]*NamedCollection)}
+	// A failed open returns no store, so the collections loaded before the
+	// failure are closed here. Close only releases their handles and mappings:
+	// it writes no checkpoint and removes no file. Deferred after the heap-mode
+	// RemoveAll, so it runs before it.
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		for _, c := range s.collections {
+			c.Stop()
+			_ = c.Close()
+		}
+		for _, mv := range s.multi {
+			mv.Stop()
+			_ = mv.Close()
+		}
+		for _, nc := range s.named {
+			nc.Stop()
+			_ = nc.Close()
+		}
+	}()
 
 	// Cluster-persistent: the mmap files are a non-authoritative cache. Wipe any
 	// left by a prior process so Raft (FSM.Restore + log replay) is the single
@@ -213,6 +251,35 @@ func OpenCollectionStorePersistent(dir string, persistentCluster bool) (store *C
 	return s, nil
 }
 
+// fileExists reports whether path names an existing file. An error other than
+// not-exist counts as existing, so a caller refusing on it stays safe.
+func fileExists(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil || !errors.Is(err, fs.ErrNotExist)
+}
+
+// openSnapshotFile opens a snapshot for reading. A variable so tests can make
+// the open fail.
+var openSnapshotFile = os.Open
+
+// openSnapshot opens the snapshot at path. A missing entry is "no snapshot" and
+// returns (nil, nil); any other error is returned, so a snapshot that exists
+// but cannot be read fails the open instead of loading the collection empty.
+// The open follows symlinks, so its not-exist error is checked against the
+// entry itself: a dangling symlink is there, and fails the open.
+func openSnapshot(path string) (*os.File, error) {
+	f, err := openSnapshotFile(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			if _, lerr := os.Lstat(path); errors.Is(lerr, fs.ErrNotExist) {
+				return nil, nil
+			}
+		}
+		return nil, err
+	}
+	return f, nil
+}
+
 // loadCollection reads cfg + snapshot for one collection and registers it
 // under its canonical name. Used by OpenCollectionStore's two passes.
 func (s *CollectionStore) loadCollection(canonical, cfgPath, snapPath string) error {
@@ -235,6 +302,11 @@ func (s *CollectionStore) loadCollection(canonical, cfgPath, snapPath string) er
 		return nil
 	}
 
+	// A durable restore stopped part way can leave its staged snapshot; no
+	// open reads it, so it is removed. Done before anything else, so a
+	// collection that then turns out read-only has its own files untouched.
+	removeRestoreLeftovers(snapPath)
+
 	// WAL collections recover from a CONSISTENT checkpoint (Snapshot) plus the
 	// WAL tail — not the mmap sidecar. Instant-restart's zero-copy mmap base is
 	// only valid when nothing mutates after Flush; with a WAL, post-checkpoint
@@ -242,61 +314,51 @@ func (s *CollectionStore) loadCollection(canonical, cfgPath, snapPath string) er
 	// the live mmap diverges from any sidecar. Restore rebuilds a consistent
 	// graph (into a fresh mmap when Persistent), then replay applies the tail.
 	if cfg.WAL {
-		eff := s.effectiveConfig(canonical, cfg)
-		c, nerr := NewCollection(canonical, eff)
-		if nerr != nil {
-			return fmt.Errorf("vector: rebuild %s: %w", canonical, nerr)
-		}
-		if f, oerr := os.Open(snapPath); oerr == nil {
-			rerr := c.Restore(f)
-			_ = f.Close()
-			if rerr != nil {
-				_ = c.Close()
-				return fmt.Errorf("vector: restore %s: %w", canonical, rerr)
-			}
-		}
-		_, _, _, walPath := s.persistPaths(canonical)
-		if rerr := c.replayWAL(walPath); rerr != nil {
-			_ = c.Close()
-			return fmt.Errorf("vector: wal replay %s: %w", canonical, rerr)
-		}
-		w, werr := openWAL(walPath, cfg.WALNoSync)
-		if werr != nil {
-			_ = c.Close()
-			return fmt.Errorf("vector: wal open %s: %w", canonical, werr)
-		}
-		c.wal = w
-		s.collections[canonical] = c
-		return nil
+		return s.loadWALCollection(canonical, cfg, cfgPath, snapPath)
 	}
 
 	// Persistent collections instant-restart: map their vector + graph files and
 	// the sidecar, no graph rebuild. A collection created but never flushed has
-	// no sidecar yet — open it as a fresh empty (mmap-backed) index.
+	// no sidecar yet — open it as a fresh empty (mmap-backed) index. A listed
+	// durable collection is then upgraded to the write-ahead log; a failed
+	// upgrade leaves it registered in this form.
 	if cfg.Persistent {
 		eff := s.effectiveConfig(canonical, cfg)
 		_, _, metaPath, _ := s.persistPaths(canonical)
+		var c *Collection
 		if _, statErr := os.Stat(metaPath); statErr == nil {
-			c, oerr := openPersistentCollection(canonical, eff, metaPath)
+			oc, oerr := openPersistentCollection(canonical, eff, metaPath)
 			if oerr != nil {
 				return fmt.Errorf("vector: instant-open %s: %w", canonical, oerr)
 			}
-			s.collections[canonical] = c
-			return nil
-		}
-		c, nerr := NewCollection(canonical, eff)
-		if nerr != nil {
-			return fmt.Errorf("vector: rebuild %s: %w", canonical, nerr)
+			c = oc
+		} else {
+			nc, nerr := NewCollection(canonical, eff)
+			if nerr != nil {
+				return fmt.Errorf("vector: rebuild %s: %w", canonical, nerr)
+			}
+			c = nc
 		}
 		s.collections[canonical] = c
+		if s.isDurable(canonical) {
+			return s.upgradeToDurable(canonical, cfg, cfgPath, snapPath)
+		}
 		return nil
 	}
 
+	// Neither Persistent nor a log: a listed collection keeps this mode (there
+	// is nothing on disk but a snapshot taken at a flush), and says so.
+	s.warnNotDurable(canonical, "dense collection on disk with neither Persistent nor a write-ahead log, which an open does not convert")
 	c, err := NewCollection(canonical, cfg)
 	if err != nil {
 		return fmt.Errorf("vector: rebuild %s: %w", canonical, err)
 	}
-	if f, err := os.Open(snapPath); err == nil {
+	f, err := openSnapshot(snapPath)
+	if err != nil {
+		_ = c.Close()
+		return fmt.Errorf("vector: open snapshot %s: %w", canonical, err)
+	}
+	if f != nil {
 		rerr := c.Restore(f)
 		_ = f.Close()
 		if rerr != nil {
@@ -307,12 +369,101 @@ func (s *CollectionStore) loadCollection(canonical, cfgPath, snapPath string) er
 	return nil
 }
 
+// loadWALCollection restores a write-ahead log collection from its snapshot
+// and replays its log, then registers it. A listed durable collection has its
+// log forced to sync and, once loaded, any files of its earlier mapped form
+// removed.
+func (s *CollectionStore) loadWALCollection(canonical string, cfg Config, cfgPath, snapPath string) error {
+	c, err := s.buildWALCollection(canonical, cfg, cfgPath, snapPath)
+	if err != nil {
+		return err
+	}
+	s.collections[canonical] = c
+	if s.isDurable(canonical) {
+		s.removeMappedLeftovers(canonical)
+	}
+	return nil
+}
+
+// buildWALCollection is loadWALCollection without registering the collection
+// or removing any file.
+func (s *CollectionStore) buildWALCollection(canonical string, cfg Config, cfgPath, snapPath string) (*Collection, error) {
+	rewrite := false
+	if s.isDurable(canonical) {
+		cfg, rewrite = syncDurableWAL(cfg)
+	}
+	eff := s.effectiveConfig(canonical, cfg)
+	c, nerr := NewCollection(canonical, eff)
+	if nerr != nil {
+		return nil, fmt.Errorf("vector: rebuild %s: %w", canonical, nerr)
+	}
+	f, oerr := openSnapshot(snapPath)
+	if oerr != nil {
+		_ = c.Close()
+		return nil, fmt.Errorf("vector: open snapshot %s: %w", canonical, oerr)
+	}
+	if f != nil {
+		rerr := c.Restore(f)
+		_ = f.Close()
+		if rerr != nil {
+			_ = c.Close()
+			return nil, fmt.Errorf("vector: restore %s: %w", canonical, rerr)
+		}
+	} else if s.isDurable(canonical) {
+		// The upgrade writes the snapshot before the manifest names the log form,
+		// so a missing snapshot beside the earlier form's sidecar was lost, not
+		// never written: loading would serve an empty collection and remove the
+		// sidecar. Fail the open and touch nothing.
+		if _, _, metaPath, _ := s.persistPaths(canonical); fileExists(metaPath) {
+			_ = c.Close()
+			return nil, fmt.Errorf("vector: open %s: the manifest names the write-ahead log form but its snapshot %s is missing while the sidecar %s of its earlier form is still there; nothing was changed", canonical, snapPath, metaPath)
+		}
+	}
+	_, _, _, walPath := s.persistPaths(canonical)
+	if rerr := c.replayWAL(walPath); rerr != nil {
+		_ = c.Close()
+		return nil, fmt.Errorf("vector: wal replay %s: %w", canonical, rerr)
+	}
+	w, werr := openWAL(walPath, cfg.WALNoSync)
+	if werr != nil {
+		_ = c.Close()
+		return nil, fmt.Errorf("vector: wal open %s: %w", canonical, werr)
+	}
+	c.wal = w
+	if rewrite {
+		rewriteSyncedManifest(canonical, cfg, cfgPath)
+	}
+	if s.isDurable(canonical) {
+		s.checkpointLargeLog(canonical, walPath, c)
+	}
+	return c, nil
+}
+
 // collectionPath returns the on-disk paths (cfg, snap) for a canonical name.
 // Caller must already canonicalize.
 func (s *CollectionStore) collectionPath(canonical string) (cfgPath, snapPath string) {
 	tenant, col, _ := splitTenant(canonical) // canonical is always valid
 	base := filepath.Join(s.dir, "vectors", tenant)
 	return filepath.Join(base, col+".json"), filepath.Join(base, col+".snap")
+}
+
+// loadedSnapPath returns the snapshot path an open loads canonical's snapshot
+// from, which is where a checkpoint or flush must write it. That is
+// collectionPath's, except for a default-tenant collection still in the legacy
+// flat layout (vectors/<col>.json with no vectors/<tenant>/<col>.json), which
+// the open reads from vectors/<col>.snap. Writing the tenant path for such a
+// collection and then emptying its log would lose what the log held.
+func (s *CollectionStore) loadedSnapPath(canonical string) string {
+	cfgPath, snapPath := s.collectionPath(canonical)
+	tenant, col, _ := splitTenant(canonical)
+	if tenant != DefaultTenant || fileExists(cfgPath) {
+		return snapPath
+	}
+	flat := filepath.Join(s.dir, "vectors", col)
+	if fileExists(flat + ".json") {
+		return flat + ".snap"
+	}
+	return snapPath
 }
 
 // persistPaths returns the mmap + sidecar + WAL paths the store manages for a
@@ -434,6 +585,7 @@ func (s *CollectionStore) Acquire(name string) (*Collection, bool) {
 	c, ok := s.collections[canonical]
 	if ok {
 		c.inuse.Add(1)
+		c.pins.Add(1)
 	}
 	// Cold-tier resolve hook: only consult the cold catalog when it is non-empty,
 	// so a store with no evicted collections pays just this len()==0 branch (the
@@ -472,6 +624,7 @@ func (s *CollectionStore) Acquire(name string) (*Collection, bool) {
 	c, ok = s.collections[canonical]
 	if ok {
 		c.inuse.Add(1)
+		c.pins.Add(1)
 	}
 	s.mu.RUnlock()
 	return c, ok
@@ -498,6 +651,10 @@ func (s *CollectionStore) CreateCollection(name string, cfg Config) error {
 	canonical, err := canonicalName(name)
 	if err != nil {
 		return err
+	}
+	cfg = s.durableConfig(canonical, cfg)
+	if s.ephemeralDir {
+		s.warnNotDurable(canonical, "dense collection in a store with no data directory")
 	}
 	defer s.lockName(canonical)()
 	s.mu.Lock()
@@ -613,12 +770,16 @@ func (s *CollectionStore) DropCollection(name string) error {
 		return err
 	}
 	defer s.lockName(canonical)()
-	return s.dropCollection(canonical)
+	return s.dropCollection(canonical, false)
 }
 
 // dropCollection is DropCollection for a caller that already holds canonical's
 // name lock.
-func (s *CollectionStore) dropCollection(canonical string) error {
+//
+// forPublish is set when the drop is made by a durable restore about to publish
+// its replacement: the restore's staged snapshot (<col>.snap.restoring) is then
+// the replacement's data and is left alone. A plain drop removes it.
+func (s *CollectionStore) dropCollection(canonical string, forPublish bool) error {
 	s.mu.Lock()
 	c, ok := s.collections[canonical]
 	if !ok {
@@ -641,6 +802,9 @@ func (s *CollectionStore) dropCollection(canonical string) error {
 			_ = os.Remove(graphPath)
 			_ = os.Remove(metaPath)
 			_ = os.Remove(walPath)
+			if !forPublish {
+				removeRestoreLeftovers(snapPath)
+			}
 			removeClusterMmapFiles(coldCfg.cfg)
 			return nil
 		}
@@ -664,6 +828,10 @@ func (s *CollectionStore) dropCollection(canonical string) error {
 		s.mu.Unlock()
 		return nil
 	}
+	if err := c.refuseReadOnly(); err != nil {
+		s.mu.Unlock()
+		return err
+	}
 	delete(s.collections, canonical)
 	s.mu.Unlock()
 	// Out of the lock: drain in-flight users (Acquire holders) before closing, so
@@ -675,6 +843,9 @@ func (s *CollectionStore) dropCollection(canonical string) error {
 	c.retire(func() {
 		_ = os.Remove(cfgPath)
 		_ = os.Remove(snapPath)
+		if !forPublish {
+			removeRestoreLeftovers(snapPath)
+		}
 		// Single-node persistent files + cluster generation files (no-ops if absent).
 		_ = os.Remove(vecsPath)
 		_ = os.Remove(graphPath)
@@ -784,6 +955,7 @@ func (s *CollectionStore) RestoreCollectionWithConfig(name string, cfg Config, r
 		// anything is touched — this used to drop the existing collection first.
 		return fmt.Errorf("vector: restore %q: a named-vector config cannot be restored from a dense snapshot", canonical)
 	}
+	cfg = s.durableConfig(canonical, cfg)
 
 	// Nothing below may resolve canonical through Acquire or Get: the name lock is
 	// not reentrant, and resolving a cold collection promotes it, which takes this
@@ -794,8 +966,17 @@ func (s *CollectionStore) RestoreCollectionWithConfig(name string, cfg Config, r
 	s.mu.RLock()
 	_, multi := s.multi[canonical]
 	_, named := s.named[canonical]
+	var readOnly error
+	if cur, ok := s.collections[canonical]; ok {
+		readOnly = cur.refuseReadOnly()
+	}
 	nowFnMs := s.nowFnMs
 	s.mu.RUnlock()
+	if readOnly != nil {
+		// Refused before staging: a durable restore stages its snapshot in the
+		// collection's own directory, and a read-only collection keeps every file.
+		return fmt.Errorf("vector: restore %q: %w", canonical, readOnly)
+	}
 	if multi || named {
 		// A dense snapshot replaces a dense collection (hot or cold) or fills an
 		// absent name; it does not change a name's family. Publication drops through
@@ -870,6 +1051,18 @@ func (s *CollectionStore) discardStaged(c *Collection) {
 	}
 }
 
+// removeRestoreLeftovers removes, best effort, the staged snapshot of a durable
+// restore that was stopped part way, and the staging file's own temporary.
+func removeRestoreLeftovers(snapPath string) {
+	_ = os.Remove(snapPath + restoreStageSuffix)
+	_ = os.Remove(snapPath + restoreStageSuffix + ".tmp")
+}
+
+// restoreStageSuffix names where a durable restore writes the restored snapshot
+// (<col>.snap<suffix>) before it removes the collection it replaces. No open
+// reads that name.
+const restoreStageSuffix = ".restoring"
+
 // publishRestore replaces canonical's current collection, if any, with the fully
 // restored c. The name resolves to no collection from the drop's catalog removal
 // until c is registered; see RestoreCollectionWithConfig. The caller holds
@@ -880,9 +1073,10 @@ func (s *CollectionStore) publishRestore(canonical string, cfg Config, c *Collec
 	s.catalogMu.RLock()
 	defer s.catalogMu.RUnlock()
 
-	cfgPath, _ := s.collectionPath(canonical)
+	cfgPath, snapPath := s.collectionPath(canonical)
 	_, _, _, walPath := s.persistPaths(canonical)
 	wal := cfg.WAL && !s.persistentCluster
+	durable := wal && s.isDurable(canonical)
 	fail := func(err error) error {
 		s.discardStaged(c)
 		// Mirrors CreateCollection: a marker left by a failed publish would
@@ -891,12 +1085,29 @@ func (s *CollectionStore) publishRestore(canonical string, cfg Config, c *Collec
 		if wal {
 			_ = os.Remove(walPath)
 		}
+		if durable {
+			_ = os.Remove(snapPath)
+		}
 		return fmt.Errorf("vector: restore %q: the snapshot restored, but the existing collection had already been removed when publishing the restored one failed: %w", canonical, err)
+	}
+	// A durable collection's restored points are acknowledged when this returns,
+	// and the fresh log holds none of them, so they are checkpointed. The
+	// snapshot is written under a name no open reads BEFORE the old collection is
+	// removed, so a snapshot that cannot be written fails the restore with the
+	// old collection and its files untouched; publication then only renames it.
+	stagedSnap := snapPath + restoreStageSuffix
+	if durable {
+		if err := s.writeSnapshotFile(c, stagedSnap); err != nil {
+			s.discardStaged(c)
+			_ = os.Remove(stagedSnap)
+			return fmt.Errorf("vector: restore %q: writing the restored snapshot: %w; the existing collection is unchanged", canonical, err)
+		}
+		defer func() { _ = os.Remove(stagedSnap) }() // gone once renamed; a leftover on failure
 	}
 	// Synchronous: returns once in-flight users have drained and the files are gone.
 	// Any other drop of this name finished before the name lock was granted, so no
 	// cleanup still pending can remove the files written below.
-	if err := s.dropCollection(canonical); err != nil {
+	if err := s.dropCollection(canonical, true); err != nil {
 		return fail(err)
 	}
 	if err := writeConfig(cfgPath, cfg); err != nil {
@@ -908,6 +1119,14 @@ func (s *CollectionStore) publishRestore(canonical string, cfg Config, c *Collec
 			return fail(err)
 		}
 		c.wal = w
+	}
+	// The staged snapshot takes its place after the marker, so a stop before it
+	// leaves an empty collection, never a stale snapshot under no marker for a
+	// later create of the name to load.
+	if durable {
+		if err := renameDurable(stagedSnap, snapPath); err != nil {
+			return fail(err)
+		}
 	}
 
 	s.mu.Lock()
@@ -1013,8 +1232,11 @@ func (s *CollectionStore) Flush(name string) error {
 		return fmt.Errorf("vector: no collection %q", name)
 	}
 	defer c.Release()
+	if err := c.refuseReadOnly(); err != nil {
+		return err
+	}
 
-	_, snapPath := s.collectionPath(canonical)
+	snapPath := s.loadedSnapPath(canonical)
 
 	// WAL collections checkpoint with a CONSISTENT snapshot (not the mmap
 	// sidecar) and rotate the log — atomically w.r.t. Insert/Delete via opMu, so
@@ -1029,11 +1251,13 @@ func (s *CollectionStore) Flush(name string) error {
 	// on a different lock. It also costs a lot: the "checkpoint subsumes the
 	// truncated log" invariant above stops being free (wal.truncate is
 	// Truncate(0); a prefix truncate would need new crash-safe machinery), and
-	// dense replay is not a general replay-over-a-newer-snapshot primitive —
-	// an insert record for an already-live id is silently dropped
-	// (vector/arena.go:376, error discarded at collection.go's replayWAL).
-	// See vector/flush_snapshot_lock_test.go, which pins both facts and flips to
-	// failing if snapshot serialization ever stops excluding writers.
+	// replay over a snapshot is only known correct when the snapshot holds the
+	// state at the START or the END of the log (an insert record replaces the
+	// id's point via restoreReplace, so either way the log's last record per id
+	// wins); a snapshot cut mid-log, which writes landing during serialization
+	// would produce, is not designed for. See vector/flush_snapshot_lock_test.go,
+	// which flips to failing if snapshot serialization ever stops excluding
+	// writers.
 	if c.cfg.WAL {
 		c.opMu.Lock()
 		defer c.opMu.Unlock()
@@ -1057,7 +1281,14 @@ func (s *CollectionStore) Flush(name string) error {
 }
 
 // writeSnapshotFile atomically writes c's snapshot to path (tmp + fsync + rename).
+// When c has a log the caller holds c.opMu (or c is not yet published).
 func (s *CollectionStore) writeSnapshotFile(c *Collection, path string) error {
+	if err := c.refuseReadOnly(); err != nil {
+		return err
+	}
+	if err := c.wal.refuseCheckpoint(); err != nil {
+		return err // memory may be ahead of a poisoned log; see refuseCheckpoint
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return err
 	}
@@ -1066,7 +1297,7 @@ func (s *CollectionStore) writeSnapshotFile(c *Collection, path string) error {
 	if err != nil {
 		return err
 	}
-	if err := c.Snapshot(f); err != nil {
+	if err := c.snapshotLocked(f); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmp)
 		return err
@@ -1548,15 +1779,79 @@ func (s *CollectionStore) StageBulkPayloads(name string, ids []uint64, vecs [][]
 	return c.StageBulkPayloads(ids, vecs, metas)
 }
 
+// buildStagedHook, when non-nil, runs in BuildStaged on a listed durable
+// collection after the build and before its checkpoint, with opMu held. Tests
+// only.
+var buildStagedHook func()
+
+// buildStagedFn is the build BuildStaged runs on a listed durable collection.
+// A variable so tests can make it fail or panic after placing points.
+var buildStagedFn = (*Collection).buildStaged
+
 // BuildStaged builds the named collection's staged vectors in one concurrent
 // pass (see Collection.BuildStaged). The collection must be empty.
+//
+// A build writes no log record. On a listed durable collection with a log the
+// build and a checkpoint of it run under opMu, so no write is logged, or
+// acknowledged, on top of a build that only memory holds: a write that arrives
+// meanwhile waits and is logged after the checkpoint. The log is poisoned
+// before opMu is released when the checkpoint fails, and when the build fails
+// or panics (or the checkpoint panics) after it found the index empty and left
+// it holding points: every later write is then refused until a restart, so
+// nothing is acknowledged that depends on the unlogged build. A build refused
+// before it changed anything (ErrBuildNonEmpty on a populated collection, a
+// quota refusal on an empty one) leaves the log healthy. The restart opens the
+// last checkpoint and the log, which hold the build only if its snapshot was
+// written before the failure. Nothing staged means no build and no checkpoint.
 func (s *CollectionStore) BuildStaged(name string, workers int) error {
 	c, ok := s.Acquire(name)
 	if !ok {
 		return fmt.Errorf("vector: no collection %q", name)
 	}
 	defer c.Release()
-	return c.BuildStaged(workers)
+	canonical, _ := canonicalName(name) // Acquire found it, so the name is valid
+	if s.ephemeralDir || !s.isDurable(canonical) || !c.cfg.WAL || c.wal == nil {
+		return c.BuildStaged(workers)
+	}
+	if err := c.refuseReadOnly(); err != nil {
+		return err
+	}
+	// opMu before the index lock the build takes, the order every writer uses.
+	c.opMu.Lock()
+	defer c.opMu.Unlock()
+	if err := c.wal.refuseWrite(); err != nil {
+		return err
+	}
+	// Emptiness before the build, read under opMu so no logged writer can change
+	// it. A build only ever starts from empty, so a failure leaves memory ahead
+	// of every file exactly when it found the index empty and left it not.
+	occupied := func() bool { st := c.idx.Stats(); return st.Size+st.Tombstoned > 0 }
+	wasEmpty := !occupied()
+	durable := false
+	defer func() {
+		// Also on a panic in the build or the checkpoint (the TCP dispatcher
+		// recovers it, and the deferred Unlock above releases opMu).
+		if !durable && wasEmpty && occupied() {
+			c.wal.poisoned.Store(true)
+		}
+	}()
+	built, err := buildStagedFn(c, workers)
+	if err != nil {
+		return err
+	}
+	if !built {
+		durable = true
+		return nil
+	}
+	if buildStagedHook != nil {
+		buildStagedHook()
+	}
+	if err := s.checkpointLocked(canonical, c); err != nil {
+		c.wal.poisoned.Store(true)
+		return fmt.Errorf("vector: the bulk build of %q could not be made durable, so the collection refuses writes until a restart, after which the build may be missing: %w", name, err)
+	}
+	durable = true
+	return nil
 }
 
 // HybridSearch runs a fused dense + sparse search against the named collection.
@@ -1614,7 +1909,7 @@ func (s *CollectionStore) FlushPersistent() error {
 	s.mu.RLock()
 	names := make([]string, 0, len(s.collections))
 	for name, c := range s.collections {
-		if c.cfg.Persistent && !c.cfg.WAL {
+		if c.cfg.Persistent && !c.cfg.WAL && c.refuseReadOnly() == nil { // a read-only one writes nothing
 			names = append(names, name)
 		}
 	}
@@ -1677,14 +1972,15 @@ func (s *CollectionStore) Close() error {
 
 // MaybeReclaim triggers reclaim on the named collection only if its
 // tombstone ratio is above threshold. Returns (count, ran) — count is the
-// number of slots reclaimed if ran is true.
+// number of slots reclaimed if ran is true. A read-only collection is never
+// reclaimed, so it reports (0, false).
 func (s *CollectionStore) MaybeReclaim(name string, threshold float64) (int, bool) {
 	c, ok := s.Acquire(name)
 	if !ok {
 		return 0, false
 	}
 	defer c.Release()
-	if c.TombstoneRatio() < threshold {
+	if c.ReadOnly() != nil || c.TombstoneRatio() < threshold {
 		return 0, false
 	}
 	return c.Reclaim(), true

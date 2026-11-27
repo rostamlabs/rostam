@@ -535,6 +535,9 @@ func (nc *NamedCollection) insertCASKeyTTLBody(id uint64, vectors map[string][]f
 	version, seq, err := func() (uint64, uint64, error) {
 		nc.opMu.Lock()
 		defer nc.opMu.Unlock()
+		if err := nc.wal.refuseWrite(); err != nil {
+			return 0, 0, err
+		}
 		now := nowMs
 		if !stamped {
 			now = nc.nowMs()
@@ -1099,6 +1102,9 @@ func (nc *NamedCollection) DeleteCAS(id uint64, cas CASCond) (removed bool, prev
 	err = func() error {
 		nc.opMu.Lock()
 		defer nc.opMu.Unlock()
+		if err := nc.wal.refuseWrite(); err != nil {
+			return err
+		}
 		var derr error
 		removed, prevVersion, derr = nc.deleteLocked(id, cas)
 		if derr != nil {
@@ -1507,6 +1513,9 @@ func (nc *NamedCollection) logPayloadOpChanged(apply func() (Metadata, map[strin
 	err := func() error {
 		nc.opMu.Lock()
 		defer nc.opMu.Unlock()
+		if err := nc.wal.refuseWrite(); err != nil {
+			return err
+		}
 		meta, ke, v, ch, err := apply()
 		if err != nil {
 			return err
@@ -2216,8 +2225,24 @@ const namedSnapshotMinReadVersion = 1
 
 // Snapshot writes a self-contained image (every named sub-index framed by its
 // space name + the shared per-point meta/ttl/ids state) to w. Mirrors
-// MultiVectorIndex.snapshot. Safe to call concurrently with reads.
+// MultiVectorIndex.snapshot. Safe to call concurrently with reads. With a log it
+// holds opMu and settles the log first, so it refuses (ErrWALPoisoned) when
+// memory could be ahead of the log (see Collection.Snapshot and wal.settle).
 func (nc *NamedCollection) Snapshot(w io.Writer) error {
+	if nc.wal == nil {
+		return nc.snapshotLocked(w)
+	}
+	nc.opMu.Lock()
+	defer nc.opMu.Unlock()
+	return nc.snapshotLocked(w)
+}
+
+// snapshotLocked is Snapshot for a caller that holds opMu (or whose collection
+// has no log).
+func (nc *NamedCollection) snapshotLocked(w io.Writer) error {
+	if err := nc.wal.settle(); err != nil {
+		return err
+	}
 	nc.mu.RLock()
 	defer nc.mu.RUnlock()
 	bw := bufio.NewWriter(w)

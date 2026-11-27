@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -75,9 +76,17 @@ func TestHelperSupervisor(t *testing.T) {
 		cmd := exec.Command(exe, "-test.run=^TestHelperChild$", "--", "-data", data, "-config", cfgPath)
 		cmd.Env = append(os.Environ(), "ROSTAM_TEST_CHILD=1")
 		return cmd
+	}, func(context.Context, string) error {
+		// The fake server "answers" once the test creates this file.
+		_, err := os.Stat(filepath.Join(data, helperAnswersName))
+		return err
 	})
 	t.Fatalf("supervisor returned: %v", err)
 }
+
+// helperAnswersName is the file whose presence makes the helper supervisor's
+// readiness probe succeed, standing in for its server answering.
+const helperAnswersName = "helper-answers"
 
 func TestHelperChild(t *testing.T) {
 	if os.Getenv("ROSTAM_TEST_CHILD") == "" {
@@ -95,7 +104,7 @@ func startHelperSupervisor(t *testing.T, data string) (*exec.Cmd, int) {
 	t.Helper()
 	exe, _ := os.Executable()
 	sup := exec.Command(exe, "-test.run=^TestHelperSupervisor$")
-	sup.Env = append(os.Environ(), "ROSTAM_TEST_SUPERVISOR_DATA="+data)
+	sup.Env = append(os.Environ(), "ROSTAM_TEST_SUPERVISOR_DATA="+data, "HOME="+t.TempDir())
 	if err := sup.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +150,7 @@ func TestDaemonLockSurvivesSupervisorKill(t *testing.T) {
 	if _, err := lockDataDir(data); !errors.Is(err, errDataDirBusy) {
 		t.Fatalf("lock after supervisor death: %v, want still busy (held by the child)", err)
 	}
-	if err := superviseDaemonWith(data, nil); !errors.Is(err, errDataDirBusy) {
+	if err := superviseDaemonWith(data, nil, nil); !errors.Is(err, errDataDirBusy) {
 		t.Fatalf("second supervisor: %v, want refusal on the busy lock", err)
 	}
 

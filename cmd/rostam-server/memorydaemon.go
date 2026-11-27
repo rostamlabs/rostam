@@ -31,12 +31,29 @@ const (
 	memoryTokenName   = "token"
 	daemonLogName     = "daemon.log"
 	daemonPidName     = "daemon.pid"
-	daemonConfigName  = "daemon-config.json"
-	spawnLockDirName  = "spawn.lock"
+	// daemonReadyName is the ready record: written by a durable daemon's
+	// supervisor, with the pid file's content, once its server first answers.
+	daemonReadyName  = "daemon.ready"
+	daemonConfigName = "daemon-config.json"
+	spawnLockDirName = "spawn.lock"
 
 	// daemonStartWait bounds how long a session waits for a freshly spawned
-	// daemon to accept an authenticated connection.
+	// daemon to accept an authenticated connection, unless the daemon is
+	// demonstrably still starting (see daemonStartMaxWait).
 	daemonStartWait = 5 * time.Second
+	// daemonStopWait bounds how long -stop (and a session replacing an older
+	// daemon) waits for a daemon to release its data directory.
+	daemonStopWait = 30 * time.Second
+	// daemonRetireWait bounds how long a session replacing an older daemon
+	// waits for a sibling holding the spawn lock, which may itself be stopping
+	// that daemon (daemonStopWait) and then starting the new one.
+	daemonRetireWait = daemonStopWait + daemonStartWait
+
+	// daemonDurableDir is the daemon's durable-memory marker: a directory inside
+	// the data dir whose lock (lockDataDir) the daemon's server holds for as
+	// long as it runs with durable memory. A daemon started by an earlier
+	// release never takes it, which is how `mcp -autostart` tells the two apart.
+	daemonDurableDir = "daemon-durable"
 
 	// daemonCacheBudget is the cache bound handed to the daemon's server: a
 	// personal memory store, not a server. Same figure mcpSetup uses embedded.
@@ -197,6 +214,16 @@ func probeDaemon(ctx context.Context, addr, token string) error {
 	return nil
 }
 
+// daemonStartMaxWait bounds how long a session keeps waiting past
+// daemonStartWait for a daemon that is demonstrably still starting
+// (daemonStartingFn): its first start upgrades an existing store, which for a
+// large one can take minutes. A variable so tests can shorten it.
+var daemonStartMaxWait = 10 * time.Minute
+
+// daemonStartingFn reports whether a memory daemon process holds data's lock
+// and is starting (daemonStarting). A variable so tests can stand one in.
+var daemonStartingFn = daemonStarting
+
 // ensureDaemon makes sure an authenticated memory daemon answers at addr,
 // calling spawn at most once across all concurrent callers.
 func ensureDaemon(ctx context.Context, data, addr string, spawn func() error) error {
@@ -227,8 +254,23 @@ func ensureDaemonWith(ctx context.Context, data, addr string, spawn func() error
 		return err
 	}
 
-	notReady := fmt.Errorf("memory daemon did not become ready on %s within %s; see %s", addr, wait, logPath)
-	deadline := time.Now().Add(wait)
+	begin := time.Now()
+	deadline := begin.Add(wait)
+	hardDeadline := begin.Add(max(wait, daemonStartMaxWait))
+	// keepWaiting: within wait, or past it while a daemon process holds the
+	// data dir and is still starting (a first-start upgrade), up to hardDeadline.
+	// An embedded holder or a daemon that is not starting gets the short wait.
+	keepWaiting := func() bool {
+		now := time.Now()
+		return now.Before(deadline) || (now.Before(hardDeadline) && daemonStartingFn(data))
+	}
+	notReadyErr := func() error {
+		if el := time.Since(begin); el > wait+time.Second {
+			return fmt.Errorf("memory daemon did not become ready on %s within %s (it was still starting after %s); see %s",
+				addr, wait, el.Round(time.Second), logPath)
+		}
+		return fmt.Errorf("memory daemon did not become ready on %s within %s; see %s", addr, wait, logPath)
+	}
 	lockDir := filepath.Join(filepath.Dir(data), spawnLockDirName)
 
 	for {
@@ -245,7 +287,7 @@ func ensureDaemonWith(ctx context.Context, data, addr string, spawn func() error
 			if err := spawn(); err != nil {
 				return fmt.Errorf("starting memory daemon: %w (see %s)", err, logPath)
 			}
-			for time.Now().Before(deadline) {
+			for keepWaiting() {
 				if ok, err := up(); ok || err != nil {
 					return err
 				}
@@ -253,7 +295,7 @@ func ensureDaemonWith(ctx context.Context, data, addr string, spawn func() error
 					return err
 				}
 			}
-			return notReady
+			return notReadyErr()
 		}
 		if !errors.Is(lerr, errDataDirBusy) {
 			return fmt.Errorf("taking daemon spawn lock: %w", lerr)
@@ -265,8 +307,8 @@ func ensureDaemonWith(ctx context.Context, data, addr string, spawn func() error
 		if ok, err := up(); ok || err != nil {
 			return err
 		}
-		if !time.Now().Before(deadline) {
-			return notReady
+		if !keepWaiting() {
+			return notReadyErr()
 		}
 	}
 }
@@ -462,4 +504,95 @@ func embeddedHolderErr(data string) error {
 		return nil
 	}
 	return fmt.Errorf("an embedded `rostam-server mcp` is using %s; stop it or remove the old MCP server entry that runs it, then retry", data)
+}
+
+// daemonIsDurable reports whether a daemon runs on data with durable memory:
+// something holds the lock in <data>/daemon-durable (its server, which keeps
+// it for as long as it lives). When nothing does, the lock taken to find out
+// is released again; a missing directory is simply false.
+func daemonIsDurable(data string) (bool, error) {
+	unlock, err := lockDataDir(filepath.Join(data, daemonDurableDir))
+	switch {
+	case err == nil:
+		_ = unlock()
+		return false, nil
+	case errors.Is(err, errDataDirBusy):
+		return true, nil
+	case errors.Is(err, os.ErrNotExist):
+		return false, nil
+	}
+	return false, err
+}
+
+// retireNonDurableDaemon stops a daemon answering at addr that runs without
+// durable memory (one started by an earlier release), so that ensureDaemon
+// then starts a new one. Concurrent sessions stop it once: the decision is
+// re-checked under the spawn lock, which ensureDaemon also spawns under.
+//
+// It never signals anything itself: stop is the verified -stop path, and when
+// stop fails (the daemon cannot be identified, or does not exit in time) it
+// warns and leaves that daemon in use. A daemon that holds the marker is never
+// stopped, and neither is one whose marker cannot be checked. Only context
+// errors are returned; every other trouble is left to ensureDaemon.
+func retireNonDurableDaemon(ctx context.Context, data, addr string, probe probeFunc, stop func() error, warn func(string)) error {
+	token, err := ensureToken(data)
+	if err != nil {
+		return nil
+	}
+	// old reports an answering daemon without the marker.
+	old := func() (bool, error) {
+		if probe(ctx, addr, token) != nil {
+			return false, nil
+		}
+		durable, err := daemonIsDurable(data)
+		if err != nil {
+			return false, fmt.Errorf("mcp: cannot tell whether the memory daemon on %s keeps memory durable (%w); using it as it is", addr, err)
+		}
+		return !durable, nil
+	}
+	if isOld, err := old(); err != nil || !isOld {
+		if err != nil {
+			warn(err.Error())
+		}
+		return nil
+	}
+
+	lockDir := filepath.Join(filepath.Dir(data), spawnLockDirName)
+	deadline := time.Now().Add(daemonRetireWait)
+	for {
+		unlock, lerr := claimDataDir(lockDir)
+		if lerr == nil {
+			defer func() { _ = unlock() }()
+			break
+		}
+		if !errors.Is(lerr, errDataDirBusy) {
+			warn(fmt.Sprintf("mcp: taking the daemon spawn lock to replace the memory daemon on %s: %v; using it as it is", addr, lerr))
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			warn(fmt.Sprintf("mcp: another session held the daemon spawn lock for over %s; using the memory daemon on %s as it is", daemonRetireWait, addr))
+			return nil
+		}
+		// A sibling session is spawning, or replacing this same daemon.
+		if err := sleepCtx(ctx, 25*time.Millisecond); err != nil {
+			return err
+		}
+	}
+	// A sibling may have replaced it while we waited.
+	if isOld, err := old(); err != nil || !isOld {
+		if err != nil {
+			warn(err.Error())
+		}
+		return nil
+	}
+	// A session cancelled while it decided never stops the daemon.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	warn(fmt.Sprintf("mcp: the memory daemon on %s was started by an earlier release without durable memory; stopping it so a new one starts", addr))
+	if err := stop(); err != nil {
+		warn(fmt.Sprintf("mcp: could not stop the memory daemon on %s (%v); using it as it is, without durable memory. "+
+			"Run \"rostam-server memory-daemon -stop\" and start a new session to replace it", addr, err))
+	}
+	return nil
 }

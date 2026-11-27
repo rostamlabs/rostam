@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/cespare/xxhash/v2"
 
 	"github.com/rostamlabs/rostam"
+	"github.com/rostamlabs/rostam/ops"
 	"github.com/rostamlabs/rostam/vector"
 )
 
@@ -36,6 +38,9 @@ const (
 	kvEmbedder     = "__mcp/embedder" // KV key: the embedIdentity this store was bootstrapped with
 )
 
+// MemoryCollection is the name of the vector collection backing remember/recall.
+const MemoryCollection = memCollection
+
 // embedIdentity fingerprints the embedder a data dir's mcp_memory collection
 // was created with. It is stored once at bootstrap and checked on every
 // subsequent NewServer so a config change (a different model, dimension, or
@@ -49,17 +54,31 @@ type embedIdentity struct {
 
 // identityReadAttempts / identityReadBackoff bound the wait for a concurrent
 // bootstrapper to finish writing the embedder identity key. The gap between
-// its CreateCollection and its Put is one round trip, so a couple of retries
-// is generous; the point of the bound is that a creator which died in that gap
-// must surface as an error rather than an indefinite hang.
+// its CreateCollection and that write is one round trip, so a couple of retries
+// is generous; a record still missing after them is rebuilt (repairIdentity).
 const (
 	identityReadAttempts = 3
 	identityReadBackoff  = 50 * time.Millisecond
 )
 
-// ErrEmbedderMismatch is wrapped by NewServer's error when the store's memory
-// was created with a different embedder than this run's.
+// identitySampleSize is how many stored memories repairIdentity re-embeds, and
+// identityMinCosine how close each new vector must be to the stored one to
+// count as a match. The sample is sought in at most identityScanPages pages of
+// identityScanPage points.
+const (
+	identitySampleSize = 3
+	identityMinCosine  = 0.999
+	identityScanPage   = 100
+	identityScanPages  = 10
+)
+
+// ErrEmbedderMismatch is wrapped by the error NewServer or a memory tool
+// returns when the store's memory was created with a different embedder than
+// this run's, or this run's cannot be verified against it.
 var ErrEmbedderMismatch = errors.New("mcp: embedder mismatch")
+
+// embedderAdvice ends every mismatch error: what to do about it.
+const embedderAdvice = `set the same ROSTAM_EMBED_* environment the store was created with (none at all for model "stub"), or use a different store`
 
 // checkEmbedderIdentity compares the configured embedder against the one
 // recorded in KV, if any. No record yet means the memory collection has
@@ -83,12 +102,53 @@ func (s *Server) matchStoredIdentity(raw []byte) error {
 	if err := json.Unmarshal(raw, &stored); err != nil {
 		return fmt.Errorf("mcp: decoding stored embedder identity: %w", err)
 	}
-	want := embedIdentity{Model: s.emb.Model(), Dim: s.emb.Dim(), Hybrid: s.hybrid}
+	want := s.identity()
 	if stored != want {
-		return fmt.Errorf("%w: this store's memory was bootstrapped with model=%q dim=%d hybrid=%v, but this run is configured with model=%q dim=%d hybrid=%v; set the same ROSTAM_EMBED_* environment the store was created with (none at all for model \"stub\"), or use a different store",
-			ErrEmbedderMismatch, stored.Model, stored.Dim, stored.Hybrid, want.Model, want.Dim, want.Hybrid)
+		return fmt.Errorf("%w: this store's memory was bootstrapped with model=%q dim=%d hybrid=%v, but this run is configured with model=%q dim=%d hybrid=%v; %s",
+			ErrEmbedderMismatch, stored.Model, stored.Dim, stored.Hybrid, want.Model, want.Dim, want.Hybrid, embedderAdvice)
 	}
 	return nil
+}
+
+// identity is this run's embedder identity.
+func (s *Server) identity() embedIdentity {
+	return embedIdentity{Model: s.emb.Model(), Dim: s.emb.Dim(), Hybrid: s.hybrid}
+}
+
+// maxIdentityBytes bounds the encoded embedder identity. A real one (a model
+// name, a dimension and a flag) is a few hundred bytes at most; anything longer
+// is refused before it is sent.
+const maxIdentityBytes = 4096
+
+// claimIdentity records this run's embedder as the memory collection's, unless
+// a record is already there: that one is never overwritten, and this run is
+// held to it instead.
+func (s *Server) claimIdentity(ctx context.Context) error {
+	b, err := json.Marshal(s.identity())
+	if err != nil {
+		return fmt.Errorf("mcp: encoding embedder identity: %w", err)
+	}
+	if len(b) > maxIdentityBytes {
+		return fmt.Errorf("mcp: embedder identity is too long to record (%d bytes, the limit is %d); use a shorter model name", len(b), maxIdentityBytes)
+	}
+	res, err := s.store.Call(ctx, "set_nx", ops.EncodeSetNXArgs([]byte(kvEmbedder), b, 0))
+	if err != nil {
+		// A hint, not a diagnosis: some servers answer an op they do not have
+		// with a bare internal error.
+		return fmt.Errorf("mcp: storing embedder identity: %w (over -connect this may mean the server is too old: recording the identity needs v0.5.0 or later)", err)
+	}
+	stored, err := ops.DecodeCASResult(res)
+	if err != nil {
+		return fmt.Errorf("mcp: storing embedder identity: %w", err)
+	}
+	if stored {
+		return nil
+	}
+	raw, err := s.store.Get(ctx, []byte(kvEmbedder))
+	if err != nil {
+		return fmt.Errorf("mcp: reading stored embedder identity: %w", err)
+	}
+	return s.matchStoredIdentity(raw)
 }
 
 // ensureMemory lazily bootstraps the mcp_memory collection on first use:
@@ -146,11 +206,11 @@ func collectionMissing(err error) bool {
 
 // bootstrapMemory is one bootstrap attempt. The caller holds s.memMu.
 func (s *Server) bootstrapMemory(ctx context.Context) error {
-	_, err := s.store.Get(ctx, []byte(kvEmbedder))
+	raw, err := s.store.Get(ctx, []byte(kvEmbedder))
 	if err == nil {
-		// Already bootstrapped; checkEmbedderIdentity already verified this
-		// run's embedder matches, so there is nothing left to do.
-		return nil
+		// Already bootstrapped. Compared here too: the record may not have been
+		// there when NewServer looked.
+		return s.matchStoredIdentity(raw)
 	}
 	if !errors.Is(err, rostam.ErrNotFound) {
 		return fmt.Errorf("mcp: reading stored embedder identity: %w", err)
@@ -172,15 +232,7 @@ func (s *Server) bootstrapMemory(ctx context.Context) error {
 	default:
 		return fmt.Errorf("mcp: creating memory collection: %w", err)
 	}
-	id := embedIdentity{Model: s.emb.Model(), Dim: s.emb.Dim(), Hybrid: s.hybrid}
-	b, err := json.Marshal(id)
-	if err != nil {
-		return fmt.Errorf("mcp: encoding embedder identity: %w", err)
-	}
-	if err := s.store.Put(ctx, []byte(kvEmbedder), b, 0); err != nil {
-		return fmt.Errorf("mcp: storing embedder identity: %w", err)
-	}
-	return nil
+	return s.claimIdentity(ctx)
 }
 
 // isCollectionExists reports whether err is "that collection is already
@@ -197,9 +249,8 @@ func isCollectionExists(err error) bool {
 //
 // The other session writes the identity key one round trip AFTER creating the
 // collection, so reading it immediately can legitimately miss it; a few
-// bounded retries cover that window. Exhausting them means the other creator
-// died mid-bootstrap, which this run reports rather than proceeding against a
-// collection whose embedder it was never able to check.
+// bounded retries cover that window. A record still missing after them is
+// rebuilt, which first checks this run's embedder against the collection.
 func (s *Server) awaitStoredIdentity(ctx context.Context) error {
 	for attempt := range identityReadAttempts {
 		if attempt > 0 {
@@ -219,8 +270,126 @@ func (s *Server) awaitStoredIdentity(ctx context.Context) error {
 			return fmt.Errorf("mcp: reading stored embedder identity: %w", err)
 		}
 	}
-	return fmt.Errorf("mcp: the %q collection already exists but carries no embedder identity after %d reads; a concurrent bootstrap looks to have failed part-way, leaving a collection whose embedder cannot be verified",
-		memCollection, identityReadAttempts)
+	return s.repairIdentity(ctx)
+}
+
+// repairIdentity records this run's embedder for a memory collection that has
+// no identity record, after verifying it against what the collection holds: the
+// dimension must match, and re-embedding a sample of memories must reproduce
+// the stored vectors of at least half of them (and at least one), so that one
+// bad stored vector does not refuse the right embedder. An empty collection
+// offers only its dimension to check; a non-empty one with no content to
+// re-embed is refused. A refusal wraps ErrEmbedderMismatch and records
+// nothing; no memory is ever changed.
+func (s *Server) repairIdentity(ctx context.Context) error {
+	probe := make([]float32, s.emb.Dim())
+	if len(probe) > 0 {
+		probe[0] = 1
+	}
+	if _, err := s.store.VectorSearch(ctx, memCollection, probe, 1); err != nil {
+		// Matched by message: over -connect the error chain does not survive
+		// the wire.
+		if strings.Contains(err.Error(), vector.ErrDimMismatch.Error()) {
+			return fmt.Errorf("%w: the %q collection does not hold vectors of this run's dim=%d; %s",
+				ErrEmbedderMismatch, memCollection, s.emb.Dim(), embedderAdvice)
+		}
+		return err
+	}
+	sample, empty, err := s.identitySample(ctx)
+	if err != nil {
+		return err
+	}
+	if empty {
+		return s.claimIdentity(ctx)
+	}
+	if len(sample) == 0 {
+		return fmt.Errorf("%w: cannot verify this run's embedder: the %q collection is not empty, but no point with content to re-embed was found in it",
+			ErrEmbedderMismatch, memCollection)
+	}
+	matched := 0
+	for _, d := range sample {
+		ok, err := s.reproduces(ctx, d)
+		if err != nil {
+			return err
+		}
+		if ok {
+			matched++
+		}
+	}
+	if matched == 0 || 2*matched < len(sample) {
+		return fmt.Errorf("%w: model=%q reproduces the stored vector of only %d of %d sampled memories; %s",
+			ErrEmbedderMismatch, s.emb.Model(), matched, len(sample), embedderAdvice)
+	}
+	return s.claimIdentity(ctx)
+}
+
+// identitySample returns up to identitySampleSize points of the memory
+// collection that have content, skipping those without, and whether the
+// collection holds no point at all. The next page's cursor is built from the
+// last id: a server reached over -connect may return a page without one.
+func (s *Server) identitySample(ctx context.Context) (sample []rostam.VectorDocument, empty bool, err error) {
+	empty = true
+	var cursor string
+	for range identityScanPages {
+		docs, _, _, err := s.store.VectorScroll(ctx, memCollection, rostam.VectorFilter{}, identityScanPage, rostam.VectorScrollOpts{Cursor: cursor})
+		if err != nil {
+			return nil, false, err
+		}
+		for _, d := range docs {
+			empty = false
+			if d.Content == "" {
+				continue
+			}
+			sample = append(sample, d)
+			if len(sample) == identitySampleSize {
+				return sample, empty, nil
+			}
+		}
+		if len(docs) < identityScanPage {
+			break
+		}
+		cursor = ops.EncodeScrollCursor(docs[len(docs)-1].ID)
+	}
+	return sample, empty, nil
+}
+
+// reproduces reports whether embedding d's content yields its stored vector.
+func (s *Server) reproduces(ctx context.Context, d rostam.VectorDocument) (bool, error) {
+	found, stored, _, _, _, err := s.store.VectorGet(ctx, memCollection, d.ID, true, false)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, fmt.Errorf("mcp: memory %d disappeared while the embedder was being verified against it", d.ID)
+	}
+	vecs, err := s.emb.Embed(ctx, []string{d.Content})
+	if err != nil {
+		return false, err
+	}
+	vec, err := firstEmbedding(vecs)
+	if err != nil {
+		return false, err
+	}
+	return cosine(stored, vec) >= identityMinCosine, nil // false for NaN
+}
+
+// cosine is the cosine similarity of a and b; 0 when their lengths differ or
+// either has no magnitude.
+func cosine(a, b []float32) float64 {
+	if len(a) != len(b) {
+		return 0
+	}
+	var dot, na, nb float64
+	for i := range a {
+		x, y := float64(a[i]), float64(b[i])
+		dot += x * y
+		na += x * x
+		nb += y * y
+	}
+	if na == 0 || nb == 0 {
+		return 0
+	}
+	return dot / math.Sqrt(na*nb)
 }
 
 // firstEmbedding pulls the single vector an Embed of one text should have

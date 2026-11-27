@@ -248,6 +248,12 @@ func clientFacingErr(err error) bool {
 		// caller unredacted.
 		errors.Is(err, vector.ErrRecordTooLarge),
 		vector.IsRecordTooLargeMessage(err.Error()),
+		// vector.ErrWALRecordTooLarge: a write (a multi-vector document) whose
+		// log record would be larger than replay reads back. Refused before it
+		// applies, and the message names only the two sizes, so the same bucket
+		// as the cap above. An applied write whose record is too large at the
+		// append is vector.ErrWALPoisoned instead: a server fault, redacted.
+		errors.Is(err, vector.ErrWALRecordTooLarge),
 		// vector.ErrRecordMalformed: a payload carrying record bytes no operate
 		// engine can open. Same bucket and same reasoning as the cap above — the
 		// caller sent those bytes, the remedy is to send a well-formed record,
@@ -370,6 +376,11 @@ func clientFacingErr(err error) bool {
 		errors.Is(err, vector.ErrDuplicateID),
 		errors.Is(err, vector.ErrCollectionFull),
 		errors.Is(err, vector.ErrCollectionRateLimited),
+		// A collection served read-only after an upgrade that left the form of
+		// its files unknown: the message says what happened and what to do, and
+		// names only the collection (paths and underlying errors stay in the
+		// server log).
+		errors.Is(err, vector.ErrCollectionReadOnly),
 		errors.Is(err, vector.ErrNoNamed),
 		errors.Is(err, vector.ErrAPIKeyExists),
 		errors.Is(err, vector.ErrAPIKeyNotFound):

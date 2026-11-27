@@ -332,6 +332,12 @@ func grpcError(err error) error {
 		// server.clientFacingErr and httpapi.statusForError's 400 bucket for the
 		// same sentinel. Unclassified it fell to codes.Internal, which reads as a
 		// server fault and which standard gRPC retry policies hammer.
+		errIs(err, vector.ErrWALRecordTooLarge),
+		// vector.ErrWALRecordTooLarge: a write (a multi-vector document) whose
+		// log record would be larger than replay reads back. Refused before it
+		// applies, and the message names only the two sizes, so the same bucket
+		// as the cap above. An applied write whose record is too large at the
+		// append is vector.ErrWALPoisoned instead: a server fault, Internal.
 		errIs(err, vector.ErrRecordMalformed),
 		// vector.ErrRecordMalformed: a payload carrying record bytes no operate
 		// engine can open. A caller mistake with a clear remedy (send a
@@ -387,6 +393,10 @@ func grpcError(err error) error {
 		strings.Contains(err.Error(), "unknown collection"),
 		strings.Contains(err.Error(), "no collection"):
 		return status.Error(codes.NotFound, err.Error())
+	case errIs(err, vector.ErrCollectionReadOnly):
+		// Served read-only after an upgrade that left the form of its files
+		// unknown; the message says what to do.
+		return status.Error(codes.FailedPrecondition, err.Error())
 	case errIs(err, vector.ErrVersionConflict), strings.Contains(err.Error(), "version conflict"):
 		// Optimistic-CAS precondition miss: the point's current version did not match
 		// the request's expected_version. FailedPrecondition (the standard etcd/gRPC

@@ -111,8 +111,8 @@ func writeNamedSparseVectors(buf *bytes.Buffer, sparseVectors map[string]*Sparse
 
 // readNamedSparseVectors is the inverse of writeNamedSparseVectors. It tolerates
 // EOF (a dense-only record with no trailing block) by returning (nil, true). A
-// present flag with a truncated body returns (nil, false) so replay stops at the
-// durability boundary.
+// present flag with a truncated body returns (nil, false), and replay fails with
+// ErrLogDamaged.
 func readNamedSparseVectors(r *bytes.Reader) (map[string]*SparseVector, bool) {
 	var flag [1]byte
 	if _, err := io.ReadFull(r, flag[:]); err != nil {
@@ -179,9 +179,9 @@ func (w *wal) appendNamedSetPayloadStaged(id uint64, meta Metadata, keyExpires m
 // NamedCollection via the shared replayFramed core. The per-record apply switches
 // on the named tag and re-calls the idempotent mutator with VERBATIM absolute
 // per-key deadlines (restorePayload, not SetPayload — replay must not recompute
-// now+ttl). It stops at the first malformed/unknown record (returning false),
-// which is the same torn-tail/durability boundary the framed core enforces for a
-// truncated final record. A missing file replays nothing.
+// now+ttl). A malformed record fails the replay with ErrLogDamaged and an
+// unknown tag with errUnknownWALRecord; a torn tail is cut by the framed core
+// (see replayFramed). A missing file replays nothing.
 func replayNamedWAL(path string, nc *NamedCollection) error {
 	return replayFramed(path, func(rec []byte) error {
 		return replayNamedRecord(rec, nc)
@@ -189,8 +189,8 @@ func replayNamedWAL(path string, nc *NamedCollection) error {
 }
 
 // replayNamedRecord decodes one named record payload and re-applies it onto nc.
-// Returns false on a malformed body so replay stops at the durability boundary
-// (mirrors dense replayRecord). Apply errors from the mutators are swallowed —
+// Returns errStopReplay on a malformed body, which replayFramed reports as
+// ErrLogDamaged (mirrors dense replayRecord). Apply errors from the mutators are swallowed —
 // replay is idempotent on top of the snapshot checkpoint.
 func replayNamedRecord(payload []byte, nc *NamedCollection) error {
 	r := bytes.NewReader(payload)

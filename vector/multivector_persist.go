@@ -41,8 +41,24 @@ func (m *MultiVectorIndex) Flush() error {
 
 // snapshot writes a self-contained image (inner hnsw snapshot + doc<->token
 // maps) to w for inclusion in a cluster FSM snapshot. The inner blob is
-// length-prefixed so restore can split it from the maps.
+// length-prefixed so restore can split it from the maps. With a log it holds
+// opMu and settles the log first, so it refuses (ErrWALPoisoned) when memory
+// could be ahead of the log (see Collection.Snapshot and wal.settle).
 func (m *MultiVectorIndex) snapshot(w io.Writer) error {
+	if m.wal == nil {
+		return m.snapshotLocked(w)
+	}
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+	return m.snapshotLocked(w)
+}
+
+// snapshotLocked is snapshot for a caller that holds opMu (or whose index has
+// no log).
+func (m *MultiVectorIndex) snapshotLocked(w io.Writer) error {
+	if err := m.wal.settle(); err != nil {
+		return err
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	var inner bytes.Buffer

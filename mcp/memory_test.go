@@ -692,7 +692,7 @@ func TestEnsureMemoryRetriesEndToEnd(t *testing.T) {
 	}
 }
 
-// hiddenIdentityStore answers the first hideFirst reads of the embedder
+// hiddenIdentityStore answers the first `remaining` reads of the embedder
 // identity key as "not found" while the underlying store already holds it.
 // That is exactly the window two concurrent bootstrappers race in: both see no
 // identity, both decide to create, and the loser's CreateCollection comes back
@@ -700,11 +700,10 @@ func TestEnsureMemoryRetriesEndToEnd(t *testing.T) {
 type hiddenIdentityStore struct {
 	rostam.Store
 	remaining atomic.Int64
-	forever   bool
 }
 
 func (h *hiddenIdentityStore) Get(ctx context.Context, key []byte) ([]byte, error) {
-	if string(key) == kvEmbedder && (h.forever || h.remaining.Add(-1) >= 0) {
+	if string(key) == kvEmbedder && h.remaining.Add(-1) >= 0 {
 		return nil, rostam.ErrNotFound
 	}
 	return h.Store.Get(ctx, key)
@@ -742,31 +741,50 @@ func TestBootstrapToleratesConcurrentCreator(t *testing.T) {
 	}
 }
 
-// TestBootstrapReportsAbandonedCreator is the other side of that tolerance: a
-// collection that exists with no identity recorded means some other creator
-// died mid-bootstrap. Proceeding would run against a collection whose embedder
-// was never verified, so it must error instead of hanging or pretending.
-func TestBootstrapReportsAbandonedCreator(t *testing.T) {
+// TestBootstrapVerifiesWhenIdentityStaysMissing is the other side of that
+// tolerance: when none of the retries sees an identity, the session gives up
+// waiting and verifies its embedder against the collection instead of hanging.
+// The identity record is removed for real, so the outcome can only come from
+// that verification: an embedder that does not fit the collection is refused
+// and records nothing, and a matching one records its identity.
+func TestBootstrapVerifiesWhenIdentityStaysMissing(t *testing.T) {
+	ctx := context.Background()
 	st := newHeapStore(t)
-	first, err := NewServer(context.Background(), Config{Store: st})
+	first, err := NewServer(ctx, Config{Store: st})
 	if err != nil {
 		t.Fatalf("NewServer (first): %v", err)
 	}
-	if err := first.ensureMemory(context.Background()); err != nil {
+	if err := first.ensureMemory(ctx); err != nil {
 		t.Fatalf("first ensureMemory: %v", err)
 	}
+	if _, err := st.Del(ctx, []byte(kvEmbedder)); err != nil {
+		t.Fatalf("removing the identity: %v", err)
+	}
 
-	hidden := &hiddenIdentityStore{Store: st, forever: true}
-	second, err := NewServer(context.Background(), Config{Store: hidden})
+	other, err := NewServer(ctx, Config{Store: st, Embedder: fakeEmbedder{}})
+	if err != nil {
+		t.Fatalf("NewServer (other): %v", err)
+	}
+	if err := other.ensureMemory(ctx); !errors.Is(err, ErrEmbedderMismatch) {
+		t.Fatalf("an embedder that does not fit the collection: err = %v, want ErrEmbedderMismatch", err)
+	}
+	if _, err := st.Get(ctx, []byte(kvEmbedder)); !errors.Is(err, rostam.ErrNotFound) {
+		t.Fatalf("a refused repair recorded an identity: err = %v, want not found", err)
+	}
+
+	second, err := NewServer(ctx, Config{Store: st})
 	if err != nil {
 		t.Fatalf("NewServer (second): %v", err)
 	}
-	err = second.ensureMemory(context.Background())
-	if err == nil {
-		t.Fatal("a collection with no recorded identity must not be accepted silently")
+	if err := second.ensureMemory(ctx); err != nil {
+		t.Fatalf("a matching embedder must not be locked out: %v", err)
 	}
-	if !strings.Contains(err.Error(), "embedder identity") {
-		t.Fatalf("error should name the missing identity, got %v", err)
+	raw, err := st.Get(ctx, []byte(kvEmbedder))
+	if err != nil {
+		t.Fatalf("the repair recorded no identity: %v", err)
+	}
+	if err := second.matchStoredIdentity(raw); err != nil {
+		t.Fatalf("recorded identity does not match the repairing embedder: %v", err)
 	}
 }
 
@@ -968,5 +986,28 @@ func TestEmbedderIdentityMismatchFailsStartup(t *testing.T) {
 	// recognisable, and its own advice must name the env that selects it.
 	if !errors.Is(err, ErrEmbedderMismatch) || !strings.Contains(err.Error(), "ROSTAM_EMBED_") {
 		t.Fatalf("mismatch error must wrap ErrEmbedderMismatch and name ROSTAM_EMBED_*: %v", err)
+	}
+}
+
+// longModelEmbedder is fakeEmbedder with a model name far longer than any real one.
+type longModelEmbedder struct{ fakeEmbedder }
+
+func (longModelEmbedder) Model() string { return strings.Repeat("m", 8<<10) }
+
+// TestClaimIdentityRefusesOversizeRecord: the embedder identity is a few
+// hundred bytes; one past maxIdentityBytes is refused before anything is
+// written.
+func TestClaimIdentityRefusesOversizeRecord(t *testing.T) {
+	st := newHeapStore(t)
+	s, err := NewServer(context.Background(), Config{Store: st, Embedder: longModelEmbedder{}})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	err = s.claimIdentity(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "too long") {
+		t.Fatalf("claimIdentity with an oversize identity = %v, want a too-long error", err)
+	}
+	if _, gerr := st.Get(context.Background(), []byte(kvEmbedder)); !errors.Is(gerr, rostam.ErrNotFound) {
+		t.Fatalf("identity key after a refused claim: err = %v, want not found", gerr)
 	}
 }

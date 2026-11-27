@@ -51,8 +51,8 @@ var flagGroups = []flagGroup{
 	}},
 	{"Storage", func(n string) bool {
 		return isAnyOf(n, "data", "shards", "config", "disable-cold-compaction",
-			"relocating-eviction", "relocate-reserve-interval", "in-place-same-size-update",
-			"in-place-seqlock-reads", "sieve-visited-bit")
+			"durable-collections", "relocating-eviction", "relocate-reserve-interval",
+			"in-place-same-size-update", "in-place-seqlock-reads", "sieve-visited-bit")
 	}},
 	{"Authentication", func(n string) bool {
 		return hasAnyPrefix(n, "jwt-") ||

@@ -7,9 +7,12 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
+	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,8 +28,9 @@ import (
 // WAL tail. Flush rotates the WAL (truncates it) once the checkpoint subsumes it.
 //
 // Records are length+CRC framed so a torn final record from a crash mid-append
-// is detected and ignored on replay — the last fsync'd record is the durability
-// boundary. The log is logical (it stores the Insert/Delete operation, not graph
+// is detected on replay and cut off before the log is appended to again — the
+// last fsync'd record is the durability boundary. Damage anywhere else refuses
+// the open (ErrLogDamaged; see replayFramed). The log is logical (it stores the Insert/Delete operation, not graph
 // edges); replay re-applies via the normal index paths, yielding a valid index
 // containing every committed vector.
 
@@ -53,6 +57,18 @@ const (
 // maxWALRecord bounds a single record's payload, rejecting a garbage/torn length
 // during replay rather than allocating wildly.
 const maxWALRecord = 64 << 20
+
+// walRecordLimit is the largest record payload an append writes: maxWALRecord,
+// the most replay reads back. A variable so tests can lower it.
+var walRecordLimit = maxWALRecord
+
+// ErrWALRecordTooLarge is returned for a write refused BEFORE it applies because
+// its log record would exceed what replay reads back (maxWALRecord): a
+// multi-vector document. Nothing changed and the log stays healthy, so it is the
+// caller's mistake. A record found too large only at the append itself was
+// already applied in memory: that is not this error. The log is poisoned as for
+// a failed write and the write returns an error matching ErrWALPoisoned.
+var ErrWALRecordTooLarge = errors.New("vector: write-ahead log record too large")
 
 // wal is an append-only operation log. The file WRITE (framing + os.Write) is
 // serialized by mu (the file offset / append position is not concurrency-safe
@@ -116,8 +132,9 @@ type wal struct {
 	syncedSeq uint64 // highest writeSeq covered by a completed Sync (or truncate)
 	syncing   bool   // a leader is currently running f.Sync()
 
-	// poisoned is a TERMINAL latch tripped on the FIRST f.Sync() failure (in
-	// commitWait or truncate). It exists because of fsyncgate: on a failed
+	// poisoned is a TERMINAL latch tripped on the FIRST failed write (see
+	// writeFrameLocked) or f.Sync() failure (in commitWait or truncate). For the
+	// fsync it exists because of fsyncgate: on a failed
 	// fsync, the kernel may DISCARD the sync's dirty pages, and a SUBSEQUENT
 	// f.Sync() on the same file can then return SUCCESS having synced nothing
 	// (the post-4.13 Linux behavior; the PostgreSQL PANIC-on-fsync-failure
@@ -143,14 +160,20 @@ type wal struct {
 	// park followers behind one in-flight flight (proving batch-on-contention).
 	onSync     func()
 	beforeSync func()
+	// writeHook, when set, replaces w.f.Write in the append path so a test can
+	// land a short write (e.g. ENOSPC partway through a frame).
+	writeHook func(f *os.File, p []byte) (int, error)
 }
 
-// ErrWALPoisoned is returned by every append/commit-wait entry point once the
-// WAL has been poisoned by a prior f.Sync() failure (fsyncgate — see the
-// poisoned field). The WAL accepts no further writes or acks until it is
-// reopened; the caller must surface this so a delete/insert is reported failed
-// rather than falsely acked on bytes that may never have reached disk.
-var ErrWALPoisoned = errors.New("vector: wal poisoned by a prior fsync failure")
+// ErrWALPoisoned is returned by every write to a log-backed collection, and by
+// every checkpoint of one, once its log has been poisoned: by a failed write
+// (a full disk, an I/O error), a record of an applied write too large to append,
+// a failed durable bulk build (see CollectionStore.BuildStaged) or a failed fsync
+// (fsyncgate — see the poisoned field). The log accepts no further writes or acks until the process is
+// restarted and the store reopened; the caller must surface this so a
+// delete/insert is reported failed rather than falsely acked on bytes that may
+// never have reached disk.
+var ErrWALPoisoned = errors.New("vector: write-ahead log refuses writes after a failed write or sync; restart the process to recover")
 
 // openWAL opens (creating if absent) the WAL at path for appending. Replay the
 // existing contents with replayWAL BEFORE calling this if recovering. The
@@ -233,7 +256,8 @@ func writeOptVersion(buf *bytes.Buffer, version uint64) {
 // readOptVersion is the inverse of writeOptVersion. It tolerates EOF (an OLD
 // record predating the version block) by returning (0, true) — replay then
 // defaults the version (a fresh insert → 1, a payload restore → leave as-is). A
-// torn block (flag present but truncated body) returns (0, false) so replay stops.
+// malformed block (flag present but truncated body) returns (0, false), and
+// replay fails with ErrLogDamaged.
 func readOptVersion(r io.Reader) (uint64, bool) {
 	var flag [1]byte
 	if _, err := io.ReadFull(r, flag[:]); err != nil {
@@ -342,12 +366,10 @@ func writeOptKeyExpires(buf *bytes.Buffer, ke map[string]uint64) {
 // appendFramedStaged): it returns the assigned commit sequence and the caller
 // waits on it outside opMu.
 //
-// Two callers, two ways of satisfying the staged-write contract. DeleteCAS /
-// DeleteCASAt commitWaitStaged the returned seq directly. An upsert's
-// replace-delete does NOT wait separately: its durability is subsumed by the
-// commit-wait on the FOLLOWING insert's sequence (the delete's bytes are written
-// first under the same opMu, so any Sync covering the insert's seq also covers
-// this earlier seq).
+// Its callers, DeleteCAS / DeleteCASAt, commitWaitStaged the returned seq. An
+// upsert never logs a delete: a replace is ONE insert record (see
+// Collection.upsertLogged), so no crash can land between a delete and the
+// insert that was meant to follow it.
 func (w *wal) appendDeleteStaged(id uint64) (uint64, error) {
 	var buf bytes.Buffer
 	buf.WriteByte(byte(walDelete))
@@ -368,7 +390,7 @@ func (w *wal) appendDeleteStaged(id uint64) (uint64, error) {
 // call it from production code; use the staged pair.
 func (w *wal) appendFramed(payload []byte) error {
 	if w.poisoned.Load() {
-		return ErrWALPoisoned // fast fail-closed: a prior fsync failure poisoned the log.
+		return ErrWALPoisoned // fast fail-closed: a prior failed write or fsync poisoned the log.
 	}
 	// WRITE phase: under mu, append the framed record and assign this writer's
 	// commit sequence (the post-write writeSeq). mu is released BEFORE the fsync so
@@ -382,14 +404,7 @@ func (w *wal) appendFramed(payload []byte) error {
 		w.mu.Unlock()
 		return ErrWALPoisoned
 	}
-	var hdr [8]byte
-	binary.BigEndian.PutUint32(hdr[0:4], uint32(len(payload))) //nolint:gosec
-	binary.BigEndian.PutUint32(hdr[4:8], crc32.ChecksumIEEE(payload))
-	if _, err := w.f.Write(hdr[:]); err != nil {
-		w.mu.Unlock()
-		return err
-	}
-	if _, err := w.f.Write(payload); err != nil {
+	if err := w.writeFrameLocked(payload); err != nil {
 		w.mu.Unlock()
 		return err
 	}
@@ -409,12 +424,84 @@ func (w *wal) appendFramed(payload []byte) error {
 	return w.commitWait(mySeq)
 }
 
+// writeFrameLocked appends [payloadLen u32][crc32 u32][payload]. Caller holds
+// w.mu.
+//
+// A FAILED WRITE POISONS THE LOG. A write that fails (ENOSPC, EIO) may have
+// landed part of the frame. If the log kept accepting appends, later records
+// would be written, fsynced and acknowledged BEHIND those partial bytes, and the
+// next open would refuse the log as damaged (a complete record follows bad
+// bytes), stranding every one of those acknowledged writes. So the first failed
+// write trips the same terminal latch as a failed fsync: no later append is
+// accepted and no waiter is acknowledged until a reopen. The partial bytes are
+// then cut back (best effort, still under w.mu so no other frame is behind them);
+// if the cut fails they stay at the end of the file, where the next open's
+// replay reads them as a torn tail and cuts them itself.
+//
+// Poisoning rather than cutting and carrying on is the safer choice with group
+// commit: the device has just refused a write, and a writer whose complete bytes
+// precede the failed frame is at worst told its write failed (it may still
+// replay — the same at-least-once outcome as an errored in-flight write), never
+// acknowledged on bytes that a later open could refuse.
+func (w *wal) writeFrameLocked(payload []byte) error {
+	var hdr [8]byte
+	binary.BigEndian.PutUint32(hdr[0:4], uint32(len(payload))) //nolint:gosec
+	binary.BigEndian.PutUint32(hdr[4:8], crc32.ChecksumIEEE(payload))
+	n, err := w.write(hdr[:])
+	if err == nil {
+		var m int
+		m, err = w.write(payload)
+		n += m
+	}
+	if err == nil {
+		return nil
+	}
+	w.poisoned.Store(true)
+	if n > 0 {
+		if st, serr := w.f.Stat(); serr == nil && st.Size() >= int64(n) {
+			_ = truncateFile(w.f.Name(), st.Size()-int64(n), false)
+		}
+	}
+	return err
+}
+
+// truncateFile sets the size of the file at path through a handle of its own,
+// opened write-only, and fsyncs that handle when sync is set.
+//
+// The log's own handle cannot do it on Windows: it is opened O_APPEND, and Go's
+// Windows open drops FILE_WRITE_DATA from an append handle (syscall.Open keeps
+// only FILE_APPEND_DATA), so SetFileInformationByHandle(FileEndOfFileInfo) on it
+// fails with access denied. A plain O_WRONLY handle has GENERIC_WRITE. Writes
+// through the append handle still land at the new end of file. On Linux
+// ftruncate and fsync act on the inode, so the second handle changes nothing
+// about durability; the callers still fsync the log's own handle afterwards.
+func truncateFile(path string, size int64, sync bool) error {
+	f, err := os.OpenFile(path, os.O_WRONLY, 0) //nolint:gosec // the log's own path
+	if err != nil {
+		return err
+	}
+	err = f.Truncate(size)
+	if err == nil && sync {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
+func (w *wal) write(p []byte) (int, error) {
+	if w.writeHook != nil {
+		return w.writeHook(w.f, p)
+	}
+	return w.f.Write(p)
+}
+
 // appendFramedStaged is appendFramed's WRITE phase only: identical bytes,
 // identical ordering under w.mu, but it returns the assigned commit sequence
 // instead of blocking on the durability wait. The caller MUST eventually call
 // commitWaitStaged(seq) (directly or via a later staged write whose own wait
-// covers this seq, e.g. an upsert's staged delete folded into its insert's
-// wait) so every staged write is either waited on or provably subsumed by a
+// covers this seq) so every staged write is either waited on or provably subsumed by a
 // later one on the SAME wal — the durability contract from appendFramed still
 // applies, just decoupled from the caller's lock hold time. This is the
 // STAGED half of the split-commit optimization described in the wal type doc:
@@ -424,7 +511,7 @@ func (w *wal) appendFramed(payload []byte) error {
 // batches them.
 func (w *wal) appendFramedStaged(payload []byte) (uint64, error) {
 	if w.poisoned.Load() {
-		return 0, ErrWALPoisoned // fast fail-closed: a prior fsync failure poisoned the log.
+		return 0, ErrWALPoisoned // fast fail-closed: a prior failed write or fsync poisoned the log.
 	}
 	w.mu.Lock()
 	// AUTHORITATIVE fail-closed check, under w.mu: a sync leader can poison the WAL
@@ -445,14 +532,17 @@ func (w *wal) appendFramedStaged(payload []byte) (uint64, error) {
 		w.mu.Unlock()
 		return 0, ErrWALPoisoned
 	}
-	var hdr [8]byte
-	binary.BigEndian.PutUint32(hdr[0:4], uint32(len(payload))) //nolint:gosec
-	binary.BigEndian.PutUint32(hdr[4:8], crc32.ChecksumIEEE(payload))
-	if _, err := w.f.Write(hdr[:]); err != nil {
+	if len(payload) > walRecordLimit {
+		// Replay could not read it back. The caller has applied it in memory,
+		// so the log is poisoned: no checkpoint may make it permanent, and a
+		// reopen holds the logged state. Nothing is written. Reported as the
+		// poisoned log, a server fault, never as ErrWALRecordTooLarge: that one
+		// tells the caller the write was refused and nothing changed.
+		w.poisoned.Store(true)
 		w.mu.Unlock()
-		return 0, err
+		return 0, fmt.Errorf("%w: an applied write's log record takes %d bytes, the limit is %d", ErrWALPoisoned, len(payload), walRecordLimit)
 	}
-	if _, err := w.f.Write(payload); err != nil {
+	if err := w.writeFrameLocked(payload); err != nil {
 		w.mu.Unlock()
 		return 0, err
 	}
@@ -485,9 +575,9 @@ func (w *wal) commitWaitStaged(seq uint64) error {
 // holding NEITHER mu NOR syncMu so writes overlap the in-flight fsync.
 func (w *wal) commitWait(seq uint64) error {
 	if seq == 0 {
-		// A no-op write (nothing staged) touches no durability, so it stays a
-		// success even on a poisoned WAL — this fast path MUST precede the poison
-		// gate so a no-op delete of an absent id is not turned into ErrWALPoisoned.
+		// A no-op write (nothing staged) touches no durability, so the wait itself
+		// succeeds even on a poisoned WAL. (A mutator of a poisoned log never gets
+		// here: it is refused before it applies, by refuseWrite.)
 		return nil
 	}
 	w.syncMu.Lock()
@@ -574,7 +664,9 @@ func (w *wal) truncate() error {
 	if w.poisoned.Load() {
 		return ErrWALPoisoned
 	}
-	if err := w.f.Truncate(0); err != nil {
+	// Through a second handle: the append handle cannot truncate on Windows (see
+	// truncateFile).
+	if err := truncateFile(w.f.Name(), 0, true); err != nil {
 		w.poisoned.Store(true)
 		return err
 	}
@@ -604,6 +696,83 @@ func (w *wal) truncate() error {
 	return nil
 }
 
+// refuseCheckpoint returns ErrWALPoisoned when w is poisoned, nil otherwise
+// (and for a nil w: a collection without a log).
+//
+// EVERY PATH THAT WRITES A SNAPSHOT OF A LOG-BACKED COLLECTION CALLS IT FIRST,
+// under the collection's opMu. Once the log is poisoned, memory may be AHEAD of
+// it: a write refused after its in-memory apply (a delete, a replace, an insert
+// whose append or fsync failed) is still applied in memory. A snapshot written
+// from that state would make the refused write permanent, and the truncate that
+// follows would fail only after the snapshot had replaced the good one, so an
+// acknowledged old version would be gone for good. Refusing before the snapshot
+// leaves the snapshot and the log on disk exactly as they were, and a reopen
+// replays the acknowledged state. truncate's own poison check stays as the
+// second line.
+//
+// On its own it cannot cover a GROUP-COMMIT SYNC THAT FAILS AFTER THE CHECK:
+// that fsync runs outside opMu (see commitWait). The snapshot itself therefore
+// goes through settle, under opMu, which waits for every record already written
+// to be synced and refuses if that fails: Collection.Snapshot and its named and
+// multi-vector twins take opMu and settle the log, so for a log that syncs
+// before acknowledging, a checkpoint, a backup and a cold-tier eviction all
+// capture only writes whose records are on disk. An unsynced (WALNoSync) log
+// promises no sync, so for it they capture only writes whose records were
+// written without error.
+func (w *wal) refuseCheckpoint() error {
+	if w != nil && w.poisoned.Load() {
+		return ErrWALPoisoned
+	}
+	return nil
+}
+
+// refuseWrite returns ErrWALPoisoned when w is poisoned, nil otherwise (and for
+// a nil w: a collection without a log).
+//
+// EVERY MUTATOR OF A LOG-BACKED COLLECTION CALLS IT FIRST, under the lock that
+// orders its apply and its append (opMu), BEFORE it applies anything. Applying
+// first and failing the append afterwards would leave a refused write visible
+// in memory until a restart (a delete that errored, then a retry that reports
+// the point missing). A no-op write is refused too: the log is dead, and
+// answering a retried delete with "not there" would hide that.
+//
+// A group-commit fsync that fails after the check (it runs outside opMu) can
+// still poison the log between the check and this writer's append; that writer
+// applies, its append fails, and it is refused. Its write was never
+// acknowledged, and no checkpoint is taken from that state (refuseCheckpoint),
+// so a reopen holds the log's state.
+func (w *wal) refuseWrite() error { return w.refuseCheckpoint() }
+
+// settle runs before a snapshot is taken from memory, with the collection's
+// opMu held so no record can be written meanwhile. It waits until every record
+// already written is synced, and returns ErrWALPoisoned when the log was
+// poisoned or that sync fails. Once it returns nil, memory holds no write whose
+// record is not on disk and none that was refused: a write that applied but has
+// not finished its group-commit wait is made durable here, or the snapshot is
+// refused. An unsynced (WALNoSync) log promises no sync, so it is only checked
+// for poison. A nil w (no log) settles at once.
+func (w *wal) settle() error {
+	if w == nil {
+		return nil
+	}
+	if w.poisoned.Load() {
+		return ErrWALPoisoned
+	}
+	if w.noSync {
+		return nil
+	}
+	w.syncMu.Lock()
+	seq := w.writeSeq
+	w.syncMu.Unlock()
+	if err := w.commitWait(seq); err != nil {
+		if errors.Is(err, ErrWALPoisoned) {
+			return err
+		}
+		return fmt.Errorf("%w: %v", ErrWALPoisoned, err)
+	}
+	return nil
+}
+
 // close closes the underlying file. Idempotent.
 func (w *wal) close() error {
 	w.mu.Lock()
@@ -618,24 +787,34 @@ func (w *wal) close() error {
 
 // errUnknownWALRecord is returned by replayFramed when an INTACT (CRC-valid)
 // record carries a record tag this binary does not recognize. Unlike a torn tail
-// (which is the legitimate durability boundary and stops replay silently), a
+// (which is the legitimate durability boundary and is cut off), a
 // CRC-valid frame is a committed record: an unknown tag means the WAL was written
 // by a NEWER binary (a downgrade) or is corrupt. Failing loud here prevents
 // silently truncating replay and discarding the committed records that follow.
 var errUnknownWALRecord = errors.New("vector: WAL contains an unrecognized record tag (newer binary or corruption); refusing to truncate replay")
 
 // replayFramed is the family-AGNOSTIC replay core: it reads path and invokes
-// apply(recordPayload) for each intact framed record, in order. It stops
-// (without error) at EOF, a torn header, a garbage/torn length, or a CRC mismatch
-// (torn/corrupt tail) — the legitimate durability boundary. apply receives the
-// opaque record-payload bytes; a per-family decoder (dense's replayRecord, or
+// apply(recordPayload) for each intact framed record, in order. apply receives
+// the opaque record-payload bytes; a per-family decoder (dense's replayRecord, or
 // named/MV elsewhere) interprets them and returns an error to halt replay:
-//   - errStopReplay (or any apply-returned error wrapping it): a malformed body of
-//     a KNOWN tag, i.e. a torn record — replay stops WITHOUT surfacing an error
-//     (the historical quiet-stop boundary).
+//   - errStopReplay (or any apply-returned error wrapping it): a CRC-valid frame
+//     whose body cannot be decoded. The frame was written whole, so this is
+//     damage, never a torn tail: replay fails with ErrLogDamaged.
 //   - errUnknownWALRecord: a CRC-valid frame with an UNRECOGNIZED tag — replay
 //     fails loud (the error propagates) so a downgraded/corrupt WAL is not
 //     silently truncated, dropping committed records.
+//
+// When the frames stop parsing before the end of the file (a short header or
+// body, a zero or oversized length, a CRC mismatch) at offset end, the bytes
+// from end on are either a half-written tail or mid-log damage:
+//   - if any later offset holds a complete, CRC-valid frame, records written
+//     after the bad bytes exist, so cutting would drop them: ErrLogDamaged, and
+//     the file is left untouched;
+//   - otherwise they are a torn tail (a crash mid-append, or trailing zeros from
+//     a filesystem that extended the file before the data landed). The bytes are
+//     saved to <path>.torn-<unixnano>, the log is truncated to end and fsynced,
+//     and a warning is logged. Cutting BEFORE openWAL appends matters: appending
+//     after a half-written record would make every later record unreplayable.
 //
 // A missing file replays nothing.
 func replayFramed(path string, apply func(rec []byte) error) error {
@@ -647,46 +826,317 @@ func replayFramed(path string, apply func(rec []byte) error) error {
 		return err
 	}
 	defer func() { _ = f.Close() }()
-	br := bufio.NewReaderSize(f, 1<<16)
-	for {
+	st, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	size := st.Size()
+	br := bufio.NewReaderSize(replayReader(f), 1<<16)
+	var end int64 // offset of the first byte not yet consumed by a good record
+	for end < size {
 		var hdr [8]byte
 		if _, err := io.ReadFull(br, hdr[:]); err != nil {
-			return nil // EOF or torn header
+			if size-end >= 8 {
+				return err // the header fits the stat'd size, so this is a read failure
+			}
+			break // short header
 		}
 		plen := binary.BigEndian.Uint32(hdr[0:4])
 		crc := binary.BigEndian.Uint32(hdr[4:8])
-		if plen == 0 || plen > maxWALRecord {
-			return nil // garbage length -> stop
+		if plen == 0 || plen > maxWALRecord || int64(plen) > size-end-8 {
+			break // zero, garbage or overlong length
 		}
 		payload := make([]byte, plen)
 		if _, err := io.ReadFull(br, payload); err != nil {
-			return nil // torn tail
+			return err // the length fits the stat'd size, so this is a read failure
 		}
 		if crc32.ChecksumIEEE(payload) != crc {
-			return nil // corrupt/torn -> stop at the durability boundary
+			break
 		}
 		if aerr := apply(payload); aerr != nil {
 			if errors.Is(aerr, errStopReplay) {
-				return nil // malformed body of a known tag (torn record) -> quiet stop
+				return damagedLog(path, end)
 			}
 			return aerr // unknown tag / unrecoverable -> fail loud
 		}
+		end += 8 + int64(plen)
 	}
+	if end >= size {
+		return nil
+	}
+	found, err := laterFrameExists(f, end+1, size)
+	if err != nil {
+		return err
+	}
+	if found {
+		return damagedLog(path, end)
+	}
+	return cutTornTail(f, path, end, size)
 }
 
-// errStopReplay signals a quiet replay stop at the durability boundary (a
-// malformed/truncated body of a KNOWN record tag, i.e. a torn final record).
-// replayFramed swallows it and stops without surfacing an error, matching the
-// historical torn-tail behavior. An apply func returns errUnknownWALRecord
-// instead when the frame is intact but the tag is unrecognized (fail loud).
-var errStopReplay = errors.New("vector: WAL replay stop (torn record)")
+// replayReader wraps the file replayFramed reads records from. Tests replace
+// it to make a read fail; production reads the file directly.
+var replayReader = func(f *os.File) io.Reader { return f }
+
+// ErrLogDamaged is returned when a write-ahead log cannot be replayed and the
+// damage is not a half-written tail: a complete record follows the bad bytes,
+// or a record passes its checksum but cannot be decoded. The error names the
+// file and the offset, and the log is left as it was. To recover, stop the
+// process, keep a copy of the named file, then truncate it at the named offset:
+// that keeps every record before the offset and loses the ones after it.
+var ErrLogDamaged = errors.New("vector: write-ahead log damaged")
+
+func damagedLog(path string, end int64) error {
+	return fmt.Errorf("%w: %s at offset %d", ErrLogDamaged, path, end)
+}
+
+// tornScanWindow is how much of the log laterFrameExists reads at a time, so a
+// long tail is scanned without loading it into memory.
+const tornScanWindow = 1 << 20
+
+// laterFrameExists reports whether any offset in [from, size) starts a complete
+// frame: a length in (0, maxWALRecord] that fits in the file and a payload whose
+// CRC matches. It reads bounded windows with ReadAt and stops at the first such
+// frame. Offsets whose length field is zero are skipped without a CRC, so a long
+// run of zeros costs one pass over its bytes.
+//
+// Candidate payloads overlap, and checksumming each one in full costs up to
+// 64 MiB per offset: hours over a tail of a few tens of megabytes whose bytes
+// read as plausible lengths. A long payload's CRC is therefore derived from
+// running CRCs of the tail (see tailCRC), so each candidate costs at most a few
+// kilobytes of checksumming whatever its length, and the answer is the same.
+func laterFrameExists(f *os.File, from, size int64) (bool, error) {
+	tc := newTailCRC(f, from, size)
+	buf := make([]byte, tornScanWindow+8)
+	for base := from; base+8 <= size; {
+		n := int64(len(buf))
+		if size-base < n {
+			n = size - base
+		}
+		win := buf[:n]
+		if _, err := f.ReadAt(win, base); err != nil {
+			return false, err
+		}
+		// Every offset whose 8-byte header lies inside win is examined; the
+		// window then advances so the next one starts at the first unexamined
+		// offset (headers straddling the boundary are re-read there).
+		last := n - 8
+		for i := int64(0); i <= last; i++ {
+			if win[i] == 0 {
+				// A frame needs a non-zero length, so skip to three bytes before
+				// the next non-zero byte (its length's last byte at the latest).
+				nz := i + 1
+				for nz < n && win[nz] == 0 {
+					nz++
+				}
+				if nz == n {
+					break // the rest of the window is zeros
+				}
+				if next := nz - 3; next > i {
+					i = next - 1
+					continue
+				}
+			}
+			plen := int64(binary.BigEndian.Uint32(win[i : i+4]))
+			if plen == 0 || plen > maxWALRecord || plen > size-(base+i)-8 {
+				continue
+			}
+			crc := binary.BigEndian.Uint32(win[i+4 : i+8])
+			var got uint32
+			if i+8+plen <= n && plen <= 2*tailCRCStride {
+				got = crc32.ChecksumIEEE(win[i+8 : i+8+plen])
+			} else {
+				start := base + i + 8
+				cs, err := tc.prefix(start)
+				if err != nil {
+					return false, err
+				}
+				ce, err := tc.prefix(start + plen)
+				if err != nil {
+					return false, err
+				}
+				got = ce ^ crcZeros(cs, plen)
+			}
+			if got == crc {
+				return true, nil
+			}
+		}
+		base += last + 1
+	}
+	return false, nil
+}
+
+// tailCRCStride is how far apart tailCRC keeps its running CRCs: what a
+// candidate payload costs to checksum at most, at each end.
+const tailCRCStride = 4096
+
+// tailCRC gives the CRC-32 (IEEE) of any prefix [from, pos) of a log tail. It
+// keeps the running CRC at every tailCRCStride bytes, computed forward only as
+// far as a query needs (at most maxWALRecord past the scan), and finishes a
+// query from the nearest one with at most tailCRCStride bytes of work.
+//
+// CRC-32 is linear: for consecutive byte strings A and B,
+// crc(A||B) = crcZeros(crc(A), len(B)) ^ crc(B). So the CRC of the payload
+// [a, b) is prefix(b) ^ crcZeros(prefix(a), b-a).
+type tailCRC struct {
+	f          *os.File
+	from, size int64
+	cps        []uint32 // cps[k] = crc of [from, from+k*tailCRCStride)
+	scratch    []byte
+}
+
+func newTailCRC(f *os.File, from, size int64) *tailCRC {
+	return &tailCRC{f: f, from: from, size: size, cps: []uint32{0}}
+}
+
+// prefix returns the CRC of [from, pos), for from <= pos <= size.
+func (t *tailCRC) prefix(pos int64) (uint32, error) {
+	k := (pos - t.from) / tailCRCStride
+	for int64(len(t.cps)) <= k {
+		if err := t.extend(); err != nil {
+			return 0, err
+		}
+	}
+	at := t.from + k*tailCRCStride
+	b, err := t.read(at, pos-at)
+	if err != nil {
+		return 0, err
+	}
+	return crc32.Update(t.cps[k], crc32.IEEETable, b), nil
+}
+
+// extend adds the running CRCs of the next tornScanWindow bytes.
+func (t *tailCRC) extend() error {
+	at := t.from + int64(len(t.cps)-1)*tailCRCStride
+	n := min(int64(tornScanWindow), t.size-at)
+	n -= n % tailCRCStride
+	if n <= 0 {
+		return fmt.Errorf("vector: torn-tail scan past the end of the log")
+	}
+	b, err := t.read(at, n)
+	if err != nil {
+		return err
+	}
+	c := t.cps[len(t.cps)-1]
+	for off := int64(0); off < n; off += tailCRCStride {
+		c = crc32.Update(c, crc32.IEEETable, b[off:off+tailCRCStride])
+		t.cps = append(t.cps, c)
+	}
+	return nil
+}
+
+func (t *tailCRC) read(at, n int64) ([]byte, error) {
+	if int64(cap(t.scratch)) < n {
+		t.scratch = make([]byte, n)
+	}
+	b := t.scratch[:n]
+	if n == 0 {
+		return b, nil
+	}
+	if _, err := t.f.ReadAt(b, at); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// crcZerosOps[k] advances an (unconditioned) CRC-32 register over 2^k zero
+// bytes, as a 32x32 GF(2) matrix (one column per input bit).
+var crcZerosOps = func() (ops [64][32]uint32) {
+	var bit [32]uint32 // one zero bit
+	bit[0] = 0xedb88320
+	for n := 1; n < 32; n++ {
+		bit[n] = 1 << (n - 1)
+	}
+	two := gf2Square(bit)
+	four := gf2Square(two)
+	ops[0] = gf2Square(four) // eight bits: one byte
+	for k := 1; k < len(ops); k++ {
+		ops[k] = gf2Square(ops[k-1])
+	}
+	return ops
+}()
+
+func gf2Times(mat *[32]uint32, vec uint32) uint32 {
+	var sum uint32
+	for i := 0; vec != 0; i, vec = i+1, vec>>1 {
+		if vec&1 != 0 {
+			sum ^= mat[i]
+		}
+	}
+	return sum
+}
+
+func gf2Square(mat [32]uint32) (sq [32]uint32) {
+	for n := range sq {
+		sq[n] = gf2Times(&mat, mat[n])
+	}
+	return sq
+}
+
+// crcZeros returns crc advanced over n zero bytes without the pre- and
+// post-conditioning, the operator in crc(A||B) = crcZeros(crc(A), len(B)) ^
+// crc(B) (zlib's crc32_combine).
+func crcZeros(crc uint32, n int64) uint32 {
+	for k := 0; n > 0; k, n = k+1, n>>1 {
+		if n&1 != 0 {
+			crc = gf2Times(&crcZerosOps[k], crc)
+		}
+	}
+	return crc
+}
+
+// cutTornTail saves the log's bytes from end on to <path>.torn-<unixnano>
+// (fsynced, with its directory), then truncates the log to end and fsyncs it.
+func cutTornTail(f *os.File, path string, end, size int64) error {
+	tornPath := fmt.Sprintf("%s.torn-%d", path, time.Now().UnixNano())
+	if err := saveTornBytes(io.NewSectionReader(f, end, size-end), tornPath); err != nil {
+		return fmt.Errorf("vector: save torn log tail %s: %w", tornPath, err)
+	}
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("vector: save torn log tail %s: %w", tornPath, err)
+	}
+	if terr := truncateFile(path, end, true); terr != nil {
+		return fmt.Errorf("vector: cut torn log tail %s: %w", path, terr)
+	}
+	slog.Warn("vector: cut a half-written write-ahead log tail",
+		"log", path, "offset", end, "bytes", size-end, "saved", tornPath)
+	return nil
+}
+
+func saveTornBytes(r io.Reader, tornPath string) error {
+	out, err := os.OpenFile(tornPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // derived from the log path
+	if err != nil {
+		return err
+	}
+	_, werr := io.Copy(out, r)
+	if werr == nil {
+		werr = out.Sync()
+	}
+	if cerr := out.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
+		// An incomplete copy proves nothing and the log keeps the bytes (it is
+		// not cut unless the copy succeeded), so it is removed rather than left
+		// to fill a disk that may already be short of space.
+		_ = os.Remove(tornPath)
+	}
+	return werr
+}
+
+// errStopReplay is what a per-family decoder returns for a malformed body of a
+// KNOWN record tag. The frame passed its CRC, so the record was written whole:
+// replayFramed reports it as ErrLogDamaged at that record's offset. An apply func
+// returns errUnknownWALRecord instead when the frame is intact but the tag is
+// unrecognized (fail loud).
+var errStopReplay = errors.New("vector: WAL record body undecodable")
 
 // replayWAL reads path and invokes onInsert/onDelete/onSetPayload for each intact
 // DENSE record, in order. It is a thin wrapper over the shared replayFramed core:
 // the per-record apply closure runs the dense replayRecord switch over the 3
-// dense record types, returning false on an unknown tag or malformed body so
-// replay stops at the durability boundary exactly as before. A missing file
-// replays nothing.
+// dense record types. A malformed body fails the replay with ErrLogDamaged and an
+// unknown tag with errUnknownWALRecord; a torn tail is cut by replayFramed. A
+// missing file replays nothing.
 func replayWAL(
 	path string,
 	onInsert func(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64),
@@ -700,7 +1150,7 @@ func replayWAL(
 
 // replayRecord decodes one record payload and dispatches it. Returns nil on a
 // successfully applied record, errStopReplay on a malformed body of a KNOWN tag
-// (torn record → quiet stop), or errUnknownWALRecord on an unrecognized tag (an
+// (damage → ErrLogDamaged), or errUnknownWALRecord on an unrecognized tag (an
 // intact frame from a newer/downgraded binary → fail loud, not silent truncation).
 func replayRecord(
 	payload []byte,
@@ -817,7 +1267,7 @@ func readOptMeta(r io.Reader) (Metadata, bool) {
 // readOptKeyExpires is the inverse of writeOptKeyExpires. It tolerates EOF (an
 // OLD walSetPayload record predating the per-key-TTL block) by returning
 // (nil, true) — no per-key TTL, replay continues. A torn block (flag present but
-// truncated body) returns (nil, false) so replay stops at the durability boundary.
+// truncated body) returns (nil, false), and replay fails with ErrLogDamaged.
 func readOptKeyExpires(r io.Reader) (map[string]uint64, bool) {
 	var flag [1]byte
 	if _, err := io.ReadFull(r, flag[:]); err != nil {

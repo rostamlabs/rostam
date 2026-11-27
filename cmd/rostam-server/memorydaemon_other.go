@@ -4,6 +4,8 @@
 
 package main
 
+import "time"
+
 // daemonSupported gates `mcp -autostart` before it touches the filesystem.
 const daemonSupported = false
 
@@ -13,4 +15,10 @@ func newDaemonSpawner(string, string) func() error {
 	return func() error { return errDaemonUnsupported }
 }
 
-// stopDaemon, processIsDaemon: unix-only; the Windows build has no daemon.
+// stopDaemon is the daemon's -stop; there is no daemon to stop here.
+func stopDaemon(string, time.Duration) error { return errDaemonUnsupported }
+
+// processIsDaemon: unix-only; the Windows build has no daemon.
+
+// daemonStarting: there is no daemon here to wait for.
+func daemonStarting(string) bool { return false }

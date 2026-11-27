@@ -13,6 +13,7 @@ func TestGroupForMatchesTheDocumentedAreas(t *testing.T) {
 		"epoll-loops":            "Transports",
 		"data":                   "Storage",
 		"in-place-seqlock-reads": "Storage",
+		"durable-collections":    "Storage",
 		"api-key":                "Authentication",
 		"jwt-issuer":             "Authentication",
 		"tls-node-cert":          "TLS", // TLS wins over Clustering: order matters

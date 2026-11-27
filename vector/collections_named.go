@@ -85,6 +85,7 @@ func (s *CollectionStore) CreateNamedConfig(name string, cfg NamedConfig) error 
 	if verr := validateNamedVectors(cfg.Spaces); verr != nil {
 		return verr
 	}
+	s.warnDurableNotApplied(canonical, "named-vector collection")
 	// Cluster mode: Raft/SnapshotAll is the durability authority — never enable a
 	// single-node WAL (mirror dense effectiveClusterConfig forcing WAL=false). DO
 	// NOT touch the cluster snapshot/Raft path.
@@ -147,6 +148,7 @@ func (s *CollectionStore) loadNamed(canonical, cfgPath string) error {
 	if err != nil {
 		return fmt.Errorf("vector: load named %s: %w", canonical, err)
 	}
+	s.warnDurableNotApplied(canonical, "named-vector collection")
 	nc, err := NewNamedCollection(canonical, cfg.Spaces)
 	if err != nil {
 		return fmt.Errorf("vector: rebuild named %s: %w", canonical, err)
@@ -154,7 +156,12 @@ func (s *CollectionStore) loadNamed(canonical, cfgPath string) error {
 	nc.suppressSweep = s.persistentCluster // cluster: sweeper off (#4 B3a; see CreateNamedConfig)
 	_, snapPath, walPath := s.namedPaths(canonical)
 	// Restore the consistent checkpoint (if any), then replay the WAL tail on top.
-	if f, oerr := os.Open(snapPath); oerr == nil { //nolint:gosec // store-managed path
+	f, oerr := openSnapshot(snapPath)
+	if oerr != nil {
+		_ = nc.Close()
+		return fmt.Errorf("vector: open snapshot named %s: %w", canonical, oerr)
+	}
+	if f != nil {
 		rerr := nc.Restore(f)
 		_ = f.Close()
 		if rerr != nil {
@@ -212,8 +219,11 @@ func (s *CollectionStore) FlushNamed(name string) error {
 
 // writeNamedSnapshotFile atomically writes nc's snapshot to path (tmp + fsync +
 // rename), mirroring writeSnapshotFile so a crash mid-write leaves the prior good
-// checkpoint intact.
+// checkpoint intact. When nc has a log the caller holds nc.opMu.
 func (s *CollectionStore) writeNamedSnapshotFile(nc *NamedCollection, path string) error {
+	if err := nc.wal.refuseCheckpoint(); err != nil {
+		return err // memory may be ahead of a poisoned log; see refuseCheckpoint
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return err
 	}
@@ -222,7 +232,7 @@ func (s *CollectionStore) writeNamedSnapshotFile(nc *NamedCollection, path strin
 	if err != nil {
 		return err
 	}
-	if err := nc.Snapshot(f); err != nil {
+	if err := nc.snapshotLocked(f); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmp)
 		return err

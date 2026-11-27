@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"errors"
 	"os"
+	"sync"
 	"testing"
 	"time"
 )
@@ -23,37 +24,21 @@ import (
 // dense contract, so these two tests characterise the existing behaviour at BOTH
 // error returns and are run before and after the refactor.
 
-// walAppendFails poisons w so the next appendFramedStaged fails immediately with
-// ErrWALPoisoned, without touching the file — the append-side error return.
-func walAppendFails(w *wal) { w.poisoned.Store(true) }
+// walAppendFails makes w's next write fail without landing a byte, so the
+// mutator applies and then its append fails — the append-side error return. (A
+// log already poisoned refuses before the apply; see wal.refuseWrite.)
+func walAppendFails(w *wal) {
+	w.writeHook = func(*os.File, []byte) (int, error) { return 0, errors.New("injected write failure") }
+}
 
-// walSyncFails swaps w's file for the write end of a pipe: a small framed record
-// still writes, but f.Sync() on a pipe fails with EINVAL, so the append succeeds
-// and commitWaitStaged fails — the tail error return. The pipe's read end is
-// held open for the test's lifetime so the write never draws EPIPE.
-//
-// CLEANUP ORDERING. t.Cleanup runs LIFO, and the store's own `_ = cs.Close()`
-// cleanup is registered FIRST (by seedB2Named/seedB2MV), so this one runs
-// BEFORE it: by the time Close reaches the WAL, w.f is a closed pipe and its
-// final Sync fails. That is harmless here and deliberate — those callers discard
-// Close's error, and the swapped-away real log file is closed by this cleanup
-// rather than leaked. A future caller that ASSERTS on Close's error must swap
-// w.f back instead of relying on this ordering.
+// walSyncFails makes w's next fsync fail: just before it, the log's file handle
+// is closed, so f.Sync() returns an error while the append before it succeeded
+// — the tail error return. Closing works the same on every platform. The
+// store's Close then finds the handle closed; callers discard that error.
 func walSyncFails(t *testing.T, w *wal) {
 	t.Helper()
-	pr, pw, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe: %v", err)
-	}
-	w.mu.Lock()
-	old := w.f
-	w.f = pw
-	w.mu.Unlock()
-	t.Cleanup(func() {
-		_ = pw.Close()
-		_ = pr.Close()
-		_ = old.Close() // the real log file the store's Close will no longer reach
-	})
+	var once sync.Once
+	w.beforeSync = func() { once.Do(func() { _ = w.f.Close() }) }
 }
 
 // seedB2Named opens a WAL-mode named collection in the store holding point 1 at

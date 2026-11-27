@@ -5,6 +5,88 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **Agent memory survives a crash.** In `rostam-server mcp` with a data
+  directory and in the memory daemon, the memory collection now has a
+  write-ahead log: a `remember` or `forget` that was acknowledged is still there
+  after the process is killed, at the price of one disk sync per remembered or
+  forgotten memory. Replacing a memory (same `key`, or identical content) is one
+  log record, so a kill before the call answers leaves the old version or the
+  new one, never neither. After an unclean stop, the previous release shows the
+  older version of memories replaced since the last checkpoint. An older
+  release also appends after a half-written log tail without cutting it, and
+  this release then refuses that log as damaged. A killed
+  process is what is tested; power-loss safety rests on the disk sync and is
+  not claimed as tested.
+  An existing store is converted in place at the first start; if that fails it
+  opens in its old form with a `not crash-safe` warning and the next start tries
+  again, which can fail the same way. A conversion that cannot tell which form
+  it left serves memory read-only instead. The memory collection is now held
+  in RAM. `mcp -autostart` replaces a running daemon from an earlier build,
+  without durable memory, by stopping it cleanly and starting a new one. Over `mcp -connect`, start the server with
+  `-durable-collections mcp_memory`. `-data ""` stays non-durable.
+  See [What survives a crash](server/mcp.md#what-survives-a-crash).
+- **`-durable-collections` and `DirectConfig.DurableCollections`.** A
+  single-node server, or an embedded store, can name dense vector collections to
+  run with a write-ahead log, synced before each write is acknowledged. A bulk
+  build has no log record: the store's `BuildStaged`, which the server's bulk
+  build uses, checkpoints it before returning, while the direct `Collection`
+  bulk-build methods do not, so their caller must keep writers out until its
+  own checkpoint. If that `BuildStaged` checkpoint fails, or the build on an
+  empty listed collection fails or panics after placing points, the collection
+  refuses writes until a restart, and the build may be missing after it. This
+  covers a listed collection created or restored while listed, an existing
+  `Persistent` one (converted at startup; if that fails it keeps its old form,
+  with a warning, and each later start tries again) and one that already has a
+  log. A listed collection that already exists with neither `Persistent` nor a log
+  keeps its mode, with a warning. Only an HNSW collection is converted. A
+  conversion that cannot tell which form the collection is in afterward
+  leaves it read-only (reads work, every change is refused with an error
+  saying to fix the disk and restart, and every file is kept). The restart
+  tries again: it may finish the conversion, leave the collection read-only or
+  in its old form with a warning, or, if what is on disk still cannot be
+  loaded, refuse to open with every file kept for manual recovery. Empty by
+  default; needs a data directory to keep anything across a restart; ignored
+  with `-cluster`.
+  See [Running a server](server/running.md).
+- **Breaking: a damaged write-ahead log now stops the open.** This applies to
+  every collection with a write-ahead log (dense, multi-vector and named).
+  Before, replay stopped silently at the first bad record, and writes made after
+  it could not be replayed later. Now a half-written tail is cut off and saved as
+  `<file>.torn-<number>`, and the store opens. Damage followed by further
+  records, or a record that passes its checksum but cannot be decoded, makes the
+  store (and a server using it) fail to start with the file and offset in the
+  error. To recover, stop the process, keep a copy of the file, and truncate it
+  at that offset, which loses the records after it. A record of an unknown type,
+  as a newer release may write, still fails the start as before; that error has
+  no offset and truncating is not the remedy: run the newer release.
+  See [A damaged log](server/mcp.md#a-damaged-log).
+- **Snapshots wait for pending log syncs.** A backup, checkpoint or cold-tier
+  eviction of a collection whose write-ahead log syncs before acknowledging
+  waits until every write already applied is synced, and refuses if that sync
+  fails, so it holds only writes whose records are on disk. (An unsynced
+  `WALNoSync` log promises no sync; there it holds the writes whose records
+  were written.)
+- **A cold-tier eviction of a collection in use leaves it resident.** If the
+  collection is used while its snapshot uploads, the eviction gives up (HTTP
+  409 on the admin route) and the idle sweep tries again later, instead of
+  retiring the collection with the write. The snapshot it had uploaded stays
+  in the object store, unused.
+- **A multi-vector document whose log record would exceed 64 MiB is
+  refused** before it is applied, instead of being acknowledged and dropped
+  when the log is next replayed.
+- **A failed log write stops further writes.** After a write or a disk sync of
+  a write-ahead log fails (a full disk, for example), the collection refuses
+  every write, before applying it, until the process restarts. A snapshot
+  that exists but cannot be read now fails the open instead of loading the
+  collection empty.
+- **Memory no longer locks out when the embedder record is missing.** The first
+  memory tool call checks the configured embedder against the stored memories
+  and records it again.
+- **Breaking: over `mcp -connect`, a new memory store needs a server at v0.5.0
+  or later**, as does rebuilding a missing embedder record. No v0.4.x server has
+  the operation this needs, so it fails there with any key, whether or not
+  authorization is on. Upgrade the server first. Existing stores that have the
+  record are unaffected.
 - **Code-linked memory and a Claude Code plugin.** `remember` takes an optional
   `path` (and `symbol`) that links a memory to a file, and `recall_for_file`
   lists what is linked to one. A linked memory whose file has since changed is
@@ -16,8 +98,8 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   (`rostam-server memory-daemon [-stop]`). Linux only in this release: macOS,
   the BSDs and Windows refuse at once, because the daemon's persistent store
   needs storage the engine provides only on Linux and Windows, and the daemon
-  itself is not ported to Windows yet. Plain `rostam-server mcp` is unchanged
-  and still allows one session at a time. Under `-autostart` or an explicit
+  itself is not ported to Windows yet. Plain `rostam-server mcp` still allows
+  one session at a time. Under `-autostart` or an explicit
   `-project-root`, a call that omits `namespace` uses the project's namespace
   instead of `"default"`, so memories saved earlier with no namespace are not
   recalled by default: pass `namespace: "default"` (or `-namespace default`)

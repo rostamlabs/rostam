@@ -115,6 +115,7 @@ func (s *CollectionStore) CreateMultiVector(name string, cfg MultiVectorConfig) 
 	if err != nil {
 		return err
 	}
+	s.warnDurableNotApplied(canonical, "multi-vector collection")
 	defer s.lockName(canonical)()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -186,6 +187,7 @@ func (s *CollectionStore) loadMultiVector(canonical, cfgPath string) error {
 	if err != nil {
 		return fmt.Errorf("vector: load multi-vector %s: %w", canonical, err)
 	}
+	s.warnDurableNotApplied(canonical, "multi-vector collection")
 
 	// Cluster-persistent: data files were wiped at open; build an empty
 	// mmap-backed index (current generation) and let Raft repopulate it. No
@@ -210,7 +212,12 @@ func (s *CollectionStore) loadMultiVector(canonical, cfgPath string) error {
 			return fmt.Errorf("vector: open multi-vector %s: %w", canonical, nerr)
 		}
 		snapPath, walPath := s.mvWALPaths(canonical)
-		if f, oerr := os.Open(snapPath); oerr == nil { //nolint:gosec // store-managed path
+		f, oerr := openSnapshot(snapPath)
+		if oerr != nil {
+			_ = idx.Close()
+			return fmt.Errorf("vector: open snapshot multi-vector %s: %w", canonical, oerr)
+		}
+		if f != nil {
 			rerr := idx.restore(f)
 			_ = f.Close()
 			if rerr != nil {
@@ -315,7 +322,11 @@ func (s *CollectionStore) FlushMVWAL(name string) error {
 // writeNamedSnapshotFile so a crash mid-write leaves the prior good checkpoint
 // intact. It uses the MV snapshot/restore HEAP codec (not the mmap SavePersist
 // sidecar) — the destination that makes WAL mode distinct from Persistent.
+// The caller holds idx.opMu: idx.snapshotLocked does not take it.
 func (s *CollectionStore) writeMVWALSnapshotFile(idx *MultiVectorIndex, path string) error {
+	if err := idx.wal.refuseCheckpoint(); err != nil {
+		return err // memory may be ahead of a poisoned log; see refuseCheckpoint
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return err
 	}
@@ -324,7 +335,7 @@ func (s *CollectionStore) writeMVWALSnapshotFile(idx *MultiVectorIndex, path str
 	if err != nil {
 		return err
 	}
-	if err := idx.snapshot(f); err != nil {
+	if err := idx.snapshotLocked(f); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmp)
 		return err
