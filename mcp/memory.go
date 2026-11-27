@@ -115,6 +115,11 @@ func (s *Server) identity() embedIdentity {
 	return embedIdentity{Model: s.emb.Model(), Dim: s.emb.Dim(), Hybrid: s.hybrid}
 }
 
+// maxIdentityBytes bounds the encoded embedder identity. A real one (a model
+// name, a dimension and a flag) is a few hundred bytes at most; anything longer
+// is refused before it is sent.
+const maxIdentityBytes = 4096
+
 // claimIdentity records this run's embedder as the memory collection's, unless
 // a record is already there: that one is never overwritten, and this run is
 // held to it instead.
@@ -122,6 +127,9 @@ func (s *Server) claimIdentity(ctx context.Context) error {
 	b, err := json.Marshal(s.identity())
 	if err != nil {
 		return fmt.Errorf("mcp: encoding embedder identity: %w", err)
+	}
+	if len(b) > maxIdentityBytes {
+		return fmt.Errorf("mcp: embedder identity is too long to record (%d bytes, the limit is %d); use a shorter model name", len(b), maxIdentityBytes)
 	}
 	res, err := s.store.Call(ctx, "set_nx", ops.EncodeSetNXArgs([]byte(kvEmbedder), b, 0))
 	if err != nil {

@@ -744,36 +744,47 @@ func TestBootstrapToleratesConcurrentCreator(t *testing.T) {
 // TestBootstrapVerifiesWhenIdentityStaysMissing is the other side of that
 // tolerance: when none of the retries sees an identity, the session gives up
 // waiting and verifies its embedder against the collection instead of hanging.
-// An embedder that does not fit the collection is still refused.
+// The identity record is removed for real, so the outcome can only come from
+// that verification: an embedder that does not fit the collection is refused
+// and records nothing, and a matching one records its identity.
 func TestBootstrapVerifiesWhenIdentityStaysMissing(t *testing.T) {
+	ctx := context.Background()
 	st := newHeapStore(t)
-	first, err := NewServer(context.Background(), Config{Store: st})
+	first, err := NewServer(ctx, Config{Store: st})
 	if err != nil {
 		t.Fatalf("NewServer (first): %v", err)
 	}
-	if err := first.ensureMemory(context.Background()); err != nil {
+	if err := first.ensureMemory(ctx); err != nil {
 		t.Fatalf("first ensureMemory: %v", err)
 	}
-
-	// Hidden from the startup check, the bootstrap check and every retry.
-	const blind = 2 + identityReadAttempts
-	hidden := &hiddenIdentityStore{Store: st}
-	hidden.remaining.Store(blind)
-	second, err := NewServer(context.Background(), Config{Store: hidden})
-	if err != nil {
-		t.Fatalf("NewServer (second): %v", err)
-	}
-	if err := second.ensureMemory(context.Background()); err != nil {
-		t.Fatalf("a matching embedder must not be locked out: %v", err)
+	if _, err := st.Del(ctx, []byte(kvEmbedder)); err != nil {
+		t.Fatalf("removing the identity: %v", err)
 	}
 
-	hidden.remaining.Store(blind)
-	other, err := NewServer(context.Background(), Config{Store: hidden, Embedder: fakeEmbedder{}})
+	other, err := NewServer(ctx, Config{Store: st, Embedder: fakeEmbedder{}})
 	if err != nil {
 		t.Fatalf("NewServer (other): %v", err)
 	}
-	if err := other.ensureMemory(context.Background()); !errors.Is(err, ErrEmbedderMismatch) {
+	if err := other.ensureMemory(ctx); !errors.Is(err, ErrEmbedderMismatch) {
 		t.Fatalf("an embedder that does not fit the collection: err = %v, want ErrEmbedderMismatch", err)
+	}
+	if _, err := st.Get(ctx, []byte(kvEmbedder)); !errors.Is(err, rostam.ErrNotFound) {
+		t.Fatalf("a refused repair recorded an identity: err = %v, want not found", err)
+	}
+
+	second, err := NewServer(ctx, Config{Store: st})
+	if err != nil {
+		t.Fatalf("NewServer (second): %v", err)
+	}
+	if err := second.ensureMemory(ctx); err != nil {
+		t.Fatalf("a matching embedder must not be locked out: %v", err)
+	}
+	raw, err := st.Get(ctx, []byte(kvEmbedder))
+	if err != nil {
+		t.Fatalf("the repair recorded no identity: %v", err)
+	}
+	if err := second.matchStoredIdentity(raw); err != nil {
+		t.Fatalf("recorded identity does not match the repairing embedder: %v", err)
 	}
 }
 
@@ -975,5 +986,28 @@ func TestEmbedderIdentityMismatchFailsStartup(t *testing.T) {
 	// recognisable, and its own advice must name the env that selects it.
 	if !errors.Is(err, ErrEmbedderMismatch) || !strings.Contains(err.Error(), "ROSTAM_EMBED_") {
 		t.Fatalf("mismatch error must wrap ErrEmbedderMismatch and name ROSTAM_EMBED_*: %v", err)
+	}
+}
+
+// longModelEmbedder is fakeEmbedder with a model name far longer than any real one.
+type longModelEmbedder struct{ fakeEmbedder }
+
+func (longModelEmbedder) Model() string { return strings.Repeat("m", 8<<10) }
+
+// TestClaimIdentityRefusesOversizeRecord: the embedder identity is a few
+// hundred bytes; one past maxIdentityBytes is refused before anything is
+// written.
+func TestClaimIdentityRefusesOversizeRecord(t *testing.T) {
+	st := newHeapStore(t)
+	s, err := NewServer(context.Background(), Config{Store: st, Embedder: longModelEmbedder{}})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	err = s.claimIdentity(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "too long") {
+		t.Fatalf("claimIdentity with an oversize identity = %v, want a too-long error", err)
+	}
+	if _, gerr := st.Get(context.Background(), []byte(kvEmbedder)); !errors.Is(gerr, rostam.ErrNotFound) {
+		t.Fatalf("identity key after a refused claim: err = %v, want not found", gerr)
 	}
 }
