@@ -245,3 +245,100 @@ func TestDurableBulkBuildNoDeadlock(t *testing.T) {
 		})
 	}
 }
+
+// TestDurableBulkBuildRejectedOnPopulatedStaysWritable: a second bulk load on
+// a populated listed collection is refused before anything is placed
+// (ErrBuildNonEmpty). Nothing changed, so the log stays healthy: the next write
+// and a checkpoint succeed and survive a reopen.
+func TestDurableBulkBuildRejectedOnPopulatedStaysWritable(t *testing.T) {
+	dir := t.TempDir()
+	cs := openBulkStore(t, dir)
+	if err := cs.Upsert("bulk", 1, durableVec(1), "first", 0, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	stageThree(t, cs, "bulk")
+	if err := cs.BuildStaged("bulk", 1); !errors.Is(err, ErrBuildNonEmpty) {
+		t.Fatalf("BuildStaged on a populated collection = %v, want ErrBuildNonEmpty", err)
+	}
+	if err := cs.Upsert("bulk", 2, durableVec(2), "second", 0, nil, nil); err != nil {
+		t.Fatalf("a write after a rejected build = %v, want nil", err)
+	}
+	if err := cs.CheckpointDurable(); err != nil {
+		t.Fatalf("a checkpoint after a rejected build = %v, want nil", err)
+	}
+	if err := cs.Close(); err != nil {
+		t.Fatal(err)
+	}
+	re := openDurable(t, dir, "bulk")
+	defer func() { _ = re.Close() }()
+	assertPoints(t, pointsOf(t, re, "bulk"), map[uint64]string{1: "first", 2: "second"})
+}
+
+// TestDurableBulkBuildQuotaRejectionStaysWritable: a quota refusal comes before
+// placement too, on an empty collection, and leaves it writable.
+func TestDurableBulkBuildQuotaRejectionStaysWritable(t *testing.T) {
+	dir := t.TempDir()
+	cs := openDurable(t, dir, "bulk")
+	t.Cleanup(func() { _ = cs.Close() })
+	cfg := durablePersistentCfg()
+	cfg.MaxVectors = 2
+	if err := cs.CreateCollection("bulk", cfg); err != nil {
+		t.Fatal(err)
+	}
+	stageThree(t, cs, "bulk")
+	if err := cs.BuildStaged("bulk", 1); !errors.Is(err, ErrCollectionFull) {
+		t.Fatalf("BuildStaged over quota = %v, want ErrCollectionFull", err)
+	}
+	if err := cs.Upsert("bulk", 9, durableVec(9), "x", 0, nil, nil); err != nil {
+		t.Fatalf("a write after a quota-rejected build = %v, want nil", err)
+	}
+}
+
+// setBuildStagedFn replaces the build BuildStaged runs. Tests only.
+func setBuildStagedFn(t *testing.T, fn func(c *Collection, workers int) (bool, error)) {
+	t.Helper()
+	prev := buildStagedFn
+	buildStagedFn = fn
+	t.Cleanup(func() { buildStagedFn = prev })
+}
+
+// TestDurableBulkBuildFailureAfterPlacementPoisons: a build on an empty listed
+// collection that places points and then fails, or panics, leaves memory
+// ahead of every file; later writes are refused.
+func TestDurableBulkBuildFailureAfterPlacementPoisons(t *testing.T) {
+	for _, panics := range []bool{false, true} {
+		name := "error"
+		if panics {
+			name = "panic"
+		}
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			cs := openBulkStore(t, dir)
+			t.Cleanup(func() { _ = cs.Close() })
+			stageThree(t, cs, "bulk")
+			setBuildStagedFn(t, func(c *Collection, workers int) (bool, error) {
+				if _, err := c.buildStaged(workers); err != nil {
+					return true, err
+				}
+				if panics {
+					panic("injected: build panics after placement")
+				}
+				return true, errors.New("injected: build fails after placement")
+			})
+			func() {
+				defer func() {
+					r := recover()
+					if panics && r == nil {
+						t.Fatal("the injected panic did not propagate")
+					}
+				}()
+				if err := cs.BuildStaged("bulk", 1); err == nil {
+					t.Fatal("BuildStaged succeeded although the build failed")
+				}
+			}()
+			if err := cs.Upsert("bulk", 9, durableVec(9), "x", 0, nil, nil); !errors.Is(err, ErrWALPoisoned) {
+				t.Fatalf("a write after a build that failed after placement = %v, want ErrWALPoisoned", err)
+			}
+		})
+	}
+}

@@ -1784,16 +1784,23 @@ func (s *CollectionStore) StageBulkPayloads(name string, ids []uint64, vecs [][]
 // only.
 var buildStagedHook func()
 
+// buildStagedFn is the build BuildStaged runs on a listed durable collection.
+// A variable so tests can make it fail or panic after placing points.
+var buildStagedFn = (*Collection).buildStaged
+
 // BuildStaged builds the named collection's staged vectors in one concurrent
 // pass (see Collection.BuildStaged). The collection must be empty.
 //
 // A build writes no log record. On a listed durable collection with a log the
 // build and a checkpoint of it run under opMu, so no write is logged, or
 // acknowledged, on top of a build that only memory holds: a write that arrives
-// meanwhile waits and is logged after the checkpoint. If the checkpoint fails,
-// or a build fails after it may have placed points, the log is poisoned before
-// opMu is released: every later write is refused until a restart, so nothing
-// is acknowledged that depends on the unlogged build. The restart opens the
+// meanwhile waits and is logged after the checkpoint. The log is poisoned
+// before opMu is released when the checkpoint fails, and when the build fails
+// or panics (or the checkpoint panics) after it found the index empty and left
+// it holding points: every later write is then refused until a restart, so
+// nothing is acknowledged that depends on the unlogged build. A build refused
+// before it changed anything (ErrBuildNonEmpty on a populated collection, a
+// quota refusal on an empty one) leaves the log healthy. The restart opens the
 // last checkpoint and the log, which hold the build only if its snapshot was
 // written before the failure. Nothing staged means no build and no checkpoint.
 func (s *CollectionStore) BuildStaged(name string, workers int) error {
@@ -1815,14 +1822,25 @@ func (s *CollectionStore) BuildStaged(name string, workers int) error {
 	if err := c.wal.refuseWrite(); err != nil {
 		return err
 	}
-	built, err := c.buildStaged(workers)
-	if err != nil {
-		if st := c.idx.Stats(); st.Size+st.Tombstoned > 0 {
-			c.wal.poisoned.Store(true) // memory may hold points no file has
+	// Emptiness before the build, read under opMu so no logged writer can change
+	// it. A build only ever starts from empty, so a failure leaves memory ahead
+	// of every file exactly when it found the index empty and left it not.
+	occupied := func() bool { st := c.idx.Stats(); return st.Size+st.Tombstoned > 0 }
+	wasEmpty := !occupied()
+	durable := false
+	defer func() {
+		// Also on a panic in the build or the checkpoint (the TCP dispatcher
+		// recovers it, and the deferred Unlock above releases opMu).
+		if !durable && wasEmpty && occupied() {
+			c.wal.poisoned.Store(true)
 		}
+	}()
+	built, err := buildStagedFn(c, workers)
+	if err != nil {
 		return err
 	}
 	if !built {
+		durable = true
 		return nil
 	}
 	if buildStagedHook != nil {
@@ -1832,6 +1850,7 @@ func (s *CollectionStore) BuildStaged(name string, workers int) error {
 		c.wal.poisoned.Store(true)
 		return fmt.Errorf("vector: the bulk build of %q could not be made durable, so the collection refuses writes until a restart, after which the build may be missing: %w", name, err)
 	}
+	durable = true
 	return nil
 }
 
