@@ -177,9 +177,13 @@ at the price of a disk sync per change. The rules are the same as for plain
   the new daemon first starts. If that fails, the daemon still runs and logs a
   `not crash-safe` warning: in `~/.rostam/memory/daemon.log` when
   `mcp -autostart` started the daemon, on stderr when you ran `memory-daemon`
-  yourself. The conversion happens before the daemon answers, so a session may
-  give up with "did not become ready" while it is still running; start another
-  session once it has finished. A session started while it is still running can
+  yourself. The conversion happens before the daemon answers; a session waits
+  for it (up to 10 minutes), because the daemon records when it has started
+  serving and until then counts as starting. A daemon that was ready and stops
+  answering, or one from an earlier build, gets the usual 5-second wait. If a
+  conversion cannot tell which form the store is in afterwards, the daemon
+  serves memory read-only: see
+  [Upgrading an existing store](mcp.md#upgrading-an-existing-store). A session started while it is still running can
   add this error to `daemon.log`, which is expected, because the first daemon
   holds the data directory: `memory-daemon: another process (a running memory
   daemon or an embedded mcp) already holds <data directory>: data directory is

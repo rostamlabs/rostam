@@ -118,9 +118,16 @@ goes to stderr. A shared daemon that `mcp -autostart` started has it in
 `~/.rostam/memory/daemon.log`; a `memory-daemon` you started yourself writes it
 to its own stderr. If a conversion was interrupted and the new snapshot cannot
 be loaded, the store fails to open instead of falling back to the old files.
-It also fails to open, keeping every file, when a conversion cannot tell which
-form the collection is in afterwards: the new manifest could not be written,
-and the old one could not be read back or put back.
+
+Two double failures leave it unknown which form the next start will load:
+writing the new manifest fails and the old one can be neither read back nor
+put back, or the new form does not load and the old manifest cannot be put
+back. In both, the store opens and serves memory **read-only** from the old
+form: `recall` and the other reads work, while `remember` and `forget` fail
+with an error that says memory is read-only and to fix the disk problem and
+restart (`forget` reports it per memory). Nothing is flushed or removed, at
+shutdown included, and every file is kept, so the next start, once the disk
+is fixed, finishes the job or fails with an error naming the file.
 
 ### A damaged log
 

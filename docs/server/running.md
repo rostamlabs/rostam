@@ -130,9 +130,13 @@ and collections that are not listed behave as before.
   retrying does not help. If the upgrade fails, the server still starts, the
   collection keeps its old form, a warning says it is not crash-safe, and the
   next start tries again. The exception is an upgrade that cannot tell which
-  form the collection is in afterwards (its manifest could not be read back or
-  put back): then the server does not start, the error names the manifest, and
-  every file is kept.
+  form the collection is in afterwards (writing the new manifest failed and the
+  old one could not be read back or put back, or the new form did not load and
+  the old manifest could not be put back): then the server starts and serves
+  that collection read-only from its old form. Reads and backups work; every
+  write, delete, payload change, bulk build, flush, checkpoint, drop, restore
+  over it and cold-tier eviction is refused with an error saying what happened
+  and to fix the disk problem and restart (HTTP 409); every file is kept.
 - A listed collection that already has a log is synced the same way from startup
   on, even if it was created with `WALNoSync`.
 - A listed collection that already exists with neither `Persistent` nor a log

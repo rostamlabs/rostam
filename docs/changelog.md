@@ -32,8 +32,10 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   with a warning, until a later start succeeds) and one that already has a log.
   A listed collection that already exists with neither `Persistent` nor a log
   keeps its mode, with a warning. Only an HNSW collection is converted. A
-  conversion that cannot tell which form the collection is in afterwards stops
-  the start and keeps every file. Empty by default; needs a data directory to keep anything
+  conversion that cannot tell which form the collection is in afterwards
+  leaves it read-only (reads work, every change is refused with an error
+  saying to fix the disk and restart, and every file is kept). Empty by
+  default; needs a data directory to keep anything
   across a restart; ignored with `-cluster`.
   See [Running a server](server/running.md).
 - **Breaking: a damaged write-ahead log now stops the open.** This applies to
@@ -49,11 +51,18 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   no offset and truncating is not the remedy: run the newer release.
   See [A damaged log](server/mcp.md#a-damaged-log).
 - **Snapshots wait for pending log syncs.** A backup, checkpoint or cold-tier
-  eviction of a collection with a write-ahead log waits until every write
-  already applied is synced, and refuses if that sync fails. A cold-tier
-  eviction of a collection that is used while it uploads leaves it resident
-  (the idle sweep tries again later) instead of retiring it with the write.
-  A multi-vector document whose log record would exceed 64 MiB is refused.
+  eviction of a collection whose write-ahead log syncs before acknowledging
+  waits until every write already applied is synced, and refuses if that sync
+  fails, so it holds only writes whose records are on disk. (An unsynced
+  `WALNoSync` log promises no sync; there it holds the writes whose records
+  were written.)
+- **A cold-tier eviction of a collection in use leaves it resident.** If the
+  collection is used while its snapshot uploads, the eviction gives up (HTTP
+  409 on the admin route), removes what it uploaded, and the idle sweep tries
+  again later, instead of retiring the collection with the write.
+- **A multi-vector document whose log record would exceed 64 MiB is
+  refused** before it is applied, instead of being acknowledged and dropped
+  when the log is next replayed.
 - **A failed log write stops further writes.** After a write or a disk sync of
   a write-ahead log fails (a full disk, for example), the collection refuses
   every write, before applying it, until the process restarts. A snapshot
