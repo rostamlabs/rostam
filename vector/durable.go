@@ -59,16 +59,28 @@ func (s *CollectionStore) isDurable(canonical string) bool {
 	return ok
 }
 
-// warnNotDurable warns, when canonical is listed as durable, that this
-// collection does not get the synced write-ahead log: kind says what it is (a
-// named-vector or multi-vector collection, or a dense one on a store with no
-// data directory, whose files are removed at Close). Called at create and at
-// open, so a listed name is never left unprotected silently.
+// warnNotDurable warns, when canonical is listed as durable, that this dense
+// collection does not get the synced write-ahead log: kind says why (a store
+// with no data directory, whose files are removed at Close, or one already on
+// disk in a form the open does not convert). Called at create and at open, so a
+// listed name is never left unprotected silently.
 func (s *CollectionStore) warnNotDurable(canonical, kind string) {
 	if !s.isDurable(canonical) {
 		return
 	}
 	slog.Warn("vector: durable collection is not crash-safe: only a dense collection in a store with a data directory runs with the synced write-ahead log",
+		"collection", canonical, "kind", kind)
+}
+
+// warnDurableNotApplied warns, when canonical is listed as durable, that the
+// option does not apply to its family (a named-vector or multi-vector
+// collection): it keeps the write-ahead log settings it was created with, which
+// may or may not sync before acknowledging.
+func (s *CollectionStore) warnDurableNotApplied(canonical, kind string) {
+	if !s.isDurable(canonical) {
+		return
+	}
+	slog.Warn("vector: the durable-collections option does not apply to this collection: it keeps the write-ahead log settings it was created with",
 		"collection", canonical, "kind", kind)
 }
 
@@ -149,18 +161,25 @@ func (s *CollectionStore) CheckpointDurable() error {
 }
 
 // syncDurableWAL is run at open for a listed collection whose manifest already
-// says WAL. A manifest that asked for an unsynced log is rewritten to a synced
-// one; a failed rewrite only warns, because the returned config, which the log
-// is opened with, syncs regardless.
-func (s *CollectionStore) syncDurableWAL(canonical string, cfg Config, cfgPath string) Config {
-	if cfg.WALNoSync {
-		cfg.WALNoSync = false
-		if err := writeConfig(cfgPath, cfg); err != nil {
-			slog.Warn("vector: rewriting a durable collection's manifest to a synced log failed; its log syncs anyway",
-				"collection", canonical, "manifest", cfgPath, "err", err)
-		}
+// says WAL: the returned config, which the log is opened with, syncs. It
+// reports whether the manifest asked for an unsynced log; the caller rewrites
+// it (rewriteSyncedManifest) only once the collection has loaded, so an open
+// that refuses leaves the manifest as it found it.
+func syncDurableWAL(cfg Config) (Config, bool) {
+	if !cfg.WALNoSync {
+		return cfg, false
 	}
-	return cfg
+	cfg.WALNoSync = false
+	return cfg, true
+}
+
+// rewriteSyncedManifest rewrites a listed collection's manifest to a synced
+// log. A failure only warns: the log syncs regardless.
+func rewriteSyncedManifest(canonical string, cfg Config, cfgPath string) {
+	if err := writeConfig(cfgPath, cfg); err != nil {
+		slog.Warn("vector: rewriting a durable collection's manifest to a synced log failed; its log syncs anyway",
+			"collection", canonical, "manifest", cfgPath, "err", err)
+	}
 }
 
 // removeMappedLeftovers removes, best effort, the mapped files and sidecar of a
@@ -202,9 +221,12 @@ func upgradeStep(step string) error {
 // loaded beside the old one, and only once it has loaded is the old one closed
 // and replaced. If it does not load, the old manifest is put back.
 //
-// No failure here fails the open: every one leaves the old form registered and
-// working, warns that the collection is not crash-safe, and the next open tries
-// again. The return value is always nil; it is kept for the caller's shape.
+// A failure here leaves the old form registered and working, warns that the
+// collection is not crash-safe, and the next open tries again, as long as the
+// manifest is known to name the old form. When it is not (it could not be read
+// back or put back), an error fails the open and every file is kept: serving
+// the old form would accept writes that the next open, loading the log form,
+// would not see.
 func (s *CollectionStore) upgradeToDurable(canonical string, cfg Config, cfgPath, snapPath string) error {
 	old := s.collections[canonical]
 	walCfg := s.durableConfig(canonical, cfg)
@@ -217,19 +239,18 @@ func (s *CollectionStore) upgradeToDurable(canonical string, cfg Config, cfgPath
 			_ = os.Remove(snapPath)
 			slog.Warn("vector: durable collection is not crash-safe: upgrading it to the write-ahead log failed, so it stays in its old form until a later open succeeds",
 				"collection", canonical, "err", res.err)
-		} else {
-			// The snapshot is kept: the manifest may name the log form, and then
-			// the snapshot is the collection.
-			slog.Error("vector: durable collection is not crash-safe, and its manifest could not be read back or put back after a failed upgrade: it stays in its old form for now, but the next open may load the write-ahead log form instead and miss what is written until then",
-				"collection", canonical, "manifest", cfgPath, "err", res.err)
+			return nil
 		}
-		return nil
+		// The manifest could not be read back or put back, so nothing says
+		// which form the next open loads. Serving the old form would accept
+		// writes that open may not see, so the open fails and every file stays.
+		return fmt.Errorf("vector: open %s: upgrading it to the write-ahead log failed and its manifest %s could not be read back or put back, so which form it is in is unknown; nothing was removed: %w",
+			canonical, cfgPath, res.err)
 	}
 
 	nc, err := s.buildWALCollection(canonical, walCfg, cfgPath, snapPath)
 	if err != nil {
-		s.rollbackUpgrade(canonical, cfg, cfgPath, snapPath, err)
-		return nil
+		return s.rollbackUpgrade(canonical, cfg, cfgPath, snapPath, err)
 	}
 	s.collections[canonical] = nc
 	if cerr := old.Close(); cerr != nil {
@@ -247,18 +268,22 @@ func (s *CollectionStore) upgradeToDurable(canonical string, cfg Config, cfgPath
 
 // rollbackUpgrade runs when the log form of a just-committed upgrade does not
 // load. The old manifest is put back, atomically, and the snapshot and the log
-// the load may have created are removed; the old form, still open, stays.
-func (s *CollectionStore) rollbackUpgrade(canonical string, cfg Config, cfgPath, snapPath string, loadErr error) {
+// the load may have created are removed; the old form, still open, stays, and
+// nil is returned. If the old manifest cannot be put back, the manifest names
+// the log form, which the next open loads: serving the old form now would
+// accept writes that open does not see. Then nothing is removed and the error
+// fails the open.
+func (s *CollectionStore) rollbackUpgrade(canonical string, cfg Config, cfgPath, snapPath string, loadErr error) error {
 	if werr := writeConfig(cfgPath, cfg); werr != nil {
-		slog.Error("vector: durable collection is not crash-safe: its upgraded form did not load and the old manifest could not be put back; it stays in its old form for now, but the next open loads the write-ahead log form and may fail",
-			"collection", canonical, "manifest", cfgPath, "err", loadErr, "rollback_err", werr)
-		return
+		return fmt.Errorf("vector: open %s: its upgraded write-ahead log form did not load (%w), and the old manifest could not be put back over %s (%v); nothing was removed, and the files of its old form are still there",
+			canonical, loadErr, cfgPath, werr)
 	}
 	_, _, _, walPath := s.persistPaths(canonical)
 	_ = os.Remove(snapPath)
 	_ = os.Remove(walPath)
 	slog.Warn("vector: durable collection is not crash-safe: its upgraded form did not load, so the old manifest was put back and it stays in its old form until a later open succeeds",
 		"collection", canonical, "err", loadErr)
+	return nil
 }
 
 // keepOrphanSnapshot handles a listed collection whose Persistent manifest has
@@ -457,8 +482,10 @@ func copyLivePoints(src *hnsw, dst *Collection) (err error) {
 			err = fmt.Errorf("vector: reading the stored points: %v", r)
 		}
 	}()
-	return src.forEachLive(func(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64) error {
-		if err := dst.RestoreInsert(id, vec, ttl, meta, sparse, keyExpires, version); err != nil {
+	return src.forEachLive(func(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64, nowMs int64) error {
+		// Restored against the clock the TTL was measured on, so the deadline
+		// is the source's, however long the copy takes.
+		if err := dst.RestoreInsertAt(id, vec, ttl, meta, sparse, keyExpires, version, nowMs); err != nil {
 			return fmt.Errorf("vector: copying point %d: %w", id, err)
 		}
 		return nil
@@ -467,11 +494,11 @@ func copyLivePoints(src *hnsw, dst *Collection) (err error) {
 
 // forEachLive calls fn, in slot order, for every point that is neither deleted
 // nor expired, with copies the caller owns: the stored vector, the remaining
-// point TTL (0 = none), the metadata, the sparse vector, the per-key deadlines
-// and the version. It never reads graph edges. It stops at fn's first error. A
+// point TTL (0 = none), the metadata, the sparse vector, the per-key deadlines,
+// the version, and the clock (unix millis) the TTL was measured against. It never reads graph edges. It stops at fn's first error. A
 // point whose slot lies outside the stored data, or whose vector cannot be read,
 // is an error.
-func (h *hnsw) forEachLive(fn func(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64) error) error {
+func (h *hnsw) forEachLive(fn func(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64, nowMs int64) error) error {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	if h.arena.poisoned.Load() {
@@ -508,7 +535,7 @@ func (h *hnsw) forEachLive(fn func(id uint64, vec []float32, ttl time.Duration, 
 			sparse = sv.Clone()
 		}
 		if err := fn(p.id, append([]float32(nil), stored...), ttl, cloneMeta(h.arena.Metadata(p.slot)),
-			sparse, maps.Clone(h.arena.KeyExpires(p.slot)), h.arena.Version(p.slot)); err != nil {
+			sparse, maps.Clone(h.arena.KeyExpires(p.slot)), h.arena.Version(p.slot), int64(now)); err != nil { //nolint:gosec // unix millis fit
 			return err
 		}
 	}

@@ -85,7 +85,7 @@ func (s *CollectionStore) CreateNamedConfig(name string, cfg NamedConfig) error 
 	if verr := validateNamedVectors(cfg.Spaces); verr != nil {
 		return verr
 	}
-	s.warnNotDurable(canonical, "named-vector collection")
+	s.warnDurableNotApplied(canonical, "named-vector collection")
 	// Cluster mode: Raft/SnapshotAll is the durability authority — never enable a
 	// single-node WAL (mirror dense effectiveClusterConfig forcing WAL=false). DO
 	// NOT touch the cluster snapshot/Raft path.
@@ -148,7 +148,7 @@ func (s *CollectionStore) loadNamed(canonical, cfgPath string) error {
 	if err != nil {
 		return fmt.Errorf("vector: load named %s: %w", canonical, err)
 	}
-	s.warnNotDurable(canonical, "named-vector collection")
+	s.warnDurableNotApplied(canonical, "named-vector collection")
 	nc, err := NewNamedCollection(canonical, cfg.Spaces)
 	if err != nil {
 		return fmt.Errorf("vector: rebuild named %s: %w", canonical, err)

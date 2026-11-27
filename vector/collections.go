@@ -167,6 +167,27 @@ func OpenCollectionStoreWith(dir string, opts StoreOptions) (store *CollectionSt
 		return nil, fmt.Errorf("vector: mkdir %s: %w", vd, err)
 	}
 	s := &CollectionStore{dir: dir, ephemeralDir: ephemeral, persistentCluster: persistentCluster, durable: durable, collections: make(map[string]*Collection), multi: make(map[string]*MultiVectorIndex), named: make(map[string]*NamedCollection)}
+	// A failed open returns no store, so the collections loaded before the
+	// failure are closed here. Close only releases their handles and mappings:
+	// it writes no checkpoint and removes no file. Deferred after the heap-mode
+	// RemoveAll, so it runs before it.
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		for _, c := range s.collections {
+			c.Stop()
+			_ = c.Close()
+		}
+		for _, mv := range s.multi {
+			mv.Stop()
+			_ = mv.Close()
+		}
+		for _, nc := range s.named {
+			nc.Stop()
+			_ = nc.Close()
+		}
+	}()
 
 	// Cluster-persistent: the mmap files are a non-authoritative cache. Wipe any
 	// left by a prior process so Raft (FSM.Restore + log replay) is the single
@@ -316,6 +337,9 @@ func (s *CollectionStore) loadCollection(canonical, cfgPath, snapPath string) er
 		return nil
 	}
 
+	// Neither Persistent nor a log: a listed collection keeps this mode (there
+	// is nothing on disk but a snapshot taken at a flush), and says so.
+	s.warnNotDurable(canonical, "dense collection on disk with neither Persistent nor a write-ahead log, which an open does not convert")
 	c, err := NewCollection(canonical, cfg)
 	if err != nil {
 		return fmt.Errorf("vector: rebuild %s: %w", canonical, err)
@@ -355,8 +379,9 @@ func (s *CollectionStore) loadWALCollection(canonical string, cfg Config, cfgPat
 // buildWALCollection is loadWALCollection without registering the collection
 // or removing any file.
 func (s *CollectionStore) buildWALCollection(canonical string, cfg Config, cfgPath, snapPath string) (*Collection, error) {
+	rewrite := false
 	if s.isDurable(canonical) {
-		cfg = s.syncDurableWAL(canonical, cfg, cfgPath)
+		cfg, rewrite = syncDurableWAL(cfg)
 	}
 	eff := s.effectiveConfig(canonical, cfg)
 	c, nerr := NewCollection(canonical, eff)
@@ -396,6 +421,9 @@ func (s *CollectionStore) buildWALCollection(canonical string, cfg Config, cfgPa
 		return nil, fmt.Errorf("vector: wal open %s: %w", canonical, werr)
 	}
 	c.wal = w
+	if rewrite {
+		rewriteSyncedManifest(canonical, cfg, cfgPath)
+	}
 	if s.isDurable(canonical) {
 		s.checkpointLargeLog(canonical, walPath, c)
 	}

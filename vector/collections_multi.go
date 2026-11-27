@@ -115,7 +115,7 @@ func (s *CollectionStore) CreateMultiVector(name string, cfg MultiVectorConfig) 
 	if err != nil {
 		return err
 	}
-	s.warnNotDurable(canonical, "multi-vector collection")
+	s.warnDurableNotApplied(canonical, "multi-vector collection")
 	defer s.lockName(canonical)()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -187,7 +187,7 @@ func (s *CollectionStore) loadMultiVector(canonical, cfgPath string) error {
 	if err != nil {
 		return fmt.Errorf("vector: load multi-vector %s: %w", canonical, err)
 	}
-	s.warnNotDurable(canonical, "multi-vector collection")
+	s.warnDurableNotApplied(canonical, "multi-vector collection")
 
 	// Cluster-persistent: data files were wiped at open; build an empty
 	// mmap-backed index (current generation) and let Raft repopulate it. No

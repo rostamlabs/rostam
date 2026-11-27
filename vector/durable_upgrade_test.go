@@ -705,26 +705,118 @@ func TestUpgradeCommittedButUnloadableRollsBack(t *testing.T) {
 	assertLegacyPoints(t, cs, want, true)
 }
 
-// If putting the old manifest back fails too, the store still opens in the old
-// form and the warning names that case.
-func TestUpgradeRollbackFailureStillOpens(t *testing.T) {
+// If putting the old manifest back fails too, the manifest names the log form
+// while the open would serve the old one, whose writes the next open (which
+// loads the log form) would not see. So the open fails, naming the manifest,
+// and every file is kept. The next open loads the log form, whose snapshot here
+// does not restore, and fails too: the outcome is a refusal, never a silent
+// fallback, and the old form's files stay for manual recovery.
+func TestUpgradeRollbackFailureFailsOpen(t *testing.T) {
 	dir := t.TempDir()
-	want := writeLegacyStore(t, dir)
-	logs := captureLogs(t)
+	writeLegacyStore(t, dir)
+	blocker := colFile(dir, ".json.tmp")
 	setUpgradeHook(t, func(s string) error {
 		if s == "manifest" {
-			if err := os.Mkdir(colFile(dir, ".json.tmp"), 0o750); err != nil {
+			if err := os.Mkdir(blocker, 0o750); err != nil {
 				return err
 			}
 			return os.WriteFile(colFile(dir, ".snap"), []byte("not a snapshot"), 0o600)
 		}
 		return nil
 	})
-	cs := openDurable(t, dir, upgradeCol)
-	defer func() { _ = cs.Close() }()
-	assertLegacyPoints(t, cs, want, true)
-	if !strings.Contains(logs.String(), "could not be put back") {
-		t.Fatalf("log = %q, want the rollback failure named", logs.String())
+	cs, err := OpenCollectionStoreWith(dir, StoreOptions{DurableCollections: []string{upgradeCol}})
+	if err == nil {
+		_ = cs.Close()
+		t.Fatal("open succeeded with the old form while the manifest names the log form")
+	}
+	if !strings.Contains(err.Error(), "could not be put back") {
+		t.Fatalf("err = %v, want the failed rollback named", err)
+	}
+	for _, p := range append(mappedFiles(dir), colFile(dir, ".snap")) {
+		if _, serr := os.Stat(p); serr != nil {
+			t.Fatalf("%s removed by a failed open: %v", p, serr)
+		}
+	}
+	upgradeStepHook = nil
+	if err := os.Remove(blocker); err != nil {
+		t.Fatal(err)
+	}
+	if cs, err := OpenCollectionStoreWith(dir, StoreOptions{DurableCollections: []string{upgradeCol}}); err == nil {
+		_ = cs.Close()
+		t.Fatal("reopen succeeded over an unloadable snapshot")
+	}
+	for _, p := range mappedFiles(dir) {
+		if _, serr := os.Stat(p); serr != nil {
+			t.Fatalf("%s removed by a failed reopen: %v", p, serr)
+		}
+	}
+}
+
+// When writing the log-form manifest fails, it cannot be read back and the old
+// one cannot be put back, nothing says which form the next open loads. The open
+// fails and the files are kept.
+func TestUpgradeUnknownManifestFailsOpen(t *testing.T) {
+	dir := t.TempDir()
+	writeLegacyStore(t, dir)
+	setUpgradeHook(t, func(s string) error {
+		if s == "manifest" {
+			if err := os.WriteFile(colFile(dir, ".json"), []byte("{torn"), 0o600); err != nil {
+				return err
+			}
+			if err := os.Mkdir(colFile(dir, ".json.tmp"), 0o750); err != nil {
+				return err
+			}
+			return errors.New("injected")
+		}
+		return nil
+	})
+	cs, err := OpenCollectionStoreWith(dir, StoreOptions{DurableCollections: []string{upgradeCol}})
+	if err == nil {
+		_ = cs.Close()
+		t.Fatal("open succeeded while the manifest's form is unknown")
+	}
+	for _, p := range append(mappedFiles(dir), colFile(dir, ".snap")) {
+		if _, serr := os.Stat(p); serr != nil {
+			t.Fatalf("%s removed by a failed open: %v", p, serr)
+		}
+	}
+}
+
+// TestUpgradeKeepsAbsoluteTTLDeadline: the copy keeps each point's absolute
+// expiry. It used to restore the remaining TTL against the clock at the time
+// of the copy, so a point copied later lived longer than its source.
+func TestUpgradeKeepsAbsoluteTTLDeadline(t *testing.T) {
+	src, err := NewCollection(upgradeCol, func() Config { c := legacyCfg(); c.Persistent = false; return c }())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = src.Close() }()
+	if err := src.Insert(1, durableVecDim(1), time.Hour, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	h := src.idx.(*hnsw)
+	slot, _ := h.arena.Slot(1)
+	want := h.arena.ExpiresAt(slot)
+
+	dstCfg := legacyCfg()
+	dstCfg.Persistent = false
+	dst, err := NewCollection(upgradeCol, dstCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = dst.Close() }()
+	// The copy's clock runs 5 s behind the restore's: a deadline recomputed from
+	// the remaining TTL would come out 5 s late.
+	base := time.Now().UnixMilli()
+	h.now = func() int64 { return base }
+	dst.SetNowFunc(func() int64 { return base + 5000 })
+	if err := copyLivePoints(h, dst); err != nil {
+		t.Fatal(err)
+	}
+	dh := dst.idx.(*hnsw)
+	dslot, _ := dh.arena.Slot(1)
+	if got := dh.arena.ExpiresAt(dslot); got != want {
+		t.Fatalf("copied deadline = %d, want the source's %d", got, want)
 	}
 }
 
