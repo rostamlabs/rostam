@@ -19,24 +19,29 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   not claimed as tested.
   An existing store is converted in place at the first start; if that fails it
   opens in its old form with a `not crash-safe` warning and the next start tries
-  again. The memory collection is now held in RAM. `mcp -autostart` replaces a
-  running daemon from an earlier build, without durable memory, by stopping it
-  cleanly and starting a new one. Over `mcp -connect`, start the server with
+  again, which can fail the same way. A conversion that cannot tell which form
+  it left serves memory read-only instead. The memory collection is now held
+  in RAM. `mcp -autostart` replaces a running daemon from an earlier build,
+  without durable memory, by stopping it cleanly and starting a new one. Over `mcp -connect`, start the server with
   `-durable-collections mcp_memory`. `-data ""` stays non-durable.
   See [What survives a crash](server/mcp.md#what-survives-a-crash).
 - **`-durable-collections` and `DirectConfig.DurableCollections`.** A
   single-node server, or an embedded store, can name dense vector collections to
-  run with a write-ahead log, synced before each write is acknowledged. This
+  run with a write-ahead log, synced before each write is acknowledged (a bulk
+  build, which has no log record, is checkpointed before it returns). This
   covers a listed collection created or restored while listed, an existing
   `Persistent` one (converted at startup; if that fails it keeps its old form,
-  with a warning, until a later start succeeds) and one that already has a log.
-  A listed collection that already exists with neither `Persistent` nor a log
+  with a warning, and each later start tries again) and one that already has a
+  log. A listed collection that already exists with neither `Persistent` nor a log
   keeps its mode, with a warning. Only an HNSW collection is converted. A
-  conversion that cannot tell which form the collection is in afterwards
+  conversion that cannot tell which form the collection is in afterward
   leaves it read-only (reads work, every change is refused with an error
-  saying to fix the disk and restart, and every file is kept). Empty by
-  default; needs a data directory to keep anything
-  across a restart; ignored with `-cluster`.
+  saying to fix the disk and restart, and every file is kept). The restart
+  tries again: it may finish the conversion, leave the collection read-only or
+  in its old form with a warning, or, if what is on disk still cannot be
+  loaded, refuse to open with every file kept for manual recovery. Empty by
+  default; needs a data directory to keep anything across a restart; ignored
+  with `-cluster`.
   See [Running a server](server/running.md).
 - **Breaking: a damaged write-ahead log now stops the open.** This applies to
   every collection with a write-ahead log (dense, multi-vector and named).
