@@ -1779,14 +1779,23 @@ func (s *CollectionStore) StageBulkPayloads(name string, ids []uint64, vecs [][]
 	return c.StageBulkPayloads(ids, vecs, metas)
 }
 
+// buildStagedHook, when non-nil, runs in BuildStaged on a listed durable
+// collection after the build and before its checkpoint, with opMu held. Tests
+// only.
+var buildStagedHook func()
+
 // BuildStaged builds the named collection's staged vectors in one concurrent
 // pass (see Collection.BuildStaged). The collection must be empty.
 //
-// A build writes no log record. On a listed durable collection with a log, a
-// successful build is therefore checkpointed before this returns, so a crash
-// after the call cannot lose it. If that checkpoint fails the build stays in
-// memory, the error is returned, and it becomes durable at the next checkpoint
-// that succeeds.
+// A build writes no log record. On a listed durable collection with a log the
+// build and a checkpoint of it run under opMu, so no write is logged, or
+// acknowledged, on top of a build that only memory holds: a write that arrives
+// meanwhile waits and is logged after the checkpoint. If the checkpoint fails,
+// or a build fails after it may have placed points, the log is poisoned before
+// opMu is released: every later write is refused until a restart, so nothing
+// is acknowledged that depends on the unlogged build. The restart opens the
+// last checkpoint and the log, which hold the build only if its snapshot was
+// written before the failure. Nothing staged means no build and no checkpoint.
 func (s *CollectionStore) BuildStaged(name string, workers int) error {
 	c, ok := s.Acquire(name)
 	if !ok {
@@ -1794,14 +1803,34 @@ func (s *CollectionStore) BuildStaged(name string, workers int) error {
 	}
 	defer c.Release()
 	canonical, _ := canonicalName(name) // Acquire found it, so the name is valid
-	if err := c.BuildStaged(workers); err != nil {
+	if s.ephemeralDir || !s.isDurable(canonical) || !c.cfg.WAL || c.wal == nil {
+		return c.BuildStaged(workers)
+	}
+	if err := c.refuseReadOnly(); err != nil {
 		return err
 	}
-	if s.ephemeralDir || !s.isDurable(canonical) || !c.cfg.WAL || c.wal == nil {
+	// opMu before the index lock the build takes, the order every writer uses.
+	c.opMu.Lock()
+	defer c.opMu.Unlock()
+	if err := c.wal.refuseWrite(); err != nil {
+		return err
+	}
+	built, err := c.buildStaged(workers)
+	if err != nil {
+		if st := c.idx.Stats(); st.Size+st.Tombstoned > 0 {
+			c.wal.poisoned.Store(true) // memory may hold points no file has
+		}
+		return err
+	}
+	if !built {
 		return nil
 	}
-	if err := s.checkpoint(canonical, c); err != nil {
-		return fmt.Errorf("vector: the bulk build of %q is applied but could not be made durable: %w", name, err)
+	if buildStagedHook != nil {
+		buildStagedHook()
+	}
+	if err := s.checkpointLocked(canonical, c); err != nil {
+		c.wal.poisoned.Store(true)
+		return fmt.Errorf("vector: the bulk build of %q could not be made durable, so the collection refuses writes until a restart, after which the build may be missing: %w", name, err)
 	}
 	return nil
 }

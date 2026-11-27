@@ -3,9 +3,16 @@
 package vector
 
 import (
+	"bytes"
+	"context"
+	"errors"
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
+
+	"github.com/rostamlabs/rostam/objstore"
 )
 
 // TestDurableBulkBuildSurvivesACrash: a bulk build writes no log record, so on a
@@ -44,5 +51,197 @@ func TestDurableBulkBuildSurvivesACrash(t *testing.T) {
 	}
 	if _, m, _, _, _, _ := c.Get(3); !reflect.DeepEqual(m["k"], NewInt(3)) {
 		t.Fatalf("payload of point 3 after reopen = %v, want k=3", m)
+	}
+}
+
+func stageThree(t *testing.T, cs *CollectionStore, col string) {
+	t.Helper()
+	ids := []uint64{1, 2, 3}
+	vecs := [][]float32{durableVec(1), durableVec(2), durableVec(3)}
+	if err := cs.StageBulk(col, ids, vecs); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func setBuildStagedHook(t *testing.T, fn func()) {
+	t.Helper()
+	buildStagedHook = fn
+	t.Cleanup(func() { buildStagedHook = nil })
+}
+
+func openBulkStore(t *testing.T, dir string) *CollectionStore {
+	t.Helper()
+	cs := openDurable(t, dir, "bulk")
+	if err := cs.CreateCollection("bulk", durablePersistentCfg()); err != nil {
+		t.Fatal(err)
+	}
+	return cs
+}
+
+func payloadK(t *testing.T, cs *CollectionStore, id uint64) Metadata {
+	t.Helper()
+	c, ok := cs.Acquire("bulk")
+	if !ok {
+		t.Fatal("collection missing")
+	}
+	defer c.Release()
+	_, m, _, _, _, _ := c.Get(id)
+	return m
+}
+
+// TestDurableBulkBuildConcurrentWriteSurvivesACrash: a write that arrives while
+// a listed collection's bulk build is running must not be acknowledged on top
+// of a build no log or snapshot holds yet. It waits for the checkpoint, and is
+// then logged after it, so a crash at any point after its acknowledgement
+// keeps it.
+func TestDurableBulkBuildConcurrentWriteSurvivesACrash(t *testing.T) {
+	dir := t.TempDir()
+	cs := openBulkStore(t, dir)
+	t.Cleanup(func() { _ = cs.Close() })
+	stageThree(t, cs, "bulk")
+
+	wrote := make(chan error, 1)
+	var earlyCopy string
+	setBuildStagedHook(t, func() {
+		go func() {
+			_, err := cs.SetPayload("bulk", 1, Metadata{"k": NewInt(7)}, nil)
+			wrote <- err
+		}()
+		select {
+		case err := <-wrote:
+			// Acknowledged before the checkpoint: a crash now must keep it.
+			if err == nil {
+				earlyCopy = filepath.Join(t.TempDir(), "early")
+				copyTree(t, dir, earlyCopy)
+			}
+			wrote <- err
+		case <-time.After(200 * time.Millisecond):
+		}
+	})
+	if err := cs.BuildStaged("bulk", 1); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-wrote:
+		if err != nil {
+			t.Fatalf("write after the build: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the write queued during the build never returned")
+	}
+	if earlyCopy != "" {
+		re := openDurable(t, earlyCopy, "bulk")
+		got := payloadK(t, re, 1)
+		_ = re.Close()
+		if !reflect.DeepEqual(got["k"], NewInt(7)) {
+			t.Fatalf("a write acknowledged during the build was lost by a crash: payload %v", got)
+		}
+	}
+	crashed := filepath.Join(t.TempDir(), "copy")
+	copyTree(t, dir, crashed)
+	re := openDurable(t, crashed, "bulk")
+	defer func() { _ = re.Close() }()
+	if got := payloadK(t, re, 1); !reflect.DeepEqual(got["k"], NewInt(7)) {
+		t.Fatalf("acknowledged write lost by a crash: payload %v", got)
+	}
+}
+
+// TestDurableBulkBuildFailedCheckpointPoisons: when the checkpoint after a
+// build fails, the build is in memory and in no file. The log is poisoned, so
+// nothing is acknowledged on top of it, and a reopen has the pre-build state.
+func TestDurableBulkBuildFailedCheckpointPoisons(t *testing.T) {
+	dir := t.TempDir()
+	cs := openBulkStore(t, dir)
+	t.Cleanup(func() { _ = cs.Close() })
+	stageThree(t, cs, "bulk")
+	// A directory where the snapshot's temp file goes makes the write fail.
+	if err := os.Mkdir(filepath.Join(dir, "vectors", DefaultTenant, "bulk.snap.tmp"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := cs.BuildStaged("bulk", 1); err == nil {
+		t.Fatal("BuildStaged succeeded although its checkpoint could not be written")
+	}
+	if _, err := cs.SetPayload("bulk", 1, Metadata{"k": NewInt(7)}, nil); !errors.Is(err, ErrWALPoisoned) {
+		t.Fatalf("a write after a failed build checkpoint = %v, want ErrWALPoisoned", err)
+	}
+	if err := cs.Upsert("bulk", 9, durableVec(9), "x", 0, nil, nil); !errors.Is(err, ErrWALPoisoned) {
+		t.Fatalf("an insert after a failed build checkpoint = %v, want ErrWALPoisoned", err)
+	}
+	crashed := filepath.Join(t.TempDir(), "copy")
+	copyTree(t, dir, crashed)
+	if err := os.Remove(filepath.Join(crashed, "vectors", DefaultTenant, "bulk.snap.tmp")); err != nil {
+		t.Fatal(err)
+	}
+	re := openDurable(t, crashed, "bulk")
+	defer func() { _ = re.Close() }()
+	if n := len(pointsOf(t, re, "bulk")); n != 0 {
+		t.Fatalf("reopen holds %d points, want the pre-build state (0)", n)
+	}
+}
+
+// TestDurableBulkBuildNothingStagedSkipsCheckpoint: with nothing staged the
+// build is a no-op, and so is the checkpoint: one that could not be written
+// is not even tried, and the log stays healthy.
+func TestDurableBulkBuildNothingStagedSkipsCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	cs := openBulkStore(t, dir)
+	t.Cleanup(func() { _ = cs.Close() })
+	if err := os.Mkdir(filepath.Join(dir, "vectors", DefaultTenant, "bulk.snap.tmp"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := cs.BuildStaged("bulk", 1); err != nil {
+		t.Fatalf("BuildStaged with nothing staged = %v, want nil", err)
+	}
+	if err := cs.Upsert("bulk", 9, durableVec(9), "x", 0, nil, nil); err != nil {
+		t.Fatalf("a write after an empty build = %v, want nil", err)
+	}
+}
+
+// TestDurableBulkBuildNoDeadlock: Flush, drop, restore over the collection and
+// eviction, started while a listed collection's build holds it, all finish.
+func TestDurableBulkBuildNoDeadlock(t *testing.T) {
+	ops := []struct {
+		name string
+		op   func(cs *CollectionStore) error
+	}{
+		{"Flush", func(cs *CollectionStore) error { return cs.Flush("bulk") }},
+		{"DropCollection", func(cs *CollectionStore) error { return cs.DropCollection("bulk") }},
+		{"RestoreCollectionWithConfig", func(cs *CollectionStore) error {
+			src, err := NewCollection("src", durablePersistentCfg())
+			if err != nil {
+				return err
+			}
+			defer func() { _ = src.Close() }()
+			var buf bytes.Buffer
+			if err := src.Snapshot(&buf); err != nil {
+				return err
+			}
+			return cs.RestoreCollectionWithConfig("bulk", durablePersistentCfg(), &buf)
+		}},
+		{"EvictCollection", func(cs *CollectionStore) error {
+			return cs.EvictCollection(context.Background(), "bulk", objstore.NewMemStore(), "t", time.Unix(1, 0))
+		}},
+	}
+	for _, tc := range ops {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			cs := openBulkStore(t, dir)
+			t.Cleanup(func() { _ = cs.Close() })
+			stageThree(t, cs, "bulk")
+			done := make(chan error, 1)
+			setBuildStagedHook(t, func() {
+				go func() { done <- tc.op(cs) }()
+				time.Sleep(50 * time.Millisecond)
+			})
+			built := make(chan error, 1)
+			go func() { built <- cs.BuildStaged("bulk", 1) }()
+			for _, ch := range []chan error{built, done} {
+				select {
+				case <-ch:
+				case <-time.After(30 * time.Second):
+					t.Fatalf("%s and a durable bulk build deadlocked", tc.name)
+				}
+			}
+		})
 	}
 }

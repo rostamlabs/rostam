@@ -124,7 +124,9 @@ and collections that are not listed behave as before.
   [write-ahead log](../vector/persistence.md), synced to disk before each write
   is acknowledged, whatever the request asked for. That costs a disk sync on the
   write path. A bulk build has no log record, so it is checkpointed before it
-  returns.
+  returns, and writes to the collection wait for that checkpoint. If the
+  checkpoint fails, the collection refuses writes until a restart, and the
+  build may be missing after it.
 - A listed collection that already exists as `Persistent` is upgraded to the log
   at startup. Only an HNSW collection can be upgraded: a `Persistent` IVF (or
   other non-HNSW) collection keeps its form on every start, with the warning, so

@@ -751,10 +751,13 @@ func (c *Collection) RecommendVecs(k int, opts RecommendVecsOpts) ([]Result, err
 // See hnsw.BuildConcurrent for constraints (empty index, heap storage, no
 // TTL/metadata/sparse).
 //
-// A bulk build is not logged: on a log-backed collection it becomes durable at
-// the next checkpoint. CollectionStore.BuildStaged takes that checkpoint before
-// it returns for a listed durable collection; a caller building through the
-// Collection directly checkpoints itself. A log-backed collection whose log is
+// A bulk build is not logged. On a log-backed collection, a write logged after
+// it and before a checkpoint covers it replays, after a crash, against a state
+// without the build. CollectionStore.BuildStaged therefore builds a listed
+// durable collection and checkpoints it under opMu (and poisons the log if
+// that fails). These Collection methods do not: a direct caller on a
+// log-backed collection must keep writers out until its own checkpoint. A
+// log-backed collection whose log is
 // poisoned refuses the build like every other write (see wal.refuseWrite): no
 // checkpoint can be taken from that state, so the build could never become
 // durable.
@@ -896,14 +899,21 @@ func (c *Collection) BuildStaged(workers int) error {
 	if err := c.wal.refuseWrite(); err != nil {
 		return err
 	}
+	_, err := c.buildStaged(workers)
+	return err
+}
+
+// buildStaged takes the staged batch and builds it, reporting whether anything
+// was staged. The caller has run the refusals; see BuildStaged.
+func (c *Collection) buildStaged(workers int) (bool, error) {
 	c.stageMu.Lock()
 	ids, vecs, metas := c.stageIDs, c.stageVecs, c.stageMetas
 	c.stageIDs, c.stageVecs, c.stageMetas = nil, nil, nil
 	c.stageMu.Unlock()
 	if len(ids) == 0 {
-		return nil
+		return false, nil
 	}
-	return c.idx.BuildConcurrentMeta(ids, vecs, metas, workers)
+	return true, c.idx.BuildConcurrentMeta(ids, vecs, metas, workers)
 }
 
 // Upsert inserts or replaces the record for id with the given vector, document

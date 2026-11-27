@@ -28,7 +28,8 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 - **`-durable-collections` and `DirectConfig.DurableCollections`.** A
   single-node server, or an embedded store, can name dense vector collections to
   run with a write-ahead log, synced before each write is acknowledged (a bulk
-  build, which has no log record, is checkpointed before it returns). This
+  build, which has no log record, is checkpointed before it returns, and a
+  failed checkpoint makes the collection refuse writes until a restart). This
   covers a listed collection created or restored while listed, an existing
   `Persistent` one (converted at startup; if that fails it keeps its old form,
   with a warning, and each later start tries again) and one that already has a

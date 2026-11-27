@@ -104,6 +104,11 @@ func (s *CollectionStore) durableConfig(canonical string, cfg Config) Config {
 func (s *CollectionStore) checkpoint(canonical string, c *Collection) error {
 	c.opMu.Lock()
 	defer c.opMu.Unlock()
+	return s.checkpointLocked(canonical, c)
+}
+
+// checkpointLocked is checkpoint for a caller that holds c.opMu.
+func (s *CollectionStore) checkpointLocked(canonical string, c *Collection) error {
 	snapPath := s.loadedSnapPath(canonical)
 	if err := s.writeSnapshotFile(c, snapPath); err != nil {
 		return err
@@ -433,7 +438,7 @@ func (s *CollectionStore) convertToDurable(canonical string, old *Collection, cf
 		// may be the one that made the rename durable, so it is retried; if the
 		// retry fails too, the caller serves the old form read-only and keeps
 		// every file, since a crash could still bring the old manifest back.
-		slog.Warn("vector: the upgraded manifest reported an error but is in place; continuing with the write-ahead log",
+		slog.Warn("vector: the upgraded manifest reported an error but is in place; syncing its directory again before the write-ahead log form is used",
 			"collection", canonical, "err", werr)
 		derr := syncDirf(filepath.Dir(cfgPath))
 		return upgradeResult{committed: true, manifestDurable: derr == nil,
