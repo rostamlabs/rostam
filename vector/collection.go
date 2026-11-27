@@ -1616,7 +1616,13 @@ func (c *Collection) snapshotLocked(w io.Writer) error {
 	return c.idx.Snapshot(w)
 }
 
-// Restore delegates to the underlying index.
+// Restore delegates to the underlying index. It writes no log record: it is
+// meant for a collection not yet published (a load, a staged restore, a cold
+// promotion), which every caller in this package restores into. Restored into a
+// published log-backed collection, the state is durable only after a checkpoint.
+// CollectionStore.RestoreCollection is the store's path: it stages a new
+// collection and publishes it, and for a listed durable collection writes its
+// snapshot before it returns.
 func (c *Collection) Restore(r io.Reader) error {
 	if err := c.refuseReadOnly(); err != nil {
 		return err

@@ -322,6 +322,7 @@ func (s *CollectionStore) FlushMVWAL(name string) error {
 // writeNamedSnapshotFile so a crash mid-write leaves the prior good checkpoint
 // intact. It uses the MV snapshot/restore HEAP codec (not the mmap SavePersist
 // sidecar) — the destination that makes WAL mode distinct from Persistent.
+// The caller holds idx.opMu: idx.snapshotLocked does not take it.
 func (s *CollectionStore) writeMVWALSnapshotFile(idx *MultiVectorIndex, path string) error {
 	if err := idx.wal.refuseCheckpoint(); err != nil {
 		return err // memory may be ahead of a poisoned log; see refuseCheckpoint
