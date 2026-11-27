@@ -67,11 +67,12 @@ func TestWALCRCZerosCombines(t *testing.T) {
 // whose length fits and whose payload's CRC matches.
 func bruteLaterFrame(b []byte, from int) bool {
 	for i := from; i+8 <= len(b); i++ {
-		plen := int(binary.BigEndian.Uint32(b[i : i+4]))
-		if plen == 0 || plen > maxWALRecord || plen > len(b)-i-8 {
+		// int64, so a length over math.MaxInt32 cannot turn negative on 32-bit.
+		plen := int64(binary.BigEndian.Uint32(b[i : i+4]))
+		if plen == 0 || plen > maxWALRecord || plen > int64(len(b)-i-8) {
 			continue
 		}
-		if crc32.ChecksumIEEE(b[i+8:i+8+plen]) == binary.BigEndian.Uint32(b[i+4:i+8]) {
+		if crc32.ChecksumIEEE(b[i+8:i+8+int(plen)]) == binary.BigEndian.Uint32(b[i+4:i+8]) {
 			return true
 		}
 	}
