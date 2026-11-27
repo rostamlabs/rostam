@@ -773,6 +773,9 @@ func assertServedReadOnly(t *testing.T, dir string, cs *CollectionStore, want ma
 	}
 	c.Release()
 
+	if n, ran := cs.MaybeReclaim(upgradeCol, 0); ran || n != 0 {
+		t.Fatalf("MaybeReclaim on a read-only collection = (%d, %v), want (0, false)", n, ran)
+	}
 	isRO("store Upsert", cs.Upsert(upgradeCol, 900, durableVecDim(1), "new", 0, nil, nil))
 	isRO("Flush", cs.Flush(upgradeCol))
 	if err := cs.FlushPersistent(); err != nil {

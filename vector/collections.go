@@ -1924,14 +1924,15 @@ func (s *CollectionStore) Close() error {
 
 // MaybeReclaim triggers reclaim on the named collection only if its
 // tombstone ratio is above threshold. Returns (count, ran) — count is the
-// number of slots reclaimed if ran is true.
+// number of slots reclaimed if ran is true. A read-only collection is never
+// reclaimed, so it reports (0, false).
 func (s *CollectionStore) MaybeReclaim(name string, threshold float64) (int, bool) {
 	c, ok := s.Acquire(name)
 	if !ok {
 		return 0, false
 	}
 	defer c.Release()
-	if c.TombstoneRatio() < threshold {
+	if c.ReadOnly() != nil || c.TombstoneRatio() < threshold {
 		return 0, false
 	}
 	return c.Reclaim(), true
