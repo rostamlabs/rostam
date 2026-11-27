@@ -751,9 +751,13 @@ func (c *Collection) RecommendVecs(k int, opts RecommendVecsOpts) ([]Result, err
 // See hnsw.BuildConcurrent for constraints (empty index, heap storage, no
 // TTL/metadata/sparse).
 //
-// A bulk build is not logged, but a log-backed collection whose log is poisoned
-// refuses it like every other write (see wal.refuseWrite): no checkpoint can be
-// taken from that state, so the build could never become durable.
+// A bulk build is not logged: on a log-backed collection it becomes durable at
+// the next checkpoint. CollectionStore.BuildStaged takes that checkpoint before
+// it returns for a listed durable collection; a caller building through the
+// Collection directly checkpoints itself. A log-backed collection whose log is
+// poisoned refuses the build like every other write (see wal.refuseWrite): no
+// checkpoint can be taken from that state, so the build could never become
+// durable.
 func (c *Collection) BuildConcurrent(ids []uint64, vecs [][]float32, workers int) error {
 	if err := c.refuseReadOnly(); err != nil {
 		return err

@@ -1781,13 +1781,29 @@ func (s *CollectionStore) StageBulkPayloads(name string, ids []uint64, vecs [][]
 
 // BuildStaged builds the named collection's staged vectors in one concurrent
 // pass (see Collection.BuildStaged). The collection must be empty.
+//
+// A build writes no log record. On a listed durable collection with a log, a
+// successful build is therefore checkpointed before this returns, so a crash
+// after the call cannot lose it. If that checkpoint fails the build stays in
+// memory, the error is returned, and it becomes durable at the next checkpoint
+// that succeeds.
 func (s *CollectionStore) BuildStaged(name string, workers int) error {
 	c, ok := s.Acquire(name)
 	if !ok {
 		return fmt.Errorf("vector: no collection %q", name)
 	}
 	defer c.Release()
-	return c.BuildStaged(workers)
+	canonical, _ := canonicalName(name) // Acquire found it, so the name is valid
+	if err := c.BuildStaged(workers); err != nil {
+		return err
+	}
+	if s.ephemeralDir || !s.isDurable(canonical) || !c.cfg.WAL || c.wal == nil {
+		return nil
+	}
+	if err := s.checkpoint(canonical, c); err != nil {
+		return fmt.Errorf("vector: the bulk build of %q is applied but could not be made durable: %w", name, err)
+	}
+	return nil
 }
 
 // HybridSearch runs a fused dense + sparse search against the named collection.
