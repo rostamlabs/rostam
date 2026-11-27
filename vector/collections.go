@@ -262,14 +262,18 @@ func fileExists(path string) bool {
 // the open fail.
 var openSnapshotFile = os.Open
 
-// openSnapshot opens the snapshot at path. A missing file is "no snapshot" and
+// openSnapshot opens the snapshot at path. A missing entry is "no snapshot" and
 // returns (nil, nil); any other error is returned, so a snapshot that exists
 // but cannot be read fails the open instead of loading the collection empty.
+// The open follows symlinks, so its not-exist error is checked against the
+// entry itself: a dangling symlink is there, and fails the open.
 func openSnapshot(path string) (*os.File, error) {
 	f, err := openSnapshotFile(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return nil, nil
+			if _, lerr := os.Lstat(path); errors.Is(lerr, fs.ErrNotExist) {
+				return nil, nil
+			}
 		}
 		return nil, err
 	}

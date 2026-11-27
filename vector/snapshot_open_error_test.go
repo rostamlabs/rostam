@@ -233,3 +233,64 @@ func TestListedLogManifestWithoutSnapshotBesideSidecarFailsTheOpen(t *testing.T)
 	}
 	assertSameFiles(t, dirFiles(t, dir), before)
 }
+
+// TestDanglingSnapshotSymlinkFailsTheOpen: a snapshot entry that is a symlink to
+// a missing file is not "no snapshot". The open follows it and gets not-exist,
+// but the entry is there, so the store must fail the open rather than load the
+// collection without its checkpointed points.
+func TestDanglingSnapshotSymlinkFailsTheOpen(t *testing.T) {
+	dir := t.TempDir()
+	cs := openDurable(t, dir)
+	if err := cs.CreateCollection(tailCol, tailDenseCfg()); err != nil {
+		t.Fatal(err)
+	}
+	for id := uint64(1); id <= 3; id++ {
+		if err := cs.Upsert(tailCol, id, tailVec(id), "x", 0, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := cs.Flush(tailCol); err != nil {
+		t.Fatal(err)
+	}
+	if err := cs.Close(); err != nil {
+		t.Fatal(err)
+	}
+	snap := filepath.Join(dir, "vectors", DefaultTenant, tailCol+".snap")
+	moved := filepath.Join(dir, "elsewhere.snap")
+	if err := os.Rename(snap, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dir, "missing.snap"), snap); err != nil {
+		t.Skipf("symlinks not available: %v", err)
+	}
+
+	cs, err := OpenCollectionStoreWith(dir, StoreOptions{})
+	if err == nil {
+		n := len(pointsOf(t, cs, tailCol))
+		_ = cs.Close()
+		t.Fatalf("the store opened through a dangling snapshot symlink, holding %d points", n)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("open = %v, want the snapshot's not-exist error", err)
+	}
+
+	if err := os.Remove(snap); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(moved, snap); err != nil {
+		t.Fatal(err)
+	}
+	re := openDurable(t, dir)
+	defer func() { _ = re.Close() }()
+	if n := len(pointsOf(t, re, tailCol)); n != 3 {
+		t.Fatalf("reopen holds %d points, want 3", n)
+	}
+}
+
+// TestMissingSnapshotIsNoSnapshot: an absent entry is still "no snapshot".
+func TestMissingSnapshotIsNoSnapshot(t *testing.T) {
+	f, err := openSnapshot(filepath.Join(t.TempDir(), "absent.snap"))
+	if f != nil || err != nil {
+		t.Fatalf("openSnapshot(absent) = (%v, %v), want (nil, nil)", f, err)
+	}
+}
