@@ -312,6 +312,7 @@ func TestDurableBulkBuildFailureAfterPlacementPoisons(t *testing.T) {
 			name = "panic"
 		}
 		t.Run(name, func(t *testing.T) {
+			const injectedPanic = "injected: build panics after placement"
 			dir := t.TempDir()
 			cs := openBulkStore(t, dir)
 			t.Cleanup(func() { _ = cs.Close() })
@@ -321,15 +322,20 @@ func TestDurableBulkBuildFailureAfterPlacementPoisons(t *testing.T) {
 					return true, err
 				}
 				if panics {
-					panic("injected: build panics after placement")
+					panic(injectedPanic)
 				}
 				return true, errors.New("injected: build fails after placement")
 			})
 			func() {
+				// Only the injected panic, and only in the panic case: any other
+				// recovered value fails the test.
 				defer func() {
-					r := recover()
-					if panics && r == nil {
-						t.Fatal("the injected panic did not propagate")
+					var want any
+					if panics {
+						want = injectedPanic
+					}
+					if r := recover(); r != want {
+						t.Fatalf("recovered %v, want %v", r, want)
 					}
 				}()
 				if err := cs.BuildStaged("bulk", 1); err == nil {
