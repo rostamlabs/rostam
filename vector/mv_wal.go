@@ -4,7 +4,9 @@ package vector
 
 import (
 	"bytes"
+	"fmt"
 	"io"
+	"math"
 )
 
 // Multi-vector (late-interaction) WAL record codec, layered on the family-agnostic
@@ -72,6 +74,40 @@ func (w *wal) appendMVAddStaged(docID uint64, tokens [][]float32, meta Metadata,
 	// tail; replay's readOptMVSparse tolerates EOF → nil).
 	writeOptMVSparse(&buf, sparse)
 	return w.appendFramedStaged(buf.Bytes())
+}
+
+// mvAddRecordFits refuses (ErrWALRecordTooLarge) a multi-vector document whose
+// add record would exceed what replay reads back. It runs before the document
+// applies, so an oversize document is never visible and the log stays healthy.
+// The token matrix is sized arithmetically; the tail (metadata, per-key
+// deadlines for the keys named in either map, version, sparse) is encoded at
+// its widest, so the result bounds what appendMVAddStaged writes.
+func mvAddRecordFits(tokens [][]float32, meta Metadata, keyExpires map[string]uint64, keyTTLMs map[string]int64, sparse *SparseVector) error {
+	size := int64(1 + 8 + 4)
+	for _, t := range tokens {
+		size += 4 + 4*int64(len(t))
+	}
+	if size > int64(walRecordLimit) {
+		return fmt.Errorf("%w: the document's tokens alone take %d bytes, the limit is %d", ErrWALRecordTooLarge, size, walRecordLimit)
+	}
+	var tail bytes.Buffer
+	if err := writeOptMeta(&tail, meta); err != nil {
+		return err
+	}
+	ke := make(map[string]uint64, len(keyExpires)+len(keyTTLMs))
+	for k := range keyExpires {
+		ke[k] = math.MaxUint64
+	}
+	for k := range keyTTLMs {
+		ke[k] = math.MaxUint64
+	}
+	writeOptKeyExpires(&tail, ke)
+	writeOptVersion(&tail, math.MaxUint64)
+	writeOptMVSparse(&tail, sparse)
+	if size += int64(tail.Len()); size > int64(walRecordLimit) {
+		return fmt.Errorf("%w: the document's record takes %d bytes, the limit is %d", ErrWALRecordTooLarge, size, walRecordLimit)
+	}
+	return nil
 }
 
 // writeOptMVSparse appends the optional doc-level sparse block. To keep a

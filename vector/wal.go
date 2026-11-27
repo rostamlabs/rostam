@@ -58,6 +58,16 @@ const (
 // during replay rather than allocating wildly.
 const maxWALRecord = 64 << 20
 
+// walRecordLimit is the largest record payload an append writes: maxWALRecord,
+// the most replay reads back. A variable so tests can lower it.
+var walRecordLimit = maxWALRecord
+
+// ErrWALRecordTooLarge is returned for a write whose log record would exceed
+// what replay reads back (maxWALRecord). A multi-vector document is refused
+// before it applies. Any other record found too large at the append itself
+// was already applied in memory, so the log is poisoned as for a failed write.
+var ErrWALRecordTooLarge = errors.New("vector: write-ahead log record too large")
+
 // wal is an append-only operation log. The file WRITE (framing + os.Write) is
 // serialized by mu (the file offset / append position is not concurrency-safe
 // otherwise). The fsync, however, is GROUP-COMMITTED outside mu (see appendFramed)
@@ -519,6 +529,14 @@ func (w *wal) appendFramedStaged(payload []byte) (uint64, error) {
 		w.mu.Unlock()
 		return 0, ErrWALPoisoned
 	}
+	if len(payload) > walRecordLimit {
+		// Replay could not read it back. The caller has applied it in memory,
+		// so the log is poisoned: no checkpoint may make it permanent, and a
+		// reopen holds the logged state. Nothing is written.
+		w.poisoned.Store(true)
+		w.mu.Unlock()
+		return 0, fmt.Errorf("%w: %d bytes, the limit is %d", ErrWALRecordTooLarge, len(payload), walRecordLimit)
+	}
 	if err := w.writeFrameLocked(payload); err != nil {
 		w.mu.Unlock()
 		return 0, err
@@ -956,6 +974,12 @@ func saveTornBytes(r io.Reader, tornPath string) error {
 	}
 	if cerr := out.Close(); werr == nil {
 		werr = cerr
+	}
+	if werr != nil {
+		// An incomplete copy proves nothing and the log keeps the bytes (it is
+		// not cut unless the copy succeeded), so it is removed rather than left
+		// to fill a disk that may already be short of space.
+		_ = os.Remove(tornPath)
 	}
 	return werr
 }

@@ -598,6 +598,9 @@ func (m *MultiVectorIndex) addCASKeyTTLSparseBody(docID uint64, tokens [][]float
 		if err := m.wal.refuseWrite(); err != nil {
 			return 0, 0, err
 		}
+		if err := mvAddRecordFits(tokens, meta, nil, keyTTLMs, sparse); err != nil {
+			return 0, 0, err
+		}
 		version, keyExpires, err := m.addLockedAt(docID, tokens, meta, keyTTLMs, sparse, cas, now)
 		if err != nil {
 			return 0, 0, err
@@ -780,6 +783,9 @@ func (m *MultiVectorIndex) AddIfAbsent(docID uint64, tokens [][]float32, meta Me
 		if err := m.wal.refuseWrite(); err != nil {
 			return false, 0, err
 		}
+		if err := mvAddRecordFits(tokens, meta, nil, nil, nil); err != nil {
+			return false, 0, err
+		}
 		inserted, err := m.addIfAbsentLocked(docID, tokens, meta, nil)
 		if err != nil || !inserted {
 			return inserted, 0, err
@@ -880,6 +886,9 @@ func (m *MultiVectorIndex) MultiAddIfAbsentVersionSparse(docID uint64, tokens []
 		m.opMu.Lock()
 		defer m.opMu.Unlock()
 		if err := m.wal.refuseWrite(); err != nil {
+			return false, 0, err
+		}
+		if err := mvAddRecordFits(tokens, meta, keyExpires, nil, sparse); err != nil {
 			return false, 0, err
 		}
 		inserted, stored, err := m.addIfAbsentVersionLocked(docID, tokens, meta, keyExpires, version, sparse)
@@ -999,6 +1008,9 @@ func (m *MultiVectorIndex) MultiRestoreAddSparse(docID uint64, tokens [][]float3
 		m.opMu.Lock()
 		defer m.opMu.Unlock()
 		if err := m.wal.refuseWrite(); err != nil {
+			return 0, err
+		}
+		if err := mvAddRecordFits(tokens, meta, keyExpires, nil, sparse); err != nil {
 			return 0, err
 		}
 		if err := m.restoreAdd(docID, tokens, meta, keyExpires, version, sparse); err != nil {
