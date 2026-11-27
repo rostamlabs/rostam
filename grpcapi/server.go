@@ -334,8 +334,10 @@ func grpcError(err error) error {
 		// server fault and which standard gRPC retry policies hammer.
 		errIs(err, vector.ErrWALRecordTooLarge),
 		// vector.ErrWALRecordTooLarge: a write (a multi-vector document) whose
-		// log record would be larger than replay reads back. Refused, and the
-		// message names only the two sizes, so the same bucket as the cap above.
+		// log record would be larger than replay reads back. Refused before it
+		// applies, and the message names only the two sizes, so the same bucket
+		// as the cap above. An applied write whose record is too large at the
+		// append is vector.ErrWALPoisoned instead: a server fault, Internal.
 		errIs(err, vector.ErrRecordMalformed),
 		// vector.ErrRecordMalformed: a payload carrying record bytes no operate
 		// engine can open. A caller mistake with a clear remedy (send a

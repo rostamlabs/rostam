@@ -62,10 +62,12 @@ const maxWALRecord = 64 << 20
 // the most replay reads back. A variable so tests can lower it.
 var walRecordLimit = maxWALRecord
 
-// ErrWALRecordTooLarge is returned for a write whose log record would exceed
-// what replay reads back (maxWALRecord). A multi-vector document is refused
-// before it applies. Any other record found too large at the append itself
-// was already applied in memory, so the log is poisoned as for a failed write.
+// ErrWALRecordTooLarge is returned for a write refused BEFORE it applies because
+// its log record would exceed what replay reads back (maxWALRecord): a
+// multi-vector document. Nothing changed and the log stays healthy, so it is the
+// caller's mistake. A record found too large only at the append itself was
+// already applied in memory: that is not this error. The log is poisoned as for
+// a failed write and the write returns an error matching ErrWALPoisoned.
 var ErrWALRecordTooLarge = errors.New("vector: write-ahead log record too large")
 
 // wal is an append-only operation log. The file WRITE (framing + os.Write) is
@@ -164,9 +166,10 @@ type wal struct {
 }
 
 // ErrWALPoisoned is returned by every write to a log-backed collection, and by
-// every checkpoint of one, once its log has been poisoned by a failed write
-// (a full disk, an I/O error) or a failed fsync (fsyncgate — see the poisoned
-// field). The log accepts no further writes or acks until the process is
+// every checkpoint of one, once its log has been poisoned: by a failed write
+// (a full disk, an I/O error), a record of an applied write too large to append,
+// a failed durable bulk build (see CollectionStore.BuildStaged) or a failed fsync
+// (fsyncgate — see the poisoned field). The log accepts no further writes or acks until the process is
 // restarted and the store reopened; the caller must surface this so a
 // delete/insert is reported failed rather than falsely acked on bytes that may
 // never have reached disk.
@@ -532,10 +535,12 @@ func (w *wal) appendFramedStaged(payload []byte) (uint64, error) {
 	if len(payload) > walRecordLimit {
 		// Replay could not read it back. The caller has applied it in memory,
 		// so the log is poisoned: no checkpoint may make it permanent, and a
-		// reopen holds the logged state. Nothing is written.
+		// reopen holds the logged state. Nothing is written. Reported as the
+		// poisoned log, a server fault, never as ErrWALRecordTooLarge: that one
+		// tells the caller the write was refused and nothing changed.
 		w.poisoned.Store(true)
 		w.mu.Unlock()
-		return 0, fmt.Errorf("%w: %d bytes, the limit is %d", ErrWALRecordTooLarge, len(payload), walRecordLimit)
+		return 0, fmt.Errorf("%w: an applied write's log record takes %d bytes, the limit is %d", ErrWALPoisoned, len(payload), walRecordLimit)
 	}
 	if err := w.writeFrameLocked(payload); err != nil {
 		w.mu.Unlock()

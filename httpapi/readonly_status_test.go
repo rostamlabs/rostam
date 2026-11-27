@@ -36,3 +36,13 @@ func TestStatusForWALRecordTooLarge(t *testing.T) {
 		t.Fatalf("clientError(%v) = (%d, %q), want 400 with the message", err, got, msg)
 	}
 }
+
+// A poisoned log is the server's durability fault, including an applied write
+// whose record was too large to append: a redacted 500, never a 400.
+func TestStatusForPoisonedWAL(t *testing.T) {
+	err := fmt.Errorf("%w: an applied write's log record takes 70000000 bytes, the limit is 67108864", vector.ErrWALPoisoned)
+	got, msg := clientError("op", err)
+	if got != http.StatusInternalServerError || msg != "internal error" {
+		t.Fatalf("clientError(%v) = (%d, %q), want a redacted 500", err, got, msg)
+	}
+}

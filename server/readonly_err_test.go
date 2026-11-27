@@ -26,3 +26,12 @@ func TestWALRecordTooLargeIsClientFacing(t *testing.T) {
 		t.Fatalf("clientFacingErr(%v) = false, want the message passed to the client", err)
 	}
 }
+
+// A poisoned log is the server's durability fault, including an applied write
+// whose record was too large to append: redacted, not the caller's mistake.
+func TestPoisonedWALIsNotClientFacing(t *testing.T) {
+	err := fmt.Errorf("%w: an applied write's log record takes 70000000 bytes, the limit is 67108864", vector.ErrWALPoisoned)
+	if clientFacingErr(err) {
+		t.Fatalf("clientFacingErr(%v) = true, want a redacted server fault", err)
+	}
+}

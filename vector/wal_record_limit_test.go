@@ -38,8 +38,12 @@ func TestWALOversizeMultiVectorAddRefusedBeforeApply(t *testing.T) {
 		"MultiRestoreAdd":         func() error { return m.MultiRestoreAdd(9, toks, nil, nil, 3) },
 	}
 	for name, op := range ops {
-		if err := op(); !errors.Is(err, ErrWALRecordTooLarge) {
+		err := op()
+		if !errors.Is(err, ErrWALRecordTooLarge) {
 			t.Fatalf("%s of an oversize document = %v, want ErrWALRecordTooLarge", name, err)
+		}
+		if errors.Is(err, ErrWALPoisoned) {
+			t.Fatalf("%s refused before it applied = %v, must not be ErrWALPoisoned", name, err)
 		}
 		if m.Exists(9) {
 			t.Fatalf("a refused %s applied in memory", name)
@@ -53,7 +57,9 @@ func TestWALOversizeMultiVectorAddRefusedBeforeApply(t *testing.T) {
 
 // TestWALOversizeRecordPoisonsLog: the last line, for any family, is the
 // append itself. An oversize payload is never written; the log is poisoned so
-// no snapshot can make the applied write permanent.
+// no snapshot can make the applied write permanent. The write already applied,
+// so it reports the poisoned log (a server fault), not ErrWALRecordTooLarge (the
+// refusal that changes nothing).
 func TestWALOversizeRecordPoisonsLog(t *testing.T) {
 	cs := openReplaceStore(t, t.TempDir(), durablePersistentCfg())
 	t.Cleanup(func() { _ = cs.Close() })
@@ -61,8 +67,12 @@ func TestWALOversizeRecordPoisonsLog(t *testing.T) {
 	defer c.Release()
 	lowerWALRecordLimit(t, 64)
 	before := fileSize(t, c.wal.f.Name())
-	if err := c.Insert(9, durableVec(9), 0, Metadata{"big": NewString(string(make([]byte, 256)))}, nil); !errors.Is(err, ErrWALRecordTooLarge) {
-		t.Fatalf("oversize insert = %v, want ErrWALRecordTooLarge", err)
+	err := c.Insert(9, durableVec(9), 0, Metadata{"big": NewString(string(make([]byte, 256)))}, nil)
+	if !errors.Is(err, ErrWALPoisoned) {
+		t.Fatalf("oversize insert = %v, want ErrWALPoisoned", err)
+	}
+	if errors.Is(err, ErrWALRecordTooLarge) {
+		t.Fatalf("oversize insert = %v, must not be ErrWALRecordTooLarge after it applied", err)
 	}
 	if after := fileSize(t, c.wal.f.Name()); after != before {
 		t.Fatalf("log grew from %d to %d bytes for a refused record", before, after)

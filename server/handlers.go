@@ -249,8 +249,10 @@ func clientFacingErr(err error) bool {
 		errors.Is(err, vector.ErrRecordTooLarge),
 		vector.IsRecordTooLargeMessage(err.Error()),
 		// vector.ErrWALRecordTooLarge: a write (a multi-vector document) whose
-		// log record would be larger than replay reads back. Refused, and the
-		// message names only the two sizes, so the same bucket as the cap above.
+		// log record would be larger than replay reads back. Refused before it
+		// applies, and the message names only the two sizes, so the same bucket
+		// as the cap above. An applied write whose record is too large at the
+		// append is vector.ErrWALPoisoned instead: a server fault, redacted.
 		errors.Is(err, vector.ErrWALRecordTooLarge),
 		// vector.ErrRecordMalformed: a payload carrying record bytes no operate
 		// engine can open. Same bucket and same reasoning as the cap above — the

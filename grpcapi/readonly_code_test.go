@@ -25,3 +25,12 @@ func TestWALRecordTooLargeIsInvalidArgument(t *testing.T) {
 		t.Fatalf("code = %v, want InvalidArgument", got)
 	}
 }
+
+// A poisoned log is the server's durability fault, including an applied write
+// whose record was too large to append: never InvalidArgument.
+func TestPoisonedWALIsInternal(t *testing.T) {
+	err := grpcError(fmt.Errorf("%w: an applied write's log record takes 70000000 bytes, the limit is 67108864", vector.ErrWALPoisoned))
+	if got := status.Code(err); got != codes.Internal {
+		t.Fatalf("code = %v, want Internal", got)
+	}
+}
