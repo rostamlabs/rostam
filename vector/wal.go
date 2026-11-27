@@ -891,7 +891,14 @@ const tornScanWindow = 1 << 20
 // CRC matches. It reads bounded windows with ReadAt and stops at the first such
 // frame. Offsets whose length field is zero are skipped without a CRC, so a long
 // run of zeros costs one pass over its bytes.
+//
+// Candidate payloads overlap, and checksumming each one in full costs up to
+// 64 MiB per offset: hours over a tail of a few tens of megabytes whose bytes
+// read as plausible lengths. A long payload's CRC is therefore derived from
+// running CRCs of the tail (see tailCRC), so each candidate costs at most a few
+// kilobytes of checksumming whatever its length, and the answer is the same.
 func laterFrameExists(f *os.File, from, size int64) (bool, error) {
+	tc := newTailCRC(f, from, size)
 	buf := make([]byte, tornScanWindow+8)
 	for base := from; base+8 <= size; {
 		n := int64(len(buf))
@@ -927,22 +934,147 @@ func laterFrameExists(f *os.File, from, size int64) (bool, error) {
 				continue
 			}
 			crc := binary.BigEndian.Uint32(win[i+4 : i+8])
-			var payload []byte
-			if i+8+plen <= n {
-				payload = win[i+8 : i+8+plen]
+			var got uint32
+			if i+8+plen <= n && plen <= 2*tailCRCStride {
+				got = crc32.ChecksumIEEE(win[i+8 : i+8+plen])
 			} else {
-				payload = make([]byte, plen)
-				if _, err := f.ReadAt(payload, base+i+8); err != nil {
+				start := base + i + 8
+				cs, err := tc.prefix(start)
+				if err != nil {
 					return false, err
 				}
+				ce, err := tc.prefix(start + plen)
+				if err != nil {
+					return false, err
+				}
+				got = ce ^ crcZeros(cs, plen)
 			}
-			if crc32.ChecksumIEEE(payload) == crc {
+			if got == crc {
 				return true, nil
 			}
 		}
 		base += last + 1
 	}
 	return false, nil
+}
+
+// tailCRCStride is how far apart tailCRC keeps its running CRCs: what a
+// candidate payload costs to checksum at most, at each end.
+const tailCRCStride = 4096
+
+// tailCRC gives the CRC-32 (IEEE) of any prefix [from, pos) of a log tail. It
+// keeps the running CRC at every tailCRCStride bytes, computed forward only as
+// far as a query needs (at most maxWALRecord past the scan), and finishes a
+// query from the nearest one with at most tailCRCStride bytes of work.
+//
+// CRC-32 is linear: for consecutive byte strings A and B,
+// crc(A||B) = crcZeros(crc(A), len(B)) ^ crc(B). So the CRC of the payload
+// [a, b) is prefix(b) ^ crcZeros(prefix(a), b-a).
+type tailCRC struct {
+	f          *os.File
+	from, size int64
+	cps        []uint32 // cps[k] = crc of [from, from+k*tailCRCStride)
+	scratch    []byte
+}
+
+func newTailCRC(f *os.File, from, size int64) *tailCRC {
+	return &tailCRC{f: f, from: from, size: size, cps: []uint32{0}}
+}
+
+// prefix returns the CRC of [from, pos), for from <= pos <= size.
+func (t *tailCRC) prefix(pos int64) (uint32, error) {
+	k := (pos - t.from) / tailCRCStride
+	for int64(len(t.cps)) <= k {
+		if err := t.extend(); err != nil {
+			return 0, err
+		}
+	}
+	at := t.from + k*tailCRCStride
+	b, err := t.read(at, pos-at)
+	if err != nil {
+		return 0, err
+	}
+	return crc32.Update(t.cps[k], crc32.IEEETable, b), nil
+}
+
+// extend adds the running CRCs of the next tornScanWindow bytes.
+func (t *tailCRC) extend() error {
+	at := t.from + int64(len(t.cps)-1)*tailCRCStride
+	n := min(int64(tornScanWindow), t.size-at)
+	n -= n % tailCRCStride
+	if n <= 0 {
+		return fmt.Errorf("vector: torn-tail scan past the end of the log")
+	}
+	b, err := t.read(at, n)
+	if err != nil {
+		return err
+	}
+	c := t.cps[len(t.cps)-1]
+	for off := int64(0); off < n; off += tailCRCStride {
+		c = crc32.Update(c, crc32.IEEETable, b[off:off+tailCRCStride])
+		t.cps = append(t.cps, c)
+	}
+	return nil
+}
+
+func (t *tailCRC) read(at, n int64) ([]byte, error) {
+	if int64(cap(t.scratch)) < n {
+		t.scratch = make([]byte, n)
+	}
+	b := t.scratch[:n]
+	if n == 0 {
+		return b, nil
+	}
+	if _, err := t.f.ReadAt(b, at); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// crcZerosOps[k] advances an (unconditioned) CRC-32 register over 2^k zero
+// bytes, as a 32x32 GF(2) matrix (one column per input bit).
+var crcZerosOps = func() (ops [64][32]uint32) {
+	var bit [32]uint32 // one zero bit
+	bit[0] = 0xedb88320
+	for n := 1; n < 32; n++ {
+		bit[n] = 1 << (n - 1)
+	}
+	two := gf2Square(bit)
+	four := gf2Square(two)
+	ops[0] = gf2Square(four) // eight bits: one byte
+	for k := 1; k < len(ops); k++ {
+		ops[k] = gf2Square(ops[k-1])
+	}
+	return ops
+}()
+
+func gf2Times(mat *[32]uint32, vec uint32) uint32 {
+	var sum uint32
+	for i := 0; vec != 0; i, vec = i+1, vec>>1 {
+		if vec&1 != 0 {
+			sum ^= mat[i]
+		}
+	}
+	return sum
+}
+
+func gf2Square(mat [32]uint32) (sq [32]uint32) {
+	for n := range sq {
+		sq[n] = gf2Times(&mat, mat[n])
+	}
+	return sq
+}
+
+// crcZeros returns crc advanced over n zero bytes without the pre- and
+// post-conditioning, the operator in crc(A||B) = crcZeros(crc(A), len(B)) ^
+// crc(B) (zlib's crc32_combine).
+func crcZeros(crc uint32, n int64) uint32 {
+	for k := 0; n > 0; k, n = k+1, n>>1 {
+		if n&1 != 0 {
+			crc = gf2Times(&crcZerosOps[k], crc)
+		}
+	}
+	return crc
 }
 
 // cutTornTail saves the log's bytes from end on to <path>.torn-<unixnano>
