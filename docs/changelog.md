@@ -31,7 +31,9 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   `Persistent` one (converted at startup; if that fails it keeps its old form,
   with a warning, until a later start succeeds) and one that already has a log.
   A listed collection that already exists with neither `Persistent` nor a log
-  keeps its mode. Empty by default; needs a data directory to keep anything
+  keeps its mode, with a warning. Only an HNSW collection is converted. A
+  conversion that cannot tell which form the collection is in afterwards stops
+  the start and keeps every file. Empty by default; needs a data directory to keep anything
   across a restart; ignored with `-cluster`.
   See [Running a server](server/running.md).
 - **Breaking: a damaged write-ahead log now stops the open.** This applies to
@@ -46,6 +48,12 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   as a newer release may write, still fails the start as before; that error has
   no offset and truncating is not the remedy: run the newer release.
   See [A damaged log](server/mcp.md#a-damaged-log).
+- **Snapshots wait for pending log syncs.** A backup, checkpoint or cold-tier
+  eviction of a collection with a write-ahead log waits until every write
+  already applied is synced, and refuses if that sync fails. A cold-tier
+  eviction of a collection that is used while it uploads leaves it resident
+  (the idle sweep tries again later) instead of retiring it with the write.
+  A multi-vector document whose log record would exceed 64 MiB is refused.
 - **A failed log write stops further writes.** After a write or a disk sync of
   a write-ahead log fails (a full disk, for example), the collection refuses
   every write, before applying it, until the process restarts. A snapshot
@@ -54,10 +62,11 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 - **Memory no longer locks out when the embedder record is missing.** The first
   memory tool call checks the configured embedder against the stored memories
   and records it again.
-- **Over `mcp -connect`, a new memory store needs a server at v0.5.0 or later**,
-  as does rebuilding a missing embedder record. No v0.4.x server has the
-  operation this needs, so it fails there with any key, whether or not
-  authorization is on. Existing stores that have the record are unaffected.
+- **Breaking: over `mcp -connect`, a new memory store needs a server at v0.5.0
+  or later**, as does rebuilding a missing embedder record. No v0.4.x server has
+  the operation this needs, so it fails there with any key, whether or not
+  authorization is on. Upgrade the server first. Existing stores that have the
+  record are unaffected.
 - **Code-linked memory and a Claude Code plugin.** `remember` takes an optional
   `path` (and `symbol`) that links a memory to a file, and `recall_for_file`
   lists what is linked to one. A linked memory whose file has since changed is

@@ -150,6 +150,22 @@ variables through from the environment Claude Code is started in; unset, the
 store is BM25-only. A store remembers the embedder it was created with, so they
 must stay the same for the life of `~/.rostam/memory`.
 
+**One user per host.** The daemon's port is fixed, so this release supports one
+user per machine. On Linux, the clients (the MCP session and the hook) check
+the kernel socket table (`/proc/net/tcp`) before the token goes anywhere:
+before each dial, that the listener on `127.0.0.1:7480` belongs to the current
+user, and after it, before the first request is sent, that every connection
+this user has open to that port was accepted by a socket of the current user
+(the new one is always among them). If either belongs to another user, or
+cannot be found or read (including `/proc` missing or hidden on Linux), the
+token is not sent. The hook then stays silent.
+`mcp -autostart` fails with "port 7480 is owned by another user (uid N)"
+without trying to start a daemon; when the owner merely cannot be verified it
+treats the daemon as not running, may try to start one (which cannot bind a
+port that is in use), and fails with a "did not become ready" error. The hook's own check
+needs the same socket table: pointed with `-connect` at a server on a platform
+without one, it sends the token unverified.
+
 ### Durability
 
 The daemon runs its server with `-durable-collections mcp_memory`, so a
@@ -190,22 +206,6 @@ does not force it: it prints a warning and uses it, without durable memory. Run
 `rostam-server memory-daemon -stop` and start a new session to replace it. An
 old daemon that takes more than 30 seconds to stop is killed by its own
 supervisor, as under `memory-daemon -stop`, and loses what it had not saved.
-
-**One user per host.** The daemon's port is fixed, so this release supports one
-user per machine. On Linux, the clients (the MCP session and the hook) check
-the kernel socket table (`/proc/net/tcp`) before the token goes anywhere:
-before each dial, that the listener on `127.0.0.1:7480` belongs to the current
-user, and after it, before the first request is sent, that every connection
-this user has open to that port was accepted by a socket of the current user
-(the new one is always among them). If either belongs to another user, or
-cannot be found or read (including `/proc` missing or hidden on Linux), the
-token is not sent. The hook then stays silent.
-`mcp -autostart` fails with "port 7480 is owned by another user (uid N)"
-without trying to start a daemon; when the owner merely cannot be verified it
-treats the daemon as not running, may try to start one (which cannot bind a
-port that is in use), and fails with a "did not become ready" error. The hook's own check
-needs the same socket table: pointed with `-connect` at a server on a platform
-without one, it sends the token unverified.
 
 ## Failure behaviour
 

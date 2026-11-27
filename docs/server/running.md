@@ -125,13 +125,21 @@ and collections that are not listed behave as before.
   is acknowledged, whatever the request asked for. That costs a disk sync on the
   write path.
 - A listed collection that already exists as `Persistent` is upgraded to the log
-  at startup. If the upgrade fails, the server still starts, the collection keeps
-  its old form, a warning says it is not crash-safe, and the next start tries
-  again.
+  at startup. Only an HNSW collection can be upgraded: a `Persistent` IVF (or
+  other non-HNSW) collection keeps its form on every start, with the warning, so
+  retrying does not help. If the upgrade fails, the server still starts, the
+  collection keeps its old form, a warning says it is not crash-safe, and the
+  next start tries again. The exception is an upgrade that cannot tell which
+  form the collection is in afterwards (its manifest could not be read back or
+  put back): then the server does not start, the error names the manifest, and
+  every file is kept.
 - A listed collection that already has a log is synced the same way from startup
   on, even if it was created with `WALNoSync`.
 - A listed collection that already exists with neither `Persistent` nor a log
-  keeps its mode.
+  keeps its mode, and a `not crash-safe` warning at startup says so.
+- A listed named-vector or multi-vector collection is not affected: it keeps
+  the log settings it was created with, and a warning says the flag does not
+  apply to it.
 - The logs are folded into a snapshot and emptied on a clean shutdown, and at
   startup when a log has grown past 16 MiB.
 - Bare names belong to the default tenant; use `tenant/collection` otherwise. An
