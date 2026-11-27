@@ -1100,6 +1100,12 @@ func (c *Collection) DeleteByFilter(filter Filter) (int, error) {
 	if err := c.refuseReadOnly(); err != nil {
 		return 0, err
 	}
+	// A poisoned log refuses the call before the match, as DeleteCAS does for an
+	// absent id: after a delete whose sync failed, a retry that matches nothing
+	// would otherwise report a clean batch for points a restart brings back.
+	if err := c.wal.refuseWrite(); err != nil {
+		return 0, err
+	}
 	pred, err := CompileFilter(filter)
 	if err != nil {
 		return 0, err
@@ -1421,6 +1427,12 @@ func (c *Collection) DeleteCASAt(id uint64, cas CASCond, nowMs int64) (bool, err
 // replica (#4 vector TTL determinism).
 func (c *Collection) DeleteByFilterAt(filter Filter, nowMs int64) (int, error) {
 	if err := c.refuseReadOnly(); err != nil {
+		return 0, err
+	}
+	// A poisoned log refuses the call before the match, as DeleteCASAt does for an
+	// absent id: after a delete whose sync failed, a retry that matches nothing
+	// would otherwise report a clean batch for points a restart brings back.
+	if err := c.wal.refuseWrite(); err != nil {
 		return 0, err
 	}
 	pred, err := CompileFilter(filter)

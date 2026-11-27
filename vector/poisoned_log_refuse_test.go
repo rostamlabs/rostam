@@ -37,8 +37,10 @@ type denseMutatorCase struct {
 	op   func(c *Collection) error
 }
 
-// denseMutatorCases is every dense Collection mutator, aimed at ids 1 and 2
-// (live) and 9 and 4242 (absent).
+// denseMutatorCases is every error-returning dense Collection mutator, aimed
+// at ids 1 and 2 (live) and 9 and 4242 (absent). Delete, which reports only a
+// bool, and the bulk paths (StageBulk, BuildStaged, BuildConcurrent) have
+// their own tests.
 func denseMutatorCases() []denseMutatorCase {
 	now := time.Now().UnixMilli()
 	vec := durableVec(9)
@@ -81,6 +83,48 @@ func denseMutatorCases() []denseMutatorCase {
 		{"ClearPayloadCAS", func(c *Collection) error { _, err := c.ClearPayloadCAS(1, CASCond{}); return err }},
 		{"MutatePayloadRecordCAS", func(c *Collection) error {
 			_, err := c.MutatePayloadRecordCAS(1, "rec", recordStore, CASCond{})
+			return err
+		}},
+		{"InsertKeyTTL", func(c *Collection) error { return c.InsertKeyTTL(9, vec, 0, nil, nil, nil) }},
+		{"InsertCAS", func(c *Collection) error { _, err := c.InsertCAS(9, vec, 0, nil, nil, CASCond{}); return err }},
+		{"InsertCASKeyTTL", func(c *Collection) error {
+			_, err := c.InsertCASKeyTTL(9, vec, 0, nil, nil, nil, CASCond{})
+			return err
+		}},
+		{"InsertIfAbsent", func(c *Collection) error { _, err := c.InsertIfAbsent(9, vec, 0, nil, nil); return err }},
+		{"UpsertKeyTTL", func(c *Collection) error { return c.UpsertKeyTTL(1, vec, "new", 0, nil, nil, nil) }},
+		{"UpsertCAS", func(c *Collection) error { _, err := c.UpsertCAS(1, vec, "new", 0, nil, nil, CASCond{}); return err }},
+		{"UpsertCASKeyTTL", func(c *Collection) error {
+			_, err := c.UpsertCASKeyTTL(1, vec, "new", 0, nil, nil, nil, CASCond{})
+			return err
+		}},
+		{"SetPayload", func(c *Collection) error { return c.SetPayload(1, Metadata{"k": NewInt(1)}, nil) }},
+		{"SetPayloadCASAt", func(c *Collection) error {
+			_, err := c.SetPayloadCASAt(1, Metadata{"k": NewInt(1)}, nil, CASCond{}, now)
+			return err
+		}},
+		{"OverwritePayload", func(c *Collection) error { return c.OverwritePayload(1, Metadata{"k": NewInt(1)}, nil) }},
+		{"OverwritePayloadCASAt", func(c *Collection) error {
+			_, err := c.OverwritePayloadCASAt(1, Metadata{"k": NewInt(1)}, nil, CASCond{}, now)
+			return err
+		}},
+		{"DeletePayloadKeys", func(c *Collection) error { return c.DeletePayloadKeys(1, []string{contentField}) }},
+		{"DeletePayloadKeysCASAt", func(c *Collection) error {
+			_, err := c.DeletePayloadKeysCASAt(1, []string{contentField}, CASCond{}, now)
+			return err
+		}},
+		{"ClearPayload", func(c *Collection) error { return c.ClearPayload(1) }},
+		{"ClearPayloadCASAt", func(c *Collection) error { _, err := c.ClearPayloadCASAt(1, CASCond{}, now); return err }},
+		{"MutatePayloadRecordCASAt", func(c *Collection) error {
+			_, err := c.MutatePayloadRecordCASAt(1, "rec", recordStore, CASCond{}, now)
+			return err
+		}},
+		{"DeleteByFilter", func(c *Collection) error {
+			_, err := c.DeleteByFilter(Filter{Op: FilterEq, Field: "kind", Value: NewString("k1")})
+			return err
+		}},
+		{"DeleteByFilterAt", func(c *Collection) error {
+			_, err := c.DeleteByFilterAt(Filter{Op: FilterEq, Field: "kind", Value: NewString("k1")}, now)
 			return err
 		}},
 	}
