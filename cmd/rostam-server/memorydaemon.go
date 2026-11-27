@@ -31,8 +31,11 @@ const (
 	memoryTokenName   = "token"
 	daemonLogName     = "daemon.log"
 	daemonPidName     = "daemon.pid"
-	daemonConfigName  = "daemon-config.json"
-	spawnLockDirName  = "spawn.lock"
+	// daemonReadyName is the ready record: written by a durable daemon's
+	// supervisor, with the pid file's content, once its server first answers.
+	daemonReadyName  = "daemon.ready"
+	daemonConfigName = "daemon-config.json"
+	spawnLockDirName = "spawn.lock"
 
 	// daemonStartWait bounds how long a session waits for a freshly spawned
 	// daemon to accept an authenticated connection, unless the daemon is

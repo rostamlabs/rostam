@@ -248,3 +248,62 @@ func TestLockDurableMarkerWaitsOutACheck(t *testing.T) {
 	}
 	_ = f.Close()
 }
+
+// A durable daemon records that it is ready only once its server answers, and
+// the record names the running daemon: a session gives the long start-up wait
+// only to a durable daemon that has not recorded ready yet.
+func TestDaemonStartingUntilReadyRecorded(t *testing.T) {
+	data := filepath.Join(t.TempDir(), "memory")
+	if err := os.MkdirAll(data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// A record left by an earlier run must never count.
+	if err := os.WriteFile(filepath.Join(data, daemonReadyName), []byte("1\n2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	startHelperSupervisor(t, data)
+	if !daemonStarting(data) {
+		t.Fatal("a durable daemon whose server has not answered yet is not counted as starting")
+	}
+	if _, err := os.Stat(filepath.Join(data, daemonReadyName)); !os.IsNotExist(err) {
+		t.Fatalf("a stale ready record survived the start (stat err %v)", err)
+	}
+	if err := os.WriteFile(filepath.Join(data, helperAnswersName), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for daemonStarting(data) {
+		if time.Now().After(deadline) {
+			t.Fatal("still counted as starting after its server answered")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	ready, err := os.ReadFile(filepath.Join(data, daemonReadyName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pids, err := os.ReadFile(filepath.Join(data, daemonPidName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(ready) != string(pids) {
+		t.Fatalf("ready record %q does not name the running daemon %q", ready, pids)
+	}
+}
+
+// A daemon without the durable marker (an earlier release) never gets the
+// long wait, even while it holds the data dir and has not answered.
+func TestDaemonStartingRefusesNonDurableDaemon(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := filepath.Join(t.TempDir(), "memory")
+	cmd, _ := startFakeOldDaemon(t, t.TempDir(), filepath.Base(self), data)
+	if !processIsDaemon(cmd.Process.Pid, data) {
+		t.Fatal("the fake old daemon is not recognised as a memory daemon; test premise broken")
+	}
+	if daemonStarting(data) {
+		t.Fatal("a daemon without the durable marker counts as starting")
+	}
+}

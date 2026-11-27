@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -79,6 +80,10 @@ func superviseDaemon(data, addr string) error {
 		// shell must not reconfigure (or re-expose) the daemon.
 		cmd.Env = daemonEnv(os.Environ(), token)
 		return cmd
+	}, func(ctx context.Context, token string) error {
+		// The server opens (and upgrades) its store before it listens, so an
+		// authenticated answer means the start-up is over.
+		return probeDaemon(ctx, addr, token)
 	})
 }
 
@@ -127,7 +132,12 @@ func lockDurableMarker(data string) (*os.File, error) {
 // process that actually has the store open) lives, even if this supervisor is
 // killed. The durable marker (daemonDurableDir) is locked and handed over the
 // same way, before the child starts, so a server that answers always holds it.
-func superviseDaemonWith(data string, mkChild func(token, cfgPath string) *exec.Cmd) error {
+//
+// Once answers (when non-nil) first succeeds, the supervisor writes the ready
+// record (daemonReadyName) with the same content as the pid file, so it names
+// this daemon and no other. Any record left by an earlier run is removed before
+// the server starts, and the record is removed again when the supervisor exits.
+func superviseDaemonWith(data string, mkChild func(token, cfgPath string) *exec.Cmd, answers func(ctx context.Context, token string) error) error {
 	if err := os.MkdirAll(data, 0o700); err != nil { //nolint:gosec // G703: data is the user's own -data flag or the home default
 		return fmt.Errorf("creating -data directory %s: %w", data, err)
 	}
@@ -162,6 +172,11 @@ func superviseDaemonWith(data string, mkChild func(token, cfgPath string) *exec.
 		return fmt.Errorf("writing %s: %w", cfgPath, err)
 	}
 
+	readyPath := filepath.Join(data, daemonReadyName)
+	if err := os.Remove(readyPath); err != nil && !errors.Is(err, os.ErrNotExist) { //nolint:gosec // G703: fixed name inside the data dir
+		return fmt.Errorf("removing a ready record from an earlier run %s: %w", readyPath, err)
+	}
+
 	cmd := mkChild(token, cfgPath)
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
 	cmd.ExtraFiles = append(cmd.ExtraFiles, lockFile, marker) // child inherits both locks
@@ -182,7 +197,18 @@ func superviseDaemonWith(data string, mkChild func(token, cfgPath string) *exec.
 		_ = cmd.Wait()
 		return fmt.Errorf("writing %s: %w", pidPath, err)
 	}
-	defer func() { _ = os.Remove(pidPath) }() //nolint:gosec // G703: fixed name inside the data dir
+	defer func() { _ = os.Remove(pidPath) }()   //nolint:gosec // G703: fixed name inside the data dir
+	defer func() { _ = os.Remove(readyPath) }() //nolint:gosec // G703: fixed name inside the data dir
+	if answers != nil {
+		readyCtx, cancelReady := context.WithCancel(context.Background())
+		readyDone := make(chan struct{})
+		go func() {
+			defer close(readyDone)
+			recordReadyWhenAnswering(readyCtx, readyPath, pids, token, answers)
+		}()
+		// Runs before the record is removed, so it is never written after.
+		defer func() { cancelReady(); <-readyDone }()
+	}
 
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
@@ -198,6 +224,30 @@ func superviseDaemonWith(data string, mkChild func(token, cfgPath string) *exec.
 			<-done
 		}
 		return nil
+	}
+}
+
+// recordReadyWhenAnswering polls answers until it succeeds or ctx ends, then
+// writes pids to readyPath (atomically, via a rename).
+func recordReadyWhenAnswering(ctx context.Context, readyPath, pids, token string, answers func(context.Context, string) error) {
+	for {
+		if answers(ctx, token) == nil {
+			tmp := readyPath + ".tmp"
+			if err := os.WriteFile(tmp, []byte(pids), 0o600); err != nil { //nolint:gosec // G703: fixed name inside the data dir
+				fmt.Fprintf(os.Stderr, "memory-daemon: writing the ready record: %v\n", err)
+				return
+			}
+			if err := os.Rename(tmp, readyPath); err != nil { //nolint:gosec // G703: fixed name inside the data dir
+				_ = os.Remove(tmp) //nolint:gosec // G703: fixed name inside the data dir
+				fmt.Fprintf(os.Stderr, "memory-daemon: writing the ready record: %v\n", err)
+			}
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 }
 
@@ -319,7 +369,8 @@ func isDaemonServerArgs(args []string, exeBase, data string) bool {
 // daemonStarting reports whether a memory daemon demonstrably holds data and
 // is still starting, so a session should keep waiting for it to answer: the
 // pid file names a live memory daemon of data (its supervisor) or that
-// daemon's server, and the data-dir lock is held. The pid file is checked
+// daemon's server, the data-dir lock is held, the daemon holds the durable
+// marker, and it has not yet recorded that it is ready. The pid file is checked
 // first: the supervisor writes it only once it holds the lock, so the lock is
 // probed only while a daemon is known to hold it and the probe cannot race a
 // daemon that is just taking it. An embedded `mcp` (the lock, no pid file) and
@@ -348,7 +399,18 @@ func daemonStarting(data string) bool {
 		_ = unlock()
 		return false
 	}
-	return errors.Is(err, errDataDirBusy)
+	if !errors.Is(err, errDataDirBusy) {
+		return false
+	}
+	// Only a daemon that runs with durable memory can be converting a store,
+	// and only until it records that it is ready: a ready one that stops
+	// answering is not starting. The record must name this daemon (the pid
+	// file's content), so one left by an earlier run never counts.
+	if durable, derr := daemonIsDurable(data); derr != nil || !durable {
+		return false
+	}
+	ready, rerr := os.ReadFile(filepath.Join(data, daemonReadyName)) //nolint:gosec // fixed name inside the data dir
+	return rerr != nil || string(ready) != string(raw)
 }
 
 // processArgs returns pid's argv: /proc where it exists (Linux), else the
