@@ -9,7 +9,18 @@ import (
 
 // A listed durable name only gets the fsynced write-ahead log as a dense
 // collection on a store with a data directory. Anything else is not silently
-// left unprotected: creating it, and opening it, logs a warning naming it.
+// left unprotected: creating it, and opening it, logs a warning naming it. A
+// named or multi-vector collection is told the option does not apply (it keeps
+// its own log settings, which may sync); the others are told they are not
+// crash-safe.
+
+func assertDurableNotAppliedWarning(t *testing.T, logs *syncBuffer, name, when string) {
+	t.Helper()
+	out := logs.String()
+	if !strings.Contains(out, "does not apply") || !strings.Contains(out, name) {
+		t.Fatalf("%s: no does-not-apply warning naming %q:\n%s", when, name, out)
+	}
+}
 
 func assertNotCrashSafeWarning(t *testing.T, logs *syncBuffer, name, when string) {
 	t.Helper()
@@ -34,7 +45,7 @@ func TestListedNamedOrMultiVectorWarnsAtCreateAndOpen(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			assertNotCrashSafeWarning(t, logs, "listed", "create")
+			assertDurableNotAppliedWarning(t, logs, "listed", "create")
 			if err := cs.Close(); err != nil {
 				t.Fatal(err)
 			}
@@ -42,7 +53,7 @@ func TestListedNamedOrMultiVectorWarnsAtCreateAndOpen(t *testing.T) {
 			logs = captureLogs(t)
 			re := openDurable(t, dir, "listed")
 			defer func() { _ = re.Close() }()
-			assertNotCrashSafeWarning(t, logs, "listed", "open")
+			assertDurableNotAppliedWarning(t, logs, "listed", "open")
 		})
 	}
 }
