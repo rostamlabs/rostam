@@ -2102,9 +2102,11 @@ func (h *hnsw) currentVersionLockedAt(id uint64, now uint64) uint64 {
 // It places a fresh point and returns its resulting version. A new point's
 // version is 1, UNLESS setVersion != 0, in which case the version is set
 // VERBATIM (the WAL-replay / reshard-copy path, which must preserve the exact
-// version rather than reset it to 1). HNSW has no in-place vector update — a live
-// id collides (ErrDuplicateID) and Collection.Upsert is delete+insert — so every
-// successful insert here is a fresh point (version 1 / setVersion).
+// version rather than reset it to 1). HNSW has no in-place vector update: a live
+// id collides (ErrDuplicateID) unless replaceLive is set, in which case the old
+// point's slot is reclaimed and the id re-placed (the atomic replace, see
+// replaceInsert). Either way every successful insert here places a fresh point
+// (version 1 / setVersion).
 //
 // EVERY clock-dependent decision is judged against the caller-supplied `now`
 // (unix millis): the dead-slot reclaim liveness check, the point-TTL absolute
@@ -2135,7 +2137,7 @@ func (h *hnsw) placeLockedAt(id uint64, stored []float32, ttl time.Duration, met
 	// (Size = arena.Size() - tombstoned). Reclaiming the expired case too lets
 	// InsertIfAbsent treat an expired slot as absent without colliding (Exists
 	// already reports it not-live). A LIVE id still collides — arena.Insert
-	// returns ErrDuplicateID below.
+	// returns ErrDuplicateID below — unless replaceLive is set (see below).
 	//
 	// FREE AND REUSE MUST BE ATOMIC, which is why the decision is taken here but
 	// the reclaim itself runs LOWER DOWN, past every check that can reject. The
@@ -2268,10 +2270,12 @@ func (h *hnsw) placeLockedAt(id uint64, stored []float32, ttl time.Duration, met
 	}
 	h.arena.SetVersion(slot, version)
 	// id-set membership grew (a brand-new id, or a resurrected dead slot whose id
-	// the reclaim branch above removed from idMap before this Insert). A LIVE-id
-	// collision returned ErrDuplicateID above and never reaches here, so this bump
-	// fires ONLY when the live id set actually changes. Invalidates the scroll
-	// snapshot; this single increment under h.mu is the only write-path cost.
+	// the reclaim branch above removed from idMap before this Insert), or, for a
+	// replaceLive insert, the id moved to a new slot while the live id set stayed
+	// the same. A LIVE-id collision returned ErrDuplicateID above and never
+	// reaches here. The replace case bumps too: a conservative invalidation of
+	// the scroll snapshot, not a sign the set changed. This single increment
+	// under h.mu is the only write-path cost.
 	h.idSetVersion++
 	h.bumpData() // id-set change also invalidates the order_by snapshot
 	if ttl > 0 {

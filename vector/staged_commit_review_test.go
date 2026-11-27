@@ -20,7 +20,8 @@ import (
 // round-trip).
 
 // panicOnceIndex wraps a VectorIndex and panics on the FIRST call to its
-// `target` method ("Insert", "Delete", or "RestoreInsert"), then delegates normally afterward
+// `target` method ("Insert", "Delete", "RestoreInsert", or "replaceInsert", the
+// atomic replace an Upsert over a live id uses), then delegates normally afterward
 // (armed is single-shot). Used to force a real panic inside the staged-commit
 // closures (Collection.InsertCASKeyTTL / UpsertCASKeyTTL) so a B1 regression —
 // opMu leaking across a panicking op — would deadlock the very next write.

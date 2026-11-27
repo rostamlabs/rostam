@@ -128,6 +128,9 @@ func TestPoisonedLogRefusesDenseBulkBuild(t *testing.T) {
 	}
 	defer c.Release()
 	c.wal.poisoned.Store(true)
+	// Staging is allowed on purpose: it fills a buffer that is neither the index
+	// nor part of any snapshot. The build that would apply it is the mutator,
+	// and it is refused.
 	if err := c.StageBulk([]uint64{1}, [][]float32{durableVec(1)}); err != nil {
 		t.Fatal(err)
 	}

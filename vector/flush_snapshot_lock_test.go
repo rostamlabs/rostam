@@ -3,6 +3,7 @@
 package vector
 
 import (
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -217,18 +218,19 @@ func TestReplayInsertOverLiveIDIsANoOp(t *testing.T) {
 		t.Fatalf("seed RestoreInsert: %v", err)
 	}
 
-	// A "newer" record for the SAME live id — what replay would see if a write
-	// landed during snapshot serialization and its record survived truncation.
+	// A "newer" insert for the SAME live id, as the reshard copy or an older
+	// binary's replay of a replace record would issue it.
 	newer := make([]float32, 16)
 	newer[0] = 2
 	err := c.idx.RestoreInsert(1, newer, 0, Metadata{"gen": NewInt(2)}, nil, nil, 6)
-	if err == nil {
-		t.Fatal("RestoreInsert over a LIVE id unexpectedly succeeded — the replay hazard " +
-			"documented here has changed; re-derive the Flush restructure's safety argument")
+	if !errors.Is(err, ErrDuplicateID) {
+		t.Fatalf("RestoreInsert over a LIVE id = %v, want ErrDuplicateID: the collision "+
+			"this primitive's callers rely on has changed", err)
 	}
 
-	// And the state is UNCHANGED — replay discards this error, so the newer record
-	// would have been silently dropped.
+	// And the state is UNCHANGED: the primitive never clobbers a live point. (An
+	// older binary's replay discards this error, so there the newer record is
+	// dropped; current replay uses restoreReplace and is not tested here.)
 	_, meta, _, _, version, ok := c.Get(1)
 	if !ok {
 		t.Fatal("point 1 vanished")

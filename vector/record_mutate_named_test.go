@@ -33,9 +33,8 @@ func walAppendFails(w *wal) {
 
 // walSyncFails makes w's next fsync fail: just before it, the log's file handle
 // is closed, so f.Sync() returns an error while the append before it succeeded
-// — the tail error return. Platform-neutral (a pipe's flush blocks on Windows
-// until the reader drains it). The store's Close then finds the handle closed;
-// callers discard that error.
+// — the tail error return. Closing works the same on every platform. The
+// store's Close then finds the handle closed; callers discard that error.
 func walSyncFails(t *testing.T, w *wal) {
 	t.Helper()
 	var once sync.Once
