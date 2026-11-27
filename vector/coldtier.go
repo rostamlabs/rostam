@@ -421,4 +421,3 @@ func (s *CollectionStore) ColdNames() []string {
 // with everything written to it, and a later eviction can try again. SweepCold
 // skips such a collection without an error.
 var ErrEvictBusy = errors.New("vector: the collection was in use during the eviction; it stays resident")
-

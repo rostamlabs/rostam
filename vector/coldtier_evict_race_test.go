@@ -124,4 +124,3 @@ func TestSweepColdSkipsBusyCollection(t *testing.T) {
 		t.Fatalf("a collection in use was evicted: %v", evicted)
 	}
 }
-

@@ -294,15 +294,17 @@ func (s *CollectionStore) rollbackUpgrade(canonical string, old *Collection, cfg
 // it is unknown which form the next open loads (see markReadOnly). Reads work.
 // The error names the collection, says what happened and to fix the disk
 // problem and restart. A restart does not always finish the job: the next open
-// either completes the upgrade or, when what is on disk still cannot be loaded
-// (a torn manifest, or an upgraded form that does not load), refuses to open
-// with every file kept for manual recovery.
+// tries the upgrade again and may complete it, leave the collection read-only
+// or in its old form with a warning, or, when what is on disk still cannot be
+// loaded (a torn manifest, or an upgraded form that does not load), refuse to
+// open with every file kept for manual recovery.
 var ErrCollectionReadOnly = errors.New("vector: collection is read-only")
 
 // readOnlyAdvice is the client-facing advice in a read-only error.
 const readOnlyAdvice = "it is served read-only from its old form and every file is kept. " +
-	"Fix the disk problem named in the server log and restart: the next start finishes the upgrade, " +
-	"or refuses to open, keeping every file for manual recovery, if what is on disk still cannot be loaded"
+	"Fix the disk problem named in the server log and restart: the next start tries the upgrade again " +
+	"and may finish it, leave the collection read-only or in its old form with a warning, " +
+	"or refuse to open, keeping every file for manual recovery, if what is on disk still cannot be loaded"
 
 // markReadOnly serves c, the old form of canonical, read-only: every change to
 // it, and every flush, checkpoint, drop, restore over it and eviction of it, is
@@ -312,7 +314,7 @@ const readOnlyAdvice = "it is served read-only from its old form and every file 
 // the store opens, before c can be reached by anyone else.
 func (s *CollectionStore) markReadOnly(canonical string, c *Collection, cfgPath, cause string, detail error) {
 	c.readOnly = fmt.Errorf("%w: %s: %s; %s", ErrCollectionReadOnly, canonical, cause, readOnlyAdvice)
-	slog.Error("vector: durable collection is read-only: its upgrade ended with the form of its files unknown; reads work, every change is refused, every file is kept. Fix the disk problem and restart; if the next open still cannot load what is on disk it refuses to open, keeping every file",
+	slog.Error("vector: durable collection is read-only: its upgrade ended with the form of its files unknown; reads work, every change is refused, every file is kept. Fix the disk problem and restart; the next open tries the upgrade again and, if it still cannot load what is on disk, refuses to open, keeping every file",
 		"collection", canonical, "cause", cause, "manifest", cfgPath, "err", detail)
 }
 

@@ -127,10 +127,11 @@ form: `recall` and the other reads work, while `remember` and `forget` fail
 with an error that says memory is read-only and to fix the disk problem and
 restart (`forget` reports it per memory). Nothing is flushed or removed, at
 shutdown included, and every file is kept. Once the disk is fixed, the next
-start either finishes the conversion or, if what is on disk still cannot be
-loaded (a torn manifest, or a new form that does not load), refuses to open
-with an error naming the file, and every file is still there for manual
-recovery. The server log names the manifest and the underlying error; the
+start tries the conversion again: it may finish, leave memory read-only again
+or in its old form with a `not crash-safe` warning, or, if what is on disk
+still cannot be loaded (a torn manifest, or a new form that does not load),
+refuse to open with an error naming the collection, every file still there
+for manual recovery. The server log names the manifest and the underlying error; the
 error a client sees names only the collection.
 
 ### A damaged log

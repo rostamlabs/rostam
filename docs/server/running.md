@@ -137,8 +137,9 @@ and collections that are not listed behave as before.
   write, delete, payload change, bulk build, flush, checkpoint, drop, restore
   over it and cold-tier eviction is refused with an error saying what happened
   and to fix the disk problem and restart (HTTP 409); every file is kept. The
-  restart then either finishes the upgrade or, if what is on disk still cannot
-  be loaded, refuses to start with every file kept for manual recovery. Paths
+  restart tries the upgrade again: it may finish, leave the collection
+  read-only or in its old form with a warning, or, if what is on disk still
+  cannot be loaded, refuse to start with every file kept for manual recovery. Paths
   and underlying errors are in the server log, not in the client's error.
 - A listed collection that already has a log is synced the same way from startup
   on, even if it was created with `WALNoSync`.
