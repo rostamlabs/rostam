@@ -766,12 +766,16 @@ func (s *CollectionStore) DropCollection(name string) error {
 		return err
 	}
 	defer s.lockName(canonical)()
-	return s.dropCollection(canonical)
+	return s.dropCollection(canonical, false)
 }
 
 // dropCollection is DropCollection for a caller that already holds canonical's
 // name lock.
-func (s *CollectionStore) dropCollection(canonical string) error {
+//
+// forPublish is set when the drop is made by a durable restore about to publish
+// its replacement: the restore's staged snapshot (<col>.snap.restoring) is then
+// the replacement's data and is left alone. A plain drop removes it.
+func (s *CollectionStore) dropCollection(canonical string, forPublish bool) error {
 	s.mu.Lock()
 	c, ok := s.collections[canonical]
 	if !ok {
@@ -794,6 +798,9 @@ func (s *CollectionStore) dropCollection(canonical string) error {
 			_ = os.Remove(graphPath)
 			_ = os.Remove(metaPath)
 			_ = os.Remove(walPath)
+			if !forPublish {
+				removeRestoreLeftovers(snapPath)
+			}
 			removeClusterMmapFiles(coldCfg.cfg)
 			return nil
 		}
@@ -832,7 +839,9 @@ func (s *CollectionStore) dropCollection(canonical string) error {
 	c.retire(func() {
 		_ = os.Remove(cfgPath)
 		_ = os.Remove(snapPath)
-		removeRestoreLeftovers(snapPath)
+		if !forPublish {
+			removeRestoreLeftovers(snapPath)
+		}
 		// Single-node persistent files + cluster generation files (no-ops if absent).
 		_ = os.Remove(vecsPath)
 		_ = os.Remove(graphPath)
@@ -1094,7 +1103,7 @@ func (s *CollectionStore) publishRestore(canonical string, cfg Config, c *Collec
 	// Synchronous: returns once in-flight users have drained and the files are gone.
 	// Any other drop of this name finished before the name lock was granted, so no
 	// cleanup still pending can remove the files written below.
-	if err := s.dropCollection(canonical); err != nil {
+	if err := s.dropCollection(canonical, true); err != nil {
 		return fail(err)
 	}
 	if err := writeConfig(cfgPath, cfg); err != nil {

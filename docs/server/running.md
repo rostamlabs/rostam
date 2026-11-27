@@ -136,7 +136,10 @@ and collections that are not listed behave as before.
   that collection read-only from its old form. Reads and backups work; every
   write, delete, payload change, bulk build, flush, checkpoint, drop, restore
   over it and cold-tier eviction is refused with an error saying what happened
-  and to fix the disk problem and restart (HTTP 409); every file is kept.
+  and to fix the disk problem and restart (HTTP 409); every file is kept. The
+  restart then either finishes the upgrade or, if what is on disk still cannot
+  be loaded, refuses to start with every file kept for manual recovery. Paths
+  and underlying errors are in the server log, not in the client's error.
 - A listed collection that already has a log is synced the same way from startup
   on, even if it was created with `WALNoSync`.
 - A listed collection that already exists with neither `Persistent` nor a log

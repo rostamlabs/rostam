@@ -4,9 +4,13 @@ package vector
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/rostamlabs/rostam/objstore"
 )
 
 // TestDurableRestoreFailedSnapshotKeepsOldCollection: a durable restore writes
@@ -93,5 +97,65 @@ func TestDurableRestoreLeftoversRemoved(t *testing.T) {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
 			t.Fatalf("%s left after drop (stat err %v)", p, err)
 		}
+	}
+}
+
+// durableSnapshotOf returns a snapshot of a collection holding point 7.
+func durableSnapshotOf(t *testing.T) []byte {
+	t.Helper()
+	src := openDurable(t, t.TempDir())
+	defer func() { _ = src.Close() }()
+	if err := src.CreateCollection("docs", durablePersistentCfg()); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Upsert("docs", 7, durableVec(7), "restored", 0, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	c, _ := src.Get("docs")
+	var snap bytes.Buffer
+	if err := c.Snapshot(&snap); err != nil {
+		t.Fatal(err)
+	}
+	return snap.Bytes()
+}
+
+// TestDurableRestoreOverExistingCollection: a durable restore over a live
+// collection replaces it, and the restored points survive a reopen.
+func TestDurableRestoreOverExistingCollection(t *testing.T) {
+	snap := durableSnapshotOf(t)
+	for _, cold := range []bool{false, true} {
+		name := "hot"
+		if cold {
+			name = "cold"
+		}
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			ds := openDurable(t, dir, "docs")
+			if err := ds.CreateCollection("docs", durablePersistentCfg()); err != nil {
+				t.Fatal(err)
+			}
+			if err := ds.Upsert("docs", 1, durableVec(1), "old", 0, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			if cold {
+				if err := ds.EvictCollection(context.Background(), "docs", objstore.NewMemStore(), "t", time.Unix(1, 0)); err != nil {
+					t.Fatal(err)
+				}
+				if !ds.IsCold("docs") {
+					t.Fatal("not evicted")
+				}
+			}
+			if err := ds.RestoreCollectionWithConfig("docs", durablePersistentCfg(), bytes.NewReader(snap)); err != nil {
+				t.Fatalf("restore over an existing collection: %v", err)
+			}
+			assertPoints(t, pointsOf(t, ds, "docs"), map[uint64]string{7: "restored"})
+			// Acknowledged once the restore returns: on disk without a Close.
+			cp := t.TempDir()
+			copyTree(t, dir, cp)
+			_ = ds.Close()
+			re := openDurable(t, cp, "docs")
+			defer func() { _ = re.Close() }()
+			assertPoints(t, pointsOf(t, re, "docs"), map[uint64]string{7: "restored"})
+		})
 	}
 }

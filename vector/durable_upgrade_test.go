@@ -739,8 +739,14 @@ func assertServedReadOnly(t *testing.T, dir string, cs *CollectionStore, want ma
 		if !errors.Is(err, ErrCollectionReadOnly) {
 			t.Fatalf("%s on a read-only collection = %v, want ErrCollectionReadOnly", what, err)
 		}
-		if !strings.Contains(err.Error(), "restart") {
-			t.Fatalf("%s: error %q does not say what to do", what, err)
+		msg := err.Error()
+		if !strings.Contains(msg, "restart") || !strings.Contains(msg, upgradeCol) {
+			t.Fatalf("%s: error %q does not name the collection and say what to do", what, err)
+		}
+		// Client-facing: no path, no underlying OS error.
+		if strings.Contains(msg, dir) || strings.Contains(msg, string(filepath.Separator)+"vectors") ||
+			strings.Contains(msg, "injected") || strings.Contains(msg, "is a directory") || strings.Contains(msg, "not a snapshot") {
+			t.Fatalf("%s: error %q leaks a path or an underlying error", what, err)
 		}
 	}
 	c, ok := cs.Acquire(upgradeCol)

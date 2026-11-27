@@ -245,7 +245,8 @@ func (s *CollectionStore) upgradeToDurable(canonical string, cfg Config, cfgPath
 		// The manifest could not be read back or put back, so nothing says
 		// which form the next open loads. A write accepted now might not be
 		// seen by it, so the old form is served read-only and every file stays.
-		s.markReadOnly(canonical, old, cfgPath, fmt.Errorf("upgrading it to the write-ahead log failed and its manifest could not be read back or put back: %w", res.err))
+		s.markReadOnly(canonical, old, cfgPath,
+			"upgrading it to the write-ahead log failed and its manifest could not be read back or put back", res.err)
 		return nil
 	}
 
@@ -276,7 +277,9 @@ func (s *CollectionStore) upgradeToDurable(canonical string, cfg Config, cfgPath
 // form is served read-only and nothing is removed.
 func (s *CollectionStore) rollbackUpgrade(canonical string, old *Collection, cfg Config, cfgPath, snapPath string, loadErr error) {
 	if werr := writeConfig(cfgPath, cfg); werr != nil {
-		s.markReadOnly(canonical, old, cfgPath, fmt.Errorf("its upgraded write-ahead log form did not load (%w), and the old manifest could not be put back (%v)", loadErr, werr))
+		s.markReadOnly(canonical, old, cfgPath,
+			"its upgraded write-ahead log form did not load and its old manifest could not be put back",
+			fmt.Errorf("load: %w; putting the old manifest back: %v", loadErr, werr))
 		return
 	}
 	_, _, _, walPath := s.persistPaths(canonical)
@@ -289,19 +292,28 @@ func (s *CollectionStore) rollbackUpgrade(canonical string, old *Collection, cfg
 // ErrCollectionReadOnly is returned for every change to a collection served
 // read-only: one whose upgrade to the write-ahead log ended in a state where
 // it is unknown which form the next open loads (see markReadOnly). Reads work.
-// The error says what happened; fixing the disk problem it names and
-// restarting lets the next open finish the job.
+// The error names the collection, says what happened and to fix the disk
+// problem and restart. A restart does not always finish the job: the next open
+// either completes the upgrade or, when what is on disk still cannot be loaded
+// (a torn manifest, or an upgraded form that does not load), refuses to open
+// with every file kept for manual recovery.
 var ErrCollectionReadOnly = errors.New("vector: collection is read-only")
+
+// readOnlyAdvice is the client-facing advice in a read-only error.
+const readOnlyAdvice = "it is served read-only from its old form and every file is kept. " +
+	"Fix the disk problem named in the server log and restart: the next start finishes the upgrade, " +
+	"or refuses to open, keeping every file for manual recovery, if what is on disk still cannot be loaded"
 
 // markReadOnly serves c, the old form of canonical, read-only: every change to
 // it, and every flush, checkpoint, drop, restore over it and eviction of it, is
-// refused, and none of its files is written or removed. Called while the store
-// opens, before c can be reached by anyone else.
-func (s *CollectionStore) markReadOnly(canonical string, c *Collection, cfgPath string, why error) {
-	c.readOnly = fmt.Errorf("%w: %s: %v; which form its files are in is unknown, so it is served read-only from the old form and every file is kept. Fix the disk problem (see the server log for the manifest %s) and restart",
-		ErrCollectionReadOnly, canonical, why, cfgPath)
-	slog.Error("vector: durable collection is read-only: its upgrade ended with the form of its files unknown; reads work, every change is refused, every file is kept. Fix the disk problem and restart",
-		"collection", canonical, "manifest", cfgPath, "err", why)
+// refused, and none of its files is written or removed. cause is a plain
+// description for the client-facing error, which carries no path and no
+// underlying error; those (cfgPath, detail) go to the log only. Called while
+// the store opens, before c can be reached by anyone else.
+func (s *CollectionStore) markReadOnly(canonical string, c *Collection, cfgPath, cause string, detail error) {
+	c.readOnly = fmt.Errorf("%w: %s: %s; %s", ErrCollectionReadOnly, canonical, cause, readOnlyAdvice)
+	slog.Error("vector: durable collection is read-only: its upgrade ended with the form of its files unknown; reads work, every change is refused, every file is kept. Fix the disk problem and restart; if the next open still cannot load what is on disk it refuses to open, keeping every file",
+		"collection", canonical, "cause", cause, "manifest", cfgPath, "err", detail)
 }
 
 // keepOrphanSnapshot handles a listed collection whose Persistent manifest has

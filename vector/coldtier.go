@@ -153,9 +153,6 @@ func (s *CollectionStore) EvictCollection(ctx context.Context, name string, obj 
 	s.mu.Unlock()
 	cfg := c.Config()
 	key := coldSnapshotKey(tenant, canonical, ts)
-	// Whether something (a backup taken in the same second) already holds the
-	// key: if this eviction then gives up, it removes only objects it created.
-	preexisting := coldObjectExists(ctx, obj, key)
 	if err := s.putColdSnapshot(ctx, c, obj, key, cfg); err != nil {
 		c.Release()
 		return fmt.Errorf("vector: evict %q: %w", canonical, err)
@@ -190,19 +187,10 @@ func (s *CollectionStore) EvictCollection(ctx context.Context, name string, obj 
 	if live.inuse.Load() != 0 || live.pins.Load() != pins {
 		// Used since the snapshot: a write may be missing from the uploaded
 		// object. New pins need s.mu, held here, so the check is final. The
-		// objects just uploaded are removed, best effort, unless they were
-		// there before or a cold stub points at them.
-		referenced := preexisting
-		for _, e := range s.cold {
-			if e.key == key {
-				referenced = true
-			}
-		}
+		// objects already uploaded are left where they are, as when the name is
+		// dropped meanwhile: deleting them could race another eviction or a
+		// backup writing the same key, and remove an object a stub points at.
 		s.mu.Unlock()
-		if !referenced {
-			_ = obj.Delete(ctx, key)
-			_ = obj.Delete(ctx, coldCfgKey(key))
-		}
 		return fmt.Errorf("vector: evict %q: %w", canonical, ErrEvictBusy)
 	}
 	if s.cold == nil {
@@ -434,17 +422,3 @@ func (s *CollectionStore) ColdNames() []string {
 // skips such a collection without an error.
 var ErrEvictBusy = errors.New("vector: the collection was in use during the eviction; it stays resident")
 
-// coldObjectExists reports whether obj holds key. An error listing counts as
-// existing, so a caller deciding whether it may delete the key stays safe.
-func coldObjectExists(ctx context.Context, obj objstore.ObjectStore, key string) bool {
-	infos, err := obj.List(ctx, key)
-	if err != nil {
-		return true
-	}
-	for _, in := range infos {
-		if in.Key == key || in.Key == coldCfgKey(key) {
-			return true
-		}
-	}
-	return false
-}

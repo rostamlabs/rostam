@@ -126,8 +126,12 @@ back. In both, the store opens and serves memory **read-only** from the old
 form: `recall` and the other reads work, while `remember` and `forget` fail
 with an error that says memory is read-only and to fix the disk problem and
 restart (`forget` reports it per memory). Nothing is flushed or removed, at
-shutdown included, and every file is kept, so the next start, once the disk
-is fixed, finishes the job or fails with an error naming the file.
+shutdown included, and every file is kept. Once the disk is fixed, the next
+start either finishes the conversion or, if what is on disk still cannot be
+loaded (a torn manifest, or a new form that does not load), refuses to open
+with an error naming the file, and every file is still there for manual
+recovery. The server log names the manifest and the underlying error; the
+error a client sees names only the collection.
 
 ### A damaged log
 

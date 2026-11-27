@@ -58,8 +58,9 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   were written.)
 - **A cold-tier eviction of a collection in use leaves it resident.** If the
   collection is used while its snapshot uploads, the eviction gives up (HTTP
-  409 on the admin route), removes what it uploaded, and the idle sweep tries
-  again later, instead of retiring the collection with the write.
+  409 on the admin route) and the idle sweep tries again later, instead of
+  retiring the collection with the write. The snapshot it had uploaded stays
+  in the object store, unused.
 - **A multi-vector document whose log record would exceed 64 MiB is
   refused** before it is applied, instead of being acknowledged and dropped
   when the log is next replayed.
